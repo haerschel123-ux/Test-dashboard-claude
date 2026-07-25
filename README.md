@@ -205,6 +205,10 @@ Installation aus. Zum Aktivieren im
    Rufst du das Dashboard auch über `https://` auf, trage **beide** Varianten ein — die
    Adresse wird aus dem tatsächlichen Aufruf gebildet und muss exakt passen.
 
+Nach dem Login steht oben rechts in der Kopfzeile das Discord-Profilbild, darunter der Name
+und darunter der Abmelden-Button. Lädt das Bild nicht (kein Zugriff auf Discords CDN im
+Browser), bleibt nur der Name stehen.
+
 Abgefragt wird nur der Scope `identify` — also wer du bist. Der Zugriffstoken bleibt auf dem
 Server und erreicht den Browser nie. Welche Rollen jemand hat, fragt der Bot selbst über die
 verbundenen Guilds ab (`fetch_member`, ein REST-Aufruf ohne privilegierte Intent).
