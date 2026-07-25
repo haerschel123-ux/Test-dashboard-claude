@@ -20,7 +20,8 @@ Beim ersten Start legt `bot.py` alles selbst an:
 | `config.json`, `guilds_config.json`, `banlist.json`, `log_state.json`, `whitelist_requests.json` | Konfiguration & Laufzeitdaten |
 | `requirements.txt`, `README.txt` | Paketliste & Kurzanleitung |
 | `dashboard_web/static/…` | Frontend (`index.html`, `app.js`, `styles.css`, `map.js`), Leaflet und die Ortslisten der drei Karten |
-| fehlende Python-Pakete | `discord.py`, `aiohttp`, `requests`, `tzdata` werden per pip nachinstalliert |
+| `dashboard_web/dashboard_cert.pem`, `dashboard_key.pem` | Selbstsigniertes Zertifikat, damit das Dashboard auch `https://` annimmt |
+| fehlende Python-Pakete | `discord.py`, `aiohttp`, `requests`, `tzdata` werden per pip nachinstalliert, `cryptography` optional für HTTPS |
 
 Das komplette Frontend, die Leaflet-Bibliothek und die Ortslisten (201/60/60 Orte) stecken
 komprimiert (zlib + base64) **in `bot.py`** und werden beim Start herausgeschrieben.
@@ -79,6 +80,8 @@ Diese Adresse steht beim Start auch direkt im Log:
 
 ```
 [DASHBOARD] ✅ Dashboard läuft:  http://testdashboard.my.pebble.host:25590
+[DASHBOARD]    …oder verschlüsselt: https://testdashboard.my.pebble.host:25590
+[DASHBOARD]    (Das Zertifikat ist selbstsigniert – der Browser warnt einmalig: "Erweitert" → "Weiter".)
 [DASHBOARD]    (lokal auf diesem Rechner: http://127.0.0.1:25590)
 ```
 
@@ -110,6 +113,52 @@ portunabhängig.
 
 Der Web-Port wird in dieser Reihenfolge bestimmt:
 **`SERVER_PORT` → `PORT` → `config.json` (`dashboard_port`) → `8080`**
+
+### `http://` oder `https://`?
+
+**Beides funktioniert – auf demselben Port.** Das ist kein Komfort-Detail, sondern
+behebt einen Fehler: Browser stufen getippte Adressen zunehmend von selbst auf
+`https://` hoch. Traf so ein TLS-Handshake früher auf das Dashboard, das nur
+Klartext-HTTP sprach, antwortete es mit HTTP-Text — der Browser konnte daraus kein
+Zertifikat lesen und brach ab:
+
+```
+Diese Website kann keine sichere Verbindung bereitstellen
+testdashboard.my.pebble.host hat eine ungültige Antwort gesendet.
+ERR_SSL_PROTOCOL_ERROR
+```
+
+Die Seite war damit schlicht nicht erreichbar, obwohl der Server lief — und zwar
+sporadisch: über ein Lesezeichen mit `http://` ging es, neu getippt nicht.
+
+Jetzt entscheidet der Server **pro Verbindung**. Das erste Byte eines
+TLS-ClientHello ist immer `0x16`; steht es an, wird die Verbindung mit TLS
+bedient, sonst wie bisher als Klartext-HTTP. Gelesen wird das Byte mit `MSG_PEEK`,
+es bleibt also im Puffer und ist danach noch Teil des Handshakes. Ein zweiter Port
+kommt nicht in Frage — PebbleHost weist genau einen zu.
+
+Das Zertifikat erzeugt `bot.py` beim Start selbst (`dashboard_web/dashboard_cert.pem`
+und `dashboard_key.pem`, beide gitignored, der Schlüssel mit `0600`). Es gilt für
+`dashboard_public_host`, `server_ip`, `localhost` und `127.0.0.1`, läuft nach
+825 Tagen ab und wird 30 Tage vorher — oder wenn sich die Adresse ändert —
+automatisch erneuert.
+
+Weil es **selbstsigniert** ist, warnt der Browser bei `https://` einmalig
+(„Erweitert" → „Weiter zur Seite"). Das ist der Unterschied zu vorher: aus einer
+Sackgasse wird ein Klick. Willst du die Warnung ganz los, brauchst du ein echtes
+Zertifikat — dafür ist der Cloudflare Tunnel weiter unten der Weg.
+
+| Aufruf | Ergebnis |
+|---|---|
+| `http://…:25590` | lädt direkt, unverändert wie bisher |
+| `https://…:25590` | lädt nach einmaliger Zertifikatswarnung, Verbindung verschlüsselt |
+| `https://…` ohne Port | geht nicht — Port 80/443 gehören PebbleHosts nginx |
+
+Abschalten lässt sich das mit `"dashboard_https": false` in der `config.json`; dann
+läuft alles wie früher über reines HTTP. Fehlt das Paket `cryptography` (es wird
+beim Start automatisch nachinstalliert, ein Fehlschlag ist nicht schlimm) oder ist
+`dashboard_web/` nicht beschreibbar, passiert dasselbe — mit einem Hinweis im Log.
+Der Bot startet in jedem Fall.
 
 ### Was **nicht** in die Browserzeile gehört
 
@@ -148,6 +197,11 @@ nur die Kacheln brauchen Internet im Browser.
   Ein gültiger Token erzeugt eine **serverseitige** Session; der Browser bekommt nur eine
   zufällige Session-ID als Cookie (`dz_sess`, httponly, 12 h). Der Token selbst verlässt den
   Server nie.
+- **Über `http://` geht der Token im Klartext durchs Netz.** Rufst du das Dashboard über
+  `https://` auf (derselbe Port, siehe oben), ist die Verbindung verschlüsselt — gegen
+  Mitlesen unterwegs. Ein selbstsigniertes Zertifikat schützt allerdings nicht gegen einen
+  Angreifer, der sich aktiv dazwischenschaltet; dagegen hilft nur ein echtes Zertifikat
+  (Cloudflare Tunnel).
 - **Das Dashboard kann den Server neu starten und stoppen.** Halte die URL (samt Port)
   deshalb **privat**.
 - **Niemals committen:** `config.json`, Nitrado-Token, Discord-Bot-Token, FTP-Zugangsdaten,

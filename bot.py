@@ -39,6 +39,8 @@ import zlib
 import secrets
 import mimetypes
 import hashlib
+import ssl
+import ipaddress
 from collections import deque
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional, Dict, List, Tuple, Any, Deque
@@ -75,6 +77,7 @@ def _install_deps():
         subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet"] + missing)
         print("[SETUP] Fertig – starte Bot neu...\n")
         os.execv(sys.executable, [sys.executable] + sys.argv)
+    _install_optional_deps()
 
 def _can_import(name: str) -> bool:
     try:
@@ -82,6 +85,48 @@ def _can_import(name: str) -> bool:
         return True
     except ImportError:
         return False
+
+
+def _x509_available() -> bool:
+    """Prüft, ob wirklich Zertifikate erzeugt werden können.
+
+    Bewusst breit abgesichert: eine kaputte cryptography-Installation meldet
+    sich nicht nur mit ImportError, sondern z. B. auch mit einem Panic aus dem
+    Rust-Backend, wenn das cffi-Backend fehlt. Das darf den Bot nicht umwerfen.
+    """
+    try:
+        __import__("cryptography.x509")
+        return True
+    except Exception:  # noqa: BLE001 – siehe Docstring
+        return False
+
+
+def _install_optional_deps():
+    """Optionale Pakete nachziehen – ein Fehlschlag darf NIE den Start blockieren.
+
+    ``cryptography`` wird nur für das selbstsignierte Zertifikat des Dashboards
+    gebraucht (HTTPS auf demselben Port). Ohne das Paket läuft alles wie
+    bisher, nur eben ausschließlich über http://.
+    """
+    if _x509_available():
+        return
+    import subprocess
+    print("[SETUP] Installiere optionales Paket für HTTPS im Dashboard: cryptography")
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                        "cryptography>=41.0"], check=True, timeout=300)
+    except Exception as e:  # noqa: BLE001 – optional, darf fehlschlagen
+        print(f"[SETUP] cryptography nicht installierbar ({e}).")
+        print("[SETUP] Das Dashboard läuft dann nur über http:// – siehe README.")
+        return
+    # Frisch installierte Pakete findet der Import-Mechanismus erst nach dem
+    # Leeren der Pfad-Caches; ohne execv-Neustart ist das nötig.
+    import importlib
+    importlib.invalidate_caches()
+    if _x509_available():
+        print("[SETUP] cryptography installiert – das Dashboard nimmt jetzt auch https:// an.")
+    else:
+        print("[SETUP] cryptography weiterhin nicht nutzbar – Dashboard läuft nur über http://.")
 
 _install_deps()
 
@@ -330,6 +375,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # einem Reverse-Proxy). Leer lassen = nur lokaler Hinweis.
     # Die Umgebungsvariable DASHBOARD_PUBLIC_HOST hat Vorrang.
     "dashboard_public_host": "testdashboard.my.pebble.host",
+    # HTTPS: Das Dashboard nimmt auf DEMSELBEN Port zusätzlich TLS an, weil
+    # Browser getippte Adressen oft von sich aus auf https:// hochstufen – ohne
+    # TLS endet das in ERR_SSL_PROTOCOL_ERROR und die Seite ist gar nicht
+    # erreichbar. Das Zertifikat ist selbstsigniert und wird beim Start
+    # automatisch erzeugt; der Browser zeigt deshalb einmalig eine Warnung
+    # ("Erweitert" → "Weiter"). Ganz ohne Warnung geht nur ein echtes
+    # Zertifikat, z. B. über einen Cloudflare Tunnel (siehe README).
+    # false = wie früher ausschließlich HTTP.
+    "dashboard_https":       True,
     # Optionale Leaflet-Kachel-URLs je Karte, z. B.
     #   {"ChernarusPlus": "https://.../{z}/{x}/{y}.png"}
     "dashboard_map_tiles":   {},
@@ -402,7 +456,9 @@ def _canonical_map_name(raw: str) -> Optional[str]:
 #  Hilfsdateien automatisch erstellen
 # ══════════════════════════════════════════════════════════════
 def _create_helper_files():
-    req = "discord.py>=2.3.0\naiohttp>=3.9.0\nrequests>=2.31.0\n"
+    req = ("discord.py>=2.3.0\naiohttp>=3.9.0\nrequests>=2.31.0\n"
+           "# optional – nur für HTTPS im Dashboard (selbstsigniertes Zertifikat)\n"
+           "cryptography>=41.0\n")
     if not os.path.exists("requirements.txt"):
         with open("requirements.txt", "w", encoding="utf-8") as f:
             f.write(req)
@@ -517,6 +573,26 @@ Server-Neustart an der angegebenen Koordinate.
 - Vor jedem Schreiben wird ein Backup (cfgEffectArea.json.bak) angelegt.
 - Guthaben liegt in economy.db (SQLite) – Datei sichern = Economy sichern.
 
+WEB-DASHBOARD IM BROWSER ÖFFNEN
+────────────────────────────────
+Die Adresse steht beim Start im Log ([DASHBOARD] ✅ ...). Gebunden wird an
+0.0.0.0 – 0.0.0.0 und 127.0.0.1 sind nur LOKALE Adressen und gehören nicht
+in die Browserzeile; nimm die Adresse deines Servers samt Port.
+
+Der Port gehört dazu, z. B. http://dein-server.example:25590
+Trage deine Adresse als "dashboard_public_host" in die config.json ein,
+dann steht im Log direkt der fertige Link.
+
+http:// ODER https:// ?
+Beides geht – derselbe Port nimmt an, was der Browser schickt. Wichtig,
+weil Browser getippte Adressen oft von allein auf https:// hochstufen;
+früher endete das in ERR_SSL_PROTOCOL_ERROR und die Seite lud gar nicht.
+Das Zertifikat erzeugt der Bot selbst (selbstsigniert), deshalb warnt der
+Browser bei https:// einmalig – "Erweitert" → "Weiter zur Seite".
+Ohne Warnung geht es nur mit einem echten Zertifikat, z. B. über einen
+Cloudflare Tunnel auf 127.0.0.1:<Port>.
+Abschalten: "dashboard_https": false in der config.json (dann nur http://).
+
 MEHRERE DISCORD-SERVER (Guilds)
 ────────────────────────────────
 Trage in config.json unter "guild_ids" mehrere IDs ein:
@@ -537,7 +613,9 @@ Der Bot sucht beim Start automatisch in folgenden Pfaden:
     if os.path.exists("README.txt"):
         try:
             with open("README.txt", "r", encoding="utf-8") as f:
-                needs_readme = "/send whitelist panel" not in f.read()
+                # Marker mitziehen, wenn oben etwas ergänzt wird – sonst
+                # bekommen bestehende Installationen die neue Fassung nie.
+                needs_readme = "WEB-DASHBOARD IM BROWSER ÖFFNEN" not in f.read()
         except Exception:
             needs_readme = True
     if needs_readme:
@@ -10325,6 +10403,8 @@ async def api_server_stop(request: web.Request) -> web.Response:
 dash_log = logging.getLogger("dashboard")
 
 _dash_runner: Optional[web.AppRunner] = None
+# Nur gesetzt, wenn der Port zusätzlich HTTPS annimmt (siehe _DualProtocolSite).
+_dash_site: Optional[Any] = None
 
 
 async def _dash_index(request: web.Request) -> web.Response:
@@ -10436,6 +10516,307 @@ def build_app() -> web.Application:
     return app
 
 
+# ══════════════════════════════════════════════════════════════
+#  HTTPS auf DEMSELBEN Port (Protokoll-Erkennung pro Verbindung)
+# ══════════════════════════════════════════════════════════════
+#  Browser stufen getippte Adressen zunehmend selbst auf https:// hoch. Trifft
+#  so ein TLS-Handshake auf einen Server, der nur Klartext-HTTP spricht,
+#  antwortet dieser mit HTTP-Text – der Browser kann das nicht als Zertifikat
+#  lesen und bricht mit ERR_SSL_PROTOCOL_ERROR ab. Die Seite ist damit nicht
+#  erreichbar, obwohl der Server läuft.
+#
+#  Ein zweiter Port ist keine Lösung: Hoster wie PebbleHost weisen genau einen
+#  zu. Deshalb entscheidet der Server pro Verbindung. Das erste Byte eines
+#  TLS-ClientHello ist immer 0x16 (Handshake-Record); alles andere ist eine
+#  HTTP-Methode ("GET" = 0x47 …). Gelesen wird es mit MSG_PEEK, es bleibt also
+#  im Puffer und ist danach noch Teil des Handshakes bzw. der HTTP-Anfrage.
+#  Beide Fälle landen anschließend im selben aiohttp-Handler.
+
+_TLS_HANDSHAKE_FIRST_BYTE = 0x16
+_TLS_CERT_FILE = "dashboard_cert.pem"
+_TLS_KEY_FILE  = "dashboard_key.pem"
+
+
+def _tls_paths() -> Tuple[str, str]:
+    """Zertifikat und Schlüssel liegen in dashboard_web/ – dort, wo schon die
+    erzeugten Frontend-Dateien liegen. Das Verzeichnis steht in .gitignore und
+    wird von /static/… nicht ausgeliefert (siehe _asset_path)."""
+    return (os.path.join(_DASH_DIR, _TLS_CERT_FILE),
+            os.path.join(_DASH_DIR, _TLS_KEY_FILE))
+
+
+def _tls_hostnames() -> List[str]:
+    """Namen/IPs, die ins Zertifikat gehören – die öffentliche Adresse zuerst."""
+    names: List[str] = []
+
+    def _add(raw: str) -> None:
+        v = (raw or "").strip().rstrip("/")
+        if "://" in v:
+            v = v.split("://", 1)[1]
+        v = v.split("/", 1)[0]
+        if v.count(":") == 1:            # host:port – Port gehört nicht ins Zertifikat
+            v = v.split(":", 1)[0]
+        if v and v not in names:
+            names.append(v)
+
+    _add(os.environ.get("DASHBOARD_PUBLIC_HOST", ""))
+    _add(str(cfg.config.get("dashboard_public_host") or ""))
+    _add(str(cfg.config.get("server_ip") or ""))
+    _add("localhost")
+    _add("127.0.0.1")
+    return names
+
+
+def _cert_is_usable(cert_path: str, names: List[str]) -> bool:
+    """True, wenn das vorhandene Zertifikat noch länger gültig ist und alle
+    Namen abdeckt. Sonst wird es neu erzeugt (z. B. nach einem Hostwechsel)."""
+    try:
+        from cryptography import x509
+        with open(cert_path, "rb") as f:
+            cert = x509.load_pem_x509_certificate(f.read())
+        expires = getattr(cert, "not_valid_after_utc", None)
+        if expires is None:              # ältere cryptography-Versionen
+            expires = cert.not_valid_after.replace(tzinfo=timezone.utc)
+        if expires - datetime.now(timezone.utc) < timedelta(days=30):
+            return False
+        san = cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName).value
+        covered = {str(entry.value) for entry in san}
+        return all(n in covered for n in names)
+    except Exception:  # noqa: BLE001 – unlesbar/kaputt = neu erzeugen
+        return False
+
+
+def _create_selfsigned_cert(cert_path: str, key_path: str, names: List[str]) -> None:
+    """Selbstsigniertes Zertifikat für die angegebenen Namen/IPs schreiben."""
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    alt_names: List[Any] = []
+    for n in names:
+        try:
+            alt_names.append(x509.IPAddress(ipaddress.ip_address(n)))
+        except ValueError:
+            alt_names.append(x509.DNSName(n))
+    subject = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, names[0][:64]),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, "DayZ Dashboard"),
+    ])
+    now = datetime.now(timezone.utc)
+    cert = (x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=825))
+            .add_extension(x509.SubjectAlternativeName(alt_names), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None),
+                           critical=True)
+            .sign(key, hashes.SHA256()))
+
+    os.makedirs(_DASH_DIR, exist_ok=True)
+    with open(key_path, "wb") as f:
+        f.write(key.private_bytes(serialization.Encoding.PEM,
+                                  serialization.PrivateFormat.TraditionalOpenSSL,
+                                  serialization.NoEncryption()))
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass
+    with open(cert_path, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+
+def _tls_context() -> Optional[ssl.SSLContext]:
+    """SSL-Kontext fürs Dashboard – ``None`` heißt: nur HTTP wie früher.
+
+    Schlägt irgendetwas fehl (Paket fehlt, Verzeichnis schreibgeschützt), ist
+    das kein Fehler: das Dashboard läuft dann unverändert über http://.
+    """
+    if not cfg.config.get("dashboard_https", True):
+        return None
+    if not _x509_available():
+        dash_log.info("[DASHBOARD] Paket 'cryptography' nicht verfügbar – HTTPS aus, "
+                      "das Dashboard ist nur über http:// erreichbar.")
+        return None
+    cert_path, key_path = _tls_paths()
+    names = _tls_hostnames()
+    try:
+        if not (os.path.exists(cert_path) and os.path.exists(key_path)
+                and _cert_is_usable(cert_path, names)):
+            _create_selfsigned_cert(cert_path, key_path, names)
+            dash_log.info(f"[DASHBOARD] Selbstsigniertes Zertifikat erzeugt für: "
+                          f"{', '.join(names)}")
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        # aiohttp spricht HTTP/1.1. Ohne diese Ansage bieten Browser zusätzlich
+        # h2 (HTTP/2) an und müssten selbst zurückfallen – hier ist es eindeutig.
+        try:
+            ctx.set_alpn_protocols(["http/1.1"])
+        except NotImplementedError:
+            pass
+        ctx.load_cert_chain(cert_path, key_path)
+        return ctx
+    except Exception as e:  # noqa: BLE001 – HTTPS ist eine Zugabe, kein Muss
+        dash_log.warning(f"[DASHBOARD] HTTPS nicht einrichtbar ({e}) – nur http://.")
+        return None
+
+
+def _close_quietly(sock: socket.socket) -> None:
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+async def _peek_first_byte(sock: socket.socket) -> bytes:
+    """Erstes Byte ansehen, ohne es aus dem Socket-Puffer zu nehmen (MSG_PEEK).
+
+    Genau deshalb funktioniert die Weitergabe danach: TLS-Handshake bzw.
+    HTTP-Anfrage sind noch vollständig vorhanden.
+    """
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    fd = sock.fileno()
+
+    def _ready() -> None:
+        if fut.done():
+            return
+        try:
+            data = sock.recv(1, socket.MSG_PEEK)
+        except (BlockingIOError, InterruptedError):
+            return                       # noch nichts da – weiter warten
+        except OSError as e:
+            loop.remove_reader(fd)
+            fut.set_exception(e)
+            return
+        loop.remove_reader(fd)
+        fut.set_result(data)
+
+    loop.add_reader(fd, _ready)
+    try:
+        return await fut
+    finally:
+        try:
+            loop.remove_reader(fd)
+        except (OSError, ValueError, NotImplementedError):
+            pass
+
+
+def _loop_supports_peek() -> bool:
+    """Die Protokoll-Erkennung braucht ``add_reader``. Das fehlt unter Windows
+    im ProactorEventLoop – dort bleibt es beim bisherigen reinen HTTP."""
+    loop = asyncio.get_running_loop()
+    a, b = socket.socketpair()
+    try:
+        loop.add_reader(a.fileno(), lambda: None)
+        loop.remove_reader(a.fileno())
+        return True
+    except NotImplementedError:
+        return False
+    except OSError:
+        return False
+    finally:
+        a.close()
+        b.close()
+
+
+class _DualProtocolSite:
+    """Ersetzt ``web.TCPSite`` und bedient HTTP und HTTPS auf einem Port.
+
+    Die Verbindungen werden selbst angenommen und – je nach erstem Byte – mit
+    oder ohne SSL-Kontext an denselben aiohttp-Handler übergeben
+    (``runner.server`` ist genau die Protokoll-Fabrik, die auch ``TCPSite``
+    benutzt). Es gibt also keinen zweiten Server und keinen Proxy davor.
+    """
+
+    def __init__(self, runner: web.AppRunner, ssl_ctx: Optional[ssl.SSLContext]):
+        self._runner = runner
+        self._ssl = ssl_ctx
+        self._sock: Optional[socket.socket] = None
+        self._accept_task: Optional[asyncio.Future] = None
+        self._conns: set = set()
+
+    async def start(self, host: str, port: int) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((host, port))
+            sock.listen(128)
+            sock.setblocking(False)
+        except BaseException:
+            _close_quietly(sock)
+            raise
+        self._sock = sock
+        self._accept_task = asyncio.ensure_future(self._accept_loop(sock))
+
+    async def _accept_loop(self, sock: socket.socket) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                conn, _addr = await loop.sock_accept(sock)
+            except asyncio.CancelledError:
+                raise
+            except OSError:
+                return                   # Listen-Socket zu = Feierabend
+            task = asyncio.ensure_future(self._serve_conn(conn))
+            self._conns.add(task)
+            task.add_done_callback(self._conns.discard)
+
+    async def _serve_conn(self, conn: socket.socket) -> None:
+        loop = asyncio.get_running_loop()
+        try:
+            conn.setblocking(False)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            _close_quietly(conn)
+            return
+        try:
+            first = await asyncio.wait_for(_peek_first_byte(conn), timeout=30)
+        except asyncio.CancelledError:
+            _close_quietly(conn)
+            raise
+        except (asyncio.TimeoutError, OSError):
+            _close_quietly(conn)         # Port-Scanner, Timeout, abgebrochen
+            return
+        if not first:                    # Gegenseite hat sofort wieder zugemacht
+            _close_quietly(conn)
+            return
+
+        use_tls = self._ssl is not None and first[0] == _TLS_HANDSHAKE_FIRST_BYTE
+        try:
+            await loop.connect_accepted_socket(
+                self._runner.server, conn, ssl=self._ssl if use_tls else None)
+        except (ssl.SSLError, OSError) as e:
+            # Typisch: der Browser lehnt das selbstsignierte Zertifikat ab.
+            # Das betrifft nur diese eine Verbindung, nicht den Server.
+            dash_log.debug(f"[DASHBOARD] Verbindung nicht zustande gekommen: {e}")
+            _close_quietly(conn)
+
+    async def stop(self) -> None:
+        if self._accept_task is not None:
+            self._accept_task.cancel()
+            try:
+                await self._accept_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
+            self._accept_task = None
+        # Verbindungen, die noch beim Erkennen bzw. im Handshake stehen: die
+        # kennt der aiohttp-Runner noch nicht, also hier selbst abräumen.
+        for task in list(self._conns):
+            task.cancel()
+        self._conns.clear()
+        if self._sock is not None:
+            _close_quietly(self._sock)
+            self._sock = None
+
+
 def _dash_public_url(port: int) -> str:
     """Öffentlich erreichbare Adresse für die Startmeldung (Env vor config).
 
@@ -10471,7 +10852,7 @@ def _dash_resolve_port() -> int:
 
 async def start_dashboard(bot: Any) -> None:
     """Bindet den Bot ans Dashboard und startet den Web-Server (idempotent)."""
-    global _dash_runner, _DASH_BOUND
+    global _dash_runner, _dash_site, _DASH_BOUND
     if _dash_runner is not None:
         return
     _DASH_BOUND = True
@@ -10499,11 +10880,24 @@ async def start_dashboard(bot: Any) -> None:
     _dash_runner = web.AppRunner(app, access_log=None)
     await _dash_runner.setup()
 
+    # HTTPS ist eine Zugabe: klappt sie nicht, bleibt es beim bisherigen
+    # reinen HTTP – und zwar über denselben Weg wie früher (web.TCPSite).
+    ssl_ctx = _tls_context()
+    if ssl_ctx is not None and not _loop_supports_peek():
+        dash_log.info("[DASHBOARD] Protokoll-Erkennung auf diesem System nicht "
+                      "möglich – HTTPS aus, nur http://.")
+        ssl_ctx = None
+
     bound, last_err = None, None
     for host in hosts:
         try:
-            site = web.TCPSite(_dash_runner, host, port)
-            await site.start()
+            if ssl_ctx is not None:
+                site = _DualProtocolSite(_dash_runner, ssl_ctx)
+                await site.start(host, port)
+                _dash_site = site
+            else:
+                site = web.TCPSite(_dash_runner, host, port)
+                await site.start()
             bound = host
             break
         except OSError as e:
@@ -10514,18 +10908,28 @@ async def start_dashboard(bot: Any) -> None:
     if bound is None:
         await _dash_runner.cleanup()
         _dash_runner = None
+        _dash_site = None
         dash_log.error(f"[DASHBOARD] Konnte auf Port {port} nicht binden: {last_err}. "
                   f"Dashboard ist AUS. Ist der Port vom Host freigegeben (SERVER_PORT) "
                   f"und nicht belegt?")
         return
 
     public = _dash_public_url(port)
+    secure = ssl_ctx is not None
     if public:
         dash_log.info(f"[DASHBOARD] ✅ Dashboard läuft:  {public}")
+        if secure and public.startswith("http://"):
+            dash_log.info(f"[DASHBOARD]    …oder verschlüsselt: "
+                          f"https://{public[len('http://'):]}")
+            dash_log.info("[DASHBOARD]    (Das Zertifikat ist selbstsigniert – der Browser "
+                          "warnt einmalig: \"Erweitert\" → \"Weiter\".)")
+        elif not secure:
+            dash_log.info("[DASHBOARD]    Nur http:// – ein getipptes https:// scheitert hier "
+                          "mit ERR_SSL_PROTOCOL_ERROR.")
         dash_log.info(f"[DASHBOARD]    (lokal auf diesem Rechner: http://127.0.0.1:{port})")
     else:
         dash_log.info(f"[DASHBOARD] ✅ Dashboard läuft auf Port {port} "
-                      f"(gebunden an {bound}).")
+                      f"(gebunden an {bound}{', HTTP und HTTPS' if secure else ''}).")
         dash_log.info(f"[DASHBOARD] 🌐 Im Browser über die Adresse deines Servers mit Port "
                       f"{port} öffnen – 127.0.0.1 und 0.0.0.0 sind nur lokale Adressen. "
                       f"Trage die Adresse als \"dashboard_public_host\" in die config.json "
@@ -10533,7 +10937,10 @@ async def start_dashboard(bot: Any) -> None:
 
 
 async def stop_dashboard() -> None:
-    global _dash_runner
+    global _dash_runner, _dash_site
+    if _dash_site is not None:
+        await _dash_site.stop()
+        _dash_site = None
     if _dash_runner is not None:
         await _dash_runner.cleanup()
         _dash_runner = None
