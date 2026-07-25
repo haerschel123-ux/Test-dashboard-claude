@@ -322,6 +322,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "dashboard_enabled":     True,
     "dashboard_host":        "0.0.0.0",
     "dashboard_port":        8080,
+    # Öffentlich erreichbare Adresse – wird NUR für die Startmeldung im Log
+    # benutzt. Gebunden wird immer an "dashboard_host" (0.0.0.0). Ohne Port
+    # angeben, dann wird der tatsächliche Port automatisch angehängt; mit
+    # Port oder als https://… wird der Wert genau so übernommen (z. B. hinter
+    # einem Reverse-Proxy). Leer lassen = nur lokaler Hinweis.
+    # Die Umgebungsvariable DASHBOARD_PUBLIC_HOST hat Vorrang.
+    "dashboard_public_host": "testdashboard.my.pebble.host",
     # Optionale Leaflet-Kachel-URLs je Karte, z. B.
     #   {"ChernarusPlus": "https://.../{z}/{x}/{y}.png"}
     "dashboard_map_tiles":   {},
@@ -10355,6 +10362,25 @@ def build_app() -> web.Application:
     return app
 
 
+def _dash_public_url(port: int) -> str:
+    """Öffentlich erreichbare Adresse für die Startmeldung (Env vor config).
+
+    Ohne Portangabe wird der tatsächlich gebundene Port angehängt. Steht in der
+    Konfiguration schon ein Port oder ``https://``, wird der Wert unverändert
+    übernommen – so stimmt der Link auch hinter einem Reverse-Proxy.
+    """
+    raw = (os.environ.get("DASHBOARD_PUBLIC_HOST")
+           or cfg.config.get("dashboard_public_host") or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    scheme, sep, rest = raw.partition("://")
+    if not sep:
+        scheme, rest = "http", raw
+    if ":" in rest or scheme == "https":
+        return f"{scheme}://{rest}"
+    return f"{scheme}://{rest}:{port}"
+
+
 def _dash_resolve_port() -> int:
     try:
         cfg_port = cfg.config.get("dashboard_port")
@@ -10419,9 +10445,17 @@ async def start_dashboard(bot: Any) -> None:
                   f"und nicht belegt?")
         return
 
-    dash_log.info(f"[DASHBOARD] ✅ Dashboard läuft:  http://127.0.0.1:{port}")
-    dash_log.info(f"[DASHBOARD] 🌐 Auf einem gehosteten Server (z. B. PebbleHost) stattdessen "
-             f"über die öffentliche Server-IP mit Port {port} öffnen.")
+    public = _dash_public_url(port)
+    if public:
+        dash_log.info(f"[DASHBOARD] ✅ Dashboard läuft:  {public}")
+        dash_log.info(f"[DASHBOARD]    (lokal auf diesem Rechner: http://127.0.0.1:{port})")
+    else:
+        dash_log.info(f"[DASHBOARD] ✅ Dashboard läuft auf Port {port} "
+                      f"(gebunden an {bound}).")
+        dash_log.info(f"[DASHBOARD] 🌐 Im Browser über die Adresse deines Servers mit Port "
+                      f"{port} öffnen – 127.0.0.1 und 0.0.0.0 sind nur lokale Adressen. "
+                      f"Trage die Adresse als \"dashboard_public_host\" in die config.json "
+                      f"ein, dann steht hier direkt der fertige Link.")
 
 
 async def stop_dashboard() -> None:

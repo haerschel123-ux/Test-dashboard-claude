@@ -67,14 +67,38 @@ IP. Das Dashboard ist deshalb hier erreichbar:
 http://testdashboard.my.pebble.host:25590
 ```
 
+Diese Adresse steht beim Start auch direkt im Log:
+
+```
+[DASHBOARD] ✅ Dashboard läuft:  http://testdashboard.my.pebble.host:25590
+[DASHBOARD]    (lokal auf diesem Rechner: http://127.0.0.1:25590)
+```
+
+Sie kommt aus dem Feld **`dashboard_public_host`** in der `config.json` (Standard:
+`testdashboard.my.pebble.host`); die Umgebungsvariable `DASHBOARD_PUBLIC_HOST` hat Vorrang.
+Ohne Portangabe wird der tatsächliche Port automatisch angehängt. Trägst du dort einen Port
+ein oder eine `https://…`-Adresse, wird der Wert unverändert übernommen — so stimmt der Link
+auch hinter einem Reverse-Proxy. Das Feld beeinflusst **nur die Anzeige**; gebunden wird
+weiterhin an `dashboard_host` (`0.0.0.0`).
+
 **Der Port gehört dazu.** Die nackte Domain ohne Port funktioniert **nicht**: Port 80 auf
 `45.143.198.35` wird bereits von PebbleHosts eigenem nginx bedient (dort erscheint die Seite
-„This server is powered by PebbleHost!"). Ohne eine freie Allocation auf Port 80 bzw. einen
-HTTP-Proxy davor gibt es das Dashboard nur mit Portangabe.
+„This server is powered by PebbleHost!"). Das lässt sich nicht im Bot ändern — der Bot kann
+nur den Port belegen, den ihm der Host zuweist (`SERVER_PORT`), und das ist `25590`, nicht 80.
+
+Wenn du die Adresse **ohne** Port brauchst, gibt es genau zwei Wege:
+
+1. **PebbleHost-Support** nach einer Allocation auf Port 80/443 für diesen Server fragen bzw.
+   nach einem HTTP-Proxy für die Subdomain. Bekommst du eine, zeigt die nackte Domain direkt
+   aufs Dashboard.
+2. **Reverse-Proxy davorsetzen**, z. B. ein Cloudflare Tunnel auf `127.0.0.1:25590`. Dann
+   trägst du in `dashboard_public_host` die dortige `https://…`-Adresse ein und rufst das
+   Dashboard ohne Port auf.
 
 Ändert sich die Allocation, steht der aktuelle Port im Panel unter **Network / Allocations**.
-Trage ihn **nicht** in `config.json` ein — PebbleHost setzt `SERVER_PORT`, und die wird
-automatisch und mit Vorrang benutzt. So bleibt die Konfiguration portunabhängig.
+Trage ihn **nicht** als `dashboard_port` in `config.json` ein — PebbleHost setzt
+`SERVER_PORT`, und die wird automatisch und mit Vorrang benutzt. So bleibt die Konfiguration
+portunabhängig.
 
 Der Web-Port wird in dieser Reihenfolge bestimmt:
 **`SERVER_PORT` → `PORT` → `config.json` (`dashboard_port`) → `8080`**
