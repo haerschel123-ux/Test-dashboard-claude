@@ -25,10 +25,18 @@ Beim ersten Start legt `bot.py` alles selbst an:
 Das komplette Frontend, die Leaflet-Bibliothek und die Ortslisten (201/60/60 Orte) stecken
 komprimiert (zlib + base64) **in `bot.py`** und werden beim Start herausgeschrieben.
 
-**Vorhandene Dateien werden dabei nie überschrieben.** Eigene Anpassungen an `styles.css`
-oder eigene Kartenbilder in `dashboard_web/static/maps/` überleben jeden Neustart. Ist das
-Verzeichnis nicht beschreibbar, liefert das Dashboard die Assets direkt aus dem Speicher —
-es läuft in jedem Fall.
+**Eigene Änderungen gehen nie verloren.** Beim Start vergleicht `bot.py` Prüfsummen:
+
+- Datei fehlt → wird angelegt.
+- Datei ist noch genau die, die eine frühere `bot.py` abgelegt hat → wird auf die neue
+  Fassung **aktualisiert** (so kommen Fehlerbehebungen am Frontend an).
+- Datei wurde **von dir** geändert → bleibt unangetastet, mit Hinweis im Log. Willst du doch
+  die mitgelieferte Fassung, lösche die Datei und starte neu.
+
+Dafür merkt sich `bot.py` die ausgelieferten Prüfsummen in `dashboard_web/.assets.json`.
+Eigene Kartenbilder in `dashboard_web/static/maps/` sind davon gar nicht betroffen — die
+werden nie angefasst. Ist das Verzeichnis nicht beschreibbar, liefert das Dashboard die
+Assets direkt aus dem Speicher — es läuft in jedem Fall.
 
 `dashboard_web/` und `requirements.txt` sind erzeugte Dateien und stehen deshalb in
 `.gitignore`; sie gehören nicht ins Repo.

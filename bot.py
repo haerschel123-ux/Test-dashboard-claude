@@ -38,6 +38,7 @@ import base64
 import zlib
 import secrets
 import mimetypes
+import hashlib
 from collections import deque
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional, Dict, List, Tuple, Any, Deque
@@ -8825,38 +8826,111 @@ def _asset_response(rel: str, fallback_text: str = "") -> web.Response:
                         charset="utf-8" if textish else None)
 
 
-def _extract_assets() -> None:
-    """Eingebettete Dateien nach dashboard_web/ schreiben – nur wenn sie fehlen.
+_ASSET_MANIFEST = ".assets.json"
 
-    Vorhandene Dateien werden NIE überschrieben: eigene Kartenbilder oder
-    Anpassungen an styles.css sollen einen Neustart überleben. Schlägt das
-    Schreiben fehl (z. B. schreibgeschütztes Verzeichnis), wird das nur
-    geloggt – die Assets liefert dann _asset_response direkt aus dem Speicher.
+
+def _asset_digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _read_asset_manifest() -> Dict[str, str]:
+    """Prüfsummen der Dateien, die wir beim letzten Start geschrieben haben."""
+    try:
+        with open(os.path.join(_DASH_DIR, _ASSET_MANIFEST), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        files = data.get("files") if isinstance(data, dict) else None
+        return files if isinstance(files, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_asset_manifest(files: Dict[str, str]) -> None:
+    try:
+        with open(os.path.join(_DASH_DIR, _ASSET_MANIFEST), "w", encoding="utf-8") as f:
+            json.dump({"_hinweis": "Von bot.py erzeugt. Merkt sich, welche Fassung der "
+                                   "Frontend-Dateien ausgeliefert wurde, damit Updates "
+                                   "ankommen, eigene Änderungen aber erhalten bleiben.",
+                       "files": files}, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def _extract_assets() -> None:
+    """Eingebettete Dateien nach dashboard_web/ schreiben.
+
+    Regel: **eigene Änderungen gehen nie verloren.** Eine vorhandene Datei wird
+    nur dann ersetzt, wenn sie beweisbar noch genau die ist, die eine frühere
+    Version von ``bot.py`` dort abgelegt hat – erkennbar an der Prüfsumme aus
+    ``dashboard_web/.assets.json`` bzw. an den in ``_ASSET_KNOWN_HASHES``
+    hinterlegten Prüfsummen früherer Auslieferungen. Weicht die Datei davon ab,
+    hat der Nutzer sie angepasst und sie bleibt unangetastet (mit Hinweis im
+    Log). Andernfalls kämen ausgelieferte Fehlerbehebungen am Frontend nie an.
+
+    Schlägt das Schreiben fehl (z. B. schreibgeschütztes Verzeichnis), wird das
+    nur geloggt – die Assets liefert dann _asset_response aus dem Speicher.
     """
-    written, failed = 0, 0
+    written = updated = kept = failed = 0
     for sub in ("", "vendor", "locations", "maps"):
         try:
             os.makedirs(os.path.join(_DASH_STATIC, sub), exist_ok=True)
         except OSError as e:
             failed += 1
             dash_log.warning(f"[DASHBOARD] Ordner '{sub or 'static'}' nicht anlegbar ({e}).")
+
+    manifest = _read_asset_manifest()
+    fresh: Dict[str, str] = {}
     for rel in _EMBEDDED_ASSETS:
         path = _asset_path(rel)
-        if not path or os.path.exists(path):
-            continue                      # vorhandene Datei bleibt unangetastet
         data = _asset_from_memory(rel)
-        if data is None:
+        if not path or data is None:
             continue
+        digest = _asset_digest(data)
+        is_update = False
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    current = _asset_digest(f.read())
+            except OSError:
+                current = None
+            if current == digest:
+                fresh[rel] = digest          # schon aktuell
+                continue
+            untouched = current is not None and (
+                current == manifest.get(rel)
+                or current in _ASSET_KNOWN_HASHES.get(rel, ()))
+            if not untouched:
+                kept += 1
+                # Bewusst KEIN Eintrag ins Manifest: dort stehen nur Prüfsummen
+                # von Dateien, die wir selbst geschrieben haben. Würden wir hier
+                # die Prüfsumme der angepassten Datei vermerken, sähe sie beim
+                # nächsten Start wie unsere eigene Auslieferung aus und würde
+                # überschrieben – die Anpassung wäre beim zweiten Start weg.
+                dash_log.info(f"[DASHBOARD] {rel}: eigene Änderung erkannt – Datei bleibt "
+                              f"unverändert. Für die mitgelieferte Fassung die Datei "
+                              f"löschen und neu starten.")
+                continue
+            is_update = True
         try:
             with open(path, "wb") as f:
                 f.write(data)
-            written += 1
+            fresh[rel] = digest
+            if is_update:
+                updated += 1
+            else:
+                written += 1
         except OSError as e:
             failed += 1
             dash_log.warning(f"[DASHBOARD] {rel} nicht schreibbar ({e}) – "
                              f"wird aus dem Speicher ausgeliefert.")
+    _write_asset_manifest(fresh)
+
     if written:
         dash_log.info(f"[DASHBOARD] {written} Frontend-Datei(en) unter {_DASH_DIR} angelegt.")
+    if updated:
+        dash_log.info(f"[DASHBOARD] {updated} Frontend-Datei(en) auf die neue Fassung "
+                      f"aktualisiert.")
+    if kept:
+        dash_log.info(f"[DASHBOARD] {kept} Datei(en) mit eigenen Änderungen beibehalten.")
     if failed:
         dash_log.info("[DASHBOARD] Einige Assets werden direkt aus bot.py bedient.")
 
@@ -10465,12 +10539,46 @@ async def stop_dashboard() -> None:
         _dash_runner = None
 
 
+# Prüfsummen früher ausgelieferter Fassungen. Passt eine Datei auf der
+# Platte auf einen dieser Werte, ist sie unverändert und darf durch die
+# neue Fassung ersetzt werden (siehe _extract_assets).
+_ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
+    "index.html": (
+        "ee561c69cf7b299f8b48061b08029fe5e4d60e05632e3950ef7ed115b6020dff",
+    ),
+    "styles.css": (
+        "f68b843465b48dbe4d294a2f319a1c391eb1b43eed1fea7db39a916c1c1ad804",
+    ),
+    "app.js": (
+        "ec14b8b4a90c6553d11b22eb5f76c732b47c827e8bf4359e9f2fb793f8ca1b79",
+    ),
+    "map.js": (
+        "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
+    ),
+    "vendor/leaflet.css": (
+        "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",
+    ),
+    "vendor/leaflet.js": (
+        "db49d009c841f5ca34a888c96511ae936fd9f5533e90d8b2c4d57596f4e5641a",
+    ),
+    "locations/ChernarusPlus.json": (
+        "46290c49d3ee8769168729a7377a6bac8915b379efc276d00821517b267dd9eb",
+    ),
+    "locations/Livonia.json": (
+        "0596b35bfbc53850d1f9495eb282480993e3354819bad1b610d29916b224fb7b",
+    ),
+    "locations/Sakhal.json": (
+        "68a7708a1b2fa4ad5689eb31005e2397f1fca1c1a02a6b7cdb0643655b909f4f",
+    ),
+}
+
+
 # ══════════════════════════════════════════════════════════════
 #  EINGEBETTETE FRONTEND-ASSETS  (zlib + base64)
 # ══════════════════════════════════════════════════════════════
 #  Erzeugt aus dashboard/static/** mit zlib.compress(data, 9) und
 #  base64.b64encode. _extract_assets() schreibt sie beim Start nach
-#  dashboard_web/static/, falls sie dort fehlen. Reine Daten – hier
+#  dashboard_web/static/. Reine Daten – hier
 #  ist absichtlich keine Logik.
 
 _EMBEDDED_ASSETS: Dict[str, str] = {
@@ -10495,37 +10603,49 @@ _EMBEDDED_ASSETS: Dict[str, str] = {
         "igy56fRwewVpRPYKhmOjIlQcgp+5ndDlLqz69Lnes52YbHeb8yV8Nr+tHVh9RG4eq/fReQyAn61N6DC1GU7bo7kZ9WyBLE51h/JXqtIW6a8kpkb6qwFP"
         "DfVXw53ZD1HLZPR7FuAXDet11IykHde4XUdYRawTxQrMMpWc/QrlW1dLniKaI62+OMHcvQwZlvo8Wc9/g4FToPvm6X9yvkDC"
     ),
-    # styles.css  (8.302 Bytes roh → 3.296 Bytes base64)
+    # styles.css  (11.019 Bytes roh → 4.756 Bytes base64)
     "styles.css": (
-        "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"
+        "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"
     ),
     # app.js  (35.705 Bytes roh → 11.996 Bytes base64)
     "app.js": (
