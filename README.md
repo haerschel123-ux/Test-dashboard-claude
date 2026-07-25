@@ -59,9 +59,25 @@ python bot.py                  # Bot + Dashboard
 python bot.py --dashboard-only # nur das Dashboard, ohne Discord-Login (lokale Vorschau)
 ```
 
-Dann im Browser öffnen, **Nitrado-Token** eingeben → **Server auswählen** → Karte/FTP werden
-automatisch erkannt. Danach sind alle 11 Kategorien freigeschaltet: Übersicht · Feeds ·
-Zones · Auto-Aufgaben · Shop · Karte · Bans · Whitelist · Economy · Ankündigungen · Server.
+Dann im Browser öffnen und durch vier Schritte gehen:
+
+1. **Nitrado-Token** eingeben
+2. **Server auswählen** — Karte, FTP-Zugang & Co. werden automatisch erkannt
+3. **Discord-Server-ID** eingeben — der Bot registriert daraufhin **sofort** alle
+   Slash-Befehle für diesen Server. Ohne diesen Schritt registriert Discord global,
+   und das dauert bis zu 24 Stunden. Die ID kommt aus Discord → Einstellungen →
+   Erweitert → Entwicklermodus, dann Rechtsklick auf den Server → *Server-ID kopieren*.
+   Sie landet in `config.json` unter `guild_ids`; vorhandene Einträge bleiben erhalten.
+4. **„Hast du den Bot bereits auf deinem Server?"** — *Nein* öffnet den Einladen-Link
+   (die Client-ID stammt von der laufenden Discord-App, nicht fest eingetragen).
+   *Ja* prüft nach: Lassen sich die Befehle registrieren, geht es ins Dashboard.
+   Ist der Bot noch nicht auf dem Server, sagt das Dashboard es, statt dich mit still
+   fehlenden Befehlen weiterzuschicken.
+
+Die Schritte 3 und 4 erscheinen nur, solange in `guild_ids` noch kein echter Discord-Server
+steht — wer schon eingerichtet ist, geht direkt ins Dashboard. Danach sind alle 11 Kategorien
+freigeschaltet: Übersicht · Feeds · Zones · Auto-Aufgaben · Shop · Karte · Bans · Whitelist ·
+Economy · Ankündigungen · Server.
 
 ## Dashboard aufrufen
 
@@ -236,7 +252,7 @@ im laufenden Bot**, ohne Neustart.
 
 ### Dashboard-API
 
-`/api/health` · `/api/session` · `/api/auth/{token,select-server,logout}` · `/api/feeds` ·
+`/api/health` · `/api/session` · `/api/auth/{token,select-server,guild,logout}` · `/api/feeds` ·
 `/api/zones` (+ `/allowlist`) · `/api/guild/{id}/{roles,channels}` · `/api/auto-restart` ·
 `/api/shop/{items,categories,classnames}` · `/api/map/{meta,players}` · `/api/events` ·
 `/api/events/types` · `/api/bans` · `/api/whitelist` ·
