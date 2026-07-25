@@ -59,8 +59,10 @@ python bot.py                  # Bot + Dashboard
 python bot.py --dashboard-only # nur das Dashboard, ohne Discord-Login (lokale Vorschau)
 ```
 
-Dann im Browser öffnen und durch vier Schritte gehen:
+Dann im Browser öffnen und durch die Schritte gehen (Schritt 0 nur, wenn der
+[Discord-Login](#discord-login-und-die-admin-kategorien) eingerichtet ist):
 
+0. **Mit Discord anmelden**
 1. **Nitrado-Token** eingeben
 2. **Server auswählen** — Karte, FTP-Zugang & Co. werden automatisch erkannt
 3. **Discord-Server-ID** eingeben — der Bot registriert daraufhin **sofort** alle
@@ -184,6 +186,47 @@ Der Bot startet in jedem Fall.
 das ist der Link für den **lokalen** Betrieb. Läuft der Bot auf PebbleHost, nimm die
 Subdomain bzw. die Server-IP mit dem zugewiesenen Port.
 
+## Discord-Login und die Admin-Kategorien
+
+Optional lässt sich dem Dashboard eine **Discord-Anmeldung** voranstellen: Erst nach dem
+Login kommt man überhaupt zum Nitrado-Token. Zusätzlich schaltet eine Discord-Rolle zwei
+weitere Kategorien frei.
+
+### Einrichten
+
+Solange kein `discord_client_secret` in der `config.json` steht, ist der Login **aus** und
+das Dashboard verhält sich exakt wie vorher — ein Update sperrt also keine laufende
+Installation aus. Zum Aktivieren im
+[Discord Developer Portal](https://discord.com/developers/applications) → deine App → OAuth2:
+
+1. **Client Secret** kopieren → `discord_client_secret` in der `config.json`
+2. Unter **Redirects** die Rücksprungadresse eintragen:
+   `http://deine-adresse:PORT/api/auth/discord/callback`
+   Rufst du das Dashboard auch über `https://` auf, trage **beide** Varianten ein — die
+   Adresse wird aus dem tatsächlichen Aufruf gebildet und muss exakt passen.
+
+Abgefragt wird nur der Scope `identify` — also wer du bist. Der Zugriffstoken bleibt auf dem
+Server und erreicht den Browser nie. Welche Rollen jemand hat, fragt der Bot selbst über die
+verbundenen Guilds ab (`fetch_member`, ein REST-Aufruf ohne privilegierte Intent).
+
+### Die zwei Kategorien
+
+Wer die Rolle aus `dashboard_admin_role_id` (Standard: `1530653925575753838`) in einem der
+verbundenen Discord-Server hat, sieht zusätzlich:
+
+| Kategorie | Inhalt |
+|---|---|
+| **📜 Logs** | Wer hat was mit dem Bot gemacht: Slash-Befehle im Discord (mit Argumenten und Server) und ändernde Zugriffe im Dashboard. Die letzten 500 Einträge, in `bot_audit.json` (gitignored). |
+| **🆔 Guild IDs** | Alle verbundenen Discord-Server mit Namen, Mitgliederzahl und ob der Bot dort tatsächlich drauf ist — plus Button zum Hinzufügen weiterer IDs. |
+
+Ohne die Rolle sind beide Kategorien nicht nur ausgeblendet: `/api/audit` und
+`/api/admin/guilds` antworten mit `403`. Wer die Rolle in Discord verliert, verliert den
+Zugriff beim nächsten Login — die Rolle wird beim Anmelden geprüft, nicht bei jedem Klick.
+
+Protokolliert werden nur **ändernde** Zugriffe (POST/PUT/DELETE), aufgezeichnet werden
+Methode, Pfad und Ergebnis — nie der Inhalt der Anfrage, in dem sonst der Nitrado-Token
+stünde.
+
 ## Die Karte
 
 Die Karte zeigt automatisch die erkannte Karte des Servers (Chernarus, Livonia oder Sakhal)
@@ -252,7 +295,8 @@ im laufenden Bot**, ohne Neustart.
 
 ### Dashboard-API
 
-`/api/health` · `/api/session` · `/api/auth/{token,select-server,guild,logout}` · `/api/feeds` ·
+`/api/health` · `/api/session` · `/api/auth/{token,select-server,guild,logout}` ·
+`/api/auth/discord/{start,callback}` · `/api/audit` · `/api/admin/guilds` · `/api/feeds` ·
 `/api/zones` (+ `/allowlist`) · `/api/guild/{id}/{roles,channels}` · `/api/auto-restart` ·
 `/api/shop/{items,categories,classnames}` · `/api/map/{meta,players}` · `/api/events` ·
 `/api/events/types` · `/api/bans` · `/api/whitelist` ·

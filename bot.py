@@ -41,6 +41,7 @@ import mimetypes
 import hashlib
 import ssl
 import ipaddress
+import urllib.parse
 from collections import deque
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional, Dict, List, Tuple, Any, Deque
@@ -386,6 +387,25 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Zertifikat, z. B. über einen Cloudflare Tunnel (siehe README).
     # false = wie früher ausschließlich HTTP.
     "dashboard_https":       True,
+
+    # ─────────── DISCORD-LOGIN FÜRS DASHBOARD ───────────
+    # Solange discord_client_secret leer ist, bleibt der Login AUS und das
+    # Dashboard verhält sich wie bisher. Das ist Absicht: ein Update darf ein
+    # laufendes Dashboard nicht aussperren.
+    # Einrichten: Discord Developer Portal → deine App → OAuth2 →
+    #   1. "Client Secret" kopieren und hier eintragen
+    #   2. unter "Redirects" die Dashboard-Adresse + /api/auth/discord/callback
+    #      eintragen, z. B. http://testdashboard.my.pebble.host:25590/api/auth/discord/callback
+    #      (am besten zusätzlich die https://-Variante)
+    # Danach muss sich jeder erst mit Discord anmelden, bevor er den
+    # Nitrado-Token eingeben kann.
+    "discord_client_id":     "",   # leer = Application-ID des laufenden Bots
+    "discord_client_secret": "",
+    "discord_redirect_uri":  "",   # leer = automatisch aus dem Aufruf gebildet
+    # Wer diese Rolle in einem der verbundenen Discord-Server hat, sieht im
+    # Dashboard zusätzlich die Kategorien "Logs" und "Guild IDs".
+    # Leer = niemand sieht sie.
+    "dashboard_admin_role_id": "1530653925575753838",
     # Optionale Leaflet-Kachel-URLs je Karte, z. B.
     #   {"ChernarusPlus": "https://.../{z}/{x}/{y}.png"}
     "dashboard_map_tiles":   {},
@@ -2225,6 +2245,28 @@ class DayZBot(discord.Client):
                 self.tree.copy_global_to(guild=g)
                 await self.tree.sync(guild=g)
                 log.info(f"[BOT] Slash-Befehle für Guild {gid} registriert.")
+
+    async def on_interaction(self, interaction: discord.Interaction):
+        """Jeden Slash-Befehl ins Aktions-Protokoll schreiben.
+
+        Nur mitschreiben, nicht eingreifen: die Befehle selbst laufen über den
+        CommandTree, der unabhängig von diesem Event ausgelöst wird.
+        """
+        try:
+            if interaction.type is not discord.InteractionType.application_command:
+                return
+            name = getattr(interaction.command, "qualified_name", None) or "?"
+            opts = []
+            for opt in ((interaction.data or {}).get("options") or []):
+                # Unterbefehle (z. B. /whitelist add) verschachteln ihre Optionen
+                for sub in (opt.get("options") or [opt]):
+                    if sub.get("value") is not None:
+                        opts.append(f"{sub.get('name')}={sub.get('value')}")
+            where = getattr(interaction.guild, "name", None) or "Direktnachricht"
+            _audit_add("discord", f"{interaction.user} ({interaction.user.id})",
+                       f"/{name}", " ".join(opts) + f" · {where}")
+        except Exception:  # noqa: BLE001 – Protokoll darf keinen Befehl stören
+            pass
 
     async def on_ready(self):
         log.info(f"[BOT] ✅ Eingeloggt als {self.user} (ID: {self.user.id})")
@@ -9260,7 +9302,14 @@ def _sess_prune() -> None:
         _SESS_STORE.pop(sid, None)
 
 
-def _sess_create(token: str, gameservers: list) -> str:
+def _sess_create(token: str, gameservers: list,
+                 discord_user: Optional[Dict[str, Any]] = None,
+                 is_admin: bool = False) -> str:
+    """Neue Session anlegen.
+
+    Sie entsteht jetzt schon beim Discord-Login – also bevor ein Nitrado-Token
+    vorliegt. ``token`` ist dann leer und wird von post_token nachgetragen.
+    """
     _sess_prune()
     sid = secrets.token_urlsafe(32)
     now = time.time()
@@ -9269,6 +9318,8 @@ def _sess_create(token: str, gameservers: list) -> str:
         "gameservers": gameservers,
         "service_id": None,
         "map_name": None,
+        "discord": discord_user,
+        "is_admin": bool(is_admin),
         "created": now,
         "seen": now,
     }
@@ -9312,13 +9363,40 @@ async def _dash_auth_middleware(request: web.Request, handler):
     path = request.path
     if path.startswith("/api/") and not _sess_is_public(path):
         sess = _sess_get(request)
-        if not sess:
+        # Der Nitrado-Token bleibt das eigentliche Tor: eine Session, die nur
+        # vom Discord-Login stammt, darf hier noch nicht durch.
+        if not sess or not sess.get("token"):
             return web.json_response(
                 {"error": "unauthorized",
                  "message": "Bitte zuerst den Nitrado-Token eingeben."},
                 status=401)
         request["session"] = sess
-    return await handler(request)
+    # Vor dem Handler merken: beim Abmelden ist die Session danach weg.
+    actor = _audit_actor(request.get("session") or _sess_get(request))
+    try:
+        response = await handler(request)
+    except Exception:
+        # Auch gescheiterte Zugriffe gehören ins Protokoll – gerade die.
+        if request.method in ("POST", "PUT", "DELETE") and path.startswith("/api/"):
+            try:
+                _audit_add("dashboard", actor, _audit_label(request.method, path),
+                           success=False)
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+    # Ändernde Zugriffe ins Protokoll – an genau einer Stelle statt in 40
+    # Handlern. Aufgezeichnet werden Methode, Pfad und Ergebnis, nie der
+    # Inhalt der Anfrage: dort steckt sonst der Nitrado-Token.
+    if (request.method in ("POST", "PUT", "DELETE")
+            and path.startswith("/api/")
+            and not any(path.startswith(p) for p in _AUDIT_SKIP_PREFIXES)):
+        try:
+            _audit_add("dashboard", actor,
+                       _audit_label(request.method, path),
+                       success=getattr(response, "status", 500) < 400)
+        except Exception:  # noqa: BLE001 – Protokoll darf nie die Antwort kippen
+            pass
+    return response
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -9371,7 +9449,316 @@ def _server_view(svc: dict) -> dict:
     }
 
 
+# ══════════════════════════════════════════════════════════════
+#  Discord-Login fürs Dashboard (OAuth2) + Aktions-Protokoll
+# ══════════════════════════════════════════════════════════════
+#  Vor dem Nitrado-Token steht eine Anmeldung mit Discord. Sie sagt nur, WER
+#  da ist (scope=identify) – welche Rollen die Person hat, fragt nicht Discord
+#  im Namen des Nutzers ab, sondern der Bot selbst über die verbundenen
+#  Guilds. Damit bleibt der OAuth-Scope so schmal wie möglich.
+#
+#  Ohne hinterlegtes Client-Secret ist der Login AUS und das Dashboard
+#  verhält sich exakt wie vorher. Das ist Absicht: ein Update darf ein
+#  laufendes Dashboard nicht aussperren.
+
+_DISCORD_API = "https://discord.com/api/v10"
+_OAUTH_STATES: Dict[str, float] = {}        # state → Ablaufzeitpunkt (CSRF-Schutz)
+_OAUTH_STATE_TTL = 600
+
+
+def _discord_app_id() -> Optional[int]:
+    try:
+        app_id = getattr(bot, "application_id", None)
+        if not app_id and getattr(bot, "user", None) is not None:
+            app_id = bot.user.id
+        return int(app_id) if app_id else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _discord_login_enabled() -> bool:
+    """Der Login ist genau dann aktiv, wenn ein Client-Secret hinterlegt ist."""
+    return bool(str(cfg.config.get("discord_client_secret") or "").strip())
+
+
+def _discord_client_id() -> str:
+    cid = str(cfg.config.get("discord_client_id") or "").strip()
+    return cid or str(_discord_app_id() or _DISCORD_INVITE_FALLBACK_CLIENT_ID)
+
+
+def _oauth_redirect_uri(request: web.Request) -> str:
+    """Rücksprungadresse – muss im Developer Portal exakt so eingetragen sein.
+
+    Ohne feste Angabe aus dem Aufruf gebildet: wer das Dashboard über https://
+    öffnet, bekommt die https-Variante. Deshalb gehören beide ins Portal.
+    """
+    fixed = str(cfg.config.get("discord_redirect_uri") or "").strip()
+    if fixed:
+        return fixed.rstrip("/")
+    return f"{request.scheme}://{request.host}/api/auth/discord/callback"
+
+
+async def _discord_fetch_user(code: str, redirect_uri: str) -> Optional[dict]:
+    """Code gegen Zugriffstoken tauschen und das Discord-Profil holen.
+
+    Der Zugriffstoken bleibt hier im Prozess – er wird nicht gespeichert und
+    erreicht den Browser nie.
+    """
+    payload = {
+        "client_id": _discord_client_id(),
+        "client_secret": str(cfg.config.get("discord_client_secret") or "").strip(),
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+    }
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{_DISCORD_API}/oauth2/token", data=payload) as r:
+                if r.status != 200:
+                    dash_log.warning(f"[LOGIN] Token-Tausch fehlgeschlagen "
+                                     f"({r.status}): {(await r.text())[:200]}")
+                    return None
+                tok = await r.json()
+            access = tok.get("access_token")
+            if not access:
+                return None
+            async with s.get(f"{_DISCORD_API}/users/@me",
+                             headers={"Authorization": f"Bearer {access}"}) as r:
+                if r.status != 200:
+                    dash_log.warning(f"[LOGIN] Profil nicht abrufbar ({r.status}).")
+                    return None
+                return await r.json()
+    except Exception as e:  # noqa: BLE001
+        dash_log.warning(f"[LOGIN] Discord nicht erreichbar: {e}")
+        return None
+
+
+async def _discord_user_is_admin(user_id: int) -> bool:
+    """Hat die Person die Dashboard-Admin-Rolle in einem verbundenen Server?
+
+    Geprüft wird über den Bot, nicht über den Nutzer-Token. ``fetch_member``
+    ist ein REST-Aufruf und braucht deshalb nicht die privilegierte
+    Members-Intent, die dieser Bot nicht anfordert.
+    """
+    try:
+        role_id = int(str(cfg.config.get("dashboard_admin_role_id") or "0") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not role_id or bot is None or getattr(bot, "user", None) is None:
+        return False
+    for gid in _configured_guild_ids():
+        guild = bot.get_guild(gid)
+        if guild is None:
+            continue
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except Exception:  # noqa: BLE001 – nicht Mitglied / nicht abrufbar
+                continue
+        if any(int(r.id) == role_id for r in getattr(member, "roles", [])):
+            return True
+    return False
+
+
+def _discord_user_view(user: dict) -> dict:
+    """Nur das, was das Dashboard anzeigt – kein Token, keine E-Mail."""
+    uid = str(user.get("id") or "")
+    name = user.get("global_name") or user.get("username") or f"Discord-Nutzer {uid}"
+    avatar = user.get("avatar")
+    return {
+        "id": uid,
+        "name": name,
+        "avatar_url": (f"https://cdn.discordapp.com/avatars/{uid}/{avatar}.png?size=64"
+                       if avatar and uid else None),
+    }
+
+
+async def api_discord_start(request: web.Request) -> web.Response:
+    """Liefert die Discord-Anmeldeadresse (das Frontend leitet dorthin weiter)."""
+    if not _discord_login_enabled():
+        return err("Der Discord-Login ist nicht eingerichtet.", 400)
+    now = time.time()
+    for st in [s for s, exp in _OAUTH_STATES.items() if exp < now]:
+        _OAUTH_STATES.pop(st, None)
+    state = secrets.token_urlsafe(24)
+    _OAUTH_STATES[state] = now + _OAUTH_STATE_TTL
+    redirect = _oauth_redirect_uri(request)
+    url = (f"{_DISCORD_API.replace('/api/v10', '')}/oauth2/authorize"
+           f"?client_id={_discord_client_id()}"
+           f"&redirect_uri={urllib.parse.quote(redirect, safe='')}"
+           f"&response_type=code&scope=identify&state={state}")
+    return ok({"url": url})
+
+
+async def api_discord_callback(request: web.Request) -> web.Response:
+    """Rücksprung von Discord: Code einlösen, Session anlegen, ins Dashboard."""
+    def _back(reason: str) -> web.Response:
+        return web.HTTPFound(f"/?login={reason}")
+
+    if not _discord_login_enabled():
+        return _back("disabled")
+    if request.query.get("error"):
+        return _back("denied")
+    code = request.query.get("code") or ""
+    state = request.query.get("state") or ""
+    expires = _OAUTH_STATES.pop(state, 0)
+    if not code or not state or expires < time.time():
+        return _back("state")
+
+    user = await _discord_fetch_user(code, _oauth_redirect_uri(request))
+    if not user or not user.get("id"):
+        return _back("failed")
+
+    view = _discord_user_view(user)
+    is_admin = await _discord_user_is_admin(int(user["id"]))
+    sid = _sess_create("", [], discord_user=view, is_admin=is_admin)
+    resp = web.HTTPFound("/")
+    _sess_cookie(resp, sid)
+    _audit_add("dashboard", f"{view['name']} ({view['id']})", "Am Dashboard angemeldet",
+               "mit Admin-Rolle" if is_admin else "ohne Admin-Rolle")
+    dash_log.info(f"[LOGIN] {view['name']} ({view['id']}) angemeldet "
+                  f"– Admin: {'ja' if is_admin else 'nein'}")
+    return resp
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Aktions-Protokoll: wer hat was mit dem Bot gemacht?
+#  Erfasst beide Bedienwege – Slash-Befehle im Discord (on_interaction) und
+#  ändernde Zugriffe im Dashboard (Middleware). Lesende Zugriffe nicht, die
+#  würden das Protokoll zumüllen.
+# ──────────────────────────────────────────────────────────────────────────
+_AUDIT_FILE = "bot_audit.json"
+_AUDIT_MAX = 500
+_audit_log: Deque[Dict[str, Any]] = deque(maxlen=_AUDIT_MAX)
+
+
+def _audit_add(source: str, actor: str, action: str, detail: str = "",
+               success: bool = True) -> None:
+    _audit_log.append({
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "source": source,          # "discord" | "dashboard"
+        "actor": actor,
+        "action": action,
+        "detail": detail[:300],
+        "ok": bool(success),
+    })
+    _audit_persist()
+
+
+def _audit_persist() -> None:
+    try:
+        with open(_AUDIT_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(_audit_log), f, ensure_ascii=False, indent=1)
+    except OSError:
+        pass
+
+
+def _audit_load() -> None:
+    try:
+        with open(_AUDIT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            for entry in data[-_AUDIT_MAX:]:
+                if isinstance(entry, dict):
+                    _audit_log.append(entry)
+    except (OSError, ValueError):
+        pass
+
+
+# Sprechende Namen für die häufigsten Dashboard-Aktionen. Was hier fehlt,
+# erscheint als "METHODE /pfad" – unschön, aber nie falsch.
+_AUDIT_LABELS = {
+    ("POST", "/api/server/restart"): "Server neu gestartet",
+    ("POST", "/api/server/stop"): "Server gestoppt",
+    ("POST", "/api/auth/token"): "Nitrado-Token eingegeben",
+    ("POST", "/api/auth/select-server"): "Nitrado-Server ausgewählt",
+    ("POST", "/api/auth/guild"): "Discord-Server verbunden",
+    ("POST", "/api/auth/logout"): "Abgemeldet",
+    ("POST", "/api/zones"): "Zone angelegt",
+    ("POST", "/api/shop/items"): "Shop-Item angelegt",
+    ("POST", "/api/shop/categories"): "Shop-Kategorie angelegt",
+    ("POST", "/api/economy/money"): "Guthaben geändert",
+    ("POST", "/api/economy/config"): "Economy-Einstellungen geändert",
+    ("POST", "/api/bans"): "Spieler gebannt",
+    ("POST", "/api/whitelist"): "Whitelist-Eintrag hinzugefügt",
+    ("POST", "/api/announcements"): "Ankündigung angelegt",
+    ("POST", "/api/auto-restart"): "Auto-Neustart geändert",
+}
+_AUDIT_SKIP_PREFIXES = ("/api/auth/discord/",)
+
+
+def _audit_label(method: str, path: str) -> str:
+    exact = _AUDIT_LABELS.get((method, path))
+    if exact:
+        return exact
+    if path.startswith("/api/shop/items/"):
+        return "Shop-Item gelöscht" if method == "DELETE" else "Shop-Item geändert"
+    if path.startswith("/api/zones/"):
+        if "/allowlist" in path:
+            return "Zonen-Allowlist geändert"
+        return "Zone gelöscht" if method == "DELETE" else "Zone geändert"
+    if path.startswith("/api/feeds/"):
+        return "Feed-Channel gesetzt"
+    if path.startswith("/api/bans/"):
+        return "Bann aufgehoben"
+    if path.startswith("/api/whitelist/"):
+        return "Whitelist-Eintrag entfernt"
+    if path.startswith("/api/announcements/"):
+        return "Ankündigung gelöscht"
+    return f"{method} {path}"
+
+
+def _audit_actor(sess: Optional[Dict[str, Any]]) -> str:
+    user = (sess or {}).get("discord") or {}
+    if user.get("id"):
+        return f"{user.get('name')} ({user.get('id')})"
+    return "Dashboard (ohne Discord-Anmeldung)"
+
+
+def _require_admin(request: web.Request) -> Optional[web.Response]:
+    """None = darf. Sonst die fertige Fehlerantwort."""
+    sess = _sess_get(request)
+    if not sess:
+        return err("Session abgelaufen – bitte neu anmelden.", 401)
+    if not sess.get("is_admin"):
+        return err("Dafür fehlt dir die nötige Discord-Rolle.", 403)
+    return None
+
+
+async def api_audit(request: web.Request) -> web.Response:
+    denied = _require_admin(request)
+    if denied is not None:
+        return denied
+    entries = list(_audit_log)
+    entries.reverse()                       # neueste zuerst
+    return ok({"entries": entries, "max": _AUDIT_MAX})
+
+
+async def api_admin_guilds(request: web.Request) -> web.Response:
+    """Alle verbundenen Discord-Server mit Namen – für die Kategorie Guild IDs."""
+    denied = _require_admin(request)
+    if denied is not None:
+        return denied
+    out = []
+    for gid in _configured_guild_ids():
+        guild = bot.get_guild(gid) if bot is not None else None
+        out.append({
+            "id": str(gid),
+            "name": (guild.name if guild is not None else None),
+            "available": guild is not None,
+            "members": (guild.member_count if guild is not None else None),
+            "feeds": len(cfg.guilds.get(str(gid), {}) or {}),
+        })
+    return ok({"guilds": out, "bot_online": bool(
+        bot is not None and getattr(bot, "user", None) is not None)})
+
+
 async def post_token(request: web.Request) -> web.Response:
+    # Ist der Discord-Login eingerichtet, geht ohne ihn gar nichts.
+    pre = _sess_get(request)
+    if _discord_login_enabled() and not (pre and pre.get("discord")):
+        return err("Bitte zuerst mit Discord anmelden.", 401)
     data = await body(request)
     token = str(data.get("token", "")).strip()
     if not token:
@@ -9392,9 +9779,14 @@ async def post_token(request: web.Request) -> web.Response:
                    "(Nitrado → Benutzereinstellungen → API-Schlüssel).", 401)
 
     view = [_server_view(s) for s in gameservers[:25]]
-    sid = _sess_create(token, gameservers)
     resp = ok({"servers": view, "count": len(gameservers)})
-    _sess_cookie(resp, sid)
+    if pre is not None:
+        # Die Session gibt es schon (Discord-Login) – sie wird ergänzt, nicht
+        # ersetzt, sonst ginge die Anmeldung beim Token-Eingeben verloren.
+        pre["token"] = token
+        pre["gameservers"] = gameservers
+    else:
+        _sess_cookie(resp, _sess_create(token, gameservers))
     return resp
 
 
@@ -9561,6 +9953,10 @@ async def _register_guild_commands(gid: int) -> dict:
     except discord.HTTPException as e:
         result["note"] = f"Discord hat die Registrierung abgelehnt: {e}"
         return result
+    except Exception as e:  # noqa: BLE001 – lieber eine Meldung als ein 500er
+        dash_log.warning(f"[BOT] Registrierung für Guild {gid} fehlgeschlagen: {e}")
+        result["note"] = f"Registrierung fehlgeschlagen: {e}"
+        return result
 
     guild = bot.get_guild(gid)
     result.update({
@@ -9614,11 +10010,18 @@ async def api_get_session(request: web.Request) -> web.Response:
     # "nur wenn gebunden"-Umweg über den Context entfällt.
     configured = bool(str(cfg.config.get("service_id") or "").strip())
     guild_configured = _guild_is_configured()
-    if not sess:
+    login_required = _discord_login_enabled()
+    discord_user = (sess or {}).get("discord")
+    if not sess or (login_required and not discord_user):
         return ok({"authed": False, "configured": configured,
-                   "guild_configured": guild_configured})
+                   "guild_configured": guild_configured,
+                   "discord_login": login_required,
+                   "discord": discord_user, "is_admin": False})
     return ok({
-        "authed": True,
+        "authed": bool(sess.get("token")),
+        "discord_login": login_required,
+        "discord": discord_user,
+        "is_admin": bool(sess.get("is_admin")),
         "service_id": sess.get("service_id") or cfg.config.get("service_id"),
         "map_name": sess.get("map_name") or cfg.config.get("map_name"),
         "configured": configured,
@@ -10617,6 +11020,12 @@ def build_app() -> web.Application:
     r.add_post("/api/auth/token", post_token)
     r.add_post("/api/auth/select-server", post_select_server)
     r.add_post("/api/auth/guild", post_setup_guild)
+    r.add_get("/api/auth/discord/start", api_discord_start)
+    r.add_get("/api/auth/discord/callback", api_discord_callback)
+
+    # ── Nur mit Dashboard-Admin-Rolle ──
+    r.add_get("/api/audit", api_audit)
+    r.add_get("/api/admin/guilds", api_admin_guilds)
     r.add_post("/api/auth/logout", post_logout)
     r.add_get("/api/session", api_get_session)
 
@@ -11024,6 +11433,7 @@ async def start_dashboard(bot: Any) -> None:
     # Eingebettete Frontend-Dateien anlegen, falls sie fehlen (nie überschreiben).
     _extract_assets()
     _ev_load()
+    _audit_load()
 
     if not cfg.config.get("dashboard_enabled", True):
         dash_log.info("[DASHBOARD] deaktiviert (dashboard_enabled=false).")
@@ -11117,6 +11527,7 @@ async def stop_dashboard() -> None:
 _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
     "index.html": (
         "ee561c69cf7b299f8b48061b08029fe5e4d60e05632e3950ef7ed115b6020dff",
+        "490d3cceb44180fdd4986647676e8a18ec0255e5ee6b9cf645019b6ead1d093b",
     ),
     "styles.css": (
         "f68b843465b48dbe4d294a2f319a1c391eb1b43eed1fea7db39a916c1c1ad804",
@@ -11124,6 +11535,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
     ),
     "app.js": (
         "ec14b8b4a90c6553d11b22eb5f76c732b47c827e8bf4359e9f2fb793f8ca1b79",
+        "82e5da5110b186c3234f7637dd397a87cb2f6939e165b35fbb21d992a4200689",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
@@ -11155,31 +11567,33 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
 #  ist absichtlich keine Logik.
 
 _EMBEDDED_ASSETS: Dict[str, str] = {
-    # index.html  (5.995 Bytes roh → 2.576 Bytes base64)
+    # index.html  (6.872 Bytes roh → 2.880 Bytes base64)
     "index.html": (
-        "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"
-        "fZls6D/R4hToPq3/HzpW0do="
+        "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"
     ),
     # styles.css  (11.251 Bytes roh → 4.840 Bytes base64)
     "styles.css": (
@@ -11226,122 +11640,141 @@ _EMBEDDED_ASSETS: Dict[str, str] = {
         "ntayEENXYHjZ8PSDMP2HVwKUWfcmakWOmChYKCJwRh4XmfaBwlh9o2JpWLZGJPapUNGDBW2HneLEWbwgjZygToVcbLv11zdmGP2CWewO1DisvzJVcYPo"
         "FCtho/S50Xl8MgR4xxZVE3HRacyPzQcdKNDtu3X2tIrEZXNP9fcode+0tcmpNjX+NETzQVwcb/4HCjiBUw=="
     ),
-    # app.js  (38.945 Bytes roh → 13.224 Bytes base64)
+    # app.js  (45.531 Bytes roh → 15.332 Bytes base64)
     "app.js": (
-        "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"
+        "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"
+        "NoL6TQ9Li7//H0I2q8k="
     ),
     # map.js  (8.934 Bytes roh → 4.372 Bytes base64)
     "map.js": (

@@ -6,6 +6,7 @@ whitelist_requests.json
 log_state.json
 announcements.json
 events_recent.json
+bot_audit.json
 
 # Economy-Datenbank & Backups
 economy.db
