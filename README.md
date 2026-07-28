@@ -231,6 +231,35 @@ Protokolliert werden nur **ändernde** Zugriffe (POST/PUT/DELETE), aufgezeichnet
 Methode, Pfad und Ergebnis — nie der Inhalt der Anfrage, in dem sonst der Nitrado-Token
 stünde.
 
+## Mehrere Nitrado-Server (Premium-Zuordnung)
+
+Der Bot kann mehrere Nitrado-Server bedienen. Jeder verbundene Server steht in
+`connections.json` (gitignored, enthält Tokens) und wird über die Dashboard-Kategorie
+**Serverliste** genau einer Discord-Guild zugeordnet — das ist die Freischaltung.
+
+| Kategorie | Wer sieht sie | Inhalt |
+|---|---|---|
+| **🗄️ Serverliste** | nur Admin-Rolle | Alle verbundenen Nitrado-Server mit Name, Service-ID, Karte und zugeordneter Guild. Der Stift-Button setzt die Guild-ID; beim Speichern werden die Slash-Befehle sofort dort registriert. Leer lassen entfernt die Zuordnung. |
+| **⚙️ Optionen** | jeder angemeldete Nutzer | Der eigene Nitrado-Token maskiert (`••••••••1111`), Auge-Button zum Einblenden, Stift zum Ändern. Darunter die zugeordnete Guild — oder der Hinweis, dass der Betreiber noch freischalten muss. |
+
+Eine Guild kann immer nur **einen** Nitrado-Server verwalten; der Versuch, sie ein zweites
+Mal zu vergeben, wird mit Nennung des bisherigen Servers abgelehnt.
+
+### „Du hast kein Premium"
+
+Ist ein Discord-Server keinem Nitrado-Server zugeordnet, antwortet **jeder** Slash-Befehl
+dort mit dieser Meldung. Ausgenommen sind nur `/setup` und `/hilfe` — sonst käme man aus der
+Sperre nicht mehr heraus. Die Prüfung hängt als `interaction_check` am gesamten
+Befehlsbaum, greift also auch bei später hinzugefügten Befehlen.
+
+Beim Ändern des Tokens in den Optionen wird geprüft, ob der neue Token denselben Server
+kennt — ein Token vom falschen Nitrado-Konto wird abgelehnt, statt die Verbindung zu
+zerstören. Danach richtet sich der Bot sofort neu ein, ohne Neustart.
+
+**Bestehende Installationen** werden beim ersten Start automatisch übernommen: Aus der
+`config.json` entsteht eine Verbindung, die der ersten echten Guild-ID zugeordnet wird —
+inklusive der bisherigen Log-Position, damit keine alten Ereignisse erneut gepostet werden.
+
 ## Die Karte
 
 Die Karte zeigt automatisch die erkannte Karte des Servers (Chernarus, Livonia oder Sakhal)
