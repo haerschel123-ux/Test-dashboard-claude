@@ -2665,57 +2665,52 @@ class DayZBot(discord.Client):
         if self.shop is None and self.ftp is not None:
             self.shop = ShopManager(self)
 
-    async def _auto_discover(self):
-        """Sucht automatisch nach DayZ-Log-Verzeichnissen via FTP."""
-        log.info("[FTP] Starte Auto-Discovery der Log-Verzeichnisse...")
+    async def _auto_discover(self, conn: Optional[ServerConnection] = None):
+        """Sucht automatisch nach DayZ-Log-Verzeichnissen via FTP.
+
+        Die gefundenen Pfade gehoeren zu genau einem Server und landen deshalb
+        in dessen Verbindung. Ohne Angabe gilt der Hauptserver.
+        """
+        conn = conn or connections.primary()
+        if conn is None or conn.ftp is None:
+            return
+        log.info(f"[FTP] Starte Auto-Discovery der Log-Verzeichnisse ({conn.name})...")
         loop = asyncio.get_running_loop()
         found = await loop.run_in_executor(
             None,
-            functools.partial(self.ftp.discover_paths,
-                              cfg.config.get("map_name", "ChernarusPlus"))
+            functools.partial(conn.ftp.discover_paths,
+                              conn.get("map_name", "ChernarusPlus"))
         )
 
-        changed = False
-        if "log_dir" in found and not cfg.config.get("ftp_log_dir"):
-            cfg.config["ftp_log_dir"] = found["log_dir"]
-            changed = True
-        if "ban_file" in found and not cfg.config.get("ftp_ban_file"):
-            cfg.config["ftp_ban_file"] = found["ban_file"]
-            changed = True
-        if "mission_dir" in found and not cfg.config.get("ftp_mission_dir"):
-            cfg.config["ftp_mission_dir"] = found["mission_dir"]
-            changed = True
-        if "cfg_effect_area" in found and not cfg.config.get("cfg_effect_area_path"):
-            cfg.config["cfg_effect_area_path"] = found["cfg_effect_area"]
-            changed = True
-        if changed:
-            cfg.save_config()
-            log.info(f"[FTP] 💾 config.json aktualisiert: log_dir={cfg.config.get('ftp_log_dir')}, "
-                     f"ban_file={cfg.config.get('ftp_ban_file')}, "
-                     f"cfgEffectArea={cfg.config.get('cfg_effect_area_path')}")
+        for key, found_key in (("ftp_log_dir", "log_dir"),
+                               ("ftp_ban_file", "ban_file"),
+                               ("ftp_mission_dir", "mission_dir"),
+                               ("cfg_effect_area_path", "cfg_effect_area")):
+            if found.get(found_key) and not conn.get(key):
+                _conn_store(conn, key, found[found_key])
+                log.info(f"[FTP] 💾 {conn.name}: {key}={found[found_key]}")
 
         # Selbstheilung: Der konfigurierte cfgEffectArea-Pfad zeigt auf einen Ordner,
         # den es auf dem FTP gar nicht gibt (z.B. Chernarus-Pfad, obwohl der Server
         # Sakhal läuft) → Shop-Käufe landen sonst in einer Datei, die der Server nie
         # liest, und spawnen nie. Auf den tatsächlich gefundenen Ordner korrigieren.
-        configured   = str(cfg.config.get("cfg_effect_area_path") or "")
+        configured   = str(conn.get("cfg_effect_area_path") or "")
         found_effect = found.get("cfg_effect_area")
         if configured and found_effect and configured != found_effect:
             parent  = configured.rsplit("/", 1)[0] or "/"
-            entries = await loop.run_in_executor(None, self.ftp.list_dir, parent)
+            entries = await loop.run_in_executor(None, conn.ftp.list_dir, parent)
             if not entries:
                 log.warning(f"[FTP] ⚠️ Konfigurierter cfg_effect_area_path existiert nicht "
                             f"auf dem FTP ({configured}) – korrigiert auf {found_effect}")
-                cfg.config["cfg_effect_area_path"] = found_effect
+                _conn_store(conn, "cfg_effect_area_path", found_effect)
                 if found.get("mission_dir"):
-                    cfg.config["ftp_mission_dir"] = found["mission_dir"]
-                cfg.save_config()
+                    _conn_store(conn, "ftp_mission_dir", found["mission_dir"])
 
     @tasks.loop(seconds=10)
     async def log_poll(self):
         if not self.ftp:
             return
-        log_dir = cfg.config.get("ftp_log_dir")
+        log_dir = conn.get("ftp_log_dir")
         if not log_dir:
             # Discovery beim Start fehlgeschlagen oder noch nicht gelaufen →
             # automatisch erneut versuchen (alle 120s), sonst würden nie
@@ -2728,7 +2723,7 @@ class DayZBot(discord.Client):
                 await self._auto_discover()
             except Exception as e:
                 log.warning(f"[FTP] Auto-Discovery-Retry fehlgeschlagen: {e}")
-            log_dir = cfg.config.get("ftp_log_dir")
+            log_dir = conn.get("ftp_log_dir")
             if not log_dir:
                 return
         try:
@@ -3344,20 +3339,58 @@ async def _deny(interaction: discord.Interaction):
         await interaction.response.send_message(msg, ephemeral=True)
 
 
-async def _require_nitrado(interaction: discord.Interaction,
-                           need_ftp: bool = False) -> bool:
-    """True, wenn die Nitrado-Anbindung (und optional FTP) einsatzbereit ist.
-    Sonst ephemere Hinweis-Meldung → Befehl mit `return` abbrechen."""
-    if bot.nitrado is not None and (not need_ftp or bot.ftp is not None):
-        return True
-    msg = ("❌ Nitrado ist noch nicht eingerichtet.\n"
-           "Führe zuerst `/setup token <dein-nitrado-token>` aus und wähle "
-           "deinen Server im Dropdown aus.")
+def _conn_of(interaction: discord.Interaction) -> Optional[ServerConnection]:
+    """Der Nitrado-Server, den diese Guild verwalten darf.
+
+    In Direktnachrichten gibt es keine Guild – dort gilt der Hauptserver,
+    damit Befehle wie frueher auch per DM funktionieren.
+    """
+    if interaction.guild_id is None:
+        return connections.primary()
+    return connections.for_guild(interaction.guild_id)
+
+
+def _conn_store(conn: ServerConnection, key: str, value: Any) -> None:
+    """Serverspezifischen Wert in der Verbindung ablegen.
+
+    Beim Hauptserver zusaetzlich in der config.json, solange Log-Abruf und
+    Dashboard dort noch mitlesen – sonst liefen beide Seiten auseinander.
+    """
+    conn.set(key, value)
+    connections.save()
+    if connections.primary() is conn:
+        cfg.config[key] = value
+        cfg.save_config()
+
+
+async def _require_conn(interaction: discord.Interaction,
+                        need_ftp: bool = False) -> Optional[ServerConnection]:
+    """Die einsatzbereite Verbindung dieser Guild – sonst None.
+
+    Ersetzt das fruehere _require_nitrado: statt einer globalen Verbindung
+    loest jeder Befehl jetzt den Server auf, der zu seiner Guild gehoert.
+    Bei None hat der Aufrufer bereits eine Antwort bekommen und bricht mit
+    `return` ab.
+    """
+    conn = _conn_of(interaction)
+    if conn is not None and conn.api is not None and (not need_ftp or conn.ftp is not None):
+        return conn
+
+    if conn is None:
+        msg = PREMIUM_MISSING_TEXT
+    elif conn.api is None:
+        msg = ("❌ Nitrado ist für diesen Server noch nicht eingerichtet.\n"
+               "Führe `/setup token <dein-nitrado-token>` aus und wähle "
+               "deinen Server im Dropdown aus.")
+    else:
+        msg = ("❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn sind "
+               "Logs und Spielerpositionen nicht lesbar.\n"
+               "`/ftp_scan` versucht die Erkennung erneut.")
     if interaction.response.is_done():
         await interaction.followup.send(msg, ephemeral=True)
     else:
         await interaction.response.send_message(msg, ephemeral=True)
-    return False
+    return None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -3695,10 +3728,11 @@ async def _feed_autocomplete(
 async def cmd_neustart(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    if not await _require_nitrado(interaction):
+    conn = await _require_conn(interaction)
+    if conn is None:
         return
     await interaction.response.defer()
-    ok, msg = await bot.nitrado.restart()
+    ok, msg = await conn.api.restart()
     embed = discord.Embed(
         title="🔄 Server Neustart",
         description=msg,
@@ -3715,10 +3749,11 @@ async def cmd_neustart(interaction: discord.Interaction):
 async def cmd_stoppen(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    if not await _require_nitrado(interaction):
+    conn = await _require_conn(interaction)
+    if conn is None:
         return
     await interaction.response.defer()
-    ok, msg = await bot.nitrado.stop()
+    ok, msg = await conn.api.stop()
     embed = discord.Embed(
         title="⏹️ Server gestoppt",
         description=msg,
@@ -3735,18 +3770,19 @@ async def cmd_stoppen(interaction: discord.Interaction):
 async def cmd_status(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    if not await _require_nitrado(interaction):
+    conn = await _require_conn(interaction)
+    if conn is None:
         return
     await interaction.response.defer()
 
     # ── 1. Nitrado API (parallel zum A2S-Ping) ────────────────
     loop       = asyncio.get_running_loop()
     nitrado_task = loop.run_in_executor(None, lambda: None)   # Placeholder
-    info = await bot.nitrado.get_info()
+    info = await conn.api.get_info()
 
     # ── 2. Direkter A2S UDP-Ping ─────────────────────────────
-    srv_ip    = cfg.config.get("server_ip",  "")
-    qport     = int(cfg.config.get("query_port",  2302))
+    srv_ip    = conn.get("server_ip",  "")
+    qport     = int(conn.get("query_port",  2302))
     rcon_port = int(cfg.config.get("rcon_port",   2310))
 
     a2s: Optional[Dict] = None
@@ -4265,13 +4301,13 @@ bot.tree.add_command(zone_group)
 #  Ban-Hilfsfunktionen (Banliste in den Nitrado-Servereinstellungen –
 #  dasselbe Settings-Feld wie im Webinterface, 1 Name pro Zeile)
 # ══════════════════════════════════════════════════════════════
-def _find_ban_setting(settings: Dict) -> Tuple[str, str, str]:
+def _find_ban_setting(conn: ServerConnection, settings: Dict) -> Tuple[str, str, str]:
     """Sucht das Banlisten-Setting in den Nitrado-Settings.
     Reihenfolge: Config-Override (nitrado_ban_category/nitrado_ban_key) →
     Auto-Erkennung (Key 'bans', Kategorie egal) → Fallback ('general', 'bans').
     Gibt (category, key, aktueller_wert) zurück."""
-    ov_cat = str(cfg.config.get("nitrado_ban_category") or "").strip()
-    ov_key = str(cfg.config.get("nitrado_ban_key") or "").strip()
+    ov_cat = str(conn.get("nitrado_ban_category") or "").strip()
+    ov_key = str(conn.get("nitrado_ban_key") or "").strip()
     if ov_cat and ov_key:
         val = ((settings.get(ov_cat) or {}).get(ov_key)
                if isinstance(settings.get(ov_cat), dict) else None)
@@ -4284,20 +4320,21 @@ def _find_ban_setting(settings: Dict) -> Tuple[str, str, str]:
                 return str(category), str(key), str(val or "")
     return "general", "bans", ""
 
-async def _read_banlist() -> Tuple[List[str], str, str]:
+async def _read_banlist(conn: ServerConnection) -> Tuple[List[str], str, str]:
     """Liest die Banliste aus den Nitrado-Servereinstellungen.
     Gibt (namen, category, key) zurück. Wirft RuntimeError bei API-Fehler –
     Aufrufer dürfen dann NICHT schreiben (sonst würde die Liste überschrieben)."""
-    settings = await bot.nitrado.get_settings()
+    settings = await conn.api.get_settings()
     if settings is None:
         raise RuntimeError("Nitrado-API nicht erreichbar (Settings konnten nicht gelesen werden)")
-    category, key, raw = _find_ban_setting(settings)
+    category, key, raw = _find_ban_setting(conn, settings)
     names = [l.strip() for l in raw.splitlines() if l.strip()]
     return names, category, key
 
-async def _write_banlist(names: List[str], category: str, key: str) -> Tuple[bool, str]:
+async def _write_banlist(conn: ServerConnection, names: List[str],
+                         category: str, key: str) -> Tuple[bool, str]:
     """Schreibt die Banliste in die Nitrado-Servereinstellungen (1 Name pro Zeile)."""
-    return await bot.nitrado.set_setting(category, key, "\r\n".join(names))
+    return await conn.api.set_setting(category, key, "\r\n".join(names))
 
 def _split_names(raw: str) -> List[str]:
     """Zerlegt die Eingabe in einzelne Namen (Komma-getrennt), Duplikate raus."""
@@ -4323,7 +4360,8 @@ def _split_names(raw: str) -> List[str]:
 async def cmd_ban(interaction: discord.Interaction, spieler: str, grund: str = "Kein Grund angegeben"):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    if not await _require_nitrado(interaction):
+    conn = await _require_conn(interaction)
+    if conn is None:
         return
     await interaction.response.defer()
 
@@ -4334,7 +4372,7 @@ async def cmd_ban(interaction: discord.Interaction, spieler: str, grund: str = "
     # Erst lesen – bei API-Fehler NICHT schreiben, sonst würde die
     # bestehende Nitrado-Banliste überschrieben/geleert
     try:
-        current, category, key = await _read_banlist()
+        current, category, key = await _read_banlist(conn)
     except Exception as e:
         return await interaction.followup.send(
             f"❌ Nitrado-Banliste konnte nicht gelesen werden – nichts geändert.\n`{e}`")
@@ -4345,7 +4383,7 @@ async def cmd_ban(interaction: discord.Interaction, spieler: str, grund: str = "
 
     sv = "ℹ️ Alle Namen standen bereits auf der Banliste"
     if added:
-        ok, msg = await _write_banlist(current + added, category, key)
+        ok, msg = await _write_banlist(conn, current + added, category, key)
         if not ok:
             return await interaction.followup.send(
                 f"❌ Nitrado-Banliste konnte nicht gespeichert werden – nichts geändert.\n`{msg}`")
@@ -4381,7 +4419,8 @@ async def cmd_ban(interaction: discord.Interaction, spieler: str, grund: str = "
 async def cmd_unban(interaction: discord.Interaction, spieler: str):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    if not await _require_nitrado(interaction):
+    conn = await _require_conn(interaction)
+    if conn is None:
         return
     await interaction.response.defer()
 
@@ -4390,7 +4429,7 @@ async def cmd_unban(interaction: discord.Interaction, spieler: str):
         return await interaction.followup.send("❌ Keinen gültigen Namen angegeben.")
 
     try:
-        current, category, key = await _read_banlist()
+        current, category, key = await _read_banlist(conn)
     except Exception as e:
         return await interaction.followup.send(
             f"❌ Nitrado-Banliste konnte nicht gelesen werden – nichts geändert.\n`{e}`")
@@ -4402,7 +4441,7 @@ async def cmd_unban(interaction: discord.Interaction, spieler: str):
 
     sv = "ℹ️ Keiner der Namen stand auf der Banliste"
     if removed:
-        ok, msg = await _write_banlist(new_list, category, key)
+        ok, msg = await _write_banlist(conn, new_list, category, key)
         if not ok:
             return await interaction.followup.send(
                 f"❌ Nitrado-Banliste konnte nicht gespeichert werden – nichts geändert.\n`{msg}`")
@@ -4431,12 +4470,13 @@ async def cmd_unban(interaction: discord.Interaction, spieler: str):
 async def cmd_banlist(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    if not await _require_nitrado(interaction):
+    conn = await _require_conn(interaction)
+    if conn is None:
         return
     await interaction.response.defer(ephemeral=True)
 
     try:
-        all_bans, _category, _key = await _read_banlist()
+        all_bans, _category, _key = await _read_banlist(conn)
     except Exception as e:
         return await interaction.followup.send(
             f"❌ Nitrado-Banliste konnte nicht gelesen werden.\n`{e}`", ephemeral=True)
@@ -4484,13 +4524,13 @@ async def cmd_banlist(interaction: discord.Interaction):
 #  Whitelist – Hilfsfunktionen (Whitelist in den Nitrado-
 #  Servereinstellungen, 1 Name pro Zeile – analog zur Banliste)
 # ══════════════════════════════════════════════════════════════
-def _find_whitelist_setting(settings: Dict) -> Tuple[str, str, str]:
+def _find_whitelist_setting(conn: ServerConnection, settings: Dict) -> Tuple[str, str, str]:
     """Sucht das Whitelist-Setting in den Nitrado-Settings.
     Reihenfolge: Config-Override (nitrado_whitelist_category/-key) →
     Auto-Erkennung (Key 'whitelist') → Fallback ('general', 'whitelist').
     Gibt (category, key, aktueller_wert) zurück."""
-    ov_cat = str(cfg.config.get("nitrado_whitelist_category") or "").strip()
-    ov_key = str(cfg.config.get("nitrado_whitelist_key") or "").strip()
+    ov_cat = str(conn.get("nitrado_whitelist_category") or "").strip()
+    ov_key = str(conn.get("nitrado_whitelist_key") or "").strip()
     if ov_cat and ov_key:
         val = ((settings.get(ov_cat) or {}).get(ov_key)
                if isinstance(settings.get(ov_cat), dict) else None)
@@ -4503,20 +4543,21 @@ def _find_whitelist_setting(settings: Dict) -> Tuple[str, str, str]:
                 return str(category), str(key), str(val or "")
     return "general", "whitelist", ""
 
-async def _read_whitelist() -> Tuple[List[str], str, str]:
+async def _read_whitelist(conn: ServerConnection) -> Tuple[List[str], str, str]:
     """Liest die Whitelist aus den Nitrado-Servereinstellungen.
     Gibt (namen, category, key) zurück. Wirft RuntimeError bei API-Fehler –
     Aufrufer dürfen dann NICHT schreiben (sonst würde die Liste überschrieben)."""
-    settings = await bot.nitrado.get_settings()
+    settings = await conn.api.get_settings()
     if settings is None:
         raise RuntimeError("Nitrado-API nicht erreichbar (Settings konnten nicht gelesen werden)")
-    category, key, raw = _find_whitelist_setting(settings)
+    category, key, raw = _find_whitelist_setting(conn, settings)
     names = [l.strip() for l in raw.splitlines() if l.strip()]
     return names, category, key
 
-async def _write_whitelist(names: List[str], category: str, key: str) -> Tuple[bool, str]:
+async def _write_whitelist(conn: ServerConnection, names: List[str],
+                           category: str, key: str) -> Tuple[bool, str]:
     """Schreibt die Whitelist in die Nitrado-Servereinstellungen (1 Name pro Zeile)."""
-    return await bot.nitrado.set_setting(category, key, "\r\n".join(names))
+    return await conn.api.set_setting(category, key, "\r\n".join(names))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -4534,7 +4575,8 @@ whitelist_group = app_commands.Group(
 async def whitelist_add(interaction: discord.Interaction, spieler: str):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    if not await _require_nitrado(interaction):
+    conn = await _require_conn(interaction)
+    if conn is None:
         return
     await interaction.response.defer()
 
@@ -4543,7 +4585,7 @@ async def whitelist_add(interaction: discord.Interaction, spieler: str):
         return await interaction.followup.send("❌ Keinen gültigen Namen angegeben.")
 
     try:
-        current, category, key = await _read_whitelist()
+        current, category, key = await _read_whitelist(conn)
     except Exception as e:
         return await interaction.followup.send(
             f"❌ Nitrado-Whitelist konnte nicht gelesen werden – nichts geändert.\n`{e}`")
@@ -4554,7 +4596,7 @@ async def whitelist_add(interaction: discord.Interaction, spieler: str):
 
     sv = "ℹ️ Alle Namen standen bereits auf der Whitelist"
     if added:
-        ok, msg = await _write_whitelist(current + added, category, key)
+        ok, msg = await _write_whitelist(conn, current + added, category, key)
         if not ok:
             return await interaction.followup.send(
                 f"❌ Nitrado-Whitelist konnte nicht gespeichert werden – nichts geändert.\n`{msg}`")
@@ -4579,7 +4621,8 @@ async def whitelist_add(interaction: discord.Interaction, spieler: str):
 async def whitelist_remove(interaction: discord.Interaction, spieler: str):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    if not await _require_nitrado(interaction):
+    conn = await _require_conn(interaction)
+    if conn is None:
         return
     await interaction.response.defer()
 
@@ -4588,7 +4631,7 @@ async def whitelist_remove(interaction: discord.Interaction, spieler: str):
         return await interaction.followup.send("❌ Keinen gültigen Namen angegeben.")
 
     try:
-        current, category, key = await _read_whitelist()
+        current, category, key = await _read_whitelist(conn)
     except Exception as e:
         return await interaction.followup.send(
             f"❌ Nitrado-Whitelist konnte nicht gelesen werden – nichts geändert.\n`{e}`")
@@ -4600,7 +4643,7 @@ async def whitelist_remove(interaction: discord.Interaction, spieler: str):
 
     sv = "ℹ️ Keiner der Namen stand auf der Whitelist"
     if removed:
-        ok, msg = await _write_whitelist(new_list, category, key)
+        ok, msg = await _write_whitelist(conn, new_list, category, key)
         if not ok:
             return await interaction.followup.send(
                 f"❌ Nitrado-Whitelist konnte nicht gespeichert werden – nichts geändert.\n`{msg}`")
@@ -4623,12 +4666,13 @@ async def whitelist_remove(interaction: discord.Interaction, spieler: str):
 async def whitelist_show(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    if not await _require_nitrado(interaction):
+    conn = await _require_conn(interaction)
+    if conn is None:
         return
     await interaction.response.defer(ephemeral=True)
 
     try:
-        names, _category, _key = await _read_whitelist()
+        names, _category, _key = await _read_whitelist(conn)
     except Exception as e:
         return await interaction.followup.send(
             f"❌ Nitrado-Whitelist konnte nicht gelesen werden.\n`{e}`", ephemeral=True)
@@ -4796,16 +4840,17 @@ class WhitelistApprovalView(discord.ui.View):
             return await interaction.response.send_message(
                 "ℹ️ Diese Anfrage wurde bereits bearbeitet.", ephemeral=True)
 
-        if bot.nitrado is None:
+        conn = _conn_of(interaction)
+        if conn is None or conn.api is None:
             cfg.whitelist_reqs[self.reqid] = req
             cfg.save_whitelist_reqs()
             return await interaction.response.send_message(
-                "❌ Nitrado ist noch nicht eingerichtet – führe zuerst "
-                "`/setup token` aus. Anfrage bleibt offen.", ephemeral=True)
+                "❌ Für diesen Discord-Server ist kein Nitrado-Server eingerichtet – "
+                "die Anfrage bleibt offen.", ephemeral=True)
 
         await interaction.response.defer()
         try:
-            current, category, key = await _read_whitelist()
+            current, category, key = await _read_whitelist(conn)
         except Exception as e:
             cfg.whitelist_reqs[self.reqid] = req
             cfg.save_whitelist_reqs()
@@ -4815,7 +4860,7 @@ class WhitelistApprovalView(discord.ui.View):
 
         psn = req["psn"]
         if psn.lower() not in {n.lower() for n in current}:
-            ok, msg = await _write_whitelist(current + [psn], category, key)
+            ok, msg = await _write_whitelist(conn, current + [psn], category, key)
             if not ok:
                 cfg.whitelist_reqs[self.reqid] = req
                 cfg.save_whitelist_reqs()
@@ -4955,11 +5000,12 @@ async def cmd_positions(interaction: discord.Interaction):
 async def cmd_search(interaction: discord.Interaction, name: str):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    if not await _require_nitrado(interaction, need_ftp=True):
+    conn = await _require_conn(interaction, need_ftp=True)
+    if conn is None:
         return
     await interaction.response.defer(ephemeral=True)
 
-    log_dir = cfg.config.get("ftp_log_dir")
+    log_dir = conn.get("ftp_log_dir")
     if not log_dir:
         return await interaction.followup.send(
             "❌ Log-Verzeichnis nicht konfiguriert. Starte den Bot neu oder nutze `/ftp_scan`.",
@@ -4967,11 +5013,11 @@ async def cmd_search(interaction: discord.Interaction, name: str):
         )
 
     loop = asyncio.get_running_loop()
-    adm_files = await loop.run_in_executor(None, bot.ftp.list_adm_files, log_dir)
+    adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
     if not adm_files:
         return await interaction.followup.send("❌ Keine Log-Dateien gefunden.", ephemeral=True)
 
-    content = await loop.run_in_executor(None, bot.ftp.read_file, adm_files[-1])
+    content = await loop.run_in_executor(None, conn.ftp.read_file, adm_files[-1])
     if not content:
         return await interaction.followup.send("❌ Log-Datei konnte nicht gelesen werden.", ephemeral=True)
 
@@ -4995,25 +5041,27 @@ async def cmd_search(interaction: discord.Interaction, name: str):
 async def cmd_ftp_scan(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    if not await _require_nitrado(interaction, need_ftp=True):
+    conn = await _require_conn(interaction, need_ftp=True)
+    if conn is None:
         return
     await interaction.response.defer(ephemeral=True)
 
     # Pfade zurücksetzen damit discover_paths nicht überspringt
-    cfg.config["ftp_log_dir"]          = ""
-    cfg.config["ftp_ban_file"]         = ""
-    cfg.config["ftp_mission_dir"]      = ""
-    cfg.config["cfg_effect_area_path"] = ""
-    cfg.log_state = {}
-    cfg.save_config()
-    cfg.save_log_state()
+    for key in ("ftp_log_dir", "ftp_ban_file", "ftp_mission_dir",
+                "cfg_effect_area_path"):
+        _conn_store(conn, key, "")
+    conn.data["log_state"] = {}
+    connections.save()
+    if connections.primary() is conn:
+        cfg.log_state = {}
+        cfg.save_log_state()
 
-    await bot._auto_discover()
+    await bot._auto_discover(conn)
 
-    log_dir  = cfg.config.get("ftp_log_dir")          or "Nicht gefunden"
-    ban_file = cfg.config.get("ftp_ban_file")         or "Nicht gefunden"
-    mission  = cfg.config.get("ftp_mission_dir")      or "Nicht gefunden"
-    effect   = cfg.config.get("cfg_effect_area_path") or "Nicht gefunden"
+    log_dir  = conn.get("ftp_log_dir")          or "Nicht gefunden"
+    ban_file = conn.get("ftp_ban_file")         or "Nicht gefunden"
+    mission  = conn.get("ftp_mission_dir")      or "Nicht gefunden"
+    effect   = conn.get("cfg_effect_area_path") or "Nicht gefunden"
 
     embed = discord.Embed(title="🔎 FTP-Scan abgeschlossen", color=0x2ECC71)
     embed.add_field(name="Log-Verzeichnis", value=f"`{log_dir}`",  inline=False)
@@ -5033,22 +5081,23 @@ async def cmd_ftp_scan(interaction: discord.Interaction):
 async def cmd_raw_log(interaction: discord.Interaction, zeilen: int = 20):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    if not await _require_nitrado(interaction, need_ftp=True):
+    conn = await _require_conn(interaction, need_ftp=True)
+    if conn is None:
         return
     await interaction.response.defer(ephemeral=True)
 
-    log_dir = cfg.config.get("ftp_log_dir")
+    log_dir = conn.get("ftp_log_dir")
     if not log_dir:
         return await interaction.followup.send(
             "❌ Log-Verzeichnis nicht konfiguriert. Nutze `/ftp_scan`.", ephemeral=True
         )
 
     loop = asyncio.get_running_loop()
-    adm_files = await loop.run_in_executor(None, bot.ftp.list_adm_files, log_dir)
+    adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
     if not adm_files:
         return await interaction.followup.send("❌ Keine ADM-Dateien gefunden.", ephemeral=True)
 
-    content = await loop.run_in_executor(None, bot.ftp.read_file, adm_files[-1])
+    content = await loop.run_in_executor(None, conn.ftp.read_file, adm_files[-1])
     if not content:
         return await interaction.followup.send("❌ Log-Datei konnte nicht gelesen werden.", ephemeral=True)
 
@@ -5079,23 +5128,24 @@ async def cmd_raw_log(interaction: discord.Interaction, zeilen: int = 20):
 async def cmd_test(interaction: discord.Interaction, zeilen: int = 500):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    if not await _require_nitrado(interaction, need_ftp=True):
+    conn = await _require_conn(interaction, need_ftp=True)
+    if conn is None:
         return
     await interaction.response.defer(ephemeral=True)
 
     # ── 1. Log-Datei lesen ────────────────────────────────────
-    log_dir = cfg.config.get("ftp_log_dir")
+    log_dir = conn.get("ftp_log_dir")
     if not log_dir:
         return await interaction.followup.send(
             "❌ Log-Verzeichnis nicht konfiguriert. Nutze `/ftp_scan`.", ephemeral=True
         )
 
     loop = asyncio.get_running_loop()
-    adm_files = await loop.run_in_executor(None, bot.ftp.list_adm_files, log_dir)
+    adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
     if not adm_files:
         return await interaction.followup.send("❌ Keine ADM-Dateien gefunden.", ephemeral=True)
 
-    content = await loop.run_in_executor(None, bot.ftp.read_file, adm_files[-1])
+    content = await loop.run_in_executor(None, conn.ftp.read_file, adm_files[-1])
     if not content:
         return await interaction.followup.send("❌ Log-Datei konnte nicht gelesen werden.", ephemeral=True)
 
@@ -5211,11 +5261,14 @@ async def cmd_ftp_status(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
     await interaction.response.defer(ephemeral=True)
+    conn = await _require_conn(interaction, need_ftp=True)
+    if conn is None:
+        return
 
-    host     = cfg.config.get("ftp_host", "–")
-    port     = cfg.config.get("ftp_port", 21)
-    user     = cfg.config.get("ftp_user", "–")
-    log_dir  = cfg.config.get("ftp_log_dir",  "Noch nicht gesetzt")
+    host     = conn.get("ftp_host", "–")
+    port     = conn.get("ftp_port", 21)
+    user     = conn.get("ftp_user", "–")
+    log_dir  = conn.get("ftp_log_dir",  "Noch nicht gesetzt")
 
     loop = asyncio.get_running_loop()
 
@@ -5229,7 +5282,7 @@ async def cmd_ftp_status(interaction: discord.Interaction):
             t0  = _time.monotonic()
             ftp = ftplib.FTP()
             ftp.connect(host, int(port), timeout=15)
-            ftp.login(user, cfg.config.get("ftp_password", ""))
+            ftp.login(user, conn.get("ftp_password", ""))
             welcome = ftp.getwelcome()
             ftp.quit()
             return _time.monotonic() - t0, welcome
@@ -5244,7 +5297,7 @@ async def cmd_ftp_status(interaction: discord.Interaction):
     adm_latest = "–"
     if connect_ok and log_dir and log_dir != "Noch nicht gesetzt":
         try:
-            adm_files = await loop.run_in_executor(None, bot.ftp.list_adm_files, log_dir)
+            adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
             adm_count  = len(adm_files)
             adm_latest = adm_files[-1].split("/")[-1] if adm_files else "Keine gefunden"
         except Exception as e:
@@ -5252,7 +5305,7 @@ async def cmd_ftp_status(interaction: discord.Interaction):
 
     # ── 3. Nitrado-Banliste prüfen (Servereinstellungen, nicht FTP) ──
     try:
-        ban_names, _bcat, _bkey = await _read_banlist()
+        ban_names, _bcat, _bkey = await _read_banlist(conn)
         ban_msg = f"✅ {len(ban_names)} Einträge"
     except Exception as e:
         ban_msg = f"⚠️ {e}"
@@ -8965,7 +9018,9 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
         delivery_info = "⏳ Your items will spawn at the **next scheduled server restart**."
 
     # ── 8. Bestätigung an den Käufer (Ort + iZurvive-Link) ────
-    map_name = cfg.config.get("map_name", "ChernarusPlus")
+    _conn = _conn_of(interaction)
+    map_name = (_conn.get("map_name", "ChernarusPlus") if _conn is not None
+                else cfg.config.get("map_name", "ChernarusPlus"))
     loc_url  = _izurvive_url(x, z, map_name)
     near     = _nearest_location(x, z, map_name)
     near_txt = f"\n*(Near {near})*" if near else ""
@@ -9757,9 +9812,14 @@ async def body(request: web.Request) -> dict:
         return {}
 
 
-def require_nitrado():
-    """Gibt (nitrado, None) zurück oder (None, Fehlerantwort), wenn nicht eingerichtet."""
-    nit = getattr(bot, "nitrado", None) if bot else None
+def require_nitrado(request: Optional[web.Request] = None):
+    """Gibt (nitrado, None) zurück oder (None, Fehlerantwort), wenn nicht eingerichtet.
+
+    Mit Request wird der Server dieser Anmeldung genommen – sonst wuerde das
+    Dashboard eines Kunden den Hauptserver steuern.
+    """
+    conn = _conn_for_session(_sess_get(request)) if request is not None else None
+    nit = conn.api if conn is not None else (getattr(bot, "nitrado", None) if bot else None)
     if not nit or not str(getattr(nit, "service_id", "") or "").strip():
         return None, err("Nitrado-Server ist noch nicht eingerichtet.", 409)
     return nit, None
@@ -10359,7 +10419,7 @@ async def post_select_server(request: web.Request) -> web.Response:
     sess["map_name"] = cfg.config.get("map_name")
     return ok({
         "service_id": service_id,
-        "map_name": cfg.config.get("map_name"),
+        "map_name": (conn.get("map_name") if conn else cfg.config.get("map_name")),
         "ftp_host": cfg.config.get("ftp_host") or None,
         "log_dir": cfg.config.get("ftp_log_dir") or None,
         "server_ip": cfg.config.get("server_ip") or None,
@@ -11132,7 +11192,9 @@ def _locations(map_name: str):
 
 
 async def api_map_meta(request: web.Request) -> web.Response:
-    map_name = cfg.config.get("map_name", "ChernarusPlus")
+    _c = _conn_for_session(_sess_get(request))
+    map_name = (_c.get("map_name", "ChernarusPlus") if _c
+                else cfg.config.get("map_name", "ChernarusPlus"))
     return ok({
         "map_name": map_name,
         "world_size": _world_size(map_name),
@@ -11148,7 +11210,9 @@ async def api_map_players(request: web.Request) -> web.Response:
     parser = getattr(bot, "parser", None) if bot else None
     positions = getattr(parser, "player_positions", {}) if parser else {}
     nearest_fn = _nearest_location
-    map_name = cfg.config.get("map_name", "ChernarusPlus")
+    _c = _conn_for_session(_sess_get(request))
+    map_name = (_c.get("map_name", "ChernarusPlus") if _c
+                else cfg.config.get("map_name", "ChernarusPlus"))
     out = []
     for name, entry in list(positions.items()):
         if not isinstance(entry, dict):
@@ -11429,8 +11493,10 @@ async def delete_announcement(request: web.Request) -> web.Response:
 # ──────────────────────────────────────────────────────────────────────────
 async def api_server_status(request: web.Request) -> web.Response:
     a2s = a2s_query
-    ip = cfg.config.get("server_ip") or ""
-    port = int(cfg.config.get("query_port", 2302) or 2302)
+    conn = _conn_for_session(_sess_get(request))
+    ip = (conn.get("server_ip") if conn else cfg.config.get("server_ip")) or ""
+    port = int((conn.get("query_port", 2302) if conn
+                else cfg.config.get("query_port", 2302)) or 2302)
     live = None
     if callable(a2s) and ip:
         try:
@@ -11438,7 +11504,7 @@ async def api_server_status(request: web.Request) -> web.Response:
         except Exception:
             live = None
     nit_info = None
-    nit = getattr(bot, "nitrado", None)
+    nit = conn.api if conn is not None else getattr(bot, "nitrado", None)
     if nit and str(getattr(nit, "service_id", "") or "").strip():
         try:
             info = await nit.get_info()
@@ -11462,7 +11528,7 @@ async def api_server_status(request: web.Request) -> web.Response:
 
 
 async def api_server_restart(request: web.Request) -> web.Response:
-    nit, e = require_nitrado()
+    nit, e = require_nitrado(request)
     if e:
         return e
     okflag, msg = await nit.restart()
@@ -11470,7 +11536,7 @@ async def api_server_restart(request: web.Request) -> web.Response:
 
 
 async def api_server_stop(request: web.Request) -> web.Response:
-    nit, e = require_nitrado()
+    nit, e = require_nitrado(request)
     if e:
         return e
     okflag, msg = await nit.stop()
