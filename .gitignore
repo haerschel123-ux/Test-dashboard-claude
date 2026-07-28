@@ -1,5 +1,6 @@
 # ─── Secrets & Laufzeitdaten – NICHT committen ───
 config.json
+connections.json
 guilds_config.json
 banlist.json
 whitelist_requests.json

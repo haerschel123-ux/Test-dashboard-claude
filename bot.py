@@ -681,6 +681,9 @@ class ConfigManager:
         if self._merge_defaults(self.config, DEFAULT_CONFIG):
             self.save_config()
             log.info("[CONFIG] config.json um neue Standard-Felder ergänzt.")
+        # Verbundene Nitrado-Server laden. Beim ersten Start nach dem Update
+        # wird daraus eine bestehende Einzelserver-Einrichtung uebernommen.
+        connections.load()
 
     def _merge_defaults(self, target: Dict, defaults: Dict) -> bool:
         """Ergänzt fehlende Keys rekursiv, ohne vorhandene Werte zu überschreiben."""
@@ -2195,6 +2198,287 @@ class EmbedBuilder:
 
 
 # ══════════════════════════════════════════════════════════════
+#  Verbundene Nitrado-Server (Mehrmandanten-Betrieb)
+# ══════════════════════════════════════════════════════════════
+#  Frueher gab es genau einen Nitrado-Server: Token, Service-ID, FTP-Zugang
+#  und Karte standen global in der config.json. Fuer mehrere Kunden braucht
+#  jeder Server seinen eigenen Satz dieser Werte plus die Discord-Guild, die
+#  ihn verwalten darf. Beides liegt jetzt in connections.json, geschluesselt
+#  nach Service-ID.
+#
+#  Die config.json bleibt als Rueckfallebene bestehen: Werte, die eine
+#  Verbindung nicht selbst kennt, werden weiterhin von dort gelesen. So
+#  funktioniert eine bestehende Installation unveraendert weiter.
+
+CONNECTIONS_FILE = "connections.json"
+
+# Werte, die nur einen bestimmten Server betreffen und deshalb aus der
+# config.json in die jeweilige Verbindung wandern.
+_CONN_SERVER_FIELDS = (
+    "ftp_host", "ftp_port", "ftp_user", "ftp_password",
+    "ftp_log_dir", "ftp_ban_file", "ftp_profile_dir", "ftp_mission_dir",
+    "cfg_effect_area_path", "map_name", "server_ip", "query_port", "rcon_port",
+    "zones", "auto_restart_schedule",
+    "nitrado_ban_category", "nitrado_ban_key",
+    "nitrado_whitelist_category", "nitrado_whitelist_key",
+)
+
+
+class ServerConnection:
+    """Ein verbundener Nitrado-Server mit allem, was nur ihn betrifft.
+
+    Haelt neben den Stammdaten auch die Laufzeit-Objekte (NitradoAPI, FTP,
+    Log-Parser), damit spaeter jeder Server unabhaengig gepollt werden kann.
+    """
+
+    def __init__(self, data: Dict[str, Any]):
+        self.data: Dict[str, Any] = data
+        self.api: Optional[NitradoAPI] = None
+        self.ftp: Optional[FTPManager] = None
+        self.parser: Optional[DayZLogParser] = None
+        self.shop: Optional[Any] = None
+
+    # ── Stammdaten ──
+    @property
+    def service_id(self) -> str:
+        return str(self.data.get("service_id") or "")
+
+    @property
+    def name(self) -> str:
+        return str(self.data.get("name") or f"Server {self.service_id}")
+
+    @property
+    def token(self) -> str:
+        return str(self.data.get("nitrado_token") or "")
+
+    @property
+    def guild_id(self) -> Optional[int]:
+        try:
+            gid = int(self.data.get("guild_id") or 0)
+        except (TypeError, ValueError):
+            return None
+        return gid or None
+
+    @property
+    def log_state(self) -> Dict[str, Any]:
+        state = self.data.get("log_state")
+        if not isinstance(state, dict):
+            state = {}
+            self.data["log_state"] = state
+        return state
+
+    def get(self, key: str, default: Any = None) -> Any:
+        """Serverspezifischer Wert.
+
+        Kennt die Verbindung den Schluessel nicht, gilt der globale Wert aus
+        der config.json – ein leerer Wert in der Verbindung bleibt dagegen
+        leer und wird NICHT global ueberschrieben.
+        """
+        if key in self.data:
+            return self.data[key]
+        return cfg.config.get(key, default)
+
+    def set(self, key: str, value: Any) -> None:
+        self.data[key] = value
+
+    def masked_token(self) -> str:
+        """Token fuer die Anzeige: nur die letzten vier Zeichen bleiben lesbar."""
+        tok = self.token
+        if not tok:
+            return ""
+        return "•" * max(8, len(tok) - 4) + tok[-4:]
+
+    # ── Laufzeit-Objekte ──
+    async def ensure_clients(self, force: bool = False) -> None:
+        """NitradoAPI/FTP fuer diese Verbindung anlegen (idempotent)."""
+        if force and self.api is not None:
+            try:
+                await self.api.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.api = None
+        if force:
+            self.ftp = None
+
+        if self.api is None and self.token and self.service_id:
+            self.api = NitradoAPI(
+                token=self.token,
+                service_id=self.service_id,
+                base=self.get("nitrado_api_base", "https://api.nitrado.net"),
+            )
+        if self.ftp is None and all(str(self.get(k) or "").strip()
+                                    for k in ("ftp_host", "ftp_user", "ftp_password")):
+            self.ftp = FTPManager(
+                host=self.get("ftp_host"),
+                port=self.get("ftp_port", 21),
+                user=self.get("ftp_user"),
+                password=self.get("ftp_password"),
+            )
+
+    async def close(self) -> None:
+        if self.api is not None:
+            try:
+                await self.api.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.api = None
+        self.ftp = None
+
+    def view(self, with_token: bool = False) -> Dict[str, Any]:
+        """Darstellung fuers Dashboard – der Token nur auf ausdrueckliche Bitte."""
+        out = {
+            "service_id": self.service_id,
+            "name": self.name,
+            "guild_id": (str(self.guild_id) if self.guild_id else None),
+            "map_name": self.get("map_name"),
+            "server_ip": self.get("server_ip") or None,
+            "ftp_host": self.get("ftp_host") or None,
+            "has_ftp": bool(self.get("ftp_host") and self.get("ftp_user")),
+            "token_masked": self.masked_token(),
+        }
+        if with_token:
+            out["token"] = self.token
+        return out
+
+
+class ConnectionRegistry:
+    """Alle verbundenen Nitrado-Server, geschluesselt nach Service-ID."""
+
+    def __init__(self):
+        self._conns: Dict[str, ServerConnection] = {}
+
+    # ── Laden/Speichern ──
+    def load(self) -> None:
+        raw: Dict[str, Any] = {}
+        if os.path.exists(CONNECTIONS_FILE):
+            try:
+                with open(CONNECTIONS_FILE, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+            except (OSError, ValueError) as e:
+                log.error(f"[CONN] {CONNECTIONS_FILE} nicht lesbar ({e}) – "
+                          f"starte mit leerer Liste.")
+                raw = {}
+        self._conns = {str(sid): ServerConnection(data)
+                       for sid, data in (raw or {}).items()
+                       if isinstance(data, dict)}
+        if not self._conns and self._migrate_from_config():
+            self.save()
+
+    def save(self) -> None:
+        try:
+            with open(CONNECTIONS_FILE, "w", encoding="utf-8") as f:
+                json.dump({sid: c.data for sid, c in self._conns.items()},
+                          f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            log.error(f"[CONN] {CONNECTIONS_FILE} nicht schreibbar: {e}")
+
+    def _migrate_from_config(self) -> bool:
+        """Bestehende Einzelserver-Installation uebernehmen.
+
+        Ohne diesen Schritt stuende eine laufende Installation nach dem Update
+        ohne Verbindung da. Die Werte bleiben zusaetzlich in der config.json –
+        dort schadet die Kopie nicht und dient als Rueckfallebene.
+        """
+        service_id = str(cfg.config.get("service_id") or "").strip()
+        if not service_id or not cfg.has_nitrado_token():
+            return False
+
+        guild_id = None
+        for raw in (cfg.config.get("guild_ids") or []):
+            try:
+                gid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if gid and gid not in _PLACEHOLDER_GUILD_IDS:
+                guild_id = gid
+                break
+
+        data: Dict[str, Any] = {
+            "service_id": service_id,
+            "name": str(cfg.config.get("server_name") or "").strip()
+                    or f"Server {service_id}",
+            "nitrado_token": str(cfg.config.get("nitrado_token") or "").strip(),
+            "guild_id": guild_id,
+            "owner_discord_id": None,
+            # Die bisherige Lese-Position wandert mit, sonst wuerden nach dem
+            # Update alte Log-Zeilen erneut als Ereignisse gepostet.
+            "log_state": dict(cfg.log_state or {}),
+        }
+        for key in _CONN_SERVER_FIELDS:
+            if key in cfg.config:
+                data[key] = cfg.config[key]
+
+        self._conns[service_id] = ServerConnection(data)
+        log.info(f"[CONN] Bestehende Einrichtung uebernommen: Service {service_id}"
+                 + (f" → Guild {guild_id}" if guild_id else " (noch keiner Guild zugeordnet)"))
+        return True
+
+    # ── Zugriff ──
+    def all(self) -> List[ServerConnection]:
+        return list(self._conns.values())
+
+    def for_service(self, service_id: Any) -> Optional[ServerConnection]:
+        return self._conns.get(str(service_id or ""))
+
+    def for_guild(self, guild_id: Any) -> Optional[ServerConnection]:
+        """Die Verbindung, die diese Discord-Guild verwalten darf."""
+        try:
+            gid = int(guild_id or 0)
+        except (TypeError, ValueError):
+            return None
+        if not gid:
+            return None
+        for conn in self._conns.values():
+            if conn.guild_id == gid:
+                return conn
+        return None
+
+    def primary(self) -> Optional[ServerConnection]:
+        """Die Verbindung des Hauptservers – die aus der config.json, sonst die erste.
+
+        Uebergangsloesung, solange Log-Abruf und Shop noch nicht pro Server
+        laufen (Stufe 4 des Umbaus).
+        """
+        conn = self.for_service(cfg.config.get("service_id"))
+        if conn is not None:
+            return conn
+        return next(iter(self._conns.values()), None)
+
+    # ── Aendern ──
+    def upsert(self, service_id: Any, **fields: Any) -> ServerConnection:
+        sid = str(service_id)
+        conn = self._conns.get(sid)
+        if conn is None:
+            conn = ServerConnection({"service_id": sid, "log_state": {}})
+            self._conns[sid] = conn
+        for key, value in fields.items():
+            if value is not None:
+                conn.data[key] = value
+        self.save()
+        return conn
+
+    def assign_guild(self, service_id: Any, guild_id: Optional[int]) -> Tuple[bool, str]:
+        """Guild einem Server zuordnen. Eine Guild kann nur einen Server verwalten."""
+        conn = self.for_service(service_id)
+        if conn is None:
+            return False, "Dieser Server ist nicht (mehr) verbunden."
+        if guild_id:
+            other = self.for_guild(guild_id)
+            if other is not None and other.service_id != conn.service_id:
+                return False, (f"Diese Guild verwaltet bereits „{other.name}“. "
+                               f"Eine Guild kann nur einen Server verwalten.")
+        conn.data["guild_id"] = int(guild_id) if guild_id else None
+        self.save()
+        return True, ("Zuordnung gespeichert." if guild_id else "Zuordnung entfernt.")
+
+    def remove(self, service_id: Any) -> bool:
+        return self._conns.pop(str(service_id), None) is not None
+
+
+connections = ConnectionRegistry()
+
+
+# ══════════════════════════════════════════════════════════════
 #  Bot-Klasse
 # ══════════════════════════════════════════════════════════════
 class DayZBot(discord.Client):
@@ -2303,32 +2587,31 @@ class DayZBot(discord.Client):
             announcement_scheduler.start()
 
     async def init_nitrado(self, force: bool = False):
-        """Initialisiert NitradoAPI + FTPManager + ShopManager aus der Config.
-        force=True (für /setup token) ersetzt bestehende Instanzen – die alte
-        aiohttp-Session wird dabei sauber geschlossen."""
-        if force and self.nitrado is not None:
-            try:
-                await self.nitrado.close()
-            except Exception:
-                pass
-            self.nitrado = None
-        if force:
-            self.ftp = None
+        """Baut die Laufzeit-Objekte aller verbundenen Server auf.
 
-        if self.nitrado is None:
-            self.nitrado = NitradoAPI(
-                token=cfg.config["nitrado_token"],
-                service_id=str(cfg.config.get("service_id") or ""),
-                base=cfg.config.get("nitrado_api_base", "https://api.nitrado.net"),
-            )
-        if self.ftp is None and all(str(cfg.config.get(k) or "").strip()
-                                    for k in ("ftp_host", "ftp_user", "ftp_password")):
-            self.ftp = FTPManager(
-                host=cfg.config["ftp_host"],
-                port=cfg.config.get("ftp_port", 21),
-                user=cfg.config["ftp_user"],
-                password=cfg.config["ftp_password"],
-            )
+        Die Stammdaten kommen aus der Registry (connections.json), nicht mehr
+        direkt aus der config.json. ``self.nitrado``/``self.ftp`` zeigen
+        weiterhin auf den Hauptserver, damit Befehle und Log-Abruf unveraendert
+        arbeiten, solange sie noch nicht pro Guild aufloesen.
+        force=True (fuer /setup token) ersetzt bestehende Instanzen – die alte
+        aiohttp-Session wird dabei sauber geschlossen."""
+        for conn in connections.all():
+            try:
+                await conn.ensure_clients(force=force)
+            except Exception as e:  # noqa: BLE001 – ein Server darf die anderen nicht kippen
+                log.error(f"[CONN] {conn.name}: Verbindung nicht aufbaubar: {e}")
+
+        primary = connections.primary()
+        if primary is None:
+            log.warning("[CONN] Keine verbundenen Server – Nitrado bleibt uneingerichtet.")
+            if force:
+                self.nitrado, self.ftp = None, None
+            return
+
+        had_ftp = self.ftp is not None
+        self.nitrado = primary.api
+        self.ftp = primary.ftp
+        if self.ftp is not None and (force or not had_ftp):
             try:
                 await self._auto_discover()
             except Exception as e:
@@ -3103,12 +3386,19 @@ async def _finish_token_setup(token: str, service_id: str,
                         "(Nitrado-API-Fehler) – FTP/Karte nicht erkannt.")
     cfg.save_config()
 
+    details  = service.get("details") or {}
+    name     = details.get("name") or details.get("game") or f"Service {service_id}"
+
+    # Denselben Weg wie das Dashboard gehen: Server in die Registry aufnehmen.
+    fields = {"nitrado_token": token, "name": name}
+    for key in _CONN_SERVER_FIELDS:
+        if key in cfg.config:
+            fields[key] = cfg.config[key]
+    connections.upsert(service_id, **fields)
+
     # Nitrado/FTP/Shop mit den neuen Daten (neu) initialisieren –
     # inklusive FTP-Auto-Discovery der Log-Verzeichnisse
     await bot.init_nitrado(force=True)
-
-    details  = service.get("details") or {}
-    name     = details.get("name") or details.get("game") or f"Service {service_id}"
     ftp_host = cfg.config.get("ftp_host") or "❌ Nicht gefunden"
     log_dir  = cfg.config.get("ftp_log_dir") or "❌ Nicht gefunden"
     if not cfg.config.get("ftp_host"):
@@ -9836,6 +10126,16 @@ async def post_select_server(request: web.Request) -> web.Response:
         warnings.append("Gameserver-Infos konnten nicht geladen werden – "
                         "FTP/Karte evtl. nicht erkannt.")
     cfg.save_config()
+
+    # Server in die Registry aufnehmen bzw. auffrischen. Die Guild-Zuordnung
+    # bleibt dabei unangetastet – die vergibt der Bot-Owner in der Serverliste.
+    fields = {"nitrado_token": token,
+              "name": _server_view(service)["name"],
+              "owner_discord_id": ((sess.get("discord") or {}).get("id"))}
+    for key in _CONN_SERVER_FIELDS:
+        if key in cfg.config:
+            fields[key] = cfg.config[key]
+    connections.upsert(service_id, **fields)
 
     # Nitrado/FTP/Shop live neu initialisieren (inkl. FTP-Auto-Discovery)
     try:
