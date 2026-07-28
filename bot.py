@@ -10475,7 +10475,7 @@ async def post_select_server(request: web.Request) -> web.Response:
     for key in _CONN_SERVER_FIELDS:
         if key in cfg.config:
             fields[key] = cfg.config[key]
-    connections.upsert(service_id, **fields)
+    conn = connections.upsert(service_id, **fields)
 
     # Nitrado/FTP/Shop live neu initialisieren (inkl. FTP-Auto-Discovery)
     try:
@@ -10488,13 +10488,13 @@ async def post_select_server(request: web.Request) -> web.Response:
                         "Shop-Lieferung funktionieren so nicht.")
 
     sess["service_id"] = service_id
-    sess["map_name"] = cfg.config.get("map_name")
+    sess["map_name"] = conn.get("map_name")
     return ok({
         "service_id": service_id,
-        "map_name": (conn.get("map_name") if conn else cfg.config.get("map_name")),
-        "ftp_host": cfg.config.get("ftp_host") or None,
-        "log_dir": cfg.config.get("ftp_log_dir") or None,
-        "server_ip": cfg.config.get("server_ip") or None,
+        "map_name": conn.get("map_name"),
+        "ftp_host": conn.get("ftp_host") or None,
+        "log_dir": conn.get("ftp_log_dir") or None,
+        "server_ip": conn.get("server_ip") or None,
         "name": _server_view(service)["name"],
         "warnings": warnings,
         "guild_configured": _guild_is_configured(),
@@ -11603,7 +11603,7 @@ async def api_server_status(request: web.Request) -> web.Response:
         "online": bool(live),
         "a2s": live,
         "nitrado": nit_info,
-        "map_name": cfg.config.get("map_name"),
+        "map_name": (conn.get("map_name") if conn else cfg.config.get("map_name")),
         "server_ip": ip or None,
     })
 
