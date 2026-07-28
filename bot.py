@@ -2314,6 +2314,10 @@ class ServerConnection:
                 user=self.get("ftp_user"),
                 password=self.get("ftp_password"),
             )
+        # Eigener Parser je Server: er merkt sich Spielerpositionen, die sonst
+        # zwischen den Servern durcheinandergeraten wuerden.
+        if self.parser is None:
+            self.parser = DayZLogParser()
 
     async def close(self) -> None:
         if self.api is not None:
@@ -2656,14 +2660,16 @@ class DayZBot(discord.Client):
         self.ftp = primary.ftp
         if self.ftp is not None and (force or not had_ftp):
             try:
-                await self._auto_discover()
+                await self._auto_discover(conn)
             except Exception as e:
                 # FTP gerade nicht erreichbar → Init nicht abbrechen;
                 # Discovery kann später per /ftp_scan nachgeholt werden
                 log.warning(f"[FTP] Auto-Discovery fehlgeschlagen: {e}")
-        # Shop-/Delivery-Manager initialisieren (braucht FTP + Nitrado)
-        if self.shop is None and self.ftp is not None:
-            self.shop = ShopManager(self)
+        # Shop-/Delivery-Manager je Verbindung (braucht FTP + Nitrado)
+        for conn in connections.all():
+            if conn.shop is None and conn.ftp is not None:
+                conn.shop = ShopManager(self, conn)
+        self.shop = primary.shop
 
     async def _auto_discover(self, conn: Optional[ServerConnection] = None):
         """Sucht automatisch nach DayZ-Log-Verzeichnissen via FTP.
@@ -2708,8 +2714,22 @@ class DayZBot(discord.Client):
 
     @tasks.loop(seconds=10)
     async def log_poll(self):
-        if not self.ftp:
-            return
+        """Jeden verbundenen Server einzeln abfragen.
+
+        Jede Verbindung hat eigene FTP-Sitzung, eigenen Log-Zustand und einen
+        eigenen Parser – die Ereignisse eines Servers erreichen dadurch nur
+        noch dessen Discord-Guild.
+        """
+        for conn in connections.all():
+            if conn.ftp is None:
+                continue
+            try:
+                await self._poll_connection(conn)
+            except Exception as e:  # noqa: BLE001 – ein Server darf die anderen nicht stoppen
+                log.error(f"[POLL] {conn.name}: {e}")
+                await self._check_ftp_health(conn)
+
+    async def _poll_connection(self, conn: ServerConnection):
         log_dir = conn.get("ftp_log_dir")
         if not log_dir:
             # Discovery beim Start fehlgeschlagen oder noch nicht gelaufen →
@@ -2728,20 +2748,20 @@ class DayZBot(discord.Client):
                 return
         try:
             loop = asyncio.get_running_loop()
-            adm_files = await loop.run_in_executor(None, self.ftp.list_adm_files, log_dir)
+            adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
             if not adm_files:
-                await self._check_ftp_health()
+                await self._check_ftp_health(conn)
                 return
 
             latest = adm_files[-1]
-            state = cfg.log_state.get("current")
+            state = conn.log_state.get("current")
             if state is None:
                 # Erststart ohne gespeicherten Offset: Alt-Events NICHT in die
                 # Feeds nachposten, sondern ab dem aktuellen Dateiende weiterlesen
-                size_now = await loop.run_in_executor(None, self.ftp.file_size, latest)
-                cfg.log_state["current"] = {"file": latest, "offset": int(size_now or 0)}
-                cfg.log_state["last_poll_ts"] = time.time()
-                cfg.save_log_state()
+                size_now = await loop.run_in_executor(None, conn.ftp.file_size, latest)
+                conn.log_state["current"] = {"file": latest, "offset": int(size_now or 0)}
+                conn.log_state["last_poll_ts"] = time.time()
+                connections.save()
                 log.info(f"[POLL] Erststart – überspringe Alt-Events, Offset={int(size_now or 0)} ({latest})")
                 return
 
@@ -2751,8 +2771,8 @@ class DayZBot(discord.Client):
             # last_poll_ts fehlt bei Updates von älteren Versionen → Lücke unbekannt
             # → sicherheitshalber ebenfalls überspringen (verliert max. 1 Poll-Zyklus).
             now = time.time()
-            last_poll = float(cfg.log_state.get("last_poll_ts") or 0)
-            backlog_limit = max(1, int(cfg.config.get("max_backlog_minutes", 10))) * 60
+            last_poll = float(conn.log_state.get("last_poll_ts") or 0)
+            backlog_limit = max(1, int(conn.get("max_backlog_minutes", 10))) * 60
             gap = (now - last_poll) if last_poll else -1.0
             skip_backlog = (not last_poll) or gap > backlog_limit
 
@@ -2767,26 +2787,26 @@ class DayZBot(discord.Client):
                 old_file = state.get("file")
                 if old_file and old_file in adm_files and not skip_backlog:
                     old_tail, _ = await loop.run_in_executor(
-                        None, self.ftp.read_from_offset, old_file, state.get("offset", 0)
+                        None, conn.ftp.read_from_offset, old_file, state.get("offset", 0)
                     )
                     if old_tail:
-                        events.extend(self.parser.parse_lines(old_tail))
+                        events.extend(conn.parser.parse_lines(old_tail))
                         log.info(f"[POLL] {len(events)} Events aus dem Rest der alten Datei {old_file}")
                 state = {"file": latest, "offset": 0}
 
-            current_size = await loop.run_in_executor(None, self.ftp.file_size, latest)
+            current_size = await loop.run_in_executor(None, conn.ftp.file_size, latest)
             if current_size and state.get("offset", 0) > current_size:
                 # Gleiche Datei, aber geschrumpft: Server hat die ADM beim Neustart geleert
                 log.info(f"[POLL] Offset {state.get('offset', 0)} > Dateigröße {current_size} – Neustart (Truncation) erkannt")
                 restart_detected = True
                 state = {"file": latest, "offset": 0}
 
-            if self.shop and (restart_detected or self.shop.cleanup_retry_needed):
+            if conn.shop and (restart_detected or conn.shop.cleanup_retry_needed):
                 # Offene Käufe ausliefern; nach FTP-Fehler automatisch erneut versuchen.
                 # Bei frisch erkanntem Neustart bleiben die Einträge in der Datei,
                 # bis der Server per A2S wieder online ist (Mission-Load fertig),
                 # und werden dann sofort entfernt
-                self.shop.spawn_cleanup(delayed=restart_detected)
+                conn.shop.spawn_cleanup(delayed=restart_detected)
 
             if restart_detected:
                 # Server-Neustart wirft alle Spieler → offene Spielzeit-Sitzungen beenden
@@ -2794,16 +2814,16 @@ class DayZBot(discord.Client):
 
             if skip_backlog:
                 # Fast-Forward ans aktuelle Dateiende – nichts nachposten
-                size_now = current_size or await loop.run_in_executor(None, self.ftp.file_size, latest)
+                size_now = current_size or await loop.run_in_executor(None, conn.ftp.file_size, latest)
                 if not size_now:
                     # Größe nicht ermittelbar (FTP-Fehler?) → nächsten Zyklus abwarten,
                     # last_poll_ts NICHT aktualisieren, damit der Skip erneut greift
-                    await self._check_ftp_health()
+                    await self._check_ftp_health(conn)
                     return
                 state = {"file": latest, "offset": int(size_now)}
-                cfg.log_state["current"] = state
-                cfg.log_state["last_poll_ts"] = now
-                cfg.save_log_state()
+                conn.log_state["current"] = state
+                conn.log_state["last_poll_ts"] = now
+                connections.save()
                 await loop.run_in_executor(None, db.close_all_sessions)
                 mins = int(gap // 60) if gap >= 0 else 0
                 log.info(f"[POLL] Bot war {mins} Min offline – überspringe Alt-Events, Offset={state['offset']} ({latest})")
@@ -2814,41 +2834,41 @@ class DayZBot(discord.Client):
                                      f"dieser Zeit werden nicht nachgepostet, um die Feeds nicht zu "
                                      f"fluten (Grenze: `max_backlog_minutes` in config.json)."),
                         color=0x95A5A6)
-                    await _post_feed(None, "adminlog", info)
-                await self._check_ftp_health()
+                    await _post_feed(conn.guild_id, "adminlog", info)
+                await self._check_ftp_health(conn)
                 return
 
             content, new_offset = await loop.run_in_executor(
-                None, self.ftp.read_from_offset, latest, state["offset"]
+                None, conn.ftp.read_from_offset, latest, state["offset"]
             )
             if content:
                 state["offset"] = new_offset
-                events.extend(self.parser.parse_lines(content))
+                events.extend(conn.parser.parse_lines(content))
 
             # Zustand auch bei reiner Rotation (ohne neuen Inhalt) speichern
-            cfg.log_state["current"] = state
-            cfg.log_state["last_poll_ts"] = now
-            cfg.save_log_state()
+            conn.log_state["current"] = state
+            conn.log_state["last_poll_ts"] = now
+            connections.save()
 
             if events:
                 log.info(f"[POLL] {len(events)} neue Events aus {latest}")
                 # Rate-Limit-Schutz: pro Zyklus höchstens N Events posten
-                cap = max(1, int(cfg.config.get("max_events_per_cycle", 30)))
+                cap = max(1, int(conn.get("max_events_per_cycle", 30)))
                 if len(events) > cap:
                     log.warning(f"[POLL] {len(events)} Events in einem Zyklus – "
                                 f"poste nur die neuesten {cap} (max_events_per_cycle)")
                     events = events[-cap:]
                 for ev in events:
-                    await self._dispatch(ev)
+                    await self._dispatch(ev, conn)
 
             # Zonen-Pings: frisch getrackte Positionen gegen /zone-Zonen prüfen
-            await self._check_zones()
+            await self._check_zones(conn)
             # Spielzeit-Belohnung für offene Sitzungen gutschreiben
             await self._credit_playtime()
-            await self._check_ftp_health()
+            await self._check_ftp_health(conn)
         except Exception as e:
-            log.error(f"[POLL] Fehler: {e}")
-            await self._check_ftp_health()
+            log.error(f"[POLL] {conn.name}: {e}")
+            await self._check_ftp_health(conn)
 
     @log_poll.before_loop
     async def _before_poll(self):
@@ -2876,8 +2896,13 @@ class DayZBot(discord.Client):
             log.error(f"[STATUS] Fehler: {e}")
 
     async def _status_update_once(self):
-        ip = str(cfg.config.get("server_ip") or "").split(":")[0].strip()
-        qport = int(cfg.config.get("query_port", 0) or 0)
+        """Status-Embed je verbundenem Server in dessen Guild aktualisieren."""
+        for conn in connections.all():
+            await self._status_update_for(conn)
+
+    async def _status_update_for(self, conn: ServerConnection):
+        ip = str(conn.get("server_ip") or "").split(":")[0].strip()
+        qport = int(conn.get("query_port", 0) or 0)
         if not ip or not qport:
             return
         loop = asyncio.get_running_loop()
@@ -2888,7 +2913,10 @@ class DayZBot(discord.Client):
         else:
             self._online_since = None
         embed = self._build_status_embed(info)
-        for gid_str in list(cfg.guilds.keys()):
+        # Nur die Guild dieses Servers – sonst saehe jeder Discord-Server den
+        # Status aller Kunden.
+        targets = ([str(conn.guild_id)] if conn.guild_id else list(cfg.guilds.keys()))
+        for gid_str in targets:
             ch_id = cfg.get_channel(int(gid_str), "status")
             if not ch_id:
                 continue
@@ -2942,7 +2970,7 @@ class DayZBot(discord.Client):
         return e
 
     # ── Zonen-Pings (/zone create): Spieler in der Zone ───────
-    async def _check_zones(self):
+    async def _check_zones(self, conn: Optional[ServerConnection] = None):
         """Bewertet frisch getrackte Spieler-Positionen gegen die konfigurierten
         Zonen und pingt WIEDERHOLT (alle zone_ping_cooldown_seconds, Default 5 Min),
         solange sich ein Spieler in der Zone befindet – auch mehrfach für denselben
@@ -2950,7 +2978,8 @@ class DayZBot(discord.Client):
         Wird pro Poll-Zyklus aufgerufen; fängt eigene Fehler selbst ab, damit
         der Poll-Zyklus (Spielzeit-Gutschrift etc.) nie daran scheitert."""
         try:
-            zones = [z for z in (cfg.config.get("zones") or [])
+            _src = conn if conn is not None else connections.primary()
+            zones = [z for z in (_zones(_src) if _src else (cfg.config.get("zones") or []))
                      if isinstance(z, dict) and z.get("name")]
             if not zones:
                 return
@@ -2958,7 +2987,8 @@ class DayZBot(discord.Client):
             zone_keys = {str(z["name"]).strip().lower() for z in zones}
             self._zone_last_ping = {k: v for k, v in self._zone_last_ping.items()
                                     if k[0] in zone_keys}
-            cooldown = max(0, int(cfg.config.get("zone_ping_cooldown_seconds", 300)))
+            cooldown = max(0, int((_src.get("zone_ping_cooldown_seconds", 300) if _src
+                                   else cfg.config.get("zone_ping_cooldown_seconds", 300))))
             now = time.time()
             for pname, info in list(DayZLogParser.player_positions.items()):
                 # Nur NEU eingetroffene Positions-Samples bewerten – alte Daten
@@ -3021,7 +3051,9 @@ class DayZBot(discord.Client):
     # ── Geplante Neustarts (/auto restart) ────────────────────
     def _next_scheduled_restart(self) -> Optional[float]:
         """Nächster geplanter Restart-Zeitpunkt (lokale Serverzeit des Bots)."""
-        sched = cfg.config.get("auto_restart_schedule") or {}
+        _c = connections.primary()
+        sched = ((_c.get("auto_restart_schedule") if _c
+                  else cfg.config.get("auto_restart_schedule")) or {})
         if not sched.get("enabled"):
             return None
         try:
@@ -3127,14 +3159,17 @@ class DayZBot(discord.Client):
                  "Verbindung wird mit den neuen Daten aufgebaut.")
         return True
 
-    async def _check_ftp_health(self):
+    async def _check_ftp_health(self, conn: Optional[ServerConnection] = None):
         """Warnt im Adminlog-Feed, wenn das FTP-Polling dauerhaft fehlschlägt
         (Passwort geändert, Nitrado-Wartung), und meldet die Erholung.
         Versucht vorher, die FTP-Zugangsdaten über den Nitrado-Token zu erneuern."""
-        if not self.ftp:
+        conn = conn or connections.primary()
+        ftp = conn.ftp if conn is not None else self.ftp
+        if not ftp:
             return
-        fails     = self.ftp.consecutive_failures
-        threshold = max(1, int(cfg.config.get("ftp_fail_warn_cycles", 10)))
+        fails     = ftp.consecutive_failures
+        threshold = max(1, int((conn.get("ftp_fail_warn_cycles", 10) if conn
+                                else cfg.config.get("ftp_fail_warn_cycles", 10))))
         now = time.time()
         if fails >= threshold:
             if now - self._ftp_warned_ts >= 1800:   # höchstens alle 30 Min erneut warnen
@@ -3149,7 +3184,7 @@ class DayZBot(discord.Client):
                                      "hat die Zugangsdaten über den Nitrado-Token neu "
                                      "geholt und die Verbindung neu aufgebaut."),
                         color=0x2ECC71)
-                    await _post_feed(None, "adminlog", embed)
+                    await _post_feed(conn.guild_id if conn else None, "adminlog", embed)
                     return
                 self._ftp_warn_active = True
                 embed = discord.Embed(
@@ -3158,9 +3193,9 @@ class DayZBot(discord.Client):
                                  f"(Host `{cfg.config.get('ftp_host')}`).\n"
                                  f"Log-Feeds und Shop-Lieferungen sind unterbrochen!\n"
                                  f"Mögliche Ursachen: FTP-Passwort geändert, Nitrado-Wartung.\n"
-                                 f"Letzter Fehler: `{self.ftp.last_error or 'unbekannt'}`"),
+                                 f"Letzter Fehler: `{ftp.last_error or 'unbekannt'}`"),
                     color=0xE74C3C)
-                await _post_feed(None, "adminlog", embed)
+                await _post_feed(conn.guild_id if conn else None, "adminlog", embed)
         elif fails == 0 and self._ftp_warn_active:
             self._ftp_warn_active = False
             self._ftp_warned_ts   = 0.0
@@ -3168,7 +3203,7 @@ class DayZBot(discord.Client):
                 title="✅ FTP-Verbindung wiederhergestellt",
                 description="Der FTP-Zugriff funktioniert wieder – die Feeds laufen normal weiter.",
                 color=0x2ECC71)
-            await _post_feed(None, "adminlog", embed)
+            await _post_feed(conn.guild_id if conn else None, "adminlog", embed)
 
     async def _resolve_channel(self, channel_id: int):
         ch = self.get_channel(channel_id)
@@ -3180,7 +3215,12 @@ class DayZBot(discord.Client):
             log.debug(f"[DISPATCH] fetch_channel({channel_id}) fehlgeschlagen: {e}")
             return None
 
-    async def _dispatch(self, ev: Dict):
+    async def _dispatch(self, ev: Dict, conn: Optional[ServerConnection] = None):
+        """Ein Log-Ereignis in die Feeds posten.
+
+        Mit Verbindung geht es nur in deren Guild – die Ereignisse eines
+        Servers haben in fremden Discord-Servern nichts zu suchen.
+        """
         log_type = DayZLogParser.EVENT_TO_LOG.get(ev["type"])
         if not log_type:
             return
@@ -3188,7 +3228,7 @@ class DayZBot(discord.Client):
         # dem Event bzw. der letzten bekannten Spielerposition). Fehler hier
         # dürfen den Log-Dispatch niemals stören.
         try:
-            _ev_record(ev, self.parser.player_positions)
+            _ev_record(ev, (conn.parser if conn is not None else self.parser).player_positions)
         except Exception:
             pass
         # Kill-Statistik, Sessions, Kill-Belohnung & Bounties verarbeiten
@@ -3196,7 +3236,9 @@ class DayZBot(discord.Client):
         embed = EmbedBuilder.build(ev)
         if not embed:
             return
-        for gid_str in cfg.guilds:
+        targets = ([str(conn.guild_id)] if conn is not None and conn.guild_id
+                   else list(cfg.guilds))
+        for gid_str in targets:
             ch_id = cfg.get_channel(int(gid_str), log_type)
             if not ch_id:
                 continue
@@ -3975,16 +4017,36 @@ bot.tree.add_command(auto_group)
 zone_group = app_commands.Group(name="zone",
                                 description="🛡️ Zonen-Pings verwalten (Admin)")
 
-def _zones() -> List[Dict]:
-    zs = cfg.config.get("zones")
+def _zones(conn: Optional[ServerConnection] = None) -> List[Dict]:
+    """Die Zonen eines Servers. Ohne Angabe die des Hauptservers."""
+    src = conn or connections.primary()
+    if src is None:
+        zs = cfg.config.get("zones")
+        if not isinstance(zs, list):
+            zs = []
+            cfg.config["zones"] = zs
+        return zs
+    # Bewusst src.data statt src.get: der Rueckfall auf die globale config
+    # wuerde sonst allen Servern DIESELBE Zonenliste geben. Migrierte
+    # Verbindungen haben ihre Zonen ohnehin bereits in den eigenen Daten.
+    zs = src.data.get("zones")
     if not isinstance(zs, list):
         zs = []
-        cfg.config["zones"] = zs
+        src.set("zones", zs)
     return zs
 
-def _find_zone(name: str) -> Optional[Dict]:
+
+def _zones_save(conn: Optional[ServerConnection] = None) -> None:
+    """Zonen sichern – beim Hauptserver zusaetzlich in der config.json."""
+    src = conn or connections.primary()
+    if src is not None:
+        _conn_store(src, "zones", _zones(src))
+    else:
+        cfg.save_config()
+
+def _find_zone(name: str, conn: Optional[ServerConnection] = None) -> Optional[Dict]:
     key = name.strip().lower()
-    for z in _zones():
+    for z in _zones(conn):
         if isinstance(z, dict) and str(z.get("name", "")).strip().lower() == key:
             return z
     return None
@@ -4017,7 +4079,7 @@ def _zone_summary(z: Dict) -> str:
 async def _zone_name_autocomplete(interaction: discord.Interaction, current: str):
     cur = (current or "").lower()
     return [app_commands.Choice(name=str(z["name"]), value=str(z["name"]))
-            for z in _zones()
+            for z in _zones(_conn_of(interaction))
             if isinstance(z, dict) and z.get("name") and cur in str(z["name"]).lower()][:25]
 
 def _validate_zone_geometry(x: float, z: float, radius: float) -> Optional[str]:
@@ -4045,11 +4107,12 @@ async def zone_create(interaction: discord.Interaction, x: float, z: float,
                       rolle: Optional[discord.Role] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
+    _c = _conn_of(interaction)
     name = name.strip()
     if not name or len(name) > 60:
         return await interaction.response.send_message(
             "❌ Zonen-Name fehlt oder ist länger als 60 Zeichen.", ephemeral=True)
-    if _find_zone(name):
+    if _find_zone(name, _c):
         return await interaction.response.send_message(
             f"❌ Zone **{name}** existiert bereits – `/zone edit` zum Ändern "
             f"oder `/zone remove` zum Löschen.", ephemeral=True)
@@ -4065,8 +4128,8 @@ async def zone_create(interaction: discord.Interaction, x: float, z: float,
         "channel_id": int(channel.id) if channel else None,
         "guild_id":   int(interaction.guild_id),
     }
-    _zones().append(zone)
-    cfg.save_config()
+    _zones(_c).append(zone)
+    _zones_save(_c)
     e = discord.Embed(title="🛡️ Zone angelegt",
                       description=f"**{name}**\n{_zone_summary(zone)}",
                       color=0x2ECC71)
@@ -4085,13 +4148,14 @@ async def zone_create(interaction: discord.Interaction, x: float, z: float,
 async def zone_remove(interaction: discord.Interaction, name: str):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    zone = _find_zone(name)
+    _c = _conn_of(interaction)
+    zone = _find_zone(name, _c)
     if not zone:
         return await interaction.response.send_message(
             f"❌ Keine Zone namens **{name.strip()}** gefunden – `/zone list` zeigt alle.",
             ephemeral=True)
-    _zones().remove(zone)
-    cfg.save_config()
+    _zones(_c).remove(zone)
+    _zones_save(_c)
     _reset_zone_state(str(zone["name"]))
     await interaction.response.send_message(
         embed=discord.Embed(
@@ -4107,7 +4171,8 @@ zone_remove.autocomplete("name")(_zone_name_autocomplete)
 async def zone_list(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    zones = [z for z in _zones() if isinstance(z, dict) and z.get("name")]
+    _c = _conn_of(interaction)
+    zones = [z for z in _zones(_c) if isinstance(z, dict) and z.get("name")]
     if not zones:
         return await interaction.response.send_message(
             "ℹ️ Keine Zonen angelegt. Mit `/zone create` eine Zone einrichten.",
@@ -4142,7 +4207,8 @@ async def zone_edit(interaction: discord.Interaction, name: str,
                     rolle_entfernen: bool = False):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    zone = _find_zone(name)
+    _c = _conn_of(interaction)
+    zone = _find_zone(name, _c)
     if not zone:
         return await interaction.response.send_message(
             f"❌ Keine Zone namens **{name.strip()}** gefunden – `/zone list` zeigt alle.",
@@ -4166,7 +4232,7 @@ async def zone_edit(interaction: discord.Interaction, name: str,
         if not neuer_name or len(neuer_name) > 60:
             return await interaction.response.send_message(
                 "❌ Neuer Name fehlt oder ist länger als 60 Zeichen.", ephemeral=True)
-        existing = _find_zone(neuer_name)
+        existing = _find_zone(neuer_name, _c)
         if existing is not None and existing is not zone:
             return await interaction.response.send_message(
                 f"❌ Es gibt bereits eine Zone namens **{neuer_name}**.", ephemeral=True)
@@ -4182,7 +4248,7 @@ async def zone_edit(interaction: discord.Interaction, name: str,
         zone["channel_id"] = None
     elif channel is not None:
         zone["channel_id"] = int(channel.id)
-    cfg.save_config()
+    _zones_save(_c)
     # Alten UND neuen Zustand verwerfen: Geometrie/Name haben sich evtl. geändert,
     # die nächste frische Position bewertet die Zone komplett neu
     _reset_zone_state(old_name)
@@ -4213,7 +4279,8 @@ allowlist_group = app_commands.Group(
 async def zone_allowlist_add(interaction: discord.Interaction, zone: str, spieler: str):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    z = _find_zone(zone)
+    _c = _conn_of(interaction)
+    z = _find_zone(zone, _c)
     if not z:
         return await interaction.response.send_message(
             f"❌ Keine Zone namens **{zone.strip()}** gefunden – `/zone list` zeigt alle.",
@@ -4227,7 +4294,7 @@ async def zone_allowlist_add(interaction: discord.Interaction, zone: str, spiele
             f"ℹ️ **{spieler}** steht bereits auf der Ignorier-Liste von **{z['name']}**.",
             ephemeral=True)
     _zone_allowlist(z).append(spieler)
-    cfg.save_config()
+    _zones_save(_c)
     await interaction.response.send_message(
         f"🙈 **{spieler}** wird in Zone **{z['name']}** ab sofort **nicht** mehr gemeldet.",
         ephemeral=True)
@@ -4244,7 +4311,8 @@ zone_allowlist_add.autocomplete("zone")(_zone_name_autocomplete)
 async def zone_allowlist_remove(interaction: discord.Interaction, zone: str, spieler: str):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    z = _find_zone(zone)
+    _c = _conn_of(interaction)
+    z = _find_zone(zone, _c)
     if not z:
         return await interaction.response.send_message(
             f"❌ Keine Zone namens **{zone.strip()}** gefunden – `/zone list` zeigt alle.",
@@ -4257,7 +4325,7 @@ async def zone_allowlist_remove(interaction: discord.Interaction, zone: str, spi
             f"ℹ️ **{spieler.strip()}** steht nicht auf der Ignorier-Liste von **{z['name']}**.",
             ephemeral=True)
     z["allowlist"] = [n for n in al if str(n).strip().lower() != key]
-    cfg.save_config()
+    _zones_save(_c)
     await interaction.response.send_message(
         f"🔔 **{matches[0]}** wird in Zone **{z['name']}** wieder gemeldet.",
         ephemeral=True)
@@ -4272,7 +4340,8 @@ zone_allowlist_remove.autocomplete("zone")(_zone_name_autocomplete)
 async def zone_allowlist_show(interaction: discord.Interaction, zone: str):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    z = _find_zone(zone)
+    _c = _conn_of(interaction)
+    z = _find_zone(zone, _c)
     if not z:
         return await interaction.response.send_message(
             f"❌ Keine Zone namens **{zone.strip()}** gefunden – `/zone list` zeigt alle.",
@@ -6683,8 +6752,11 @@ async def _notify_link_change(guild_id: Optional[int], embed: discord.Embed):
 class ShopManager:
     AREA_PREFIX = "SHOP_"
 
-    def __init__(self, bot_ref: "DayZBot"):
+    def __init__(self, bot_ref: "DayZBot", conn: "ServerConnection"):
         self.bot  = bot_ref
+        # Jeder Server liefert in seine eigene cfgEffectArea.json aus und wird
+        # ueber seine eigene Nitrado-Verbindung neu gestartet.
+        self.conn = conn
         self.lock = asyncio.Lock()   # serialisiert ALLE Schreibzugriffe auf die Datei
         self._restart_task: Optional[asyncio.Task] = None
         self._last_restart_ts = 0.0
@@ -6715,10 +6787,10 @@ class ShopManager:
 
     # ── Pfad zur cfgEffectArea.json ──────────────────────────
     def effect_area_path(self) -> Optional[str]:
-        path = cfg.config.get("cfg_effect_area_path")
+        path = self.conn.get("cfg_effect_area_path")
         if path:
             return path
-        mission = cfg.config.get("ftp_mission_dir")
+        mission = self.conn.get("ftp_mission_dir")
         if mission:
             return f"{mission.rstrip('/')}/cfgEffectArea.json"
         return None
@@ -6748,10 +6820,10 @@ class ShopManager:
         Eine evtl. noch vorhandene .bak aus früheren Bot-Versionen wird entfernt."""
         loop = asyncio.get_running_loop()
         content = json.dumps(new_data, ensure_ascii=False, indent=2)
-        ok = await loop.run_in_executor(None, self.bot.ftp.write_file, path, content)
+        ok = await loop.run_in_executor(None, self.conn.ftp.write_file, path, content)
         if ok:
             # Aufräumen (Best-Effort): keine .bak mehr im Mission-Ordner
-            await loop.run_in_executor(None, self.bot.ftp.delete_file, path + ".bak")
+            await loop.run_in_executor(None, self.conn.ftp.delete_file, path + ".bak")
         return ok
 
     # ── Kauf: Einträge anhängen ───────────────────────────────
@@ -6767,7 +6839,7 @@ class ShopManager:
                     "Run `/ftp_scan` or set `cfg_effect_area_path` in config.json.", [])
         async with self.lock:
             loop = asyncio.get_running_loop()
-            raw, status = await loop.run_in_executor(None, self.bot.ftp.read_file_ex, path)
+            raw, status = await loop.run_in_executor(None, self.conn.ftp.read_file_ex, path)
             if status == "error":
                 # Inhalt unbekannt → NIE mit leerer Grundstruktur überschreiben,
                 # sonst gehen Vanilla-Zonen + andere pending-Käufe verloren
@@ -6810,7 +6882,7 @@ class ShopManager:
         wanted = set(area_names)
         async with self.lock:
             loop = asyncio.get_running_loop()
-            raw, status = await loop.run_in_executor(None, self.bot.ftp.read_file_ex, path)
+            raw, status = await loop.run_in_executor(None, self.conn.ftp.read_file_ex, path)
             if status == "error":
                 # Lesefehler ≠ leere Datei: sonst würden Käufe als geliefert
                 # markiert, obwohl die Einträge noch drinstehen (Dauer-Respawn)
@@ -6844,7 +6916,7 @@ class ShopManager:
                 pass
         async with self.lock:
             loop = asyncio.get_running_loop()
-            raw, status = await loop.run_in_executor(None, self.bot.ftp.read_file_ex, path)
+            raw, status = await loop.run_in_executor(None, self.conn.ftp.read_file_ex, path)
             if status == "error":
                 log.error("[SHOP] Orphan-Sweep: cfgEffectArea.json nicht lesbar (FTP).")
                 return -1
@@ -6882,7 +6954,7 @@ class ShopManager:
         report["pending"] = len(pending)
         async with self.lock:
             loop = asyncio.get_running_loop()
-            raw, status = await loop.run_in_executor(None, self.bot.ftp.read_file_ex, path)
+            raw, status = await loop.run_in_executor(None, self.conn.ftp.read_file_ex, path)
             report["status"] = status
             if status == "error":
                 return report
@@ -6950,7 +7022,7 @@ class ShopManager:
         await asyncio.sleep(wait)
         self._last_restart_ts = time.time()
         try:
-            ok, msg = await self.bot.nitrado.restart()
+            ok, msg = await self.conn.api.restart()
             log.info(f"[SHOP] Auto-Restart nach Kauf ausgelöst: ok={ok} – {msg}")
         except Exception as e:
             log.error(f"[SHOP] Auto-Restart fehlgeschlagen: {e}")
@@ -6961,8 +7033,8 @@ class ShopManager:
         True = online gesehen. False = server_ip/query_port fehlt oder Timeout
         (delivery_online_wait_max_seconds) – dann greift der feste Delay als
         Fallback, sonst würden Items bei falschem Query-Port ewig respawnen."""
-        ip = str(cfg.config.get("server_ip") or "").split(":")[0].strip()
-        qport = int(cfg.config.get("query_port", 0) or 0)
+        ip = str(self.conn.get("server_ip") or "").split(":")[0].strip()
+        qport = int(self.conn.get("query_port", 0) or 0)
         if not ip or not qport:
             log.warning("[SHOP] server_ip/query_port nicht gesetzt – kann Server-online "
                         "nicht prüfen, nutze festen Delivery-Delay als Fallback.")
@@ -10673,9 +10745,9 @@ async def set_feed(request: web.Request) -> web.Response:
 #  ``{name, x, z, radius, role_id?, channel_id?, guild_id, allowlist?}`` –
 #  x = Ost (iZurvive), z = Nord.
 # ──────────────────────────────────────────────────────────────────────────
-def _find(name: str):
+def _find(name: str, conn: Optional[ServerConnection] = None):
     n = (name or "").strip().lower()
-    for z in _zones():
+    for z in _zones(conn):
         if isinstance(z, dict) and str(z.get("name", "")).lower() == n:
             return z
     return None
@@ -10687,16 +10759,20 @@ def _default_guild() -> int:
 
 
 async def list_zones(request: web.Request) -> web.Response:
-    zones = [z for z in _zones() if isinstance(z, dict) and z.get("name")]
-    return ok({"zones": zones, "map_name": cfg.config.get("map_name", "ChernarusPlus")})
+    _c = _conn_for_session(_sess_get(request))
+    zones = [z for z in _zones(_c) if isinstance(z, dict) and z.get("name")]
+    return ok({"zones": zones,
+               "map_name": (_c.get("map_name", "ChernarusPlus") if _c
+                            else cfg.config.get("map_name", "ChernarusPlus"))})
 
 
 async def create_zone(request: web.Request) -> web.Response:
+    _c = _conn_for_session(_sess_get(request))
     data = await body(request)
     name = str(data.get("name", "")).strip()
     if not name or len(name) > 60:
         return err("Zonen-Name fehlt oder ist länger als 60 Zeichen.")
-    if _find(name):
+    if _find(name, _c):
         return err(f"Zone '{name}' existiert bereits.")
     try:
         x = float(data["x"]); z = float(data["z"]); radius = float(data["radius"])
@@ -10716,19 +10792,20 @@ async def create_zone(request: web.Request) -> web.Response:
         "channel_id": int(data["channel_id"]) if data.get("channel_id") else None,
         "guild_id": int(data.get("guild_id") or _default_guild()),
     }
-    _zones().append(zone)
-    cfg.save_config()
+    _zones(_c).append(zone)
+    _zones_save(_c)
     return ok(zone)
 
 
 async def update_zone(request: web.Request) -> web.Response:
-    zone = _find(request.match_info["name"])
+    _c = _conn_for_session(_sess_get(request))
+    zone = _find(request.match_info["name"], _c)
     if not zone:
         return err("Zone nicht gefunden.", 404)
     data = await body(request)
 
     new_name = str(data.get("name", zone["name"])).strip() or zone["name"]
-    if new_name.lower() != str(zone["name"]).lower() and _find(new_name):
+    if new_name.lower() != str(zone["name"]).lower() and _find(new_name, _c):
         return err(f"Zone '{new_name}' existiert bereits.")
     try:
         x = float(data.get("x", zone["x"]))
@@ -10749,17 +10826,18 @@ async def update_zone(request: web.Request) -> web.Response:
         zone["role_id"] = int(data["role_id"]) if data.get("role_id") else None
     if "channel_id" in data:
         zone["channel_id"] = int(data["channel_id"]) if data.get("channel_id") else None
-    cfg.save_config()
+    _zones_save(_c)
     return ok(zone)
 
 
 async def delete_zone(request: web.Request) -> web.Response:
-    zone = _find(request.match_info["name"])
+    _c = _conn_for_session(_sess_get(request))
+    zone = _find(request.match_info["name"], _c)
     if not zone:
         return err("Zone nicht gefunden.", 404)
     name = str(zone["name"])
-    _zones().remove(zone)
-    cfg.save_config()
+    _zones(_c).remove(zone)
+    _zones_save(_c)
     # Ping-Cooldown-Status im Bot zurücksetzen (wie /zone remove), falls vorhanden
     reset = _reset_zone_state
     if callable(reset):
@@ -10772,14 +10850,16 @@ async def delete_zone(request: web.Request) -> web.Response:
 
 # ── Allowlist ─────────────────────────────────────────────────
 async def get_allowlist(request: web.Request) -> web.Response:
-    zone = _find(request.match_info["name"])
+    _c = _conn_for_session(_sess_get(request))
+    zone = _find(request.match_info["name"], _c)
     if not zone:
         return err("Zone nicht gefunden.", 404)
     return ok({"allowlist": zone.get("allowlist", [])})
 
 
 async def add_allowlist(request: web.Request) -> web.Response:
-    zone = _find(request.match_info["name"])
+    _c = _conn_for_session(_sess_get(request))
+    zone = _find(request.match_info["name"], _c)
     if not zone:
         return err("Zone nicht gefunden.", 404)
     data = await body(request)
@@ -10789,18 +10869,19 @@ async def add_allowlist(request: web.Request) -> web.Response:
     al = zone.setdefault("allowlist", [])
     if player.lower() not in [str(p).lower() for p in al]:
         al.append(player)
-        cfg.save_config()
+        _zones_save(_c)
     return ok({"allowlist": al})
 
 
 async def remove_allowlist(request: web.Request) -> web.Response:
-    zone = _find(request.match_info["name"])
+    _c = _conn_for_session(_sess_get(request))
+    zone = _find(request.match_info["name"], _c)
     if not zone:
         return err("Zone nicht gefunden.", 404)
     player = request.match_info["player"]
     al = zone.get("allowlist", [])
     zone["allowlist"] = [p for p in al if str(p).lower() != player.lower()]
-    cfg.save_config()
+    _zones_save(_c)
     return ok({"allowlist": zone["allowlist"]})
 
 

@@ -245,6 +245,23 @@ Der Bot kann mehrere Nitrado-Server bedienen. Jeder verbundene Server steht in
 Eine Guild kann immer nur **einen** Nitrado-Server verwalten; der Versuch, sie ein zweites
 Mal zu vergeben, wird mit Nennung des bisherigen Servers abgelehnt.
 
+### Was pro Server getrennt läuft
+
+Die Trennung ist vollständig — jeder verbundene Server hat eigene:
+
+| | |
+|---|---|
+| Nitrado-Verbindung und FTP-Sitzung | `/neustart`, `/stoppen`, `/serverstatus`, `/ban`, `/whitelist` wirken auf den Server der aufrufenden Guild |
+| Log-Abfrage, Lese-Position und Parser | Kills, Builds und Positionen aus Server A erscheinen **nur** im Discord von Server A |
+| Shop-Auslieferung (`cfgEffectArea.json`) | Käufe landen in der Mission des jeweiligen Servers |
+| Zonen, Karte, Server-IP und Query-Port | pro Server gepflegt, nicht global |
+
+Die Feeds folgen der Zuordnung: Ein Ereignis geht ausschließlich in die Guild, der sein
+Server zugeordnet ist. Economy und Feed-Channels waren schon vorher pro Guild getrennt.
+
+Im Dashboard richtet sich alles nach der Anmeldung: Wer sich mit seinem Nitrado-Token
+anmeldet, sieht Status, Karte, Zonen und Steuerung **seines** Servers.
+
 ### „Du hast kein Premium"
 
 Ist ein Discord-Server keinem Nitrado-Server zugeordnet, antwortet **jeder** Slash-Befehl
