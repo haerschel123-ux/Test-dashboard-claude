@@ -2238,6 +2238,11 @@ class ServerConnection:
         self.ftp: Optional[FTPManager] = None
         self.parser: Optional[DayZLogParser] = None
         self.shop: Optional[Any] = None
+        self._catalog: Optional[Any] = None
+        # Lief die FTP-Auto-Erkennung fuer DIESEN Server schon?
+        self.discovered: bool = False
+        # Zeitpunkt des letzten Discovery-Versuchs (Wiederholsperre je Server)
+        self.discover_retry_ts: float = 0.0
 
     # ── Stammdaten ──
     @property
@@ -2275,7 +2280,7 @@ class ServerConnection:
         "nitrado_token", "service_id", "ftp_host", "ftp_port", "ftp_user",
         "ftp_password", "ftp_log_dir", "ftp_ban_file", "ftp_profile_dir",
         "ftp_mission_dir", "cfg_effect_area_path", "server_ip", "query_port",
-        "rcon_port", "zones", "shop_items_file",
+        "rcon_port", "zones", "shop_items_file", "types_xml_path",
         # Karte und Neustart-Zeitplan beschreiben ebenfalls genau einen Server –
         # geerbt wuerde sonst der Zeitplan des Betreibers auf fremden Servern
         # Neustarts ausloesen.
@@ -2297,6 +2302,19 @@ class ServerConnection:
 
     def set(self, key: str, value: Any) -> None:
         self.data[key] = value
+
+    @property
+    def catalog(self) -> "ShopCatalog":
+        """Eigener Item-Katalog dieses Servers (beim ersten Zugriff geladen).
+
+        Ohne diese Trennung teilten sich alle Kunden eine Item-Liste – Preise
+        und Bundles des einen Servers landeten im Shop des anderen.
+        """
+        if self._catalog is None:
+            self._catalog = ShopCatalog(self.service_id,
+                                        path=str(self.data.get("shop_items_file") or ""))
+            self._catalog.load()
+        return self._catalog
 
     def masked_token(self) -> str:
         """Token fuer die Anzeige: nur die letzten vier Zeichen bleiben lesbar."""
@@ -2592,7 +2610,8 @@ class DayZBot(discord.Client):
         # Zonen-Pings (/zone create): wiederholte Pings im Cooldown-Intervall
         self._zone_last_ping: Dict[Tuple[str, str], float] = {}  # letzter Ping pro Zone+Spieler
         self._zone_pos_seen: Dict[str, str] = {}              # Spieler → bereits bewertetes last_seen
-        self._discover_retry_ts = 0.0  # letzter Auto-Discovery-Retry (log_poll)
+        # Der Discovery-Retry haengt jetzt an der jeweiligen Verbindung
+        # (ServerConnection.discover_retry_ts), nicht mehr am Bot.
 
     async def setup_hook(self):
         # Web-Dashboard im selben Prozess/Loop starten (aiohttp). Fehler hier
@@ -2703,21 +2722,29 @@ class DayZBot(discord.Client):
                 self.nitrado, self.ftp = None, None
             return
 
-        had_ftp = self.ftp is not None
         self.nitrado = primary.api
         self.ftp = primary.ftp
-        if self.ftp is not None and (force or not had_ftp):
+        # Shop-/Delivery-Manager je Verbindung (braucht FTP + Nitrado)
+        for verbindung in connections.all():
+            if verbindung.shop is None and verbindung.ftp is not None:
+                verbindung.shop = ShopManager(self, verbindung)
+        self.shop = primary.shop
+
+        # Auto-Discovery fuer JEDEN Server einzeln. Log-Verzeichnis,
+        # Mission-Ordner und Shop-Katalog gehoeren jeweils zu genau einem
+        # Server – frueher lief das nur einmal und schrieb die gefundenen
+        # Pfade in die zuletzt durchlaufene Verbindung.
+        for verbindung in connections.all():
+            if verbindung.ftp is None or (verbindung.discovered and not force):
+                continue
+            verbindung.discovered = True
             try:
-                await self._auto_discover(conn)
-            except Exception as e:
+                await self._auto_discover(verbindung)
+            except Exception as e:  # noqa: BLE001
                 # FTP gerade nicht erreichbar → Init nicht abbrechen;
                 # Discovery kann später per /ftp_scan nachgeholt werden
-                log.warning(f"[FTP] Auto-Discovery fehlgeschlagen: {e}")
-        # Shop-/Delivery-Manager je Verbindung (braucht FTP + Nitrado)
-        for conn in connections.all():
-            if conn.shop is None and conn.ftp is not None:
-                conn.shop = ShopManager(self, conn)
-        self.shop = primary.shop
+                verbindung.discovered = False
+                log.warning(f"[FTP] {verbindung.name}: Auto-Discovery fehlgeschlagen: {e}")
 
     async def _auto_discover(self, conn: Optional[ServerConnection] = None):
         """Sucht automatisch nach DayZ-Log-Verzeichnissen via FTP.
@@ -2760,6 +2787,16 @@ class DayZBot(discord.Client):
                 if found.get("mission_dir"):
                     _conn_store(conn, "ftp_mission_dir", found["mission_dir"])
 
+        # Shop-Katalog dieses Servers: ist er noch leer, die types.xml direkt
+        # vom Server holen. So bekommt jeder Kunde genau seine eigenen Items,
+        # ohne den Katalog von Hand pflegen zu muessen.
+        if not conn.catalog.items:
+            n, meldung = await katalog_von_server_holen(conn)
+            if n:
+                log.info(f"[SHOP] {conn.name}: {meldung}")
+            else:
+                log.info(f"[SHOP] {conn.name}: Katalog bleibt leer – {meldung}")
+
     @tasks.loop(seconds=10)
     async def log_poll(self):
         """Jeden verbundenen Server einzeln abfragen.
@@ -2783,14 +2820,16 @@ class DayZBot(discord.Client):
             # Discovery beim Start fehlgeschlagen oder noch nicht gelaufen →
             # automatisch erneut versuchen (alle 120s), sonst würden nie
             # Kills/Builds/Damage gepostet, bis jemand /ftp_scan ausführt
+            # Wiederholsperre je Server: ein Server mit kaputtem FTP darf die
+            # Discovery der anderen nicht ausbremsen.
             now = time.time()
-            if now - self._discover_retry_ts < 120:
+            if now - conn.discover_retry_ts < 120:
                 return
-            self._discover_retry_ts = now
+            conn.discover_retry_ts = now
             try:
-                await self._auto_discover()
+                await self._auto_discover(conn)
             except Exception as e:
-                log.warning(f"[FTP] Auto-Discovery-Retry fehlgeschlagen: {e}")
+                log.warning(f"[FTP] {conn.name}: Auto-Discovery-Retry fehlgeschlagen: {e}")
             log_dir = conn.get("ftp_log_dir")
             if not log_dir:
                 return
@@ -2857,8 +2896,9 @@ class DayZBot(discord.Client):
                 conn.shop.spawn_cleanup(delayed=restart_detected)
 
             if restart_detected:
-                # Server-Neustart wirft alle Spieler → offene Spielzeit-Sitzungen beenden
-                await loop.run_in_executor(None, db.close_all_sessions)
+                # Server-Neustart wirft alle Spieler → offene Spielzeit-Sitzungen
+                # DIESES Servers beenden (nicht die der anderen Kunden)
+                await loop.run_in_executor(None, db.close_all_sessions, conn.service_id)
 
             if skip_backlog:
                 # Fast-Forward ans aktuelle Dateiende – nichts nachposten
@@ -2872,7 +2912,7 @@ class DayZBot(discord.Client):
                 conn.log_state["current"] = state
                 conn.log_state["last_poll_ts"] = now
                 connections.save()
-                await loop.run_in_executor(None, db.close_all_sessions)
+                await loop.run_in_executor(None, db.close_all_sessions, conn.service_id)
                 mins = int(gap // 60) if gap >= 0 else 0
                 log.info(f"[POLL] Bot war {mins} Min offline – überspringe Alt-Events, Offset={state['offset']} ({latest})")
                 if gap >= 0:
@@ -3283,7 +3323,7 @@ class DayZBot(discord.Client):
         except Exception:
             pass
         # Kill-Statistik, Sessions, Kill-Belohnung & Bounties verarbeiten
-        rewards = await self._process_event_rewards(ev)
+        rewards = await self._process_event_rewards(ev, conn)
         _p = conn.parser if conn is not None else self.parser
         embed = EmbedBuilder.build(ev, _p.player_positions if _p else None)
         if not embed:
@@ -3310,37 +3350,48 @@ class DayZBot(discord.Client):
             else:
                 log.warning(f"[DISPATCH] Channel {ch_id} in Guild {gid_str} nicht gefunden")
 
-    async def _process_event_rewards(self, ev: Dict) -> Dict[int, str]:
+    async def _process_event_rewards(self, ev: Dict,
+                                     conn: Optional[ServerConnection] = None) -> Dict[int, str]:
         """Nebenwirkungen eines Log-Events: Kill-Statistik schreiben, Spielzeit-
         Sitzungen öffnen/schließen, Kill-Belohnung und Kopfgelder an verlinkte
-        Spieler auszahlen. Gibt pro Guild eine Belohnungszeile fürs Embed zurück."""
+        Spieler auszahlen. Gibt pro Guild eine Belohnungszeile fürs Embed zurück.
+
+        Alles haengt am Server, von dem das Ereignis stammt: Statistik und
+        Sitzungen bekommen dessen service_id, Belohnungen gehen nur an
+        Verknuepfungen in dessen Guild.
+        """
         out: Dict[int, str] = {}
         loop = asyncio.get_running_loop()
         t = ev["type"]
+        sid = conn.service_id if conn is not None else ""
+        gid_ev = conn.guild_id if conn is not None else None
         try:
             if t == "connect":
                 pid = ev.get("player_id")
                 pid = pid if pid and pid != "Unbekannt" else None
-                await loop.run_in_executor(None, db.open_session, ev["player"], pid)
+                await loop.run_in_executor(None, db.open_session, sid, ev["player"], pid)
                 if pid:
-                    await loop.run_in_executor(None, db.update_link_id, ev["player"], pid)
+                    await loop.run_in_executor(None, db.update_link_id,
+                                               ev["player"], pid, gid_ev)
 
             elif t == "disconnect":
-                await loop.run_in_executor(None, db.close_session, ev["player"])
+                await loop.run_in_executor(None, db.close_session, sid, ev["player"])
 
             elif t == "kill_pvp":
                 killer = ev.get("killer") or ""
                 victim = ev.get("victim") or ""
                 await loop.run_in_executor(
-                    None, db.record_kill, killer, ev.get("killer_id"),
+                    None, db.record_kill, sid, killer, ev.get("killer_id"),
                     victim, ev.get("victim_id"), ev.get("weapon"), ev.get("distance"))
                 for nm, key in ((killer, "killer_id"), (victim, "victim_id")):
                     pid = ev.get(key)
                     if nm and pid and pid != "Unbekannt":
-                        await loop.run_in_executor(None, db.update_link_id, nm, pid)
+                        await loop.run_in_executor(None, db.update_link_id, nm, pid, gid_ev)
                 if killer and victim and killer.lower() != victim.lower():
-                    reward = max(0, int(cfg.config.get("kill_reward", 0)))
-                    links = await loop.run_in_executor(None, db.links_for_name, killer)
+                    reward = max(0, int((conn.get("kill_reward", 0) if conn is not None
+                                         else cfg.config.get("kill_reward", 0)) or 0))
+                    links = await loop.run_in_executor(None, db.links_for_name,
+                                                       killer, gid_ev)
                     for lk in links:
                         gid, uid = int(lk["guild_id"]), int(lk["user_id"])
                         parts: List[str] = []
@@ -3374,10 +3425,14 @@ class DayZBot(discord.Client):
             # gerade aktiv sind, aber keine offene Sitzung haben → Sitzung öffnen
             positions = dict((conn.parser or self.parser).player_positions
                              if conn is not None else self.parser.player_positions)
-            await loop.run_in_executor(None, db.sync_sessions_from_positions, positions, 300)
-            due = await loop.run_in_executor(None, db.playtime_credits_due, interval)
+            sid = conn.service_id if conn is not None else ""
+            gid_conn = conn.guild_id if conn is not None else None
+            await loop.run_in_executor(None, db.sync_sessions_from_positions,
+                                       sid, positions, 300)
+            due = await loop.run_in_executor(None, db.playtime_credits_due, sid, interval)
             for entry in due:
-                links = await loop.run_in_executor(None, db.links_for_name, entry["name"])
+                links = await loop.run_in_executor(None, db.links_for_name,
+                                                   entry["name"], gid_conn)
                 for lk in links:
                     gid, uid = int(lk["guild_id"]), int(lk["user_id"])
                     credit = amount * int(entry["blocks"])
@@ -6273,9 +6328,11 @@ class EconomyDB:
                 payout     INTEGER,
                 result     TEXT,
                 created_at REAL)""")
-            # PvP-Kills für /stats und /leaderboard (Server-weit, nicht pro Guild)
+            # PvP-Kills für /stats und /leaderboard – je Nitrado-Server getrennt,
+            # sonst stünden die Spieler fremder Kunden in derselben Rangliste.
             c.execute("""CREATE TABLE IF NOT EXISTS kills (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id  TEXT NOT NULL DEFAULT '',
                 created_at  REAL,
                 killer_name TEXT,
                 killer_id   TEXT,
@@ -6303,14 +6360,59 @@ class EconomyDB:
                 status      TEXT DEFAULT 'open',
                 claimed_by  INTEGER,
                 claimed_at  REAL)""")
-            # Offene Spielzeit-Sitzungen (connect → disconnect/Restart)
+            # Offene Spielzeit-Sitzungen (connect → disconnect/Restart).
+            # service_id gehoert in den Primaerschluessel: derselbe Spielername
+            # kann gleichzeitig auf mehreren Servern online sein.
             c.execute("""CREATE TABLE IF NOT EXISTS sessions (
-                ingame_name     TEXT PRIMARY KEY COLLATE NOCASE,
+                service_id      TEXT NOT NULL DEFAULT '',
+                ingame_name     TEXT NOT NULL COLLATE NOCASE,
                 ingame_id       TEXT,
                 connect_ts      REAL NOT NULL,
                 last_seen_ts    REAL NOT NULL,
-                credited_blocks INTEGER NOT NULL DEFAULT 0)""")
+                credited_blocks INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (service_id, ingame_name))""")
+            self._migriere_serverspalten(c)
             c.commit()
+
+    def _migriere_serverspalten(self, c: sqlite3.Connection):
+        """Ergaenzt ``service_id`` in Alt-Datenbanken.
+
+        Ohne diese Spalte zaehlten Kills aller Kunden in eine gemeinsame
+        Rangliste und ein Neustart auf einem Server beendete die Spielzeit-
+        Sitzungen aller anderen. Bestandsdaten bekommen die Service-ID des
+        Hauptservers, denn vor der Mandantentrennung gab es nur ihn.
+        """
+        try:
+            haupt = connections.primary()
+            alt_id = haupt.service_id if haupt is not None else ""
+        except Exception:  # noqa: BLE001 – Registry evtl. noch nicht geladen
+            alt_id = ""
+        for tabelle in ("kills", "sessions"):
+            spalten = {r["name"] for r in c.execute(f"PRAGMA table_info({tabelle})")}
+            if not spalten or "service_id" in spalten:
+                continue
+            if tabelle == "sessions":
+                # Primaerschluessel aendert sich → Tabelle neu aufbauen
+                c.execute("ALTER TABLE sessions RENAME TO sessions_alt")
+                c.execute("""CREATE TABLE sessions (
+                    service_id      TEXT NOT NULL DEFAULT '',
+                    ingame_name     TEXT NOT NULL COLLATE NOCASE,
+                    ingame_id       TEXT,
+                    connect_ts      REAL NOT NULL,
+                    last_seen_ts    REAL NOT NULL,
+                    credited_blocks INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (service_id, ingame_name))""")
+                c.execute(
+                    "INSERT INTO sessions (service_id, ingame_name, ingame_id, "
+                    "connect_ts, last_seen_ts, credited_blocks) "
+                    "SELECT ?, ingame_name, ingame_id, connect_ts, last_seen_ts, "
+                    "credited_blocks FROM sessions_alt", (alt_id,))
+                c.execute("DROP TABLE sessions_alt")
+            else:
+                c.execute("ALTER TABLE kills ADD COLUMN service_id TEXT NOT NULL DEFAULT ''")
+                c.execute("UPDATE kills SET service_id=?", (alt_id,))
+            log.info(f"[ECON] Tabelle '{tabelle}' um service_id ergaenzt "
+                     f"(Bestand → Server {alt_id or '-'}).")
 
     # ── Salden ────────────────────────────────────────────────
     def ensure_user(self, guild_id: int, user_id: int):
@@ -6468,7 +6570,7 @@ class EconomyDB:
             self._conn.commit()
 
     # ── Kill-Statistiken ──────────────────────────────────────
-    def record_kill(self, killer_name: str, killer_id: Optional[str],
+    def record_kill(self, service_id: str, killer_name: str, killer_id: Optional[str],
                     victim_name: str, victim_id: Optional[str],
                     weapon: Optional[str], distance: Any):
         try:
@@ -6477,30 +6579,36 @@ class EconomyDB:
             dist = None
         with self._lock:
             self._conn.execute(
-                "INSERT INTO kills (created_at, killer_name, killer_id, victim_name, "
-                "victim_id, weapon, distance) VALUES (?,?,?,?,?,?,?)",
-                (time.time(), killer_name, killer_id, victim_name, victim_id, weapon, dist))
+                "INSERT INTO kills (service_id, created_at, killer_name, killer_id, "
+                "victim_name, victim_id, weapon, distance) VALUES (?,?,?,?,?,?,?,?)",
+                (str(service_id or ""), time.time(), killer_name, killer_id,
+                 victim_name, victim_id, weapon, dist))
             self._conn.commit()
 
-    def player_stats(self, name: str) -> Optional[Dict]:
-        """Kills, Tode (PvP), Lieblingswaffe und weitester Kill eines Spielers."""
+    def player_stats(self, service_id: str, name: str) -> Optional[Dict]:
+        """Kills, Tode (PvP), Lieblingswaffe und weitester Kill eines Spielers
+        auf **einem** Server."""
+        sid = str(service_id or "")
         with self._lock:
             kills = int(self._conn.execute(
-                "SELECT COUNT(*) AS n FROM kills WHERE killer_name=? COLLATE NOCASE",
-                (name,)).fetchone()["n"])
+                "SELECT COUNT(*) AS n FROM kills "
+                "WHERE service_id=? AND killer_name=? COLLATE NOCASE",
+                (sid, name)).fetchone()["n"])
             deaths = int(self._conn.execute(
-                "SELECT COUNT(*) AS n FROM kills WHERE victim_name=? COLLATE NOCASE",
-                (name,)).fetchone()["n"])
+                "SELECT COUNT(*) AS n FROM kills "
+                "WHERE service_id=? AND victim_name=? COLLATE NOCASE",
+                (sid, name)).fetchone()["n"])
             if kills == 0 and deaths == 0:
                 return None
             fav = self._conn.execute(
                 "SELECT weapon, COUNT(*) AS n FROM kills "
-                "WHERE killer_name=? COLLATE NOCASE AND weapon IS NOT NULL "
+                "WHERE service_id=? AND killer_name=? COLLATE NOCASE AND weapon IS NOT NULL "
                 "AND weapon NOT IN ('', 'Unbekannt') "
-                "GROUP BY weapon ORDER BY n DESC LIMIT 1", (name,)).fetchone()
+                "GROUP BY weapon ORDER BY n DESC LIMIT 1", (sid, name)).fetchone()
             longest = self._conn.execute(
-                "SELECT MAX(distance) AS d FROM kills WHERE killer_name=? COLLATE NOCASE",
-                (name,)).fetchone()["d"]
+                "SELECT MAX(distance) AS d FROM kills "
+                "WHERE service_id=? AND killer_name=? COLLATE NOCASE",
+                (sid, name)).fetchone()["d"]
         return {
             "kills": kills, "deaths": deaths,
             "kd": (kills / deaths) if deaths else float(kills),
@@ -6509,33 +6617,37 @@ class EconomyDB:
             "longest": float(longest) if longest is not None else None,
         }
 
-    def leaderboard(self, limit: int = 10) -> List[Dict]:
+    def leaderboard(self, service_id: str, limit: int = 10) -> List[Dict]:
+        sid = str(service_id or "")
         with self._lock:
             rows = self._conn.execute(
                 "SELECT killer_name AS name, COUNT(*) AS kills, MAX(distance) AS best "
-                "FROM kills GROUP BY killer_name COLLATE NOCASE "
-                "ORDER BY kills DESC, best DESC LIMIT ?", (limit,)).fetchall()
+                "FROM kills WHERE service_id=? GROUP BY killer_name COLLATE NOCASE "
+                "ORDER BY kills DESC, best DESC LIMIT ?", (sid, limit)).fetchall()
             out: List[Dict] = []
             for r in rows:
                 deaths = int(self._conn.execute(
-                    "SELECT COUNT(*) AS n FROM kills WHERE victim_name=? COLLATE NOCASE",
-                    (r["name"],)).fetchone()["n"])
+                    "SELECT COUNT(*) AS n FROM kills "
+                    "WHERE service_id=? AND victim_name=? COLLATE NOCASE",
+                    (sid, r["name"])).fetchone()["n"])
                 out.append({"name": r["name"], "kills": int(r["kills"]), "deaths": deaths,
                             "kd": (int(r["kills"]) / deaths) if deaths else float(r["kills"]),
                             "best": float(r["best"]) if r["best"] is not None else None})
         return out
 
-    def known_player_names(self, prefix: str = "", limit: int = 25) -> List[str]:
-        """Spielernamen aus Kills + Sitzungen (für Autocomplete)."""
+    def known_player_names(self, service_id: str, prefix: str = "",
+                           limit: int = 25) -> List[str]:
+        """Spielernamen aus Kills + Sitzungen **dieses** Servers (Autocomplete)."""
         like = f"%{prefix}%" if prefix else "%"
+        sid = str(service_id or "")
         with self._lock:
             rows = self._conn.execute(
                 "SELECT name FROM ("
-                "  SELECT killer_name AS name FROM kills"
-                "  UNION SELECT victim_name FROM kills"
-                "  UNION SELECT ingame_name FROM sessions) "
+                "  SELECT killer_name AS name FROM kills WHERE service_id=?"
+                "  UNION SELECT victim_name FROM kills WHERE service_id=?"
+                "  UNION SELECT ingame_name FROM sessions WHERE service_id=?) "
                 "WHERE name LIKE ? COLLATE NOCASE ORDER BY name LIMIT ?",
-                (like, limit)).fetchall()
+                (sid, sid, sid, like, limit)).fetchall()
         return [r["name"] for r in rows if r["name"]]
 
     # ── /link: Discord ↔ Ingame-Name ──────────────────────────
@@ -6573,22 +6685,40 @@ class EconomyDB:
                 "SELECT * FROM links WHERE guild_id=? AND user_id=?",
                 (guild_id, user_id)).fetchone()
 
-    def links_for_name(self, ingame_name: str) -> List[sqlite3.Row]:
-        """Alle Guild-Verknüpfungen für einen Ingame-Namen (case-insensitive)."""
-        with self._lock:
-            return list(self._conn.execute(
-                "SELECT * FROM links WHERE ingame_name=? COLLATE NOCASE",
-                (ingame_name,)).fetchall())
+    def links_for_name(self, ingame_name: str,
+                       guild_id: Optional[int] = None) -> List[sqlite3.Row]:
+        """Verknüpfungen zu einem Ingame-Namen (case-insensitive).
 
-    def update_link_id(self, ingame_name: str, ingame_id: str):
-        """Trägt die im Log gesehene Ingame-ID zum verlinkten Namen nach."""
+        Mit ``guild_id`` nur die dieser Guild – sonst bekaeme ein gleichnamiger
+        Spieler auf einem fremden Server die Belohnung ausgezahlt.
+        """
+        with self._lock:
+            if guild_id is None:
+                return list(self._conn.execute(
+                    "SELECT * FROM links WHERE ingame_name=? COLLATE NOCASE",
+                    (ingame_name,)).fetchall())
+            return list(self._conn.execute(
+                "SELECT * FROM links WHERE guild_id=? AND ingame_name=? COLLATE NOCASE",
+                (int(guild_id), ingame_name)).fetchall())
+
+    def update_link_id(self, ingame_name: str, ingame_id: str,
+                       guild_id: Optional[int] = None):
+        """Trägt die im Log gesehene Ingame-ID zum verlinkten Namen nach –
+        mit ``guild_id`` nur in der Guild des Servers, von dem das Log stammt."""
         if not ingame_id:
             return
         with self._lock:
-            self._conn.execute(
-                "UPDATE links SET ingame_id=? WHERE ingame_name=? COLLATE NOCASE "
-                "AND (ingame_id IS NULL OR ingame_id != ?)",
-                (ingame_id, ingame_name, ingame_id))
+            if guild_id is None:
+                self._conn.execute(
+                    "UPDATE links SET ingame_id=? WHERE ingame_name=? COLLATE NOCASE "
+                    "AND (ingame_id IS NULL OR ingame_id != ?)",
+                    (ingame_id, ingame_name, ingame_id))
+            else:
+                self._conn.execute(
+                    "UPDATE links SET ingame_id=? WHERE guild_id=? AND "
+                    "ingame_name=? COLLATE NOCASE "
+                    "AND (ingame_id IS NULL OR ingame_id != ?)",
+                    (ingame_id, int(guild_id), ingame_name, ingame_id))
             self._conn.commit()
 
     def list_links(self, guild_id: int) -> List[sqlite3.Row]:
@@ -6598,15 +6728,16 @@ class EconomyDB:
                 "SELECT * FROM links WHERE guild_id=? ORDER BY ingame_name COLLATE NOCASE",
                 (guild_id,)).fetchall())
 
-    def has_session(self, ingame_name: str) -> bool:
-        """True, wenn für den Spieler gerade eine Spielzeit-Sitzung offen ist."""
+    def has_session(self, service_id: str, ingame_name: str) -> bool:
+        """True, wenn für den Spieler auf DIESEM Server eine Sitzung offen ist."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT 1 FROM sessions WHERE ingame_name=? COLLATE NOCASE",
-                (ingame_name,)).fetchone()
+                "SELECT 1 FROM sessions WHERE service_id=? AND ingame_name=? COLLATE NOCASE",
+                (str(service_id or ""), ingame_name)).fetchone()
         return row is not None
 
-    def sync_sessions_from_positions(self, positions: Dict, max_age_seconds: int = 300) -> int:
+    def sync_sessions_from_positions(self, service_id: str, positions: Dict,
+                                     max_age_seconds: int = 300) -> int:
         """Öffnet Sitzungen für VERLINKTE Spieler, die laut Log-Positions-Tracking
         gerade aktiv sind, aber keine offene Sitzung haben (verpasstes Connect-Event
         durch Bot-Downtime/Backlog-Skip oder /link während man schon online ist).
@@ -6626,9 +6757,9 @@ class EconomyDB:
                 continue
             if (now_utc - seen).total_seconds() > max_age_seconds:
                 continue
-            if self.has_session(pname):
+            if self.has_session(service_id, pname):
                 continue
-            self.open_session(pname, info.get("id"))
+            self.open_session(service_id, pname, info.get("id"))
             opened += 1
             log.info(f"[PLAYTIME] Sitzung für {pname} aus Log-Sichtung geöffnet (Connect-Event verpasst).")
         return opened
@@ -6676,43 +6807,52 @@ class EconomyDB:
         return total
 
     # ── Spielzeit-Sitzungen ───────────────────────────────────
-    def open_session(self, ingame_name: str, ingame_id: Optional[str]):
+    def open_session(self, service_id: str, ingame_name: str, ingame_id: Optional[str]):
         """Connect-Event: neue Sitzung (Reconnect setzt den Zähler zurück)."""
         now = time.time()
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO sessions "
-                "(ingame_name, ingame_id, connect_ts, last_seen_ts, credited_blocks) "
-                "VALUES (?,?,?,?,0)",
-                (ingame_name, ingame_id, now, now))
+                "(service_id, ingame_name, ingame_id, connect_ts, last_seen_ts, credited_blocks) "
+                "VALUES (?,?,?,?,?,0)",
+                (str(service_id or ""), ingame_name, ingame_id, now, now))
             self._conn.commit()
 
-    def close_session(self, ingame_name: str):
+    def close_session(self, service_id: str, ingame_name: str):
         with self._lock:
-            self._conn.execute("DELETE FROM sessions WHERE ingame_name=? COLLATE NOCASE",
-                               (ingame_name,))
+            self._conn.execute(
+                "DELETE FROM sessions WHERE service_id=? AND ingame_name=? COLLATE NOCASE",
+                (str(service_id or ""), ingame_name))
             self._conn.commit()
 
-    def close_all_sessions(self):
+    def close_all_sessions(self, service_id: str):
+        """Alle offenen Sitzungen EINES Servers beenden (Server-Neustart).
+
+        Ohne die Einschraenkung wuerde ein Neustart bei einem Kunden die
+        Spielzeit-Sitzungen aller anderen Kunden mitloeschen.
+        """
         with self._lock:
-            self._conn.execute("DELETE FROM sessions")
+            self._conn.execute("DELETE FROM sessions WHERE service_id=?",
+                               (str(service_id or ""),))
             self._conn.commit()
 
-    def playtime_credits_due(self, interval_seconds: int) -> List[Dict]:
-        """Berechnet pro offener Sitzung neu fällige Spielzeit-Blöcke und
-        schreibt credited_blocks fort. Gibt [{name, blocks}] zurück."""
+    def playtime_credits_due(self, service_id: str, interval_seconds: int) -> List[Dict]:
+        """Berechnet pro offener Sitzung dieses Servers neu fällige Spielzeit-
+        Blöcke und schreibt credited_blocks fort. Gibt [{name, blocks}] zurück."""
         now = time.time()
+        sid = str(service_id or "")
         out: List[Dict] = []
         with self._lock:
-            rows = self._conn.execute("SELECT * FROM sessions").fetchall()
+            rows = self._conn.execute("SELECT * FROM sessions WHERE service_id=?",
+                                      (sid,)).fetchall()
             for r in rows:
                 total = int((now - float(r["connect_ts"])) // max(60, interval_seconds))
                 due = total - int(r["credited_blocks"])
                 if due > 0:
                     self._conn.execute(
                         "UPDATE sessions SET credited_blocks=?, last_seen_ts=? "
-                        "WHERE ingame_name=?",
-                        (total, now, r["ingame_name"]))
+                        "WHERE service_id=? AND ingame_name=?",
+                        (total, now, sid, r["ingame_name"]))
                     out.append({"name": r["ingame_name"], "blocks": due})
             if out:
                 self._conn.commit()
@@ -7474,12 +7614,17 @@ async def cmd_economy_reload(interaction: discord.Interaction):
         return await _deny(interaction)
     ok = cfg.reload_config()
     if ok:
-        catalog.load()   # Katalog (shop_items.json bzw. config-Fallback) mit neu laden
-        items = [i for i in catalog.items if i.get("enabled", True)]
+        katalog = _catalog_of(interaction)   # nur der Katalog DIESES Servers
+        if katalog is not None:
+            katalog.load()
+            items = [i for i in katalog.items if i.get("enabled", True)]
+            katalog_txt = f"**{len(items)}** active items from `{katalog.source}`"
+        else:
+            katalog_txt = "kein Server zugeordnet"
         embed = discord.Embed(
             title="🔄 Config reloaded",
             description=(f"`config.json` was reloaded successfully.\n"
-                         f"Catalog: **{len(items)}** active items from `{catalog.source}` · "
+                         f"Catalog: {katalog_txt} · "
                          f"Currency: **{cfg.config.get('currency_name', '?')} ({_cur_symbol()})**"),
             color=0x2ECC71)
     else:
@@ -7495,10 +7640,14 @@ async def cmd_economy_reload(interaction: discord.Interaction):
 # ══════════════════════════════════════════════════════════════
 async def _player_name_ac(interaction: discord.Interaction,
                           current: str) -> List[app_commands.Choice[str]]:
-    """Autocomplete: bekannte Spielernamen aus Kills + Sitzungen."""
+    """Autocomplete: bekannte Spielernamen aus Kills + Sitzungen dieses Servers."""
+    conn = _conn_of(interaction)
+    if conn is None:
+        return []
     loop = asyncio.get_running_loop()
     try:
-        names = await loop.run_in_executor(None, db.known_player_names, current, 25)
+        names = await loop.run_in_executor(None, db.known_player_names,
+                                           conn.service_id, current, 25)
     except Exception:
         names = []
     return [app_commands.Choice(name=n[:100], value=n[:100]) for n in names[:25]]
@@ -7508,7 +7657,10 @@ async def _player_name_ac(interaction: discord.Interaction,
 @app_commands.describe(spieler="Ingame-/PlayStation-Name")
 @app_commands.autocomplete(spieler=_player_name_ac)
 async def cmd_stats(interaction: discord.Interaction, spieler: str):
-    st = db.player_stats(spieler.strip())
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+    st = db.player_stats(conn.service_id, spieler.strip())
     if not st:
         return await interaction.response.send_message(
             f"❌ Keine PvP-Daten für **{spieler}** gefunden. Statistiken werden "
@@ -7523,8 +7675,7 @@ async def cmd_stats(interaction: discord.Interaction, spieler: str):
     e.add_field(name="🎯 Weitester Kill",
                 value=(f"{st['longest']:.0f} m" if st["longest"] else "–"), inline=True)
     if interaction.guild_id:
-        links = [lk for lk in db.links_for_name(spieler.strip())
-                 if int(lk["guild_id"]) == interaction.guild_id]
+        links = db.links_for_name(spieler.strip(), interaction.guild_id)
         if links:
             e.add_field(name="🔗 Verknüpft mit",
                         value=f"<@{int(links[0]['user_id'])}>", inline=True)
@@ -7533,7 +7684,10 @@ async def cmd_stats(interaction: discord.Interaction, spieler: str):
 
 @bot.tree.command(name="leaderboard", description="🏆 Top 10 PvP-Killer des Servers")
 async def cmd_leaderboard(interaction: discord.Interaction):
-    rows = db.leaderboard(10)
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+    rows = db.leaderboard(conn.service_id, 10)
     if not rows:
         return await interaction.response.send_message(
             "❌ Noch keine PvP-Kills aufgezeichnet – das Leaderboard füllt sich "
@@ -7597,11 +7751,12 @@ async def cmd_link(interaction: discord.Interaction, playstation_name: str):
     _conn = _conn_of(interaction)
     seen = _seen_in_logs(name, positions=(_conn.parser.player_positions
                                           if _conn is not None and _conn.parser else {}))
+    _sid = _conn.service_id if _conn is not None else ""
     if seen:
         if seen.get("id"):
-            db.update_link_id(name, str(seen["id"]))
-        if not db.has_session(name):
-            db.open_session(name, seen.get("id"))
+            db.update_link_id(name, str(seen["id"]), interaction.guild_id)
+        if not db.has_session(_sid, name):
+            db.open_session(_sid, name, seen.get("id"))
         online_line = "\n🟢 Du bist gerade auf dem Server – der Spielzeit-Zähler läuft ab jetzt!"
     else:
         online_line = ("\nℹ️ Aktuell nicht in den Logs gesehen – der Spielzeit-Zähler "
@@ -7653,8 +7808,8 @@ async def cmd_forcelink(interaction: discord.Interaction,
         return
     name = playstation_name.strip()
     # Bestehende Verknüpfung dieses Namens (anderer User) lösen
-    for lk in db.links_for_name(name):
-        if int(lk["guild_id"]) == interaction.guild_id and int(lk["user_id"]) != user.id:
+    for lk in db.links_for_name(name, interaction.guild_id):
+        if int(lk["user_id"]) != user.id:
             db.unlink_user(interaction.guild_id, int(lk["user_id"]))
     db.link_user(interaction.guild_id, user.id, name)
     await interaction.response.send_message(
@@ -7704,7 +7859,9 @@ async def username_list(interaction: discord.Interaction):
                 "ℹ️ Du bist mit keinem PSN-Namen verknüpft. Nutze `/link <psn-name>`.",
                 ephemeral=True)
         name   = str(own["ingame_name"])
-        online = "🟢 " if db.has_session(name) else "⚫ "
+        _conn  = _conn_of(interaction)
+        _sid   = _conn.service_id if _conn is not None else ""
+        online = "🟢 " if db.has_session(_sid, name) else "⚫ "
         e = discord.Embed(
             title="🔗 Deine Verknüpfung",
             description=f"{online}**{name}** ↔ {interaction.user.mention}",
@@ -7717,8 +7874,10 @@ async def username_list(interaction: discord.Interaction):
             "ℹ️ Noch keine Verknüpfungen vorhanden. Spieler verbinden sich mit "
             "`/link <psn-name>`.", ephemeral=True)
     lines = []
+    _conn = _conn_of(interaction)
+    _sid  = _conn.service_id if _conn is not None else ""
     for r in rows[:50]:
-        online = "🟢 " if db.has_session(str(r["ingame_name"])) else "⚫ "
+        online = "🟢 " if db.has_session(_sid, str(r["ingame_name"])) else "⚫ "
         lines.append(f"{online}**{r['ingame_name']}** ↔ <@{int(r['user_id'])}>")
     e = discord.Embed(
         title=f"🔗 Verknüpfte PSN-Namen ({len(rows)})",
@@ -8177,36 +8336,93 @@ async def cmd_blackjack(interaction: discord.Interaction, bet: app_commands.Rang
 #  SHOP-COMMANDS – /shop list|pending|cleanup|setprice und /buy
 # ══════════════════════════════════════════════════════════════
 class ShopCatalog:
-    """Item-Katalog: lädt bevorzugt shop_items.json (generiert aus types.xml),
-    sonst shop_items aus config.json. Hält Indizes, damit Lookups und
-    Autocomplete auch bei ~1700 Items schnell bleiben."""
+    """Item-Katalog **eines** Nitrado-Servers.
 
-    def __init__(self):
+    Jeder verbundene Server hat seinen eigenen Katalog in
+    ``shop_items_<service_id>.json`` – sonst würden alle Kunden dieselben
+    Items, Preise und Bundles teilen. Der Katalog wird aus der ``types.xml``
+    des jeweiligen Servers erzeugt (per FTP geholt) oder von Hand gepflegt.
+    Hält Indizes, damit Lookups und Autocomplete auch bei ~1700 Items
+    schnell bleiben.
+    """
+
+    def __init__(self, service_id: str = "", path: str = ""):
+        self.service_id = str(service_id or "")
+        self._path = str(path or "")
         self.items: List[Dict] = []
-        self.source = "config.json"
+        self.source = self.path
         self._by_key: Dict[str, Dict] = {}              # name/classname (lower) → Item
         self.by_category: Dict[str, List[Dict]] = {}
         # (suchtext, label, value, enabled) – vorberechnet für Autocomplete
         self._ac_index: List[Tuple[str, str, str, bool]] = []
 
+    # ── Speicherort ──────────────────────────────────────────
+    @property
+    def path(self) -> str:
+        """Katalogdatei dieses Servers."""
+        if self._path:
+            return self._path
+        if self.service_id:
+            return f"shop_items_{self.service_id}.json"
+        return self._legacy_path()
+
+    @staticmethod
+    def _legacy_path() -> str:
+        """Der frühere gemeinsame Katalog aus der Zeit vor der Mandantentrennung."""
+        return str(cfg.config.get("shop_items_file") or "shop_items.json")
+
+    def _erbt_altbestand(self) -> bool:
+        """Darf dieser Katalog den alten gemeinsamen Bestand übernehmen?
+
+        Nur der Server des Betreibers (``primary()``) – bei allen anderen wäre
+        das genau das Leck, das die Trennung verhindern soll: ein neuer Kunde
+        bekäme die Items und Preise eines fremden Servers.
+        """
+        if not self.service_id:
+            return True                      # Dashboard-Vorschau ohne Verbindung
+        try:
+            haupt = connections.primary()
+        except Exception:  # noqa: BLE001 – Registry evtl. noch nicht geladen
+            return False
+        return haupt is not None and haupt.service_id == self.service_id
+
+    @staticmethod
+    def _datei_lesen(path: str) -> Optional[List[Dict]]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            log.error(f"[SHOP] {path} unlesbar ({e}).")
+            return None
+        cand = data.get("items") if isinstance(data, dict) else data
+        return cand if isinstance(cand, list) else None
+
     def load(self):
-        items: Optional[List[Dict]] = None
-        path = str(cfg.config.get("shop_items_file") or "shop_items.json")
-        if os.path.exists(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                cand = data.get("items") if isinstance(data, dict) else data
-                if isinstance(cand, list):
-                    items, self.source = cand, path
-            except Exception as e:
-                log.error(f"[SHOP] {path} unlesbar ({e}) – Fallback auf config.json.")
+        path = self.path
+        items = self._datei_lesen(path) if os.path.exists(path) else None
+        migriert = False
+        if items is None and self._erbt_altbestand():
+            # Einmalige Übernahme: aus dem alten gemeinsamen shop_items.json bzw.
+            # aus shop_items in der config.json.
+            legacy = self._legacy_path()
+            if legacy != path and os.path.exists(legacy):
+                items = self._datei_lesen(legacy)
+                migriert = items is not None
+            if items is None:
+                aus_config = list(cfg.config.get("shop_items", []) or [])
+                if aus_config:
+                    items, migriert = aus_config, True
         if items is None:
-            items, self.source = list(cfg.config.get("shop_items", [])), "config.json"
+            items = []
+        self.source = path
         self.items = [it for it in items
                       if isinstance(it, dict) and (it.get("classname") or it.get("classnames"))]
         self.rebuild_index()
-        log.info(f"[SHOP] Katalog geladen: {len(self.items)} Items aus {self.source}")
+        if migriert and self.items:
+            self.save()          # Bestand ab jetzt unter dem eigenen Dateinamen
+            log.info(f"[SHOP] Alter Katalog nach {path} übernommen.")
+        log.info(f"[SHOP] Katalog {self.service_id or '-'}: "
+                 f"{len(self.items)} Items aus {self.source}")
 
     def rebuild_index(self):
         self._by_key.clear()
@@ -8237,11 +8453,7 @@ class ShopCatalog:
         return self._by_key.get(key.strip().lower())
 
     def save(self) -> bool:
-        """Persistiert Änderungen (/shop setprice, /shop enable) in die geladene Quelle."""
-        if self.source == "config.json":
-            cfg.save_config()
-            self.rebuild_index()
-            return True
+        """Persistiert Änderungen (/shop setprice, /shop enable) in die Katalogdatei."""
         data: Dict[str, Any] = {}
         try:
             with open(self.source, "r", encoding="utf-8") as f:
@@ -8262,12 +8474,26 @@ class ShopCatalog:
             return False
 
 
-catalog = ShopCatalog()
+def _catalog_of(interaction: discord.Interaction) -> Optional["ShopCatalog"]:
+    """Der Item-Katalog des Servers, den diese Guild verwalten darf.
+
+    Es gibt bewusst KEINEN globalen Katalog mehr: ohne zugeordneten Server
+    gibt es auch keine Items, sonst sähe jede Guild den Shop des Betreibers.
+    """
+    conn = _conn_of(interaction)
+    return conn.catalog if conn is not None else None
 
 
-def _find_shop_item(name: str) -> Optional[Dict]:
-    """Sucht ein Item per Anzeigename oder Classname (O(1) über den Katalog-Index)."""
-    return catalog.find(name)
+async def _require_catalog(interaction: discord.Interaction) -> Optional["ShopCatalog"]:
+    """Wie ``_catalog_of``, antwortet aber selbst, wenn kein Server zugeordnet ist."""
+    cat = _catalog_of(interaction)
+    if cat is not None:
+        return cat
+    if interaction.response.is_done():
+        await interaction.followup.send(PREMIUM_MISSING_TEXT, ephemeral=True)
+    else:
+        await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+    return None
 
 def _item_classnames(it: Dict) -> List[str]:
     """Classname-Liste eines Shop-Items: Bundle ("classnames") oder Einzelitem ("classname")."""
@@ -8294,9 +8520,12 @@ def _make_item_autocomplete(only_enabled: bool):
     """Autocomplete über den vorberechneten Index (max. 25 Treffer, Substring-Suche)."""
     async def _ac(interaction: discord.Interaction,
                   current: str) -> List[app_commands.Choice[str]]:
+        cat = _catalog_of(interaction)
+        if cat is None:
+            return []            # kein zugeordneter Server → nichts vorschlagen
         cur = current.strip().lower()
         out: List[app_commands.Choice] = []
-        for search, label, value, enabled in catalog._ac_index:
+        for search, label, value, enabled in cat._ac_index:
             if only_enabled and not enabled:
                 continue
             if cur and cur not in search:
@@ -8312,12 +8541,15 @@ _shop_buy_autocomplete  = _make_item_autocomplete(only_enabled=True)    # /buy
 
 async def _shop_category_autocomplete(interaction: discord.Interaction,
                                       current: str) -> List[app_commands.Choice[str]]:
+    katalog = _catalog_of(interaction)
+    if katalog is None:
+        return []
     cur = current.strip().lower()
     out: List[app_commands.Choice] = []
-    for cat in sorted(catalog.by_category):
+    for cat in sorted(katalog.by_category):
         if cur and cur not in cat.lower():
             continue
-        n = sum(1 for i in catalog.by_category[cat] if i.get("enabled", True))
+        n = sum(1 for i in katalog.by_category[cat] if i.get("enabled", True))
         if n == 0:
             continue
         out.append(app_commands.Choice(name=f"{cat} ({n} items)"[:100], value=cat))
@@ -8357,7 +8589,10 @@ shop_group = app_commands.Group(name="shop", description="🛒 Item shop")
 @shop_group.command(name="list", description="🛒 Show the shop catalog (all items or one category)")
 @app_commands.describe(category="Category to list – leave empty for the overview")
 async def shop_list(interaction: discord.Interaction, category: Optional[str] = None):
-    enabled_items = [it for it in catalog.items if it.get("enabled", True)]
+    katalog = await _require_catalog(interaction)
+    if katalog is None:
+        return
+    enabled_items = [it for it in katalog.items if it.get("enabled", True)]
     if not enabled_items:
         return await interaction.response.send_message(
             "🛒 The shop is currently empty. Admins: put your `types.xml` next to the bot "
@@ -8367,8 +8602,8 @@ async def shop_list(interaction: discord.Interaction, category: Optional[str] = 
     if category is not None:
         # Eine Kategorie komplett auflisten
         wanted = category.strip().lower()
-        match = next((c for c in catalog.by_category if c.lower() == wanted), None)
-        items = ([i for i in catalog.by_category.get(match, []) if i.get("enabled", True)]
+        match = next((c for c in katalog.by_category if c.lower() == wanted), None)
+        items = ([i for i in katalog.by_category.get(match, []) if i.get("enabled", True)]
                  if match else [])
         if not items:
             return await interaction.response.send_message(
@@ -8380,8 +8615,8 @@ async def shop_list(interaction: discord.Interaction, category: Optional[str] = 
     elif len(enabled_items) > 45:
         # Groß-Katalog (generierte shop_items.json): Kategorie-Übersicht statt 1700 Zeilen
         lines = []
-        for cat in sorted(catalog.by_category):
-            items = [i for i in catalog.by_category[cat] if i.get("enabled", True)]
+        for cat in sorted(katalog.by_category):
+            items = [i for i in katalog.by_category[cat] if i.get("enabled", True)]
             if not items:
                 continue
             prices = [int(i.get("price", 0)) for i in items]
@@ -8561,14 +8796,17 @@ async def shop_setprice(interaction: discord.Interaction,
                         item: str, price: app_commands.Range[int, 0]):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    it = _find_shop_item(item)
+    katalog = await _require_catalog(interaction)
+    if katalog is None:
+        return
+    it = katalog.find(item)
     if not it:
         return await interaction.response.send_message(
             f"❌ Item `{item}` not found in the shop catalog.", ephemeral=True)
     old = int(it.get("price", 0))
     it["price"] = int(price)
-    saved = catalog.save()
-    note = "" if saved else f"\n⚠️ Could not persist to `{catalog.source}` – change is in memory only."
+    saved = katalog.save()
+    note = "" if saved else f"\n⚠️ Could not persist to `{katalog.source}` – change is in memory only."
     await interaction.response.send_message(
         f"💲 **{it['name']}**: {_fmt_money(old)} → **{_fmt_money(int(price))}**{note}",
         ephemeral=True)
@@ -8581,14 +8819,17 @@ shop_setprice.autocomplete("item")(_shop_item_autocomplete)
 async def shop_enable(interaction: discord.Interaction, item: str, enabled: bool):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    it = _find_shop_item(item)
+    katalog = await _require_catalog(interaction)
+    if katalog is None:
+        return
+    it = katalog.find(item)
     if not it:
         return await interaction.response.send_message(
             f"❌ Item `{item}` not found in the shop catalog.", ephemeral=True)
     it["enabled"] = bool(enabled)
-    saved = catalog.save()
+    saved = katalog.save()
     state = "✅ **enabled**" if enabled else "🚫 **disabled**"
-    note  = "" if saved else f"\n⚠️ Could not persist to `{catalog.source}` – change is in memory only."
+    note  = "" if saved else f"\n⚠️ Could not persist to `{katalog.source}` – change is in memory only."
     await interaction.response.send_message(
         f"🔧 **{it['name']}** is now {state}.{note}", ephemeral=True)
 
@@ -8601,16 +8842,19 @@ shop_enable.autocomplete("item")(_shop_item_autocomplete)
 async def shop_removeitem(interaction: discord.Interaction, item: str):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    it = _find_shop_item(item)
+    katalog = await _require_catalog(interaction)
+    if katalog is None:
+        return
+    it = katalog.find(item)
     if not it:
         return await interaction.response.send_message(
             f"❌ Item `{item}` not found in the shop catalog.", ephemeral=True)
     try:
-        catalog.items.remove(it)
+        katalog.items.remove(it)
     except ValueError:
         pass
-    saved = catalog.save()
-    note = "" if saved else f"\n⚠️ Could not persist to `{catalog.source}` – change is in memory only."
+    saved = katalog.save()
+    note = "" if saved else f"\n⚠️ Could not persist to `{katalog.source}` – change is in memory only."
     await interaction.response.send_message(
         f"🗑️ **{it.get('name', item)}** was removed from the catalog.{note}", ephemeral=True)
 
@@ -8639,6 +8883,9 @@ async def add_shopitem(interaction: discord.Interaction, classnames: str,
                        max_amount: Optional[app_commands.Range[int, 1]] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
+    katalog = await _require_catalog(interaction)
+    if katalog is None:
+        return
 
     # Classnames parsen: Komma/Semikolon/Leerzeichen, Reihenfolge behalten, Duplikate raus
     parts: List[str] = []
@@ -8655,13 +8902,13 @@ async def add_shopitem(interaction: discord.Interaction, classnames: str,
     is_bundle = len(parts) > 1
     # Anforderung: der Classname IST der Anzeigename in /shop list (Bundles brauchen einen eigenen)
     display = (name or "").strip() or (f"{parts[0]} Bundle ({len(parts)} items)" if is_bundle else parts[0])
-    if catalog.find(display):
+    if katalog.find(display):
         return await interaction.response.send_message(
             f"❌ `{display}` already exists in the catalog. Pick a different `name` or "
             f"remove the existing entry first (`/shop removeitem`).", ephemeral=True)
 
     # Tippfehler-Schutz VOR dem Einfügen: unbekannte Classnames melden (nicht blockierend)
-    unknown = [c for c in parts if catalog.find(c) is None]
+    unknown = [c for c in parts if katalog.find(c) is None]
 
     cat = (category or "").strip() or ("Bundles" if is_bundle else "Custom")
     mx  = int(max_amount) if max_amount is not None else (1 if is_bundle else 5)
@@ -8679,8 +8926,8 @@ async def add_shopitem(interaction: discord.Interaction, classnames: str,
     else:
         it["classname"] = parts[0]
 
-    catalog.items.append(it)
-    saved = catalog.save()
+    katalog.items.append(it)
+    saved = katalog.save()
 
     embed = discord.Embed(
         title="➕ Shop bundle added" if is_bundle else "➕ Shop item added",
@@ -8700,9 +8947,9 @@ async def add_shopitem(interaction: discord.Interaction, classnames: str,
             inline=False)
     if not saved:
         embed.add_field(name="⚠️ Warning",
-                        value=f"Could not persist to `{catalog.source}` – item is in memory only.",
+                        value=f"Could not persist to `{katalog.source}` – item is in memory only.",
                         inline=False)
-    embed.set_footer(text=f"Catalog: {catalog.source} · buy it with /buy {display[:40]}")
+    embed.set_footer(text=f"Catalog: {katalog.source} · buy it with /buy {display[:40]}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 add_shopitem.autocomplete("category")(_shop_category_autocomplete)
@@ -8732,7 +8979,10 @@ async def edit_shopitem(interaction: discord.Interaction, item: str,
                         max_amount: Optional[app_commands.Range[int, 1]] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    it = _find_shop_item(item)
+    katalog = await _require_catalog(interaction)
+    if katalog is None:
+        return
+    it = katalog.find(item)
     if not it:
         return await interaction.response.send_message(
             f"❌ Item `{item}` not found in the shop catalog.", ephemeral=True)
@@ -8765,7 +9015,7 @@ async def edit_shopitem(interaction: discord.Interaction, item: str,
             it["classname"] = parts[0]
             it.pop("classnames", None)
         # Tippfehler-Schutz: unbekannte Classnames nur melden, nicht blockieren
-        unknown = [c for c in parts if catalog.find(c) is None]
+        unknown = [c for c in parts if katalog.find(c) is None]
         changes.append(f"Classnames: `{old_cls}` → `{' + '.join(parts)}`")
 
     # ── Preis ─────────────────────────────────────────────────
@@ -8780,7 +9030,7 @@ async def edit_shopitem(interaction: discord.Interaction, item: str,
         if not new_name:
             return await interaction.response.send_message(
                 "❌ `name` must not be empty.", ephemeral=True)
-        existing = catalog.find(new_name)
+        existing = katalog.find(new_name)
         if existing is not None and existing is not it:
             return await interaction.response.send_message(
                 f"❌ `{new_name}` is already used by another catalog entry.", ephemeral=True)
@@ -8795,7 +9045,7 @@ async def edit_shopitem(interaction: discord.Interaction, item: str,
         changes.append(f"Max/buy: {int(it.get('max_amount_per_buy', 1))} → **{int(max_amount)}**")
         it["max_amount_per_buy"] = int(max_amount)
 
-    saved = catalog.save()   # persistiert + Index/Autocomplete neu aufbauen
+    saved = katalog.save()   # persistiert + Index/Autocomplete neu aufbauen
 
     embed = discord.Embed(
         title="✏️ Shop item updated",
@@ -8809,9 +9059,9 @@ async def edit_shopitem(interaction: discord.Interaction, item: str,
             inline=False)
     if not saved:
         embed.add_field(name="⚠️ Warning",
-                        value=f"Could not persist to `{catalog.source}` – change is in memory only.",
+                        value=f"Could not persist to `{katalog.source}` – change is in memory only.",
                         inline=False)
-    embed.set_footer(text=f"Catalog: {catalog.source}")
+    embed.set_footer(text=f"Catalog: {katalog.source}")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 edit_shopitem.autocomplete("item")(_shop_item_autocomplete)
@@ -8891,15 +9141,16 @@ def _parse_bundle_items(text: str) -> Tuple[List[str], List[Tuple[int, str]], Li
     return expanded, summary, errors
 
 
-def _bundle_category_options(preselect: str = "Bundles") -> List[discord.SelectOption]:
-    """Kategorie-Optionen fürs Dropdown: 'Bundles' zuerst, dann bestehende
-    Katalog-Kategorien (Discord erlaubt max. 25 Optionen)."""
+def _bundle_category_options(katalog: Optional["ShopCatalog"] = None,
+                             preselect: str = "Bundles") -> List[discord.SelectOption]:
+    """Kategorie-Optionen fürs Dropdown: 'Bundles' zuerst, dann die Kategorien
+    aus dem Katalog **dieses** Servers (Discord erlaubt max. 25 Optionen)."""
     opts: List[discord.SelectOption] = [
         discord.SelectOption(label="Bundles", value="Bundles", emoji="📦",
                              description="Default category for bundles",
                              default=(preselect == "Bundles")),
     ]
-    for cat in sorted(catalog.by_category):
+    for cat in sorted((katalog.by_category if katalog is not None else {})):
         if cat.lower() == "bundles":
             continue
         opts.append(discord.SelectOption(label=cat[:100], value=cat[:100],
@@ -8938,6 +9189,11 @@ class BundleAddModal(discord.ui.Modal, title="📦 Create shop bundle"):
         # Admin-Recht erneut prüfen (Modal kann verzögert abgeschickt werden)
         if not _is_admin(interaction):
             return await _deny(interaction)
+        # Der Katalog wird erst hier aufgelöst: zwischen Dropdown und Absenden
+        # kann sich die Server-Zuordnung geändert haben.
+        katalog = await _require_catalog(interaction)
+        if katalog is None:
+            return
 
         # ── Items parsen ─────────────────────────────────────────
         expanded, summary, errors = _parse_bundle_items(str(self.items_in.value))
@@ -8968,7 +9224,7 @@ class BundleAddModal(discord.ui.Modal, title="📦 Create shop bundle"):
         if not display:
             return await interaction.response.send_message(
                 "❌ The shop name must not be empty.", ephemeral=True)
-        if catalog.find(display):
+        if katalog.find(display):
             return await interaction.response.send_message(
                 f"❌ `{display}` already exists in the catalog. Pick a different "
                 f"name or remove the existing entry first (`/shop removeitem`).",
@@ -8978,7 +9234,7 @@ class BundleAddModal(discord.ui.Modal, title="📦 Create shop bundle"):
         seen_unknown: set = set()
         unknown: List[str] = []
         for _, cn in summary:
-            if catalog.find(cn) is None and cn.lower() not in seen_unknown:
+            if katalog.find(cn) is None and cn.lower() not in seen_unknown:
                 seen_unknown.add(cn.lower())
                 unknown.append(cn)
 
@@ -8992,8 +9248,8 @@ class BundleAddModal(discord.ui.Modal, title="📦 Create shop bundle"):
             "classnames":         expanded,
             "custom":             True,   # übersteht die Katalog-Regenerierung
         }
-        catalog.items.append(it)
-        saved = catalog.save()
+        katalog.items.append(it)
+        saved = katalog.save()
 
         # ── Bestätigung ──────────────────────────────────────────
         sym = _cur_symbol()
@@ -9019,9 +9275,9 @@ class BundleAddModal(discord.ui.Modal, title="📦 Create shop bundle"):
         if not saved:
             embed.add_field(
                 name="⚠️ Warning",
-                value=f"Could not persist to `{catalog.source}` – bundle is in memory only.",
+                value=f"Could not persist to `{katalog.source}` – bundle is in memory only.",
                 inline=False)
-        embed.set_footer(text=f"Catalog: {catalog.source} · buy it with /buy {display[:40]}")
+        embed.set_footer(text=f"Catalog: {katalog.source} · buy it with /buy {display[:40]}")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
@@ -9036,10 +9292,10 @@ class BundleAddModal(discord.ui.Modal, title="📦 Create shop bundle"):
 class BundleCategorySelect(discord.ui.Select):
     """Dropdown zur Kategorie-Wahl; öffnet danach das Bundle-Modal."""
 
-    def __init__(self):
+    def __init__(self, katalog: Optional["ShopCatalog"] = None):
         super().__init__(placeholder="📂 Choose a category for the bundle…",
                          min_values=1, max_values=1,
-                         options=_bundle_category_options())
+                         options=_bundle_category_options(katalog))
 
     async def callback(self, interaction: discord.Interaction):
         if not _is_admin(interaction):
@@ -9048,9 +9304,9 @@ class BundleCategorySelect(discord.ui.Select):
 
 
 class BundleCategoryView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, katalog: Optional["ShopCatalog"] = None):
         super().__init__(timeout=300)
-        self.add_item(BundleCategorySelect())
+        self.add_item(BundleCategorySelect(katalog))
 
 
 bundle_group = app_commands.Group(
@@ -9063,6 +9319,9 @@ bundle_group = app_commands.Group(
 async def bundle_add(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
+    katalog = await _require_catalog(interaction)
+    if katalog is None:
+        return
     embed = discord.Embed(
         title="📦 Create a shop bundle",
         description=("Choose a **category** below – then a form opens where you "
@@ -9072,7 +9331,7 @@ async def bundle_add(interaction: discord.Interaction):
                      "All items of the bundle spawn together on a single `/buy`."),
         color=0x5865F2)
     await interaction.response.send_message(
-        embed=embed, view=BundleCategoryView(), ephemeral=True)
+        embed=embed, view=BundleCategoryView(katalog), ephemeral=True)
 
 
 bot.tree.add_command(bundle_group)
@@ -9094,8 +9353,11 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
         return
     gid, uid = interaction.guild_id, interaction.user.id
 
-    # ── 1. Item & Menge validieren ────────────────────────────
-    it = _find_shop_item(item)
+    # ── 1. Item & Menge validieren (Katalog DIESES Servers) ───
+    katalog = await _require_catalog(interaction)
+    if katalog is None:
+        return
+    it = katalog.find(item)
     if not it or not it.get("enabled", True):
         return await interaction.response.send_message(
             f"❌ Item `{item}` is not available. Use `/shop list` to see the catalog.",
@@ -9248,17 +9510,20 @@ def _gen_prettify(classname: str) -> str:
 
 
 def generate_shop_items_from_types(input_path: str = TYPES_XML_FILE,
-                                   output_path: Optional[str] = None) -> Optional[int]:
-    """Erzeugt shop_items.json aus einer types.xml (DayZBoosterZ-Format).
-    Kategorie-Preise kommen aus shop_category_prices in config.json.
+                                   output_path: Optional[str] = None,
+                                   conn: Optional["ServerConnection"] = None) -> Optional[int]:
+    """Erzeugt einen Item-Katalog aus einer types.xml (DayZBoosterZ-Format).
+    Kategorie-Preise kommen aus dem jeweiligen Server (``conn``), sonst aus
+    shop_category_prices in config.json.
     Per /add shopitem angelegte Items ("custom": true) werden übernommen.
     Gibt die Item-Anzahl zurück, None bei Fehler."""
     out_file = output_path or str(cfg.config.get("shop_items_file") or "shop_items.json")
     if not os.path.exists(input_path):
         return None
 
-    prices        = cfg.config.get("shop_category_prices") or {}
-    default_price = int(cfg.config.get("shop_default_price", 100))
+    quelle        = conn if conn is not None else cfg.config
+    prices        = quelle.get("shop_category_prices") or {}
+    default_price = int(quelle.get("shop_default_price", 100) or 100)
 
     # types.xml zeilenweise parsen: Kategorie-Kommentare + <type name="...">
     category = "UNCATEGORIZED"
@@ -9338,6 +9603,79 @@ def generate_shop_items_from_types(input_path: str = TYPES_XML_FILE,
         return None
     log.info(f"[GEN] Katalog generiert: {len(items)} Items -> {out_file}")
     return len(items)
+
+
+def _types_xml_kandidaten(conn: "ServerConnection") -> List[str]:
+    """Wo die types.xml auf dem FTP dieses Servers liegen kann."""
+    pfade: List[str] = []
+    eigener = str(conn.get("types_xml_path") or "").strip()
+    if eigener:
+        pfade.append(eigener)
+    mission = str(conn.get("ftp_mission_dir") or "").rstrip("/")
+    if mission:
+        pfade += [f"{mission}/db/types.xml", f"{mission}/types.xml"]
+    # Ohne erkanntes Mission-Verzeichnis die üblichen Ablagen probieren
+    if not mission:
+        karte = str(conn.get("map_name") or "").strip()
+        if karte:
+            pfade.append(f"/dayzxb_missions/dayzOffline.{karte.lower()}/db/types.xml")
+            pfade.append(f"/dayzstandalone/mpmissions/dayzOffline.{karte.lower()}/db/types.xml")
+    # Duplikate raus, Reihenfolge behalten
+    gesehen, out = set(), []
+    for p in pfade:
+        if p not in gesehen:
+            gesehen.add(p)
+            out.append(p)
+    return out
+
+
+async def katalog_von_server_holen(conn: "ServerConnection") -> Tuple[Optional[int], str]:
+    """Holt die ``types.xml`` **dieses** Servers per FTP und baut daraus seinen Katalog.
+
+    Jeder Kunde bekommt damit genau die Items, die auf seinem eigenen Server
+    existieren – ein gemeinsamer Katalog wuerde fremde Classnames anbieten,
+    die dort gar nicht spawnen koennen.
+    Rueckgabe: ``(Item-Anzahl, Meldung)``; Anzahl ``None`` bei Fehlschlag.
+    """
+    if conn.ftp is None:
+        return None, ("Für diesen Server ist kein FTP-Zugang eingerichtet – "
+                      "ohne ihn ist die types.xml nicht erreichbar.")
+    kandidaten = _types_xml_kandidaten(conn)
+    if not kandidaten:
+        return None, ("Das Mission-Verzeichnis ist noch unbekannt. "
+                      "`/ftp_scan` sucht es erneut.")
+
+    loop = asyncio.get_running_loop()
+    roh, gefunden = None, ""
+    for pfad in kandidaten:
+        roh = await loop.run_in_executor(None, conn.ftp.read_file, pfad)
+        if roh and "<type" in roh:
+            gefunden = pfad
+            break
+        roh = None
+    if roh is None:
+        return None, ("Keine types.xml gefunden. Geprüft: "
+                      + ", ".join(f"`{p}`" for p in kandidaten))
+
+    tmp = f"types_{conn.service_id or 'server'}.xml"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(roh)
+    except Exception as e:  # noqa: BLE001
+        return None, f"Konnte die geladene types.xml nicht zwischenspeichern: {e}"
+
+    katalog = conn.catalog
+    n = await loop.run_in_executor(
+        None, functools.partial(generate_shop_items_from_types, tmp, katalog.path, conn))
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    if n is None:
+        return None, f"`{gefunden}` konnte nicht ausgewertet werden."
+    katalog.load()
+    log.info(f"[SHOP] {conn.name}: Katalog aus {gefunden} erzeugt ({n} Items).")
+    return n, f"{n} Items aus `{gefunden}` übernommen."
 
 
 # ══════════════════════════════════════════════════════════════
@@ -10336,6 +10674,7 @@ _AUDIT_LABELS = {
     ("POST", "/api/zones"): "Zone angelegt",
     ("POST", "/api/shop/items"): "Shop-Item angelegt",
     ("POST", "/api/shop/categories"): "Shop-Kategorie angelegt",
+    ("POST", "/api/shop/refresh-types"): "Shop-Katalog aus types.xml erneuert",
     ("POST", "/api/economy/money"): "Guthaben geändert",
     ("POST", "/api/economy/config"): "Economy-Einstellungen geändert",
     ("POST", "/api/bans"): "Spieler gebannt",
@@ -11201,10 +11540,10 @@ async def set_auto_restart(request: web.Request) -> web.Response:
 # ──────────────────────────────────────────────────────────────────────────
 #  Shop-Katalog: Items & Bundles anlegen/bearbeiten, Autofill der Classnames.
 #
-#  Nutzt den vorhandenen ``ShopCatalog`` (``catalog``). Ein "Bundle" ist ein Item
-#  mit mehreren ``classnames``; ein Einzelitem hat ``classname``. Persistiert wie
-#  der Bot über ``catalog.save()`` – bei Quelle ``config.json`` wird zusätzlich
-#  ``config["shop_items"]`` gespiegelt, damit auch Hinzufügen/Löschen dauerhaft ist.
+#  Arbeitet immer auf dem ``ShopCatalog`` des angemeldeten Servers
+#  (``_session_conn(request).catalog``) – jeder Nitrado-Server hat seine eigene
+#  Item-Liste. Ein "Bundle" ist ein Item mit mehreren ``classnames``; ein
+#  Einzelitem hat ``classname``. Persistiert wird über ``katalog.save()``.
 # ──────────────────────────────────────────────────────────────────────────
 def _classnames(it: dict) -> List[str]:
     fn = _item_classnames
@@ -11216,11 +11555,9 @@ def _classnames(it: dict) -> List[str]:
     return [str(it["classname"])] if it.get("classname") else []
 
 
-def _shop_persist() -> bool:
-    """catalog.save() + bei config.json-Quelle die Liste spiegeln."""
-    if getattr(catalog, "source", "") == "config.json":
-        cfg.config["shop_items"] = catalog.items
-    return bool(catalog.save())
+def _shop_persist(katalog: "ShopCatalog") -> bool:
+    """Katalog dieses Servers in seine eigene Datei schreiben."""
+    return bool(katalog.save())
 
 
 def _item_view(it: dict) -> dict:
@@ -11238,6 +11575,10 @@ def _item_view(it: dict) -> dict:
 
 
 async def list_items(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
+    katalog = conn.catalog
     q = request.query.get("q", "").strip().lower()
     category = request.query.get("category", "").strip()
     try:
@@ -11246,7 +11587,7 @@ async def list_items(request: web.Request) -> web.Response:
     except ValueError:
         page, page_size = 1, 50
 
-    items = catalog.items
+    items = katalog.items
     if category:
         items = [it for it in items if str(it.get("category", "Misc")) == category]
     if q:
@@ -11260,28 +11601,36 @@ async def list_items(request: web.Request) -> web.Response:
     start = (page - 1) * page_size
     view = [_item_view(it) for it in items[start:start + page_size]]
     return ok({"items": view, "total": total, "page": page, "page_size": page_size,
-               "source": getattr(catalog, "source", "?")})
+               "source": getattr(katalog, "source", "?"),
+               "server": conn.name, "service_id": conn.service_id})
 
 
 async def api_shop_categories(request: web.Request) -> web.Response:
-    counts = {k: len(v) for k, v in getattr(catalog, "by_category", {}).items()}
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
+    counts = {k: len(v) for k, v in getattr(conn.catalog, "by_category", {}).items()}
+    preise = conn.get("shop_category_prices") or {}
     names = set(counts)
-    names.update((cfg.config.get("shop_category_prices") or {}).keys())
-    names.update(cfg.config.get("shop_categories_custom", []) or [])
+    names.update(preise.keys())
+    names.update(_eigene_kategorien(conn))
     cats = [{"name": n, "count": counts.get(n, 0),
-             "default_price": (cfg.config.get("shop_category_prices") or {}).get(n)}
+             "default_price": preise.get(n)}
             for n in sorted(names, key=str.lower)]
     return ok({"categories": cats,
-               "default_price": int(cfg.config.get("shop_default_price", 100))})
+               "default_price": int(conn.get("shop_default_price", 100) or 100)})
 
 
 async def api_shop_classnames(request: web.Request) -> web.Response:
     """Autofill: Classnames (Einzelitems) per Substring-Suche."""
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
     q = request.query.get("q", "").strip().lower()
     limit = min(50, max(1, int(request.query.get("limit", 25) or 25)))
     out = []
     seen = set()
-    for it in catalog.items:
+    for it in conn.catalog.items:
         cls = _classnames(it)
         if len(cls) != 1:
             continue  # Bundles nicht als Classname vorschlagen
@@ -11314,6 +11663,10 @@ def _split_classnames(raw) -> List[str]:
 
 
 async def create_item(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
+    katalog = conn.catalog
     data = await body(request)
     parts = _split_classnames(data.get("classnames") or data.get("classname"))
     if not parts:
@@ -11322,7 +11675,7 @@ async def create_item(request: web.Request) -> web.Response:
     is_bundle = len(parts) > 1
     display = str(data.get("name", "")).strip() or (
         f"{parts[0]} Bundle ({len(parts)} items)" if is_bundle else parts[0])
-    if catalog.find(display):
+    if katalog.find(display):
         return err(f"'{display}' existiert bereits im Katalog. Anderen Namen wählen "
                    f"oder den Eintrag zuerst löschen.")
 
@@ -11357,18 +11710,22 @@ async def create_item(request: web.Request) -> web.Response:
         it["classname"] = parts[0]
 
     # Unbekannte Classnames (Tippfehler-Hinweis, nicht blockierend)
-    unknown = [c for c in parts if catalog.find(c) is None]
+    unknown = [c for c in parts if katalog.find(c) is None]
 
-    catalog.items.append(it)
-    saved = _shop_persist()
+    katalog.items.append(it)
+    saved = _shop_persist(katalog)
     # neue Kategorie ggf. als custom merken
-    if cat not in (getattr(catalog, "by_category", {}) or {}):
-        _remember_category(cat)
+    if cat not in (getattr(katalog, "by_category", {}) or {}):
+        _remember_category(conn, cat)
     return ok({"item": _item_view(it), "saved": saved, "unknown_classnames": unknown})
 
 
 async def update_item(request: web.Request) -> web.Response:
-    it = catalog.find(request.match_info["name"])
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
+    katalog = conn.catalog
+    it = katalog.find(request.match_info["name"])
     if not it:
         return err("Item nicht gefunden.", 404)
     data = await body(request)
@@ -11376,7 +11733,7 @@ async def update_item(request: web.Request) -> web.Response:
     if "name" in data:
         new_name = str(data["name"]).strip()
         if new_name and new_name.lower() != str(it.get("name", "")).lower():
-            if catalog.find(new_name):
+            if katalog.find(new_name):
                 return err(f"'{new_name}' existiert bereits.")
             it["name"] = new_name[:100]
     if "price" in data:
@@ -11386,7 +11743,7 @@ async def update_item(request: web.Request) -> web.Response:
             return err("Preis muss eine Zahl sein.")
     if "category" in data and str(data["category"]).strip():
         it["category"] = str(data["category"]).strip()
-        _remember_category(it["category"])
+        _remember_category(conn, it["category"])
     if "enabled" in data:
         it["enabled"] = bool(data["enabled"])
     if "max_amount_per_buy" in data or "limit" in data:
@@ -11405,38 +11762,72 @@ async def update_item(request: web.Request) -> web.Response:
         else:
             it["classname"] = parts[0]
 
-    saved = _shop_persist()
+    saved = _shop_persist(katalog)
     return ok({"item": _item_view(it), "saved": saved})
 
 
 async def delete_item(request: web.Request) -> web.Response:
-    it = catalog.find(request.match_info["name"])
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
+    katalog = conn.catalog
+    it = katalog.find(request.match_info["name"])
     if not it:
         return err("Item nicht gefunden.", 404)
     try:
-        catalog.items.remove(it)
+        katalog.items.remove(it)
     except ValueError:
         pass
-    saved = _shop_persist()
+    saved = _shop_persist(katalog)
     return ok({"removed": str(it.get("name")), "saved": saved})
 
 
-def _remember_category(cat: str) -> None:
-    lst = cfg.config.setdefault("shop_categories_custom", [])
+def _eigene_kategorien(conn: "ServerConnection") -> List[str]:
+    """Selbst angelegte Shop-Kategorien **dieses** Servers.
+
+    Der Hauptserver erbt einmalig die Liste aus der config.json – neue Kunden
+    starten mit einer leeren Liste statt mit den Kategorien des Betreibers.
+    """
+    lst = conn.data.get("shop_categories_custom")
+    if isinstance(lst, list):
+        return lst
+    seed = (list(cfg.config.get("shop_categories_custom", []) or [])
+            if connections.primary() is conn else [])
+    conn.data["shop_categories_custom"] = seed
+    return seed
+
+
+def _remember_category(conn: "ServerConnection", cat: str) -> None:
+    lst = _eigene_kategorien(conn)
     if cat and cat not in lst:
         lst.append(cat)
-        cfg.save_config()
+        connections.save()
 
 
 async def add_category(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
     data = await body(request)
     cat = str(data.get("name", "")).strip()
     if not cat:
         return err("Kategoriename fehlt.")
     if len(cat) > 60:
         return err("Kategoriename ist zu lang.")
-    _remember_category(cat)
+    _remember_category(conn, cat)
     return ok({"category": cat})
+
+
+async def api_shop_refresh_types(request: web.Request) -> web.Response:
+    """Holt die types.xml vom eigenen Nitrado-Server und baut den Katalog neu."""
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
+    n, meldung = await katalog_von_server_holen(conn)
+    if n is None:
+        return err(meldung)
+    return ok({"items": n, "message": meldung,
+               "source": conn.catalog.source, "server": conn.name})
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -12011,6 +12402,7 @@ def build_app() -> web.Application:
     r.add_put("/api/shop/items/{name}", update_item)
     r.add_delete("/api/shop/items/{name}", delete_item)
     r.add_post("/api/shop/categories", add_category)
+    r.add_post("/api/shop/refresh-types", api_shop_refresh_types)
 
     # ── Karte / Events ──
     r.add_get("/api/map/meta", api_map_meta)
@@ -12486,6 +12878,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "2dcf10883a586ae06ee8b5b4acccaf61c18a870181755e78ec8f1e579bb8fc29",
         "0469d0c19aa2445e00a0d25dcafe86fe3adff474aa7711a5bc1656f1a9e5e381",
         "829b70721c73a3fe1d4b7b374cb72009e488d21e4e06dae6f9d696a6d23d75aa",
+        "2dd6cd54b9c94468a6ca32e3fea5b33170e653e82be5076cc24b14e6bb80a912",
     ),
     "styles.css": (
         "f68b843465b48dbe4d294a2f319a1c391eb1b43eed1fea7db39a916c1c1ad804",
@@ -12500,6 +12893,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "bee4fd3e9b3370dbd02f4f32cb88049eb754892d98fbd4a92cd2b32699d1389f",
         "087abf48c810dec7bf622d0729c4cfce47fa599fb6da1789d69b8a70bb1d0d18",
         "ab6d6775e6fa45093ff46ba47f826f311510b66ead9ef1e7dea056da8c3d912f",
+        "efb12fbcf465d781d30a0f999fa614fe9fc71945db872ceecbcee3e58702cd08",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
@@ -12611,160 +13005,163 @@ _EMBEDDED_ASSETS: Dict[str, str] = {
         "WKiYwYKxw05x4sxekEaOUKdELrbd+gqsGka/YBa7AzUO6reqqrhBdIKVcKX020rn8dEQ4B6blU3EWacxP6pe6ECBbt+ts6ZVJM6ba8rvoureaWuRUy5q"
         "fKJk+CAuDlf/A6gxaCI="
     ),
-    # app.js  (53.115 Bytes roh → 17.528 Bytes base64)
+    # app.js  (54.234 Bytes roh → 17.972 Bytes base64)
     "app.js": (
-        "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"
-        "+/8AqUbJ0Q=="
+        "eNrdfWtvHFeW2Hf9iquahdw96i5SGo/XIUejUCZtayyRiihbE3EJorrrdneJ1VXtqmpSpFfABNhZBAiQyc5OdpDEiIPAGyRAvuTLZh/+tPon+gPrn5Dz"
+        "uPfWvfXoB6XxCtn1UNVV933P+55z7saPxW5w8Qz+5JNBGmSheP2rvxQfZ2lSyCTsP0jH0an48ca1zmieDIsoTUSnK766JoQ3z6XIiywaFt72NXixsSFe"
+        "/+5X8J/4VMYzmeXq5zvyH4zwLMjEH4k7opxK3hMZTEdksphn8DsTf/qnIkyH86lMiq7/5VxmF4cylsMizTp5d1u83NbtLGxoJ8uCC3+WpUVaXMykn8fR"
+        "UPrDII47C/vYgQJ5V/djmp90imDcE0FRZNDRaRTmvAc8FAkj0e35w0wGhdyLJf7Cat1tKkh1oSD/CyP46iV/GKWZ6GAzpyJK+LNuXIhoJDqn4s6dO8Ib"
+        "xkGee10B08Cn/WAqdXNHp8fbqoKMASqsWpNiGlOlKElk9umThw8WVuKF6mz2xO0uN5AmVD0Iw70zmNGDKAe4lJkpervbM+11aw3qL+L6HZHM4xibymWx"
+        "A6+jwbyQndNa7Zf0t4OLjMt0dNz1YYn2guHEQoGhu0RDGKtqnwHADMQPZjPAo48mURx2EBTSkRjyzBB3krEn7lY374l8UeynocRetsRQj0v9qyBM4q+X"
+        "NpDIfNjJLRg8pPY7uR4bdOR50GDe9TM5iwNYvI2jGz/7uXe8AbDVMDfVzlfCu+FtwZ9gOtv2esL7Gf2KC/rxc/oxph/vee/hjy/nKfwUL4+Gx9s4bBim"
+        "QpoiDfLiiQPa9KozzccI10low3UBoPJHHe9HVMSDdgq/gKX5iEgTfoRavCaFA5MeVRCeuInbmIS4jZ6nlm8YyyB7Ek1lOgf0oPFgy/QAdQE49EeH4Oku"
+        "EP4QGDveJApDmeCwXvbET25vbnZ5R+BPkF8kw3KKwSzqTGUxScOemAXFpCcGaXhxMHhuTzad4Yy+ElxwS+gKExmEQEu3AF+FwliEONUCwPUdMU9COYoS"
+        "iYuH7fiqzpGnlqr/BADPO8alAXAEtAlwXBvPc0AuDalYDxuFQr84PNj3GTqj0YXuivZRjzZDLD4PokKMZAGYwdOCNrrlEDNoIyjmOUH7+5u3cHT5JD0/"
+        "SIjPIGziyk+y9Fwk8lzsZRkQWW+eBHOYehZdytBzOn1uOs18HHunCxS1cPDSAn+gbwZncDjXMz89RVB4jv/imEYBkIlubQTPfYn/ctGpzPNgLPFHx/v0"
+        "yZNHBFZ6al0XJ5/7YVAE7p4A1qnXW+K5gRAz4mkaBnGniIpY9sSQtwtxHxYzOQzO4N8c/j4IBjK2oWUwhrWYdLwwOgO8+0oQbALuUXP9AVAVPXUsjU1w"
+        "eaB5BWy6XWVQJGKWRdMgu/Cw1yHAx+lWFYY7JcErsguozhvBg8R9NDQMwQUIzDQ9k0z1BmOzi4B+uGGiIwmlCPWlXmMgJoOAtxz/vyeOzNQJgw9nMhpO"
+        "ZJZ4x9bcBumLBUvhUTuqbyg0+QmWwXe05Mddd9HLgs0LG9Bi5E6rYsG6jicpUC5rVV1IXbZm1I23MxhkEiaO8+6ZTnnlAbpoc7eIwh939coMxg7jgUWy"
+        "PlRZqUeD82weQPuDWCP9IsjGsiCEgVEtHbPqxy3mjGXsIs1gbLCilCAPAb3kuyU/OlJkTuNDej2ew6Rgv4+Oe2IchbwRPSFxhZHsqk+jKC4UGe8RFXwU"
+        "Bxf0osjmstxW/X/TYPYgBSoODRKZAs6RxjGypkx3cRbJc4AzWP8MH716IzS2+9CEB5sbJWdRIT/PYvUz3wmnUWKaD6N8mGYhyvvmZa1BVejzXI8CWZKz"
+        "cSVxF+/Qdh3cOzl8svfoEHbsyFOTQOGlSE8lYq0HE4JlxCdaM3zg9fKOHWklHRwWctZJQNDQBFG33SAlWoI0yjHpoA8YN+sjBwEhrJQninQ8jqURKQBA"
+        "iIdQL7bw54h7VVaqusKOAN28bqu8YoqlprZTmnG6WgG2eFdmYpcXr384nGRRUQAiyEkBoJCJIIFxp3GQALcMIyl2kqmMwzkAQpICyR/JSVz41JRaRMIh"
+        "34Y7ceOGuO68RkhDuVXvGRA6tWldm2o8ylJAsAHsHCwtSYGhzAUOBccggcyZge/Pi0vUTaE3kJHEZ+lsdCmjWPr22qKUdLFbDqEDum6mV7g+QGD3+A8w"
+        "KcSJkjdF07ESYaeyH5yBEJB5wHGSafkW99izpRS7J4EttMudyXTxHgtHGWEODHVcGRr783EULCVvm1LIHxd8XwYvOBmqy/M+mWdxOS3YsgeBDAvagnsg"
+        "fuHyhUEu7uEWJsDmCxDdJezRviwuxeVcbx+s3iCW0YBArmwMm6FtR3CEzcYtKgTUByg4DWbAnOElUNzichIQHfat9U0TlvfuVLjzwrV/uW21kGdDvVLl"
+        "bO0C0GnbUlb3uHk1X7JKuwpYmM3WyLELyHh5LiNBBL//GUDvGMRrWJFJIAFFANzjGNc6YJTQmPIYGE4DWlArHcU+XJxQL2Gq16+rZ0VtANphmNh9msQX"
+        "XpNKLS34kPEi6njd6a1CIa8ZWqswtA+CGHTYLvW0SbqVZgBIoBkXefQmFpMoR4oQAHCG8B55+ja/rVR49VejUSL1GovXv/ofugmUqtX0kXaERtlB9dH7"
+        "ZO8JMqUN+LGB+tGGGtYGrEVWlBh/Dvpueu7HKet4/iSTIzQP+QYiX9oyuMudFk3ViOm6p+qcSWRonvRDmIWecUBsQWrFkwC1u11lbDuzmbsPzayqhbFV"
+        "+V8TTtmQQhzlynDCho1TRdN1c9DUWRDPQX4G3apjc13d3yKAIlYAxZAOLa90DzixFE+wABK9sRzIxPe2NflXpH91IH2UvfpuJFcHzkcHhxXo1IIVKnnw"
+        "tEUL9NJAKYnQoNaZJVPyFxBWeO3YCks6GfpcKl8saQlqwtY4QD9LZ1iOBkS7siVyPwpZyWSSfBMU+w5JZtpsAW+6oHKZQZfDVwKMZ0ZdR6zlu1YiVMv+"
+        "LEAo3uoZbRNITWIg8+LVt0U0VniFQy3Bm4f5RvCdR2F9sxjAHchWXS0C7cqg5vnFCtJnI+xeDTRzMrX3jcT/lcDHaChPUHvDiZYbjWgY+udBlgBW5Sie"
+        "lr/8GJhnMekqM4b14XkKDNIT//h/BUp7yqhRCiv3cxCbh5OUcLUUqGk8YhLBemWxHBcgTaPtEkXpgYxgLcQojWGD4alsS4nhUmCdMBoXdHoTBgmw8iiT"
+        "pwXIuXl5tuM78yJV52SYJqNoPM/YfGiI77ZaxUGaFh3Cy+IL0DI7pb5pWXVIONFYwRrUIqRYACU1rFgCLhWxrBmHSoxoUlS3qnsA/xtEuM7iykpnBZck"
+        "bqrZBYNZay22LdEBEZTxAHSs+Sibj8To1XcZbPx/vSdRy5JA98cR2m9lBquCpkgugQK2zBI5B3hhEp9wewx02MIvgh5IhdAyiOAewRK8h7ZEMMhRKgdS"
+        "MQEZQ4KcOEnjQZD59cmiQeoThIHOOHLs+UtRU+veyqpCCDm2EJLlPmXVgMbgW8kuQ581dtY0lIiobR4kApXfHQNUWLfK4sbcp9IE0mFFJOSGVqFyqmSS"
+        "FrJWNPR5n2CXQoVHd4EFvf7612RjDv1hOp0GCWLoHCogg6pvcOGVRpqbJVITSwO92YAGt2h9hOZe/+prUqi9Lv7yva5qagvbwSE7BycavZVdpCZEUdtv"
+        "xGTGNpNRVKRdiOL+lgpRDIMrVGIhCsktk4H+/d0FwpQ76bfJxCqwxwjj4tQi2to+wzbS2jKHNSlrFeAXQkF9/5XekoLU1qngLpCIk0EcJFjRS1IsUgpd"
+        "bxMj1QZ4aOfai5I4gKn3H0TJKVHAiPi1nAogoMAangQDkY6AhPriMB0Ecci2jBSIG1DkkItq5AT0UrwFWuqJIgLpFKgu/MbCFboLaFly8XOZISNCsGxA"
+        "ft9r3YELmb+J1rvCgv5B9IkS0B1iX5HISsJpy/3cQpXXbpvvWlBrp6vMJnHvaoKZs+poJ05TS6x7WbocXA/9QVqcpEkMzdjDA0Z7MCl1/z6bPONX3+Yo"
+        "ECJjJcNXbuR6BIIkkjhWNNLM83wG+wEQt/aMEdqrkmjFpLTKznND1qkA8oddBfaII2TpZfMdYUEkc8ACdyV9b7ulywU4SXj5hNBGYcw+7FKJM9wpYE5P"
+        "zKcimhCuXs4JhcsOX7aTzQWzfhNFzZGnKrgKrLIfp+N0XlwJUe1j2BZ5Sre+7c75pTbo7wzYFgNtySTBPYMiSGr0jpU2fCJIxBvzHIeBu30uxwyKNXM5"
+        "ucJs2/ZCPmvfNmKv4wTQJJ8fshL+Dp7/VTYkk6NM5hMer7s7trWj3ZzHqs0GWx08x0Yyi2JtJOHPfXxTlsFfFZDLfaY8KP29/v1vQM/BXyTnvf79vxMH"
+        "oxH9dlpwnGeoT/KdsZtKy2ZS1YQZhTW8aTCr4U/uw9sTY/d+/avfec4ch1QmuJ2j+EsP/owPR5E2b7BNBt9Ogxcn6ktXbFUPJ6FqEhVZEKaop5sfpq3r"
+        "xguq/m2Lh9U0I1WkzgW//+Yv/prWaTZsEMdequM6jegKSvp6lxcgvANQVbTYD86iMZl236Xz1QzNEpkkB8OvXNdFrcraR6bM2lGvFXzKaZ0SJMFZ4/HA"
+        "AIn1oOFYAH0yziSs24DcbKA/1bI5QTX6I3XA6nRDD2fYw9mig4cz00MuudL1eicoAxCw4zcPEYLgkaZszvC75Cgig+w+8m7QcTrVAtvVKoLhVzMh8rDS"
+        "y36EHR53ReVFx5waL11adg5ZVWQ3u+quuVkFi5r/x/+w4D9x8MXe4y/u7z1dUu6aKKfma5sIUtQF2uSQCOd7RzjAvtqvO6VB5fg97RDYaG4eVi3Ik9va"
+        "c8h79fUAxoECR2kerpWfOc5A+XzATkPeUyCvpyCAAteNpuR6reSifmmlK5vVviZ5s4/TOAOVmb6XDl/uSOij+lLiJLzsgPQU01Ziieroqx1hIZyAoo9H"
+        "DUUSnqDyOk266FvVUEy5ZJGvkrEgVrnlZTu3vEwTWeGS+WQBc52ksw2Q7Kb53RmIcCd5dCnv3HLrB9nCs7YUiHfllI0W8NKnsSg7MFR4Bj+TWiHN/KDA"
+        "zimSKvEZtCUr5fIJkJsiQGX3EIbcB/2zyF59O66WCzI/H05kOI+lLxOWQIE97+wTa975/BBHvoODfuwOukECxLl/OQf0bgauYYAOF7hZjuOcdzgELSaO"
+        "L+cAfaORVzqdHXkjKcMcR8C7hI41MBn8F+ngcQvRVfOjoVQBsdmxDl1kiotYomNekKHH0vuzF57tHNfob6ep1plxrjszmNaMPjQmJmkrUrSP9/Z2D9ch"
+        "Z7RmV6JlvNpIyK5AxD7mymvTrwdyLEFDTQWor+hXLEJLV/5oEsAwYjGSaOYgF5tEjOUsBW4C+kJUo20LTrl5drZrjLJflicvX9WH3Q7E3meo1wsyLuTi"
+        "VJ16sD5PpMg18JnO6jA77jrECrtYC4PG+sSxM0Z/kShGNNbe+Z7ooDathOy7Xa9bIhiOCnS6E4wjaBpYXNj2hvKQdYJHlXjqRSOw7AMrnZR6av1AQhbk"
+        "k6N3GUVm63xUiLE/5E9NgxtO7MEpp3ceXL3P4UQfz3o/QhkbfrOIs221gEAxZvw5igv/VF4ck9RHlbsi9XnSFVtr88xTq2V7hdiGXM6LQQ8lukrP3QWN"
+        "N06xUr8n9GgR3dSjWnm94LgSlWrO+lO/dQlugo5wCywJdbfuuj2BOt3gAUShUcx4FATzPEY+RIVx0Cy1S5yzpKVhyvtE5sqpu9gSqr0YHb6h2/S0ZrhY"
+        "4DHeuHmIf8sIBE6sn6XnFZ/uRidwGpqSX8xAEbmmAWjlCrs1PKD8AwvR6EDgki0cpuvFtCKveXawv7cCr6nse5wGIVHBR8DbgANVj+mGE3Js1iCP/ss4"
+        "5Syl11kaS/XOsuVypRZKToSUYUeBjm67xTTFTVKHKzdJ42ppzwQylXMCGqF/9PScstSnJ56ZeyKIAs1DitWYgX4excZZTf2EoeonK7YOlzNhu8oET85m"
+        "88ImAaqG5RPYExSYNUnjEF2sWaTso2nGjeh4UW0RWQIK4fPpgLwa0NEYfm/6t1Bvdbt7YdlCyndM6K0+Lt+kj8uGPi7rfWRBuGIvDX1A5WieN3SkPmyJ"
+        "2z/ddLobTg4bGCLz57UZnx2FkqVv0rAU5GtZabeGp+pEBLDVLyYysXjrrCTls6U8mFdhOYNq5cGWsQP7I5xp6IzjYdOV+spMV/+S46tqPb10Yn4oTq2k"
+        "0BbpjgdxxyOE6bFlZkFQD6nPxXmqSDrW/KXoHORFF4q9APpNr56Jzj66HsO7y24ZgkPfHjOkdab4FcDO/fo0yBIjE3d41kGMRWkL3MKPQG1mn1u3KK2g"
+        "PQtXMp/OUU4o9aFRmhR91HK3bt0GnajU2VE/wxOULUH2CzxD2ZmPWBkVl8iFgdTg2SNoSZeFCOfilxvPNtQEB/LLuZyKGXrMZzLKfQtOpzZZ9LXnAVIu"
+        "qBZkAwnqd0KiLb0LkliOyZyG27hIKiHrcHCBeECsB5veor+OVwBsFdCEIMvlx1C06Lzgr/D+0nl/qd+bBWE64RSCV6a6LdIwzjhCDfMN+spQ7n695kTh"
+        "sFykEdhyHwf5Ui+dDKNin8ykthT2ecX2QVxPJsM0lJ8/vv9ROp0hjyjqrfT04rlh0W0SnlbZq5WUqEZ7Ny7lNc+IaKUqS0102kNWEM7Rig6YCaO3YjUB"
+        "qlm2ciSzSMal+pTPgsTE7kEbKF5hK8dK+itj5UGY6wzTOHfbLzJVGz+hUcaiVEWl6MR0RK13dQhzZaZXUtp5ma+otD/jymsr7YTx50CeAdVJpODzPHVy"
+        "OwPKU5TBO8jpDmew+BSTkUUJB/msrrk7JjoysHHYZLOSjLJ31ZzTH6RFkU63br3PJMwO4Vw9hNU1/pQSXBlaeZNWw4qrXGRxagvizIJzbOUgeRjMrLa/"
+        "/+b3f/9Pf/sbUSeyFu10d1Ctk7VyxYAXrUBaaWvvoTI+1tnuZWKF6g6qEGLQwAlfLUL99jJRrLfnvldmXfj8orvgo80g6y0ruQw9LqZea0FXB2vZbq1y"
+        "NW+Ko2uWG69ZiJpkT2haab16Qc8viHnghHqGS5QTeFnu8uuv/70zk6VjRreesRJsHZCP5ajY+gDNmKsEYVvWCXLgzaaKRCtfPzUf5eYn4ld/g2bj5K7X"
+        "raaosD1JCJV39x7sPdlbjemobro6hQKq9NzXcgah3VA0tvwF4UXNIMtooITrAk1llmxdYKoD8xsp/5EW/rxf4p9n+IeFGHzyWC8vBsdtJLTdhhc69n6Q"
+        "cXBUW43B4vPSdrOPLjEs5BPlZcnJUvPN7lYIiT4r1a7AdLSuVG5e6s8QSCS59T6Dzcjm0x47jbEDE8Z8UdzbPDkttGtTIngxfLM9ZbTiGee/MEeSTXCH"
+        "EMdijIlQrp9lRmfWFivPvt1nMCufjiR2YaK2niBz2zjvVU54qigMCAo1FIbik4Wi+NPG0W7F86cnbt3edFypl1hYdj5/ctDf+fzjT3bu7e2vY9XHc6Mi"
+        "yE+vJiSY2lcVFOgECDjPGKSq5AoCA9afBkWEREP7w+7LOW1fjjYKBLDOTnL66rskjMZzCiO89dONn27cEg9BYjhLMxASu6vLDE3nbJTbKGmxD8DAhqeD"
+        "9AXZE6CYTy/I1hvWjsjK9kZFS3tFRFRD6aNWE0Bb8+IEP5OJZvP9rc1N14hBiLPQhkGB9mTCmAYAv97t9xu7ihQCnUzSOSdpet/pKJittBjBzFmMYASt"
+        "nszmGegzubQMUy+KlswZJfkK/QRk7ZNsnpzAvt/VHrL7r74dTtABU2igYPMtJlHZBeLQcev9WNza3Nzs+kX6IB0GsVTyAmY3olMZ0wqeFQFskaxpWW1W"
+        "OGAp5be6IjGcnHIhmQC4CQe2S6AO8HDWFQVb7QU15l2ks61bmxVhVSn2ewA/Ev3ZsgIkwEJ0Pv106+FDVO1HhbYxaNIZi85hgbljYKS3QEa//T6WA3rq"
+        "jKt5io2D+lCPKZjh3PdBVhTPZQi6PB0zf4belEG5IOjcTOvhZBtZVWqnVXi/tgpvKe9MaRl2MxA1Oj+WxAT7VGRgy6IT1eQWJZqDLFmwLo9HmDZGKksB"
+        "bBawOF3k1iZmIHNwbMtGwZajj2cACgjrjTq1UwHwtOJ7lrlYuQI+Zm+Kj67ItlYWHydxTyNQLUSmBHX9ZnHNHJysemBy+OnBo+Vc3AAfgSrKtx+jKaIT"
+        "JVERBU4epvNM0+QqgqDPSZ99Jh1ekcxaDgNU683nAB/pkYB+54t7vnj4/s4tJA0I6kMQx2NZSPbNrBjYpwsTP1VUkhYVF2epY1pK1efV7xsSMbFhrLAd"
+        "1lzfo2Gc5rKj0wthYiL060tfWO2XLVFf7ACQzBqONvUiNpELN9Eb+9RptVgNz0r2tojsqCFbbvWWu9IKsg35IBlYyu9+eadFm8JJ2pbNbu24+3rolw0Z"
+        "P4i6QteaFSsY9rWcYBV3Wm04Nkiqiidu2BLFCXpCHFhNR+cNZgPqHTFMyvFsm+UnuKvUOrKL1s9ih6UWTOG4eIqRYNI4zIBxYSmb9bNjwVDfnEWrxaGK"
+        "NYwPNysabDPsDuJ51uRXqSGSpq2aM03VxgRtw+fa62xqVzjRC9uYKK8KdSa5ifqOTbSlNhyArBJrs5qt1rDL4kKE0HlIHFNh02mpSwpVep+MBJgYl1Ns"
+        "ULqfezSW3KV/0Mthuw8MDtMvB9IE+mQb5lZWODIrGN4I9opKYgF4YSKOOLGAK9yH4UdBsZxaryYs0VomdCoN5KXolMvG4WsmC8wWsmoiLUlSpSSLXUKq"
+        "u9grj2gSBUoVb4zVFtHUXuASY8o4GKztInpMlAEKY+m9tf1JSgsxyEKyXC6H5YH4OpSr6X6bpcJHQBfKUTCPixNuAng+SGQOOMTRNCpW1ytV27dcYQP9"
+        "Xp9WRRRDlvRXV6ZyZZ6uC6H3oc56INpoRFqx53ITsN+KtLHCETAbvQydaDgRXufUybOBwLFdNylHuoWqjDuK5YutW/yZMQINkoz8x8vUvAWDwxXCg2gA"
+        "GlRw8SgQ4ENOMplJMX31N2MM3Uey0yuXv6e39HjNU/JHeAYsOqC6BFM6LCcw1srsAwLdzjR4sYH6JX4naO5Wz4y977/5L79lRZSJt5CoK8fxysfDpdiC"
+        "djQMcijlbmui3cqB37nF/s4VeyTG1/U5UWPnXpqC/Jg4cafXG0SvWvrah5g5Anl8rsywpege6GByt9XagXZDqwzNlELP9V1fpAaXvu82ba4fn2t5aEuT"
+        "aNZsLflXT3vLelabbunE9NtRizFiK5gi0zuZgX48mF9YxQkmrOKVvCuZP09Ok/Q8ObE2+cYN0fReb0eVE3waJecAqVtingzkaZCAAl3uR06HoOxu0tAk"
+        "Z3HpNeRwoWN01YOC2wVKfGkTxv0wp+NQStXVDhGlXZqDGtLZocky+iUn7YT94QeMZSBqv32t2sOVDM7kpn9FW/Mh1V3bxAzUNIjTMcY1CyZeN7QIRxtz"
+        "CqRjQEkU+TSanE82AIR88QtJCf84iM9kzgHhKWeUk5gIiYUc7KJihb6ybPrlYsH0cA77jzHuhhubPfS/tG1lL/rnUVhMtm5/wEaOpeJqU93bxkCy0MVs"
+        "B/2JypR/9tHzirLvYj/tdQReG7t1YfTXLpcJhtPkt90kOqaW+PzlqqYBe0eg8S9VBivrNSIWfLm1Te53BJcdqyc9kHYn67b+hiTb2wR2nW6XKdvILgay"
+        "OJcyWcuZolVy+bInjHSyQvHltl5bJlQRrpQeWR///u7PFBU4S6fqxElQ+H5V2FpqSl7hXN1SW3X/rYKIcyjNknlefLTsSIIoqb1pulaZTvfTNC4opp7D"
+        "OV5MmcR9/OQRrYEmYhUyh9mcBsG8QNccIJ3XTAZUQ+447UKuFjFHhU+F6TcGrtMuVE54S5+CcmzWvgDJg+5wJHa30I8gmg365d0/Sf4kAegZYOoopYRJ"
+        "tcFYTxN6SuaKFDujxKwoG9WUUGa0DwAWRNNokOJ2HY3ViYBZKiDpyGxquxogw51nzjUAGcmY7MbCM3r1HahjCQV1+iQuuMlBRBOil2dEFsJfW8/AbuX1"
+        "bfDxV42a9dAQ2JJecRUjZi2QcnPzBv4ig2ZlkjfNDL0brRZPix5TEqobWhZdXgF5hVkxM7cldLLqLetSyA+rDrMhB2XSVpuITLQkMujxIUtHJ6Yk0/1d"
+        "zqaFhf7VHCnIlsrmlafzbCgte4Wy53IPlPnaYk7ub+KLJVy3zbZR1LIsmkfex+QFgvQh0chMWQaT0kuFQbrMQ+ijS9EC+ozuRZN2UobYLrNLOR8XLpEi"
+        "8uU7CTYtSGx1fENjNYFhg8ASOau0kvNbxfcsKpQbGDxE+QnzCXFXWNq2Wd8iGCshS/GMV7/HnY6Kuon+uKtuaHDt11h0ngPkLe2Bi3mmnZrLmTOF0sDd"
+        "Wkod+UFhVt1XKlpX5xbVa5gRtGEFLQMZG8t+yr7h6gedX/EsrJJ8No/FAGacU8RF3oPi7ZhSG1zkbKfskjC2OckpoOo6J9HXrRlWj4hFRQpsWJFQ0pr4"
+        "vCj86K5KDbx+MK/EqgyhXBKjYj2XxEVOiasvene7aTG1v6F1cUpDmB4SInQwVKQoc+lQ6WlYGgZ7gm1j+EBmMHzgTC7sfthAtUjLwm5q5Mr2Q3fc2doY"
+        "wGL3SHjWzo9uliFg16gRPwyKCeJ451aPn4cyijuaQ4GM6RvOvz7nbXcY2VzDYWSxeZm9E10x5OfilquI4dt+vw4VOiTr76oKR40s2+6dh+hjqTg8iz3w"
+        "Y4PzAuGyrqa8rD+tn3Hz9andvNk+tb/3bP/aaw3S56qOFJ/tPH6yt9yTgi65CGZ9WEEZ9zmfzpqJIQlA9X0ZuimUfmcNmXqGaRwHs1yGTspN13nGrod3"
+        "PwVRkjs1KXPWN/+LU2Z98z+VgOy4sUYJaPBRiJ41Jt8Nz3YUF1bKqNXtBLR/1r1AaPrAsSsvom26/kcHGJjecEGU/rL6slabsj1eBhir9DHfVeRsATsU"
+        "6D7VbUYeO2s0KhRqvfa+2Nt/cvLRwYODx4cmOZTOAFVektRCFt1LDey2jmDToeIxhyqncQrCOO4nPLjBVdyTGnBZy702r6UQtKjO6RyTe3rerPrD3nPe"
+        "tMbWTH4HlHG6NYJXozJhWlgEcxAMT8cZiF7hFvZhptpMqohn+HKaPo+IIHEVOk9aRtyGCfEsMg/jMy4rToBpyKZnZ6OAlVgLl8udry/19cYPpUSAfdUR"
+        "Htey11LXEqrYQg4wT0O1NW3zVPVogf7qN4vg9k91Kx8F6EB6Rxy5V0TV+nIz3DIB4UKqhNtiz10i2ziMknduYZFbselOFXJeoGpH0ix1p/IG1NZNVFpv"
+        "uZnSjjQMHLff14I3tbjkVbcd+2P7ntUSoLrc4bZ1oalZC9zbTrcefV8r0kiZiJz0USBZRJi0CQ/vD62sHx/9VZZPHRO6IKaWjk4M+R7a/gebeK8qWtyM"
+        "rxiJwdiXlbFmBc+pqpFiBjiGeeqNL68dVMITaExhQz03A4VFzqayCNAXrkaRq6thR0kqmoBklJcCV+Jo89hOfrCSl5g8Wyz2qCtzpf+CL81Vrg9dF51G"
+        "KSg6HYlBIdK/NFL+QkIXDdWJNi6AopWcn/K/L5UAC9SH8GpjeP7Z4OekguTDDrUU6wsreWHIGvSzjcHPtQMaFgRWP5+iuVplWG+j42WHU+XB7ptABK8W"
+        "K9XkoGV4fUteUnnWbvIjYMjv5lEylHc2S3tmjQLKMwYcdWGye/LZQHVLvmxJPPqsaRa3jwh63jDSVVuIkSxUi51ZrDN89uggiQCDTm/batBVjVaq2oac"
+        "ns6B6zRYdN5K+F+Plqoj34LpYgn3yJ9sbMt2bYPN2U7yOBu9UbghNKe/ldujeFlQNSCQLnmkIx26TZsJVpItlR77KyT1q+0LBTzrTHvNyV10HusFErq2"
+        "kVPnpfR7zYVFKznnktSclghrp+e0Y+dULz3xx5v6ZugVVat7O/uHoEE+/fT+k70H9w+frOGvjgT/YZCAFph11NG+vnFa3TCczwfl7d46V6gqerwAkhf5"
+        "DryHtn+VD/WmeG+RG8FCRwJ1I2+3tWiLJwE8VAwaDU72laN6Dm9P2H6z9GR+tQPYFQ5eYTy9P0RYDBGamvd4g1WtzaOTgYSW6QJXqNoWHWiWTjWX87Ec"
+        "vfpuXAvy7Ti5uNa87plbxnbVsauzqatEgfEpIZ4IHtcOYK0sWw1HoTx42+m//aRsjQAAXNcmJ37XieyrlTKV2WYn0rYoCXssMaV+g/SnD0vanPprPv3D"
+        "1ax4DX4GWkD9YPYCBPtBmoV4VZMCfniXp0CKcZE6fXLN69aSrTXor0nVnC2uEMey3FTdbGXGfTNJ7hqsy4kV8b6XFCOgJc24wNulilTBuhpz4J77rrIf"
+        "eF+BEgwVWllZdcsTNTMg5pg6MYvNLwAZk9wwZP3jXvlvn2EOPe1dl4RcdM4jiX5aT+WgTxxwBMS2qzwVnU7OJ1EhSUPTPTlvnjb+aOqTGl+Jn+59dLB/"
+        "8PBfrxO8LYdpkk4vruRJp+pe1ZluT1df25/uk3mBN03wHa46fwtsH12Ii6ewQTKDOpyBYM3o2hXp6hp3mKplAkCLA1AvLEl1uNhFoeE8Br2fk7E6i8H7"
+        "J/r3dwmA8F7bQoHv6ds8f1l6Qq2ntSjb+lXPqAewOmP7NoVaPpaBj1cNn0ThgnPSgX9Oy2Psg6GfX0wHadzQGlCD06ZyC05+r3bQMQXqesHRRPqysijs"
+        "iUHP9FrS1H/8P65rlpNfs0o6rR0x6TvWOS9bnudDZxdmJOxj1K2NaQ2kvQLjb0rv3WsXrJUcqyWEBbTJVzBdGl6ig0oqoSnpbPVMhyAZeE3CneVU2FCL"
+        "Y0G1C+vgMkIipuG8oTxoXuY8rrh03FxVpIGhjq++RSqfGN/vjo1OBnGc3PUm7AHzt1PP6UzHOtyTwJbG6ubYiym7uvZwcS0nhQYu0uqTpgkjbWDlLkTj"
+        "Ok9bih72BgPVuK0yZi7KFz+dbcH/tL89u3FYxWHEzb74VrJeXrvGzD5q2OXx1IoJVg4ePbl/sL9ebhUGgKtlVlF1r8qeD6j6lVKq7FJgvZJins3HIKuy"
+        "C6V139KzOfxN5sn4neDReq1WYc06ODmFr+i6XVOlVldu7Cu/jKG76gaLd7RSngxfPMQ7rGAZoWQwoCXNIsp0h9eAoVMqVPfdROWuYkygqvxo9TU7qrcn"
+        "fHv1NMhPMVN8T+yA5isu51N0BwTewZk6DotoVNDbV3+mqIu+Hce6IFwmT6ROuYIKhWvgpQuzVc4V+nGCncrQ4vLunRfpeWJfw2gMuhdyhYj/8SQlIZts"
+        "Llv6Qmlp5tR0l8JyEwQNqqpimZnXLpOzp7ndPCPrqvn69Uv/5p/+9jflxZy2TlW1eDitNXgFN0C9usK8lryjeTIZT6acRftliN9/85/+7ZXSaVyrpUzj"
+        "FXABY6YzJi2RwNydV1xx+RUaNE0lodlZ8H6jR3KtHeetO0Qc/LJxc0UjBGOK2Y0egn0P575mUy3+wOiX9EHNLQk44OTV32SI6eWVurZLW+eQbxLHq2OV"
+        "qGyuFifJQJGhGrnZDbI5XcGMzAAdbO+lRf/gHAitQFMbMgVZqLsr6rSFBIQF7GGNPD3WFrm3NjpHYqVsboHx3eZg3HqYrIKYX2vnaetSYqR1PEn7vmIQ"
+        "xxptQWtsppmsd393q9I4yopW48sk/co4mEXxnZejDIM28iHFMhS+UFdj9lFIxDgHEJ1pJ/UVo4qXeZUmAVLoaih1HZSY69u5uTzFMiO4YSOZkR143Qg0"
+        "/1IMolyEwQT4ZkPj6tJHus4R5jfp6+tPoYvduZgAAWKe+wjk8Gg+hb58x+/DFS5oHX9INcfWcxx6ZEl/DUcASrtBI8h5SmjRkDynVzMPWv9XSUQh52UU"
+        "oniQJuP+g2gkFU0zErRSQByKV9LbZqRpyfJdIUe669d//ltxTyZz0HwAzBIKXOKMfPhl59H9/uFwEr/6Lsd7OQgoMQeE4JFM53luAclNdC1O6HZ5A59Q"
+        "LEExJwe2yLf44K3wwQDDeiacrM3JZM4LgMmzZouVoJUDdVye3NN8qPmcYlHwjmJ3Y63K+PWUWzU9w/IWgsJawrth3QjsBO+ukIVq7/EXe4/xbG9PdJJ5"
+        "JihoH69J5fzv3XWUodzQhKsF/prqVw7/LYnS+lqRTihIYapGpq9FvfkqZz2SLRa2iZDmlKaer9qu0FKEY0ux0sSxR1QPFYMzTIiNIWcYiTJSF27ndKSC"
+        "RT5GL24i5K429pYOApems9YCeosY1rT/tRRJwGX//B/EzmkxD+A7w2kllvGfR7EMENbVvbdrqZeqSnlw9kPpmOqK9+d0GbcOM2daYjNYgDqpwsRQJs0w"
+        "wAF+UwUTPBnpA7tWdXS16ANuT51he6XoyREJGeU7qUpxPcoe0G4HL2XBt2sP1xtX7zV/U3N4rhOWNxVo2vvcksrXqla7xniBCTxvEpEF33DcKvCWlbpO"
+        "ra2lYQh4k0yTDNoeK9U8Rd2/9jB7AxO/VjBpeqgRXZJxy7EtLFA0aSQs2OUNiuaqhv8rBMX84DKsM9WVZFg0KbCANS9AvlRGe5lFw8UCrM5LUdnnNYRe"
+        "zj556/ZP3v/pB3/84b/YNE81gdelPJyKSWnNua01v5kM/FgC0OenCEEYfO7cRql6RiFYpbAGKDxNZ8QJYR6SUouo3KSuDHwus2YVKU+BhIGIgH9KARB0"
+        "vQeSAmLxgFVI5RFQkauhMWPgNRdwlLwmxoY4gXtuaV818Voj1FuVsB2WrO5cd40XfOfaQlixzypWksx5BWE7wkqrdzHMHlQzZLcnJomI0Ltgr7zXrdTd"
+        "Eq7Mn/lJWihSW6bpoUB9ewR0y/2pjkVt1ggcYctSCsoMt+voAQ8OPjm8qgJgdnk0pYyRnShP23x8UYIwmYCxXOmgS87coUkEjCVUuC+ogf3dPULAMLjA"
+        "nOX9MBpTQOM0TYqJ9Qa21oZzZV7RbeLo6m1iPmW30QgUWOm22kSPddLKPFW01HXIjdPx1Q6GsOJVVaAHVPequs9TlbzoHNQPBARMzo3X8oxB2ESOjpTC"
+        "JUJoHWIaR8cdrJKyxm8bjt5ltQWX23KQelcVlXkYFesoKHgNRyT/EAoKSXc5pvMs0lMgEsx1XL2E1RKGEoH2INCTkccAUFS0lNK4KAuEO2UO6fFVT0Lm"
+        "b09NeQoMjbxx0gkrIE/VPwF5lu3KIoji/AfXSPROLYyPWV8jadpLTaKBFeaLUhdIlSOEI11CxnAP+dL33/z2f2uUJw71/Td/9dd4uZTZR29hu8GwSLNV"
+        "1BYYY3pK/dMxHIXC/uf/hj1Rt5TbpEPt4VLpBtfRMaQf0o7XYljethj/xgdADYHpVQSvJIbpoIgX4/WJaBcgLjgNXlAhJVBifiR5HkyyovtDOwetJJJ8"
+        "8vn9B7vi/u7hmxsmSRSMrni1va58VY7MOvX93fwtmiRdtULpD5ZXk2hVGiyjpNIfzG1MnI1ZKQGOWPuD8+6mqIOQb6C1MqXdFEahnzS76/9z2xUJdtYy"
+        "K3KNN2falimxooOWpsS3wVItDbBqBTSpRh5GxRiEhJCZ7cd4ffsPzmPVutY7Hb+p0Q8voV/Axsb+qna6sR+cATdC3kLM7utfk+xNxwAZUGuvTd3dwqNr"
+        "QLKTNMGQBotTYn22xbFBQp9NcEIJEOaxQDoaUZLidVjnGMg6embaV14rzcp86nInrXNuate0MUIo+f/KtOYQsM4f1rh2VUNZIz2tJ92sumrMVlEdtJqI"
+        "NrC92tHwXkZXBAI/ol9JcQ5UP5YZDGyeq7sEbQNbRYnQ9rbFdjYHEt/MgBUuvvNpok1U6xqiwoWGqHA1Q1QDpai6twCNcOygzkdlDTVittdo2QrbjVnh"
+        "msYsLWO5pizbTXutmxL3P3v19f7u/U8+3/9kzasSkwTWlS5SuMJNiarylS9KdK4wvIJb71PisaeYaB8mRBessftpoq5JfEckObVOjiRnT/4dkeDUMKcY"
+        "w76OCOdUfIPASg7jcKGiJbyy2mldzAnWlSUXh1d+eOXwSpeLIODo58APgwtjtQ04vYR1XVIARGUm8WqK3rUV3e84LwamuQg0e0aie8VbklcO5WxPFuhs"
+        "0wbPCm9peLHircW6fj19YIOg9AMF+lRWw0Fvh2zC9qIKfuRN0wSecX7FXObq8VyiG41+P5ln+nmUReopB40i089zauN4226+6X6lHvVbuXUjtOz3jXE8"
+        "Ifu/H5OWYV//HE3lSte2erc+rN3OCvDbFK4EU5enMc1qEJXPwMvLH3TQAY/HlYlkyyaS0USy2kSm+VipSyBjBpkMqBJgPW75T2q3/hlmUrkkYNK85Itv"
+        "AkAXgY8mAChQ9/zVtxNM4c2KgnbsxIQfJJs9wnuls1wlvhhHYdcHyT6xVmBGeeT8IbfXeHmApUjTgFe4PWsCWh0P9kd0f8BEuXaw1lmVm20ibS7RaD9M"
+        "XuFam6cpJiTFrLs9Bdg6zOvzSYZ3t3p8tWG3ciLLMgBsG/LRHkKcrqcWHK/umFjNlRvbQ5i4YqiYyyzNSR2PXAdz8Y2m+Ld6rQsTdszGb6LC1H6S3Myb"
+        "pj4oGrSFo10mTcPGVG/daqGl6ztNru8Z+QZekW/mEXkFWZKtN+IGaPXoW4xw3Rj67ghqOVdaSVRTHTRLbNzQqqJq09XLVvSAmYH3ti6QuGJWFJOFWGmp"
+        "z9E8b11z3JJ+eLWLhhlONsp7yxt9js1tusE8H5OgYV9Id+VsKZSTfb/pvuZFq7iuYNW4iHmRInS8jbXDptoWDjRc7OitrNbr3/wdGucOeeSuB1lVQVl0"
+        "PZAeNdlZoQN+alFO1MclqEScCIvmFVzAd7c7uV+aGA8SvlIYah0oC2Jp9bX2X9esuSwa39CGwsHtnB0U4UEnTjNJUPgtZoCf6XxtW1g2UUEIN24I88NU"
+        "Lu2U9W/KTtntmXRMTWPi9T6JZvYMtJXpkddtMS0278qK+7FykD0PMgGm7gqE1QaxXO1CQP0xcYywSffYiT03xWIlp5C4VjJNjh+7l6aFen7X/mu4MxYG"
+        "6+YjJKQbtSMd2aU1skl1rIChourRzUQH8qr1rcz3YELd9aejzWNfhcerPPCNCeZUgmVGMm0ss3O9OQV64iebJuUb7lL1amm857s1HeNCypPnKDC7WRQx"
+        "0V1UyJN5Fus0xvzm8wxVBPu7u0rKveBBOo4wYPT69Vy/OonxncmUNZvFF8qMjLlVOqYcYiQuWtcpSsfFOK78hI7jzFeA1sdzOTzF6DOUbDDMUZ+SPZYD"
+        "TG0sOnep7zsgoHStVYnxztFOnMLWwAoATQiyIWaqh43qbBzdvXHMtTpHQf/y+GZ3o8t5KLtHt47txYqnzrETsYyv0IId0Q2zejA7iR4ihjgNMlIK/Abb"
+        "/yiI4paaaB0mL+w4IGM7heQVBd4rBaJHgeeB+bytXdogaNYdSBzMR2s3BVul7pvwdq1YQd51POTigyoZoVBAZsvCB0JzFE+Pq20h/W2bIIVRVQzNE2g+"
+        "zS7QfoRKLWWo7/D18BiDYHYTU23RTQ3VU1AAmB0dYwZjt65YhF8qMF9mp3GAxww9cR5k8ykdvu9hQo8BJvmkewLDAGfqq1YxUXA66FP8WB9WmhLS1xNL"
+        "T6KQwuAF4AXHqauMkmX4bpk50sElurlHv1L5+c8PEvLSQQpvSTGUuJLRGI8vZMhclA8FSOYazzM3lwITB4krYnx/7KvpYdFYG4WVwfsut8jJmCNVToMp"
+        "3bYYVlYzEV/IbBAluLH+NSeg3+A6DUwxY9otR0hUit/TKI5P6RoscTnPXn03PGXnRXU+pJ2/rWZ05LR1Pl4LyKsmM6utmj0WBBqAZQpxLXqAOBjtuPRU"
+        "Hq9FhTIUSWY3BdI13XHE/t58WIZOmZJ5P99odIi6fEFR4XQRWD5DTg5Tsa//qkBAOgAFadZhPxfPuviLJlcr3yThNELVyy6W5r//DwDUL/4="
     ),
     # map.js  (8.934 Bytes roh → 4.372 Bytes base64)
     "map.js": (
@@ -13440,7 +13837,12 @@ def main():
         if n:
             print(f"   Shop-Katalog aus types.xml generiert: {n} Items -> {shop_file}")
 
-    catalog.load()   # Item-Katalog (shop_items.json bzw. shop_items aus config.json)
+    # Kataloge sind serverbezogen. Der Hauptserver uebernimmt beim ersten Start
+    # den bisherigen gemeinsamen Bestand; alle anderen Server starten leer und
+    # holen sich ihre types.xml per FTP von IHREM eigenen Server.
+    _haupt = connections.primary()
+    if _haupt is not None:
+        print(f"   Shop-Katalog {_haupt.name}: {len(_haupt.catalog.items)} Items")
 
     valid, missing = cfg.is_valid()
     if not valid:
@@ -13512,7 +13914,9 @@ def run_dashboard_only():
     shop_file = str(cfg.config.get("shop_items_file") or "shop_items.json")
     if not os.path.exists(shop_file) and os.path.exists(TYPES_XML_FILE):
         generate_shop_items_from_types(TYPES_XML_FILE, shop_file)
-    catalog.load()
+    _haupt = connections.primary()
+    if _haupt is not None:
+        _haupt.catalog          # laedt bzw. uebernimmt den Katalog des Hauptservers
 
 
     async def _serve():
