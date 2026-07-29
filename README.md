@@ -239,11 +239,27 @@ Der Bot kann mehrere Nitrado-Server bedienen. Jeder verbundene Server steht in
 
 | Kategorie | Wer sieht sie | Inhalt |
 |---|---|---|
-| **🗄️ Serverliste** | nur Admin-Rolle | Alle verbundenen Nitrado-Server mit Name, Service-ID, Karte und zugeordneter Guild. Der Stift-Button setzt die Guild-ID; beim Speichern werden die Slash-Befehle sofort dort registriert. Leer lassen entfernt die Zuordnung. |
+| **🗄️ Serverliste** | nur Admin-Rolle | Alle verbundenen Nitrado-Server mit Name, Service-ID, Karte und zugeordneter Guild. Der Stift-Button setzt die Guild-ID; beim Speichern werden die Slash-Befehle sofort dort registriert. Leer lassen entfernt die Zuordnung. Eine offene Anfrage steht als **⏳ angefragt – freischalten?** in der Zeile und ist im Stift-Dialog schon eingetragen. |
 | **⚙️ Optionen** | jeder angemeldete Nutzer | Der eigene Nitrado-Token maskiert (`••••••••1111`), Auge-Button zum Einblenden, Stift zum Ändern. Darunter die zugeordnete Guild — oder der Hinweis, dass der Betreiber noch freischalten muss. |
 
 Eine Guild kann immer nur **einen** Nitrado-Server verwalten; der Versuch, sie ein zweites
 Mal zu vergeben, wird mit Nennung des bisherigen Servers abgelehnt.
+
+### Freischalten liegt beim Betreiber
+
+Der Guild-Schritt im Onboarding **schaltet nicht frei**. Wer seinen Nitrado-Token verbunden
+hat und dort seine Discord-Server-ID einträgt, meldet damit nur einen Wunsch an: die ID wird
+als `guild_id_requested` an seiner Verbindung vermerkt, in seinen *Optionen* als
+„⏳ Angefragt" angezeigt und dir in der *Serverliste* zum Freischalten vorgelegt. Registriert
+werden die Slash-Befehle erst, wenn du im Stift-Dialog speicherst.
+
+Zwei Ausnahmen, beide beabsichtigt:
+
+* Wer die **Admin-Rolle** hat, trägt Guild-IDs weiter direkt ein (Kategorie *Guild IDs*).
+* Ist die eigene Guild bereits freigeschaltet, prüft der Button „Ja, habe ich" wie bisher
+  erneut, ob die Befehle stehen — der Aufruf ist absichtlich wiederholbar.
+
+Eine Guild-ID, die schon zu einem anderen Server gehört, wird in beiden Wegen abgelehnt.
 
 ### Abgrenzung im Dashboard
 
