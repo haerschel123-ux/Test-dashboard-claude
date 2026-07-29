@@ -2267,15 +2267,31 @@ class ServerConnection:
             self.data["log_state"] = state
         return state
 
+    # Werte, die NIEMALS aus der globalen config nachgeladen werden duerfen.
+    # Sonst liest die Verbindung eines Kunden die Zugangsdaten eines anderen,
+    # sobald dessen Daten in der config.json stehen.
+    _KEINE_RUECKFALL_SCHLUESSEL = frozenset({
+        "nitrado_token", "service_id", "ftp_host", "ftp_port", "ftp_user",
+        "ftp_password", "ftp_log_dir", "ftp_ban_file", "ftp_profile_dir",
+        "ftp_mission_dir", "cfg_effect_area_path", "server_ip", "query_port",
+        "rcon_port", "zones", "shop_items_file",
+        # Karte und Neustart-Zeitplan beschreiben ebenfalls genau einen Server –
+        # geerbt wuerde sonst der Zeitplan des Betreibers auf fremden Servern
+        # Neustarts ausloesen.
+        "map_name", "auto_restart_schedule", "auto_restart_after_purchase",
+    })
+
     def get(self, key: str, default: Any = None) -> Any:
         """Serverspezifischer Wert.
 
-        Kennt die Verbindung den Schluessel nicht, gilt der globale Wert aus
-        der config.json – ein leerer Wert in der Verbindung bleibt dagegen
-        leer und wird NICHT global ueberschrieben.
+        Fuer unkritische Einstellungen gilt die globale config.json als
+        Rueckfallebene. Fuer Zugangsdaten und Serverkennungen NICHT – dort
+        wuerde der Rueckfall Daten fremder Kunden liefern.
         """
         if key in self.data:
             return self.data[key]
+        if key in self._KEINE_RUECKFALL_SCHLUESSEL:
+            return default
         return cfg.config.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
@@ -3504,22 +3520,21 @@ async def setup_overview(interaction: discord.Interaction):
 
 async def _finish_token_setup(token: str, service_id: str,
                               service: Dict,
-                              actor_id: Optional[str] = None) -> discord.Embed:
+                              actor_id: Optional[str] = None,
+                              guild_id: Optional[int] = None) -> discord.Embed:
     """Wendet Token + Server-Auswahl aus /setup token an: speichert beides,
     erkennt FTP-Zugang & aktuelle Karte, initialisiert Nitrado/FTP/Shop neu
     und gibt ein Ergebnis-Embed zurück."""
-    old_service = str(cfg.config.get("service_id") or "").strip()
-    cfg.config["nitrado_token"] = token
-    cfg.config["service_id"]    = service_id
-    if old_service and old_service != service_id:
-        # Server-Wechsel: per-Server-Caches leeren, sonst zeigen Pfade,
-        # Server-IP und Log-Offset noch auf den alten Server
+    # Die globale config.json wird bewusst NICHT mehr umgeschrieben: sonst
+    # wuerde der Server des zuletzt einrichtenden Kunden zum Hauptserver, und
+    # seine FTP-Zugangsdaten laegen dort fuer alle anderen bereit.
+    vorhandene = connections.for_service(service_id)
+    if vorhandene is not None and vorhandene.token != token:
         for k in ("ftp_log_dir", "ftp_ban_file", "ftp_profile_dir",
                   "ftp_mission_dir", "cfg_effect_area_path", "server_ip"):
-            cfg.config[k] = ""
-        cfg.log_state.pop("current", None)
-        cfg.save_log_state()
-        log.info(f"[SETUP] Server-Wechsel {old_service} → {service_id}: "
+            vorhandene.set(k, "")
+        vorhandene.data["log_state"] = {}
+        log.info(f"[SETUP] Neuer Token für Service {service_id}: "
                  f"FTP-Pfade und Log-Position zurückgesetzt.")
 
     api = NitradoAPI(token=token, service_id=service_id,
@@ -3529,34 +3544,38 @@ async def _finish_token_setup(token: str, service_id: str,
     finally:
         await api.close()
 
-    warnings = []
-    if info:
-        _apply_gameserver_info(info)
-    else:
-        warnings.append("⚠️ Gameserver-Infos konnten nicht geladen werden "
-                        "(Nitrado-API-Fehler) – FTP/Karte nicht erkannt.")
-    cfg.save_config()
-
     details  = service.get("details") or {}
     name     = details.get("name") or details.get("game") or f"Service {service_id}"
 
-    # Denselben Weg wie das Dashboard gehen: Server in die Registry aufnehmen.
+    # Verbindung anlegen bzw. auffrischen. Bewusst OHNE die Werte aus der
+    # globalen config zu kopieren – ein neuer Kunde soll nicht die FTP-Pfade,
+    # Zonen und Zeitpläne des Betreibers erben.
     # Besitzer mitschreiben: dieselbe Person erkennt das Dashboard beim
     # Discord-Login wieder und fragt den Token nicht erneut ab.
     fields = {"nitrado_token": token, "name": name}
     if actor_id:
         fields["owner_discord_id"] = str(actor_id)
-    for key in _CONN_SERVER_FIELDS:
-        if key in cfg.config:
-            fields[key] = cfg.config[key]
-    connections.upsert(service_id, **fields)
+    conn = connections.upsert(service_id, **fields)
+
+    warnings = []
+    if info:
+        _apply_gameserver_info(info, conn)
+        connections.save()
+    else:
+        warnings.append("⚠️ Gameserver-Infos konnten nicht geladen werden "
+                        "(Nitrado-API-Fehler) – FTP/Karte nicht erkannt.")
+
+    # Ohne Zuordnung bliebe diese Guild ohne Premium – sie richtet hier ja
+    # gerade ihren eigenen Server ein.
+    if guild_id and connections.for_guild(guild_id) is None:
+        connections.assign_guild(service_id, int(guild_id))
 
     # Nitrado/FTP/Shop mit den neuen Daten (neu) initialisieren –
     # inklusive FTP-Auto-Discovery der Log-Verzeichnisse
     await bot.init_nitrado(force=True)
-    ftp_host = cfg.config.get("ftp_host") or "❌ Nicht gefunden"
-    log_dir  = cfg.config.get("ftp_log_dir") or "❌ Nicht gefunden"
-    if not cfg.config.get("ftp_host"):
+    ftp_host = conn.get("ftp_host") or "❌ Nicht gefunden"
+    log_dir  = conn.get("ftp_log_dir") or "❌ Nicht gefunden"
+    if not conn.get("ftp_host"):
         warnings.append("⚠️ Keine FTP-Zugangsdaten gefunden – Log-Feeds und "
                         "Shop-Lieferung funktionieren so nicht.")
 
@@ -3565,7 +3584,7 @@ async def _finish_token_setup(token: str, service_id: str,
         description=f"Der Bot arbeitet jetzt mit **{name}**.",
         color=0x2ECC71 if not warnings else 0xE67E22)
     embed.add_field(name="Service-ID",      value=f"`{service_id}`", inline=True)
-    embed.add_field(name="Aktive Karte",    value=cfg.config.get("map_name", "–"), inline=True)
+    embed.add_field(name="Aktive Karte",    value=conn.get("map_name", "–"), inline=True)
     embed.add_field(name="FTP-Host",        value=f"`{ftp_host}`",   inline=False)
     embed.add_field(name="Log-Verzeichnis", value=f"`{log_dir}`",    inline=False)
     if warnings:
@@ -3625,7 +3644,7 @@ class NitradoServerSelectView(discord.ui.View):
         try:
             embed = await _finish_token_setup(
                 self.token, self.selected, self._services.get(self.selected) or {},
-                actor_id=str(itx.user.id))
+                actor_id=str(itx.user.id), guild_id=itx.guild_id)
         except Exception as e:
             log.error(f"[SETUP] /setup token fehlgeschlagen: {e}")
             embed = discord.Embed(
@@ -9302,16 +9321,22 @@ def _cached_ftp_available(reason: str) -> bool:
     return False
 
 
-def _apply_gameserver_info(info: Dict) -> None:
-    """Schreibt FTP-Zugang, aktuelle Karte und (falls leer) Server-IP/Query-Port
-    aus den Nitrado-Gameserver-Infos in cfg.config. Speichert NICHT selbst."""
+def _apply_gameserver_info(info: Dict, conn: Optional[ServerConnection] = None) -> None:
+    """Schreibt FTP-Zugang, Karte und Server-IP aus den Nitrado-Infos.
+
+    Mit Verbindung landen die Werte dort – das ist der Normalfall. Nur ohne
+    Verbindung wird noch die globale config.json beschrieben; FTP-Zugangsdaten
+    eines Kunden duerfen dort nicht liegen, weil sie sonst anderen Kunden als
+    Rueckfallebene dienen wuerden.
+    """
+    ziel = conn.data if conn is not None else cfg.config
     ftp = NitradoAPI.extract_ftp_credentials(info)
     if ftp:
         # Immer überschreiben – fängt von Nitrado geänderte Passwörter ab
-        cfg.config["ftp_host"]     = ftp["host"]
-        cfg.config["ftp_port"]     = ftp["port"]
-        cfg.config["ftp_user"]     = ftp["user"]
-        cfg.config["ftp_password"] = ftp["password"]
+        ziel["ftp_host"]     = ftp["host"]
+        ziel["ftp_port"]     = ftp["port"]
+        ziel["ftp_user"]     = ftp["user"]
+        ziel["ftp_password"] = ftp["password"]
         log.info(f"[NITRADO] ✅ FTP-Zugang automatisch erkannt: "
                  f"{ftp['user']}@{ftp['host']}:{ftp['port']}")
     else:
@@ -9319,18 +9344,18 @@ def _apply_gameserver_info(info: Dict) -> None:
                     "Gameserver-Infos gefunden.")
 
     detected_map = NitradoAPI.extract_map(info)
-    if detected_map and detected_map != cfg.config.get("map_name"):
+    if detected_map and detected_map != ziel.get("map_name"):
         log.info(f"[NITRADO] 🗺️ Aktuelle Karte erkannt: {detected_map} "
-                 f"(vorher: {cfg.config.get('map_name')})")
-        cfg.config["map_name"] = detected_map
+                 f"(vorher: {ziel.get('map_name')})")
+        ziel["map_name"] = detected_map
 
     # Bonus: Server-IP/Query-Port nur befüllen, wenn noch nicht gesetzt
-    if not cfg.config.get("server_ip") and info.get("ip"):
-        cfg.config["server_ip"] = str(info["ip"])
+    if not ziel.get("server_ip") and info.get("ip"):
+        ziel["server_ip"] = str(info["ip"])
         qport = (info.get("query") or {}).get("connect_port") or info.get("query_port")
         if qport:
             try:
-                cfg.config["query_port"] = int(qport)
+                ziel["query_port"] = int(qport)
             except (TypeError, ValueError):
                 pass
         log.info(f"[NITRADO] Server-IP automatisch gesetzt: {info['ip']}")
@@ -10607,15 +10632,15 @@ async def post_select_server(request: web.Request) -> web.Response:
     _apply = _apply_gameserver_info
 
     # --- Kern von _finish_token_setup (ohne Discord-Embed) ---
-    old_service = str(cfg.config.get("service_id") or "").strip()
-    cfg.config["nitrado_token"] = token
-    cfg.config["service_id"] = service_id
-    if old_service and old_service != service_id:
+    # Die globale config.json bleibt unangetastet: sonst wuerde der zuletzt
+    # eingerichtete Kunde zum Hauptserver und seine FTP-Zugangsdaten laegen
+    # dort als Rueckfallebene fuer alle anderen bereit.
+    vorhandene = connections.for_service(service_id)
+    if vorhandene is not None and vorhandene.token != token:
         for k in ("ftp_log_dir", "ftp_ban_file", "ftp_profile_dir",
                   "ftp_mission_dir", "cfg_effect_area_path", "server_ip"):
-            cfg.config[k] = ""
-        cfg.log_state.pop("current", None)
-        cfg.save_log_state()
+            vorhandene.set(k, "")
+        vorhandene.data["log_state"] = {}
 
     base = cfg.config.get("nitrado_api_base", "https://api.nitrado.net")
     api = NitradoAPI(token=token, service_id=service_id, base=base)
@@ -10624,22 +10649,23 @@ async def post_select_server(request: web.Request) -> web.Response:
         info = await api.get_info()
     finally:
         await api.close()
+
+    # Erst die Verbindung anlegen, dann die erkannten Daten hineinschreiben.
+    # Bewusst OHNE Werte aus der globalen config zu kopieren – ein neuer Kunde
+    # soll nicht die FTP-Pfade, Zonen und Zeitpläne des Betreibers erben.
+    # Die Guild-Zuordnung bleibt unangetastet, die vergibt der Bot-Owner.
+    conn = connections.upsert(
+        service_id,
+        nitrado_token=token,
+        name=_server_view(service)["name"],
+        owner_discord_id=((sess.get("discord") or {}).get("id")))
+
     if info and _apply:
-        _apply(info)
+        _apply(info, conn)
+        connections.save()
     else:
         warnings.append("Gameserver-Infos konnten nicht geladen werden – "
                         "FTP/Karte evtl. nicht erkannt.")
-    cfg.save_config()
-
-    # Server in die Registry aufnehmen bzw. auffrischen. Die Guild-Zuordnung
-    # bleibt dabei unangetastet – die vergibt der Bot-Owner in der Serverliste.
-    fields = {"nitrado_token": token,
-              "name": _server_view(service)["name"],
-              "owner_discord_id": ((sess.get("discord") or {}).get("id"))}
-    for key in _CONN_SERVER_FIELDS:
-        if key in cfg.config:
-            fields[key] = cfg.config[key]
-    conn = connections.upsert(service_id, **fields)
 
     # Nitrado/FTP/Shop live neu initialisieren (inkl. FTP-Auto-Discovery)
     try:
@@ -10647,7 +10673,7 @@ async def post_select_server(request: web.Request) -> web.Response:
     except Exception as e:  # noqa: BLE001
         warnings.append(f"Init-Warnung: {e}")
 
-    if not cfg.config.get("ftp_host"):
+    if not conn.get("ftp_host"):
         warnings.append("Keine FTP-Zugangsdaten gefunden – Log-Feeds & "
                         "Shop-Lieferung funktionieren so nicht.")
 
