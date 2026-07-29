@@ -2243,6 +2243,11 @@ class ServerConnection:
         self._catalog: Optional[Any] = None
         # Lief die FTP-Auto-Erkennung fuer DIESEN Server schon?
         self.discovered: bool = False
+        # FTP-Warnzustand je Server (sonst verschluckt ein Kunde die Warnung
+        # eines anderen) und Zeitpunkt, seit dem er als online gilt
+        self.ftp_warned_ts: float = 0.0
+        self.ftp_warn_active: bool = False
+        self.online_since: Optional[float] = None
         # Zeitpunkt des letzten Discovery-Versuchs (Wiederholsperre je Server)
         self.discover_retry_ts: float = 0.0
 
@@ -2626,13 +2631,15 @@ class DayZBot(discord.Client):
         self.ftp:     Optional[FTPManager]  = None
         self.parser   = DayZLogParser()
         self.shop:    Optional["ShopManager"] = None   # wird in on_ready initialisiert
-        self._ftp_warned_ts   = 0.0    # Zeitpunkt der letzten FTP-Ausfall-Warnung
-        self._ftp_warn_active = False  # Warnung aktiv → bei Erholung Entwarnung posten
-        self._online_since: Optional[float] = None  # Server online seit (A2S, Bot-Sicht)
+        # FTP-Warnzustand und "online seit" haengen jetzt an der jeweiligen
+        # Verbindung (ServerConnection.ftp_warned_ts / .online_since) – als
+        # Bot-Attribut haetten sich die Kunden gegenseitig ueberschrieben.
         self._restart_announced: set = set()  # (restart_ts, minuten) bereits angekündigt
         # Zonen-Pings (/zone create): wiederholte Pings im Cooldown-Intervall
-        self._zone_last_ping: Dict[Tuple[str, str], float] = {}  # letzter Ping pro Zone+Spieler
-        self._zone_pos_seen: Dict[str, str] = {}              # Spieler → bereits bewertetes last_seen
+        # Schluessel jeweils MIT service_id – sonst greifen gleichnamige Zonen
+        # bzw. gleichnamige Spieler zweier Kunden ineinander.
+        self._zone_last_ping: Dict[Tuple[str, str, str], float] = {}  # (Server, Zone, Spieler)
+        self._zone_pos_seen: Dict[Tuple[str, str], str] = {}          # (Server, Spieler)
         # Der Discovery-Retry haengt jetzt an der jeweiligen Verbindung
         # (ServerConnection.discover_retry_ts), nicht mehr am Bot.
 
@@ -2723,7 +2730,8 @@ class DayZBot(discord.Client):
         if not announcement_scheduler.is_running():
             announcement_scheduler.start()
 
-    async def init_nitrado(self, force: bool = False):
+    async def init_nitrado(self, force: bool = False,
+                           only: Optional[ServerConnection] = None):
         """Baut die Laufzeit-Objekte aller verbundenen Server auf.
 
         Die Stammdaten kommen aus der Registry (connections.json), nicht mehr
@@ -2732,7 +2740,11 @@ class DayZBot(discord.Client):
         arbeiten, solange sie noch nicht pro Guild aufloesen.
         force=True (fuer /setup token) ersetzt bestehende Instanzen – die alte
         aiohttp-Session wird dabei sauber geschlossen."""
-        for conn in connections.all():
+        # ``only`` begrenzt das Neuaufsetzen auf einen Server. Ohne das wuerde
+        # ein /setup token bei einem Kunden die API- und FTP-Objekte ALLER
+        # anderen Kunden schliessen und deren Discovery erneut anstossen.
+        ziele = [only] if only is not None else list(connections.all())
+        for conn in ziele:
             try:
                 await conn.ensure_clients(force=force)
             except Exception as e:  # noqa: BLE001 – ein Server darf die anderen nicht kippen
@@ -2748,7 +2760,7 @@ class DayZBot(discord.Client):
         self.nitrado = primary.api
         self.ftp = primary.ftp
         # Shop-/Delivery-Manager je Verbindung (braucht FTP + Nitrado)
-        for verbindung in connections.all():
+        for verbindung in ziele:
             if verbindung.shop is None and verbindung.ftp is not None:
                 verbindung.shop = ShopManager(self, verbindung)
         self.shop = primary.shop
@@ -2757,7 +2769,7 @@ class DayZBot(discord.Client):
         # Mission-Ordner und Shop-Katalog gehoeren jeweils zu genau einem
         # Server – frueher lief das nur einmal und schrieb die gefundenen
         # Pfade in die zuletzt durchlaufene Verbindung.
-        for verbindung in connections.all():
+        for verbindung in ziele:
             if verbindung.ftp is None or (verbindung.discovered and not force):
                 continue
             verbindung.discovered = True
@@ -2830,6 +2842,12 @@ class DayZBot(discord.Client):
         """
         for conn in connections.all():
             if conn.ftp is None:
+                continue
+            if conn.guild_id is None:
+                # Ohne zugeordnete Guild gibt es keinen Discord-Server, der
+                # diesen Nitrado-Server verwaltet ("kein Premium"). Wuerde er
+                # trotzdem gepollt, gingen seine Ereignisse mangels Ziel an
+                # ALLE konfigurierten Guilds – also an fremde Kunden.
                 continue
             try:
                 await self._poll_connection(conn)
@@ -3021,14 +3039,16 @@ class DayZBot(discord.Client):
         loop = asyncio.get_running_loop()
         info = await loop.run_in_executor(None, a2s_query, ip, qport)
         if info:
-            if self._online_since is None:
-                self._online_since = time.time()
+            if conn.online_since is None:
+                conn.online_since = time.time()
         else:
-            self._online_since = None
+            conn.online_since = None
         embed = self._build_status_embed(info, conn)
         # Nur die Guild dieses Servers – sonst saehe jeder Discord-Server den
         # Status aller Kunden.
-        targets = ([str(conn.guild_id)] if conn.guild_id else list(cfg.guilds.keys()))
+        if conn.guild_id is None:
+            return          # keine Guild → nirgends posten, statt ueberall
+        targets = [str(conn.guild_id)]
         for gid_str in targets:
             ch_id = cfg.get_channel(int(gid_str), "status")
             if not ch_id:
@@ -3066,8 +3086,8 @@ class DayZBot(discord.Client):
                         value=f"{info.get('players', '?')} / {info.get('max_players', '?')}",
                         inline=True)
             e.add_field(name="🗺️ Map", value=str(info.get("map") or "?"), inline=True)
-            if self._online_since:
-                h, m = divmod(int((time.time() - self._online_since) // 60), 60)
+            if conn is not None and conn.online_since:
+                h, m = divmod(int((time.time() - conn.online_since) // 60), 60)
                 e.add_field(name="⏱️ Online seit (Bot-Sicht)",
                             value=f"{h} Std {m} Min", inline=True)
         else:
@@ -3097,10 +3117,13 @@ class DayZBot(discord.Client):
                      if isinstance(z, dict) and z.get("name")]
             if not zones:
                 return
-            # Zustände entfernter Zonen entsorgen
+            # Zustände entfernter Zonen entsorgen – aber NUR die dieses
+            # Servers. Frueher loeschte jeder Poll-Durchlauf die Cooldowns der
+            # anderen Kunden, deren Zonen dann alle 10 s erneut pingten.
+            _sid = _src.service_id if _src is not None else ""
             zone_keys = {str(z["name"]).strip().lower() for z in zones}
             self._zone_last_ping = {k: v for k, v in self._zone_last_ping.items()
-                                    if k[0] in zone_keys}
+                                    if k[0] != _sid or k[1] in zone_keys}
             cooldown = max(0, int((_src.get("zone_ping_cooldown_seconds", 300) if _src
                                    else cfg.config.get("zone_ping_cooldown_seconds", 300))))
             now = time.time()
@@ -3110,9 +3133,9 @@ class DayZBot(discord.Client):
                 # Nur NEU eingetroffene Positions-Samples bewerten – alte Daten
                 # dürfen nach Zonen-Änderungen keine nachträglichen Pings auslösen
                 last_seen = str(info.get("last_seen") or "")
-                if self._zone_pos_seen.get(pname) == last_seen:
+                if self._zone_pos_seen.get((_sid, pname)) == last_seen:
                     continue
-                self._zone_pos_seen[pname] = last_seen
+                self._zone_pos_seen[(_sid, pname)] = last_seen
                 parts = [p.strip() for p in str(info.get("position") or "").split(",")]
                 if len(parts) < 2:
                     continue
@@ -3127,7 +3150,7 @@ class DayZBot(discord.Client):
                         zr = float(zone.get("radius", 0.0))
                     except (TypeError, ValueError):
                         continue
-                    zkey = (str(zone["name"]).strip().lower(), pname)
+                    zkey = (_sid, str(zone["name"]).strip().lower(), pname)
                     inside = (px - zx) ** 2 + (pz - zz) ** 2 <= zr * zr
                     if not inside:
                         continue
@@ -3156,6 +3179,11 @@ class DayZBot(discord.Client):
         role_id = zone.get("role_id")
         content = f"<@&{int(role_id)}>" if role_id else None
         gid = int(zone["guild_id"]) if zone.get("guild_id") else None
+        if gid is None:
+            # Ohne Guild ginge der Alarm samt Spielername und Koordinaten an
+            # ALLE konfigurierten Discord-Server.
+            log.warning(f"[ZONE] {zone.get('name')}: keine guild_id – Ping unterdrueckt.")
+            return
         zone_ch = zone.get("channel_id")
         if zone_ch:
             await _post_feed(gid, "zone", e, content=content, channel_id=int(zone_ch))
@@ -3268,83 +3296,93 @@ class DayZBot(discord.Client):
             lt = "restart" if cfg.get_channel(gid, "restart") else "adminlog"
             await _post_feed(gid, lt, embed)
 
-    async def _try_refresh_ftp_credentials(self) -> bool:
-        """Selbstheilung bei FTP-Dauerausfall: Zugangsdaten frisch über den
-        Nitrado-Token holen und den FTPManager ersetzen, falls Nitrado sie
-        geändert hat (z.B. Passwort-Rotation). True = neue Daten übernommen."""
-        if not self.nitrado:
+    async def _try_refresh_ftp_credentials(self, conn: ServerConnection) -> bool:
+        """Selbstheilung bei FTP-Dauerausfall: Zugangsdaten fuer DIESEN Server
+        frisch ueber seinen Nitrado-Token holen und den FTPManager ersetzen,
+        falls Nitrado sie geaendert hat (z.B. Passwort-Rotation).
+        True = neue Daten uebernommen.
+
+        Frueher lief das immer ueber ``self.nitrado`` – also ueber den Token des
+        Hauptservers – und schrieb dessen Zugangsdaten in die globale config.json.
+        Ein FTP-Ausfall bei einem Kunden hat damit die Verbindung des Betreibers
+        umgebaut, statt die des Kunden zu reparieren.
+        """
+        if conn is None or conn.api is None:
             return False
         try:
-            info = await self.nitrado.get_info()
-        except Exception:
+            info = await conn.api.get_info()
+        except Exception:  # noqa: BLE001
             return False
         if not info:
             return False
         creds = NitradoAPI.extract_ftp_credentials(info)
         if not creds:
             return False
-        changed = (creds["host"] != cfg.config.get("ftp_host")
-                   or creds["user"] != cfg.config.get("ftp_user")
-                   or creds["password"] != cfg.config.get("ftp_password")
-                   or int(creds["port"]) != int(cfg.config.get("ftp_port") or 21))
+        changed = (creds["host"] != conn.get("ftp_host")
+                   or creds["user"] != conn.get("ftp_user")
+                   or creds["password"] != conn.get("ftp_password")
+                   or int(creds["port"]) != int(conn.get("ftp_port") or 21))
         if not changed:
             return False
-        cfg.config["ftp_host"]     = creds["host"]
-        cfg.config["ftp_port"]     = creds["port"]
-        cfg.config["ftp_user"]     = creds["user"]
-        cfg.config["ftp_password"] = creds["password"]
-        cfg.save_config()
-        self.ftp = FTPManager(host=creds["host"], port=creds["port"],
+        for schluessel, wert in (("ftp_host", creds["host"]), ("ftp_port", creds["port"]),
+                                 ("ftp_user", creds["user"]),
+                                 ("ftp_password", creds["password"])):
+            _conn_store(conn, schluessel, wert)
+        conn.ftp = FTPManager(host=creds["host"], port=creds["port"],
                               user=creds["user"], password=creds["password"])
-        log.info("[NITRADO] 🔄 FTP-Zugangsdaten über die API erneuert – "
-                 "Verbindung wird mit den neuen Daten aufgebaut.")
+        if connections.primary() is conn:
+            self.ftp = conn.ftp
+        log.info(f"[NITRADO] 🔄 {conn.name}: FTP-Zugangsdaten über die API erneuert.")
         return True
 
     async def _check_ftp_health(self, conn: Optional[ServerConnection] = None):
         """Warnt im Adminlog-Feed, wenn das FTP-Polling dauerhaft fehlschlägt
         (Passwort geändert, Nitrado-Wartung), und meldet die Erholung.
-        Versucht vorher, die FTP-Zugangsdaten über den Nitrado-Token zu erneuern."""
+        Versucht vorher, die FTP-Zugangsdaten über den Nitrado-Token zu erneuern.
+
+        Warn-Zustand und Sperrzeit haengen an der Verbindung – sonst wuerde die
+        Warnung eines Kunden die eines anderen 30 Minuten lang verschlucken.
+        """
         conn = conn or connections.primary()
-        ftp = conn.ftp if conn is not None else self.ftp
-        if not ftp:
+        if conn is None or conn.ftp is None:
             return
+        ftp = conn.ftp
         fails     = ftp.consecutive_failures
-        threshold = max(1, int((conn.get("ftp_fail_warn_cycles", 10) if conn
-                                else cfg.config.get("ftp_fail_warn_cycles", 10))))
+        threshold = max(1, int(conn.get("ftp_fail_warn_cycles", 10) or 10))
         now = time.time()
         if fails >= threshold:
-            if now - self._ftp_warned_ts >= 1800:   # höchstens alle 30 Min erneut warnen
-                self._ftp_warned_ts   = now
-                if await self._try_refresh_ftp_credentials():
+            if now - conn.ftp_warned_ts >= 1800:   # höchstens alle 30 Min erneut warnen
+                conn.ftp_warned_ts = now
+                if await self._try_refresh_ftp_credentials(conn):
                     # Zugangsdaten waren veraltet → mit den neuen weitermachen,
                     # keine Ausfall-Warnung nötig
-                    self._ftp_warn_active = False
+                    conn.ftp_warn_active = False
                     embed = discord.Embed(
                         title="🔄 FTP-Zugang automatisch erneuert",
                         description=("Die FTP-Zugriffe schlugen wiederholt fehl – der Bot "
                                      "hat die Zugangsdaten über den Nitrado-Token neu "
                                      "geholt und die Verbindung neu aufgebaut."),
                         color=0x2ECC71)
-                    await _post_feed(conn.guild_id if conn else None, "adminlog", embed)
+                    await _post_feed(conn.guild_id, "adminlog", embed)
                     return
-                self._ftp_warn_active = True
+                conn.ftp_warn_active = True
                 embed = discord.Embed(
                     title="🚨 FTP-Verbindung gestört",
                     description=(f"**{fails} FTP-Zugriffe in Folge fehlgeschlagen** "
-                                 f"(Host `{cfg.config.get('ftp_host')}`).\n"
+                                 f"(Host `{conn.get('ftp_host') or '–'}`).\n"
                                  f"Log-Feeds und Shop-Lieferungen sind unterbrochen!\n"
                                  f"Mögliche Ursachen: FTP-Passwort geändert, Nitrado-Wartung.\n"
                                  f"Letzter Fehler: `{ftp.last_error or 'unbekannt'}`"),
                     color=0xE74C3C)
-                await _post_feed(conn.guild_id if conn else None, "adminlog", embed)
-        elif fails == 0 and self._ftp_warn_active:
-            self._ftp_warn_active = False
-            self._ftp_warned_ts   = 0.0
+                await _post_feed(conn.guild_id, "adminlog", embed)
+        elif fails == 0 and conn.ftp_warn_active:
+            conn.ftp_warn_active = False
+            conn.ftp_warned_ts   = 0.0
             embed = discord.Embed(
                 title="✅ FTP-Verbindung wiederhergestellt",
                 description="Der FTP-Zugriff funktioniert wieder – die Feeds laufen normal weiter.",
                 color=0x2ECC71)
-            await _post_feed(conn.guild_id if conn else None, "adminlog", embed)
+            await _post_feed(conn.guild_id, "adminlog", embed)
 
     async def _resolve_channel(self, channel_id: int):
         ch = self.get_channel(channel_id)
@@ -3363,6 +3401,12 @@ class DayZBot(discord.Client):
         Servers haben in fremden Discord-Servern nichts zu suchen.
         """
         _setze_aktuellen_server(conn)
+        if conn is not None and conn.guild_id is None:
+            # Ohne zugeordnete Guild gibt es kein Ziel. Frueher fiel der
+            # Versand hier auf ALLE konfigurierten Guilds zurueck – Kills,
+            # Chat und Positionen eines Servers landeten dann bei fremden
+            # Kunden, und Belohnungen wurden guilduebergreifend ausgezahlt.
+            return
         log_type = DayZLogParser.EVENT_TO_LOG.get(ev["type"])
         if not log_type:
             return
@@ -3380,7 +3424,7 @@ class DayZBot(discord.Client):
         embed = EmbedBuilder.build(ev, _p.player_positions if _p else None)
         if not embed:
             return
-        targets = ([str(conn.guild_id)] if conn is not None and conn.guild_id
+        targets = ([str(conn.guild_id)] if conn is not None
                    else list(cfg.guilds))
         for gid_str in targets:
             ch_id = cfg.get_channel(int(gid_str), log_type)
@@ -3466,6 +3510,8 @@ class DayZBot(discord.Client):
     async def _credit_playtime(self, conn: Optional[ServerConnection] = None):
         """Schreibt verlinkten Spielern volle Spielzeit-Blöcke gut
         (playtime_reward: amount pro interval_minutes, z.B. 500 pro 30 Min)."""
+        if conn is not None and conn.guild_id is None:
+            return          # kein Discord-Server → keine Auszahlung
         conf = ((conn.get("playtime_reward") if conn is not None
                  else cfg.config.get("playtime_reward")) or {})
         amount = max(0, int(conf.get("amount", 0)))
@@ -3481,7 +3527,7 @@ class DayZBot(discord.Client):
             sid = conn.service_id if conn is not None else ""
             gid_conn = conn.guild_id if conn is not None else None
             await loop.run_in_executor(None, db.sync_sessions_from_positions,
-                                       sid, positions, 300)
+                                       sid, positions, 300, gid_conn)
             due = await loop.run_in_executor(None, db.playtime_credits_due, sid, interval)
             for entry in due:
                 links = await loop.run_in_executor(None, db.links_for_name,
@@ -3518,9 +3564,13 @@ def _is_admin(interaction: discord.Interaction) -> bool:
         return False
     if interaction.user.guild_permissions.administrator:
         return True
-    if _member_has_role_ids(interaction.user, cfg.config.get("admin_role_ids", [])):
+    # Rollen kommen vom Server dieser Guild – so kann jeder Kunde seine
+    # eigenen Admin-Rollen festlegen statt die des Betreibers zu erben.
+    _c = _conn_of(interaction)
+    _get = _c.get if _c is not None else cfg.config.get
+    if _member_has_role_ids(interaction.user, _get("admin_role_ids", [])):
         return True
-    role_name = cfg.config.get("admin_role_name", "")
+    role_name = _get("admin_role_name", "")
     if role_name and any(r.name == role_name for r in interaction.user.roles):
         return True
     return False
@@ -3531,7 +3581,9 @@ def _is_economy_admin(interaction: discord.Interaction) -> bool:
         return True
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return False
-    return _member_has_role_ids(interaction.user, cfg.config.get("economy_admin_role_ids", []))
+    _c = _conn_of(interaction)
+    _get = _c.get if _c is not None else cfg.config.get
+    return _member_has_role_ids(interaction.user, _get("economy_admin_role_ids", []))
 
 async def _deny(interaction: discord.Interaction):
     msg = ("❌ No permission. You need one of the configured admin roles "
@@ -3549,7 +3601,12 @@ def _conn_of(interaction: discord.Interaction) -> Optional[ServerConnection]:
     damit Befehle wie frueher auch per DM funktionieren.
     """
     if interaction.guild_id is None:
-        return connections.primary()
+        # In einer Direktnachricht gibt es keine Guild. Frueher galt hier der
+        # Hauptserver – damit haette jeder per DM die Daten des Betreibers
+        # abrufen koennen. Jetzt zaehlt der Server, der diesem Discord-Konto
+        # gehoert; wer keinen hat, bekommt "kein Premium".
+        eigene = connections.for_owner(interaction.user.id)
+        return eigene[0] if eigene else None
     return connections.for_guild(interaction.guild_id)
 
 
@@ -3719,8 +3776,9 @@ async def _finish_token_setup(token: str, service_id: str,
         connections.assign_guild(service_id, int(guild_id))
 
     # Nitrado/FTP/Shop mit den neuen Daten (neu) initialisieren –
-    # inklusive FTP-Auto-Discovery der Log-Verzeichnisse
-    await bot.init_nitrado(force=True)
+    # inklusive FTP-Auto-Discovery der Log-Verzeichnisse. NUR dieser Server,
+    # damit die Verbindungen der anderen Kunden nicht neu aufgebaut werden.
+    await bot.init_nitrado(force=True, only=conn)
     ftp_host = conn.get("ftp_host") or "❌ Nicht gefunden"
     log_dir  = conn.get("ftp_log_dir") or "❌ Nicht gefunden"
     if not conn.get("ftp_host"):
@@ -3737,7 +3795,7 @@ async def _finish_token_setup(token: str, service_id: str,
     embed.add_field(name="Log-Verzeichnis", value=f"`{log_dir}`",    inline=False)
     if warnings:
         embed.add_field(name="Hinweise", value="\n".join(warnings), inline=False)
-    embed.set_footer(text="Alle Werte wurden in config.json gespeichert – "
+    embed.set_footer(text="Alle Werte wurden in connections.json gespeichert – "
                           "beim nächsten Start ist kein /setup token nötig.")
     return embed
 
@@ -4030,7 +4088,7 @@ async def cmd_status(interaction: discord.Interaction):
     # ── 2. Direkter A2S UDP-Ping ─────────────────────────────
     srv_ip    = conn.get("server_ip",  "")
     qport     = int(conn.get("query_port",  2302))
-    rcon_port = int(cfg.config.get("rcon_port",   2310))
+    rcon_port = int(conn.get("rcon_port", 2310) or 2310)
 
     a2s: Optional[Dict] = None
     a2s_ping_ms = -1
@@ -4279,11 +4337,18 @@ def _player_in_allowlist(zone: Dict, pname: str) -> bool:
     key = (pname or "").strip().lower()
     return any(str(n).strip().lower() == key for n in _zone_allowlist(zone))
 
-def _reset_zone_state(zone_name: str):
+def _reset_zone_state(zone_name: str, conn: Optional[ServerConnection] = None):
     """Ping-Cooldowns einer Zone verwerfen (nach remove/edit),
-    damit die nächste frische Position sauber neu bewertet wird."""
+    damit die nächste frische Position sauber neu bewertet wird.
+
+    Mit Verbindung nur die Zone DIESES Servers – sonst setzt eine geloeschte
+    Zone „Airfield“ die Cooldowns gleichnamiger Zonen aller Kunden zurueck.
+    """
     zk = zone_name.strip().lower()
-    bot._zone_last_ping = {k: v for k, v in bot._zone_last_ping.items() if k[0] != zk}
+    sid = conn.service_id if conn is not None else None
+    bot._zone_last_ping = {
+        k: v for k, v in bot._zone_last_ping.items()
+        if not (k[1] == zk and (sid is None or k[0] == sid))}
 
 def _zone_summary(z: Dict) -> str:
     role = f" · Ping: <@&{int(z['role_id'])}>" if z.get("role_id") else ""
@@ -4371,7 +4436,7 @@ async def zone_remove(interaction: discord.Interaction, name: str):
             ephemeral=True)
     _zones(_c).remove(zone)
     _zones_save(_c)
-    _reset_zone_state(str(zone["name"]))
+    _reset_zone_state(str(zone["name"]), _c)
     await interaction.response.send_message(
         embed=discord.Embed(
             title="🗑️ Zone entfernt",
@@ -4466,8 +4531,8 @@ async def zone_edit(interaction: discord.Interaction, name: str,
     _zones_save(_c)
     # Alten UND neuen Zustand verwerfen: Geometrie/Name haben sich evtl. geändert,
     # die nächste frische Position bewertet die Zone komplett neu
-    _reset_zone_state(old_name)
-    _reset_zone_state(str(zone["name"]))
+    _reset_zone_state(old_name, _c)
+    _reset_zone_state(str(zone["name"]), _c)
     await interaction.response.send_message(
         embed=discord.Embed(
             title="✏️ Zone aktualisiert",
@@ -5625,7 +5690,7 @@ async def cmd_ftp_status(interaction: discord.Interaction):
                     value=ban_msg,                                         inline=False)
 
     if not connect_ok:
-        embed.set_footer(text="Tipp: Prüfe Host, Port, Benutzername und Passwort in config.json")
+        embed.set_footer(text="Tipp: `/ftp_scan` holt die Zugangsdaten neu über den Nitrado-Token")
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -6702,9 +6767,14 @@ class EconomyDB:
         if created_before is not None:
             q += " AND created_at <= ?"
             args = (created_before,)
-        if guild_id is not None:
-            q += " AND guild_id = ?"
-            args = args + (int(guild_id),)
+        if guild_id is None:
+            # Ohne Guild gibt es nichts zurueckzugeben. Frueher lieferte der
+            # Aufruf die offenen Kaeufe ALLER Kunden – ein Cleanup auf einem
+            # Server markierte dann fremde Kaeufe als geliefert, obwohl die
+            # Items dort nie gespawnt sind.
+            return []
+        q += " AND guild_id = ?"
+        args = args + (int(guild_id),)
         with self._lock:
             return list(self._conn.execute(q + " ORDER BY id", args).fetchall())
 
@@ -6896,16 +6966,24 @@ class EconomyDB:
         return row is not None
 
     def sync_sessions_from_positions(self, service_id: str, positions: Dict,
-                                     max_age_seconds: int = 300) -> int:
+                                     max_age_seconds: int = 300,
+                                     guild_id: Optional[int] = None) -> int:
         """Öffnet Sitzungen für VERLINKTE Spieler, die laut Log-Positions-Tracking
         gerade aktiv sind, aber keine offene Sitzung haben (verpasstes Connect-Event
         durch Bot-Downtime/Backlog-Skip oder /link während man schon online ist).
         Gibt die Anzahl neu geöffneter Sitzungen zurück."""
         now_utc = datetime.now(timezone.utc)
         with self._lock:
-            linked = {str(r["ingame_name"]).lower()
-                      for r in self._conn.execute(
-                          "SELECT DISTINCT ingame_name FROM links").fetchall()}
+            if guild_id is None:
+                rows = self._conn.execute(
+                    "SELECT DISTINCT ingame_name FROM links").fetchall()
+            else:
+                # Nur Verknuepfungen DIESER Guild – sonst entstehen auf Server A
+                # Geister-Sitzungen fuer Namen, die nur bei Kunde B verlinkt sind.
+                rows = self._conn.execute(
+                    "SELECT DISTINCT ingame_name FROM links WHERE guild_id=?",
+                    (int(guild_id),)).fetchall()
+            linked = {str(r["ingame_name"]).lower() for r in rows}
         opened = 0
         for pname, info in list(positions.items()):
             if pname.lower() not in linked:
@@ -7047,6 +7125,17 @@ db = EconomyDB()
 # ══════════════════════════════════════════════════════════════
 #  Economy-Hilfsfunktionen
 # ══════════════════════════════════════════════════════════════
+def _srv_conf(interaction: discord.Interaction, key: str) -> Dict:
+    """Einstellungsblock (economy/casino/bounty) des Servers dieser Guild.
+
+    Jeder Kunde stellt Verdienstspannen, Cooldowns und Einsaetze selbst ein;
+    ohne diese Aufloesung gaelten ueberall die Werte des Betreibers.
+    """
+    conn = _conn_of(interaction)
+    wert = (conn.get(key) if conn is not None else cfg.config.get(key))
+    return wert if isinstance(wert, dict) else {}
+
+
 def _cur_symbol(conn: Optional[ServerConnection] = None) -> str:
     """Waehrungssymbol des gerade behandelten Servers."""
     conn = conn if conn is not None else _AKTUELLER_SERVER.get()
@@ -7228,7 +7317,7 @@ class ShopManager:
             except Exception as e:
                 return False, f"Could not parse cfgEffectArea.json: `{e}`", []
             try:
-                radius = float(cfg.config.get("default_radius", 1))
+                radius = float(self.conn.get("default_radius", 1) or 1)
             except (TypeError, ValueError):
                 radius = 1.0
             if radius.is_integer():
@@ -7348,7 +7437,7 @@ class ShopManager:
             report["shop_entries"]    = shop_n
             report["vanilla_entries"] = len(areas) - shop_n
             try:
-                radius = float(cfg.config.get("default_radius", 1))
+                radius = float(self.conn.get("default_radius", 1) or 1)
             except (TypeError, ValueError):
                 radius = 1.0
             if radius.is_integer():
@@ -7392,7 +7481,7 @@ class ShopManager:
         self._restart_task = asyncio.create_task(self._restart_worker())
 
     async def _restart_worker(self):
-        delay = max(5, int(cfg.config.get("restart_cooldown_seconds", 300)))
+        delay = max(5, int(self.conn.get("restart_cooldown_seconds", 300) or 300))
         # Mindestabstand zum vorherigen Auto-Restart erzwingen (Server bootet evtl. noch)
         wait = max(delay, (self._last_restart_ts + delay) - time.time())
         log.info(f"[SHOP] Auto-Restart in {int(wait)}s geplant (Käufe werden gesammelt).")
@@ -7416,7 +7505,7 @@ class ShopManager:
             log.warning("[SHOP] server_ip/query_port nicht gesetzt – kann Server-online "
                         "nicht prüfen, nutze festen Delivery-Delay als Fallback.")
             return False
-        max_wait = max(60, int(cfg.config.get("delivery_online_wait_max_seconds", 2700)))
+        max_wait = max(60, int(self.conn.get("delivery_online_wait_max_seconds", 2700) or 2700))
         deadline = time.time() + max_wait
         loop = asyncio.get_running_loop()
         while time.time() < deadline:
@@ -7439,8 +7528,8 @@ class ShopManager:
         als fester Fallback-Delay. Danach werden hinreichend alte pending-Käufe
         geliefert und die Datei bereinigt."""
         self.cleanup_retry_needed = False
-        grace = int(cfg.config.get("delivery_grace_seconds", 90))
-        poll  = int(cfg.config.get("log_poll_interval_seconds", 10))
+        grace = int(self.conn.get("delivery_grace_seconds", 90) or 90)
+        poll  = int(self.conn.get("log_poll_interval_seconds", 10) or 10)
         # Grace muss über dem Poll-Intervall liegen, sonst könnte ein Kauf, der NACH
         # dem Restart einging, fälschlich als geliefert gelten (bezahlt, nie gespawnt)
         grace = max(grace, poll + 30)
@@ -7454,7 +7543,7 @@ class ShopManager:
         if not rows:
             return
         if delayed:
-            delay = max(0, int(cfg.config.get("delivery_cleanup_delay_seconds", 600)))
+            delay = max(0, int(self.conn.get("delivery_cleanup_delay_seconds", 600) or 600))
             log.info(f"[SHOP] Server-Neustart erkannt – warte bis der Server wieder online "
                      f"ist, danach werden {len(rows)} Lieferung(en) sofort abgeschlossen.")
             while True:
@@ -7558,7 +7647,7 @@ async def _require_guild(interaction: discord.Interaction) -> bool:
 async def cmd_work(interaction: discord.Interaction):
     if not await _require_guild(interaction):
         return
-    conf = cfg.config.get("economy", {}).get("work", {})
+    conf = _srv_conf(interaction, "economy").get("work", {})
     gid, uid = interaction.guild_id, interaction.user.id
 
     remaining = db.cooldown_remaining(gid, uid, "work")
@@ -7583,7 +7672,7 @@ async def cmd_work(interaction: discord.Interaction):
 async def cmd_daily(interaction: discord.Interaction):
     if not await _require_guild(interaction):
         return
-    conf = cfg.config.get("economy", {}).get("daily", {})
+    conf = _srv_conf(interaction, "economy").get("daily", {})
     gid, uid = interaction.guild_id, interaction.user.id
 
     remaining = db.cooldown_remaining(gid, uid, "daily")
@@ -7612,7 +7701,7 @@ async def cmd_daily(interaction: discord.Interaction):
 async def cmd_beg(interaction: discord.Interaction):
     if not await _require_guild(interaction):
         return
-    conf = cfg.config.get("economy", {}).get("beg", {})
+    conf = _srv_conf(interaction, "economy").get("beg", {})
     gid, uid = interaction.guild_id, interaction.user.id
 
     remaining = db.cooldown_remaining(gid, uid, "beg")
@@ -8070,7 +8159,7 @@ async def cmd_bounty(interaction: discord.Interaction,
     if own and str(own["ingame_name"]).lower() == name.lower():
         return await interaction.response.send_message(
             "❌ Auf deinen eigenen Kopf kannst du kein Kopfgeld aussetzen.", ephemeral=True)
-    bconf   = cfg.config.get("bounty", {})
+    bconf   = _srv_conf(interaction, "bounty")
     min_amt = int(bconf.get("min_amount", 100))
     max_amt = int(bconf.get("max_amount", 10000))
     if not (min_amt <= int(betrag) <= max_amt):
@@ -8152,7 +8241,7 @@ async def cmd_pay(interaction: discord.Interaction,
 async def cmd_slots(interaction: discord.Interaction, bet: app_commands.Range[int, 1]):
     if not await _require_guild(interaction):
         return
-    conf = cfg.config.get("casino", {}).get("slots", {})
+    conf = _srv_conf(interaction, "casino").get("slots", {})
     gid, uid = interaction.guild_id, interaction.user.id
     bet = int(bet)
 
@@ -8223,7 +8312,7 @@ async def cmd_roulette(interaction: discord.Interaction,
                        bet: app_commands.Range[int, 1], wager: str):
     if not await _require_guild(interaction):
         return
-    conf = cfg.config.get("casino", {}).get("roulette", {})
+    conf = _srv_conf(interaction, "casino").get("roulette", {})
     gid, uid = interaction.guild_id, interaction.user.id
     bet = int(bet)
 
@@ -8457,7 +8546,7 @@ class BlackjackView(discord.ui.View):
 async def cmd_blackjack(interaction: discord.Interaction, bet: app_commands.Range[int, 1]):
     if not await _require_guild(interaction):
         return
-    conf = cfg.config.get("casino", {}).get("blackjack", {})
+    conf = _srv_conf(interaction, "casino").get("blackjack", {})
     gid, uid = interaction.guild_id, interaction.user.id
     bet = int(bet)
 
@@ -8951,7 +9040,7 @@ async def shop_check(interaction: discord.Interaction):
             embed.colour = 0xE74C3C
     embed.add_field(name="Offene Käufe", value=str(pending), inline=True)
 
-    if pending and not cfg.config.get("auto_restart_after_purchase", False):
+    if pending and not conn.get("auto_restart_after_purchase", False):
         embed.add_field(
             name="Hinweis",
             value=("`auto_restart_after_purchase` ist **aus** – Items spawnen erst "
@@ -9524,6 +9613,7 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
     gid, uid = interaction.guild_id, interaction.user.id
 
     # ── 1. Item & Menge validieren (Katalog DIESES Servers) ───
+    katalog_conn = _conn_of(interaction)
     katalog = await _require_catalog(interaction)
     if katalog is None:
         return
@@ -9550,7 +9640,7 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
             "`x` (East) and `z` (North), e.g. `x: 4640` `z: 10350`.", ephemeral=True)
     # ACHTUNG Achsen-Mapping: cfgEffectArea Pos = [X, HÖHE, NORD]
     # → iZurvive-X → Pos[0], Höhe (y-Parameter) → Pos[1], iZurvive-Y → Pos[2]
-    y_val = float(cfg.config.get("default_pos_y", 0.0)) if y is None else float(y)
+    y_val = float(katalog_conn.get("default_pos_y", 0.0) or 0.0) if y is None else float(y)
     if not (-100.0 <= y_val <= 1000.0):
         return await interaction.response.send_message(
             "❌ Height `y` out of range (−100 … 1000). Leave it empty for ground level.",
@@ -9605,9 +9695,9 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
         int(amount), total, x, y_val, z, area_names)
 
     # ── 7. Auto-Restart oder Hinweis auf nächsten Neustart ────
-    if cfg.config.get("auto_restart_after_purchase", False):
+    if _conn.get("auto_restart_after_purchase", False):
         _conn.shop.schedule_auto_restart()
-        cooldown = int(cfg.config.get("restart_cooldown_seconds", 300))
+        cooldown = int(_conn.get("restart_cooldown_seconds", 300) or 300)
         delivery_info = (f"🔄 A server restart has been scheduled – your items will spawn "
                          f"in about **{max(5, cooldown)} seconds** (plus boot time).")
     else:
@@ -10521,8 +10611,16 @@ def require_nitrado(request: Optional[web.Request] = None):
     Mit Request wird der Server dieser Anmeldung genommen – sonst wuerde das
     Dashboard eines Kunden den Hauptserver steuern.
     """
-    conn = _conn_for_session(_sess_get(request)) if request is not None else None
-    nit = conn.api if conn is not None else (getattr(bot, "nitrado", None) if bot else None)
+    if request is not None:
+        # Aus dem Dashboard gilt AUSSCHLIESSLICH der Server der Anmeldung.
+        # Ein Rueckfall auf bot.nitrado (= Hauptserver des Betreibers) haette
+        # jedem Angemeldeten ohne eigenen Server dessen Steuerung gegeben.
+        conn, denied = _session_conn(request)
+        if denied is not None:
+            return None, denied
+        nit = conn.api
+    else:
+        nit = getattr(bot, "nitrado", None) if bot else None
     if not nit or not str(getattr(nit, "service_id", "") or "").strip():
         return None, err("Nitrado-Server ist noch nicht eingerichtet.", 409)
     return nit, None
@@ -11115,7 +11213,8 @@ async def post_options_token(request: web.Request) -> web.Response:
 
     sess["token"] = token
     try:
-        await bot.init_nitrado(force=True)
+        # Nur den eigenen Server neu aufsetzen, nicht die aller Kunden
+        await bot.init_nitrado(force=True, only=conn)
     except Exception as e:  # noqa: BLE001
         return err(f"Token gespeichert, Neueinrichtung fehlgeschlagen: {e}", 500)
     return ok({"token_masked": conn.masked_token(),
@@ -11211,9 +11310,10 @@ async def post_select_server(request: web.Request) -> web.Response:
         warnings.append("Gameserver-Infos konnten nicht geladen werden – "
                         "FTP/Karte evtl. nicht erkannt.")
 
-    # Nitrado/FTP/Shop live neu initialisieren (inkl. FTP-Auto-Discovery)
+    # Nitrado/FTP/Shop live neu initialisieren (inkl. FTP-Auto-Discovery) –
+    # nur fuer den gerade gewaehlten Server
     try:
-        await bot.init_nitrado(force=True)
+        await bot.init_nitrado(force=True, only=conn)
     except Exception as e:  # noqa: BLE001
         warnings.append(f"Init-Warnung: {e}")
 
@@ -11357,9 +11457,12 @@ async def post_setup_guild(request: web.Request) -> web.Response:
     Wird vom „Ja, habe ich"-Button erneut aufgerufen: der Aufruf ist bewusst
     wiederholbar, damit nach dem Einladen einfach noch einmal geprüft wird.
     """
-    sess = _sess_get(request)
-    if not sess:
-        return err("Session abgelaufen – bitte Token erneut eingeben.", 401)
+    # Der Schritt gehoert zum eigenen Server. Ohne diese Klammer konnte jeder
+    # Angemeldete eine beliebige fremde Guild-ID in die globale Konfiguration
+    # schreiben und dort die Befehle synchronisieren lassen.
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
     data = await body(request)
     raw = str(data.get("guild_id", "")).strip()
     if not raw.isdigit() or not (17 <= len(raw) <= 20):
@@ -11369,6 +11472,11 @@ async def post_setup_guild(request: web.Request) -> web.Response:
     gid = int(raw)
     if gid in _PLACEHOLDER_GUILD_IDS:
         return err("Das ist die Beispiel-ID aus der Anleitung, nicht die deines Servers.")
+
+    # assign_guild lehnt Guilds ab, die bereits einem ANDEREN Server gehoeren.
+    okay, msg = connections.assign_guild(conn.service_id, gid)
+    if not okay:
+        return err(msg)
 
     # Ergänzen statt ersetzen – vorhandene Discord-Server bleiben angebunden.
     # Platzhalter fliegen dabei raus, sonst scheitert setup_hook() beim nächsten
@@ -11404,8 +11512,10 @@ async def api_get_session(request: web.Request) -> web.Response:
         "discord_login": login_required,
         "discord": discord_user,
         "is_admin": bool(sess.get("is_admin")),
-        "service_id": sess.get("service_id") or cfg.config.get("service_id"),
-        "map_name": sess.get("map_name") or cfg.config.get("map_name"),
+        # Bewusst OHNE Rueckfall auf die config.json: sonst saehe jede
+        # Anmeldung ohne eigenen Server die Kennung des Betreibers.
+        "service_id": sess.get("service_id"),
+        "map_name": sess.get("map_name"),
         "configured": configured,
         "guild_configured": guild_configured,
         "invite_url": _discord_invite_url(),
@@ -11486,21 +11596,73 @@ def _find(name: str, conn: Optional[ServerConnection] = None):
     return None
 
 
-def _default_guild() -> int:
-    gids = cfg.config.get("guild_ids", []) or []
-    return int(gids[0]) if gids else 0
+def _zonen_ziel(request: web.Request, conn: ServerConnection,
+                data: dict, alt: Optional[dict] = None
+                ) -> Tuple[Optional[dict], Optional[web.Response]]:
+    """Guild, Channel und Rolle einer Zone gegen die Anmeldung pruefen.
+
+    Ohne diese Pruefung koennte ein Kunde eine Zone auf SEINEM Server anlegen
+    und als Ziel einen Channel im Discord eines anderen Kunden eintragen – der
+    Bot wuerde dann dort Alarme samt Rollen-Ping posten.
+    """
+    erlaubt = _session_guilds(request)
+    eigen = conn.guild_id
+    roh = data.get("guild_id")
+    if roh:
+        try:
+            gid = int(roh)
+        except (TypeError, ValueError):
+            return None, err("guild_id muss eine Zahl sein.")
+        if gid not in erlaubt:
+            return None, err("Dieser Discord-Server gehört nicht zu deinem "
+                             "Nitrado-Server.", 403)
+    else:
+        gid = int((alt or {}).get("guild_id") or eigen or 0)
+    if not gid:
+        return None, err("Für diesen Server ist noch kein Discord-Server "
+                         "zugeordnet – der Bot-Betreiber schaltet ihn frei.", 409)
+    if eigen and gid != eigen and gid not in erlaubt:
+        return None, err("Dieser Discord-Server gehört nicht zu deinem "
+                         "Nitrado-Server.", 403)
+
+    g = bot.get_guild(gid) if bot else None
+    ziel: Dict[str, Any] = {"guild_id": gid}
+    for schluessel, feld in (("channel_id", "Channel"), ("role_id", "Rolle")):
+        if schluessel not in data:
+            continue
+        roh_id = data.get(schluessel)
+        if not roh_id:
+            ziel[schluessel] = None
+            continue
+        try:
+            wert = int(roh_id)
+        except (TypeError, ValueError):
+            return None, err(f"{feld}-ID muss eine Zahl sein.")
+        # Channel/Rolle muessen in DIESER Guild liegen – sonst laesst sich der
+        # Alarm in einen fremden Discord umleiten.
+        if g is not None:
+            treffer = (g.get_channel(wert) if schluessel == "channel_id"
+                       else g.get_role(wert))
+            if treffer is None:
+                return None, err(f"Diese {feld}-ID gibt es in dem gewählten "
+                                 f"Discord-Server nicht.")
+        ziel[schluessel] = wert
+    return ziel, None
 
 
 async def list_zones(request: web.Request) -> web.Response:
-    _c = _conn_for_session(_sess_get(request))
+    _c, denied = _session_conn(request)
+    if denied is not None:
+        return denied
     zones = [z for z in _zones(_c) if isinstance(z, dict) and z.get("name")]
     return ok({"zones": zones,
-               "map_name": (_c.get("map_name", "ChernarusPlus") if _c
-                            else cfg.config.get("map_name", "ChernarusPlus"))})
+               "map_name": _c.get("map_name", "ChernarusPlus")})
 
 
 async def create_zone(request: web.Request) -> web.Response:
-    _c = _conn_for_session(_sess_get(request))
+    _c, denied = _session_conn(request)
+    if denied is not None:
+        return denied
     data = await body(request)
     name = str(data.get("name", "")).strip()
     if not name or len(name) > 60:
@@ -11518,12 +11680,15 @@ async def create_zone(request: web.Request) -> web.Response:
         if geo_err:
             return err(geo_err.replace("❌", "").strip())
 
+    ziel, denied = _zonen_ziel(request, _c, data)
+    if denied is not None:
+        return denied
     zone = {
         "name": name,
         "x": round(x, 1), "z": round(z, 1), "radius": round(radius, 1),
-        "role_id": int(data["role_id"]) if data.get("role_id") else None,
-        "channel_id": int(data["channel_id"]) if data.get("channel_id") else None,
-        "guild_id": int(data.get("guild_id") or _default_guild()),
+        "role_id": ziel.get("role_id"),
+        "channel_id": ziel.get("channel_id"),
+        "guild_id": ziel["guild_id"],
     }
     _zones(_c).append(zone)
     _zones_save(_c)
@@ -11531,7 +11696,9 @@ async def create_zone(request: web.Request) -> web.Response:
 
 
 async def update_zone(request: web.Request) -> web.Response:
-    _c = _conn_for_session(_sess_get(request))
+    _c, denied = _session_conn(request)
+    if denied is not None:
+        return denied
     zone = _find(request.match_info["name"], _c)
     if not zone:
         return err("Zone nicht gefunden.", 404)
@@ -11553,18 +11720,24 @@ async def update_zone(request: web.Request) -> web.Response:
         if geo_err:
             return err(geo_err.replace("❌", "").strip())
 
+    ziel, denied = _zonen_ziel(request, _c, data, zone)
+    if denied is not None:
+        return denied
     zone["name"] = new_name
     zone["x"], zone["z"], zone["radius"] = round(x, 1), round(z, 1), round(radius, 1)
-    if "role_id" in data:
-        zone["role_id"] = int(data["role_id"]) if data.get("role_id") else None
-    if "channel_id" in data:
-        zone["channel_id"] = int(data["channel_id"]) if data.get("channel_id") else None
+    zone["guild_id"] = ziel["guild_id"]
+    if "role_id" in ziel:
+        zone["role_id"] = ziel["role_id"]
+    if "channel_id" in ziel:
+        zone["channel_id"] = ziel["channel_id"]
     _zones_save(_c)
     return ok(zone)
 
 
 async def delete_zone(request: web.Request) -> web.Response:
-    _c = _conn_for_session(_sess_get(request))
+    _c, denied = _session_conn(request)
+    if denied is not None:
+        return denied
     zone = _find(request.match_info["name"], _c)
     if not zone:
         return err("Zone nicht gefunden.", 404)
@@ -11575,7 +11748,7 @@ async def delete_zone(request: web.Request) -> web.Response:
     reset = _reset_zone_state
     if callable(reset):
         try:
-            reset(name)
+            reset(name, _c)
         except Exception:
             pass
     return ok({"removed": name})
@@ -11583,7 +11756,9 @@ async def delete_zone(request: web.Request) -> web.Response:
 
 # ── Allowlist ─────────────────────────────────────────────────
 async def get_allowlist(request: web.Request) -> web.Response:
-    _c = _conn_for_session(_sess_get(request))
+    _c, denied = _session_conn(request)
+    if denied is not None:
+        return denied
     zone = _find(request.match_info["name"], _c)
     if not zone:
         return err("Zone nicht gefunden.", 404)
@@ -11591,7 +11766,9 @@ async def get_allowlist(request: web.Request) -> web.Response:
 
 
 async def add_allowlist(request: web.Request) -> web.Response:
-    _c = _conn_for_session(_sess_get(request))
+    _c, denied = _session_conn(request)
+    if denied is not None:
+        return denied
     zone = _find(request.match_info["name"], _c)
     if not zone:
         return err("Zone nicht gefunden.", 404)
@@ -11607,7 +11784,9 @@ async def add_allowlist(request: web.Request) -> web.Response:
 
 
 async def remove_allowlist(request: web.Request) -> web.Response:
-    _c = _conn_for_session(_sess_get(request))
+    _c, denied = _session_conn(request)
+    if denied is not None:
+        return denied
     zone = _find(request.match_info["name"], _c)
     if not zone:
         return err("Zone nicht gefunden.", 404)
@@ -11855,9 +12034,9 @@ async def create_item(request: web.Request) -> web.Response:
         price = int(data.get("price"))
     except (TypeError, ValueError):
         # Kategorie-Standardpreis als Fallback
-        cat_prices = cfg.config.get("shop_category_prices") or {}
+        cat_prices = conn.get("shop_category_prices") or {}
         price = int(cat_prices.get(str(data.get("category", "")).strip(),
-                                   cfg.config.get("shop_default_price", 100)))
+                                   conn.get("shop_default_price", 100) or 100))
     if price < 0:
         return err("Preis darf nicht negativ sein.")
 
@@ -12068,9 +12247,10 @@ def _locations(map_name: str):
 
 
 async def api_map_meta(request: web.Request) -> web.Response:
-    _c = _conn_for_session(_sess_get(request))
-    map_name = (_c.get("map_name", "ChernarusPlus") if _c
-                else cfg.config.get("map_name", "ChernarusPlus"))
+    _c, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    map_name = _c.get("map_name", "ChernarusPlus")
     return ok({
         "map_name": map_name,
         "world_size": _world_size(map_name),
@@ -12428,10 +12608,11 @@ async def delete_announcement(request: web.Request) -> web.Response:
 # ──────────────────────────────────────────────────────────────────────────
 async def api_server_status(request: web.Request) -> web.Response:
     a2s = a2s_query
-    conn = _conn_for_session(_sess_get(request))
-    ip = (conn.get("server_ip") if conn else cfg.config.get("server_ip")) or ""
-    port = int((conn.get("query_port", 2302) if conn
-                else cfg.config.get("query_port", 2302)) or 2302)
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    ip = str(conn.get("server_ip") or "")
+    port = int(conn.get("query_port", 2302) or 2302)
     live = None
     if callable(a2s) and ip:
         try:
@@ -12439,7 +12620,7 @@ async def api_server_status(request: web.Request) -> web.Response:
         except Exception:
             live = None
     nit_info = None
-    nit = conn.api if conn is not None else getattr(bot, "nitrado", None)
+    nit = conn.api
     if nit and str(getattr(nit, "service_id", "") or "").strip():
         try:
             info = await nit.get_info()
@@ -12457,7 +12638,7 @@ async def api_server_status(request: web.Request) -> web.Response:
         "online": bool(live),
         "a2s": live,
         "nitrado": nit_info,
-        "map_name": (conn.get("map_name") if conn else cfg.config.get("map_name")),
+        "map_name": conn.get("map_name"),
         "server_ip": ip or None,
     })
 
