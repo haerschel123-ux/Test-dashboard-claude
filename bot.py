@@ -3259,7 +3259,8 @@ class DayZBot(discord.Client):
         # dem Event bzw. der letzten bekannten Spielerposition). Fehler hier
         # dürfen den Log-Dispatch niemals stören.
         try:
-            _ev_record(ev, (conn.parser if conn is not None else self.parser).player_positions)
+            _ev_record(ev, (conn.parser if conn is not None else self.parser).player_positions,
+                       service_id=(conn.service_id if conn is not None else None))
         except Exception:
             pass
         # Kill-Statistik, Sessions, Kill-Belohnung & Bounties verarbeiten
@@ -9682,8 +9683,13 @@ def _ev_summary(ev: Dict[str, Any], etype: str) -> str:
     return str(g("raw", etype))[:180]
 
 
-def _ev_record(ev: Dict[str, Any], player_positions: Optional[Dict[str, Any]] = None) -> None:
-    """Ein geparstes Event in den Ringpuffer aufnehmen (aus ``_dispatch``)."""
+def _ev_record(ev: Dict[str, Any], player_positions: Optional[Dict[str, Any]] = None,
+               service_id: Optional[str] = None) -> None:
+    """Ein geparstes Event in den Ringpuffer aufnehmen (aus ``_dispatch``).
+
+    ``service_id`` haelt fest, von welchem Nitrado-Server das Ereignis stammt –
+    ohne diese Angabe saehe jeder Kunde die Kills aller anderen.
+    """
     global _ev_next_id, _ev_since_save, _ev_last_save
     try:
         etype = _ev_classify(ev)
@@ -9703,6 +9709,7 @@ def _ev_record(ev: Dict[str, Any], player_positions: Optional[Dict[str, Any]] = 
             "summary": _ev_summary(ev, etype),
             "player": ev.get("victim") or ev.get("player") or ev.get("killer") or ev.get("admin"),
             "raw": str(ev.get("raw", ""))[:400],
+            "service_id": str(service_id or ""),
         }
         if xz:
             rec["x"], rec["z"] = xz[0], xz[1]
@@ -9721,12 +9728,26 @@ def _ev_record(ev: Dict[str, Any], player_positions: Optional[Dict[str, Any]] = 
 
 
 def _ev_snapshot(since_id: int = 0, types: Optional[List[str]] = None,
-             limit: int = 500) -> Dict[str, Any]:
-    """Aktuelle Events (optional nur neuere / bestimmte Typen) für die API."""
+             limit: int = 500, service_id: Optional[str] = None) -> Dict[str, Any]:
+    """Aktuelle Events (optional nur neuere / bestimmte Typen) für die API.
+
+    ``service_id`` grenzt auf einen Server ein. Altbestand ohne Server-Angabe
+    zaehlt zum Hauptserver, damit vorhandene Ereignisse nicht verschwinden.
+    """
     tset = set(types) if types else None
+    primary = connections.primary()
+    ist_haupt = bool(primary is not None and service_id == primary.service_id)
+
+    def passt(e):
+        if service_id is None:
+            return True
+        sid = str(e.get("service_id") or "")
+        return sid == service_id or (not sid and ist_haupt)
+
     with _EV_LOCK:
         items = [e for e in _EV_BUF
-                 if e["id"] > since_id and (tset is None or e["type"] in tset)]
+                 if e["id"] > since_id and (tset is None or e["type"] in tset)
+                 and passt(e)]
         last = _ev_next_id - 1
     if len(items) > limit:
         items = items[-limit:]
@@ -10335,13 +10356,49 @@ async def api_admin_guilds(request: web.Request) -> web.Response:
 #  Serverliste (Bot-Owner) und Optionen (jeder angemeldete Nutzer)
 # ──────────────────────────────────────────────────────────────────────────
 def _conn_for_session(sess: Optional[Dict[str, Any]]) -> Optional[ServerConnection]:
-    """Die Verbindung, die zu dieser Anmeldung gehört.
+    """Die Verbindung, die zu dieser Anmeldung gehört – sonst None.
 
-    Der in der Session hinterlegte Server hat Vorrang; ohne Auswahl gilt der
-    Hauptserver, damit bestehende Einrichtungen die Optionen sehen.
+    Bewusst OHNE Rückfall auf den Hauptserver: wer keinen eigenen Server
+    ausgewählt hat, darf nicht den des Betreibers bekommen.
     """
-    conn = connections.for_service((sess or {}).get("service_id"))
-    return conn if conn is not None else connections.primary()
+    return connections.for_service((sess or {}).get("service_id"))
+
+
+def _session_conn(request: web.Request) -> Tuple[Optional[ServerConnection],
+                                                 Optional[web.Response]]:
+    """``(verbindung, fehlerantwort)`` für Endpunkte, die auf einen Server gehören.
+
+    Damit hängt jeder Zugriff am eigenen Server der Anmeldung – ohne diese
+    Klammer würden Endpunkte weiterhin global arbeiten und Daten anderer
+    Kunden preisgeben.
+    """
+    sess = _sess_get(request)
+    if not sess:
+        return None, err("Session abgelaufen – bitte neu anmelden.", 401)
+    conn = _conn_for_session(sess)
+    if conn is None:
+        return None, err("Für diese Anmeldung ist kein Nitrado-Server ausgewählt.", 409)
+    return conn, None
+
+
+def _session_guilds(request: web.Request) -> List[int]:
+    """Die Discord-Guilds, die diese Anmeldung sehen darf.
+
+    Das ist genau die Guild des eigenen Servers – der Betreiber mit
+    Admin-Rolle sieht alle.
+    """
+    sess = _sess_get(request)
+    if (sess or {}).get("is_admin"):
+        out = [int(g) for g in _configured_guild_ids()]
+        for gid in cfg.guilds.keys():
+            try:
+                if int(gid) not in out:
+                    out.append(int(gid))
+            except (TypeError, ValueError):
+                continue
+        return out
+    conn = _conn_for_session(sess)
+    return [conn.guild_id] if (conn is not None and conn.guild_id) else []
 
 
 async def _refresh_server_name(conn: ServerConnection) -> None:
@@ -10816,13 +10873,7 @@ def _guild_payload(gid: int) -> dict:
 
 
 async def get_feeds(request: web.Request) -> web.Response:
-    guild_ids = list(cfg.config.get("guild_ids", []) or [])
-    for gid in cfg.guilds.keys():
-        try:
-            if int(gid) not in [int(x) for x in guild_ids]:
-                guild_ids.append(int(gid))
-        except (TypeError, ValueError):
-            continue
+    guild_ids = _session_guilds(request)
     return ok({
         "log_types": [{"key": k, "label": v} for k, v in LOG_TYPES.items()],
         "guilds": [_guild_payload(int(gid)) for gid in guild_ids],
@@ -10834,6 +10885,8 @@ async def set_feed(request: web.Request) -> web.Response:
     log_type = request.match_info["log_type"]
     if log_type not in LOG_TYPES:
         return err(f"Unbekannter Feed-Typ: {log_type}")
+    if int(gid) not in _session_guilds(request):
+        return err("Dieser Discord-Server gehört nicht zu deinem Nitrado-Server.", 403)
     data = await body(request)
     channel_id = data.get("channel_id")
     guilds = cfg.guilds.setdefault(str(gid), {})
@@ -10997,6 +11050,8 @@ async def remove_allowlist(request: web.Request) -> web.Response:
 
 # ── Rollen/Channels für Picker ────────────────────────────────
 async def guild_roles(request: web.Request) -> web.Response:
+    if int(request.match_info["guild_id"]) not in _session_guilds(request):
+        return err("Dieser Discord-Server gehört nicht zu deinem Nitrado-Server.", 403)
     g = bot.get_guild(int(request.match_info["guild_id"])) if bot else None
     if g is None:
         return ok({"roles": []})
@@ -11006,6 +11061,8 @@ async def guild_roles(request: web.Request) -> web.Response:
 
 
 async def guild_channels(request: web.Request) -> web.Response:
+    if int(request.match_info["guild_id"]) not in _session_guilds(request):
+        return err("Dieser Discord-Server gehört nicht zu deinem Nitrado-Server.", 403)
     g = bot.get_guild(int(request.match_info["guild_id"])) if bot else None
     if g is None:
         return ok({"channels": []})
@@ -11029,8 +11086,11 @@ def _next_run():
 
 
 async def get_auto_restart(request: web.Request) -> web.Response:
-    sched = cfg.config.get("auto_restart_schedule",
-                           {"enabled": False, "first_time": "04:00", "interval_hours": 4})
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    sched = conn.get("auto_restart_schedule",
+                     {"enabled": False, "first_time": "04:00", "interval_hours": 4})
     nxt = _next_run()
     return ok({
         "schedule": sched,
@@ -11041,9 +11101,12 @@ async def get_auto_restart(request: web.Request) -> web.Response:
 
 
 async def set_auto_restart(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
     data = await body(request)
-    sched = dict(cfg.config.get("auto_restart_schedule",
-                                {"enabled": False, "first_time": "04:00", "interval_hours": 4}))
+    sched = dict(conn.get("auto_restart_schedule",
+                          {"enabled": False, "first_time": "04:00", "interval_hours": 4}))
 
     if "enabled" in data:
         sched["enabled"] = bool(data["enabled"])
@@ -11061,12 +11124,10 @@ async def set_auto_restart(request: web.Request) -> web.Response:
             return err("Intervall muss zwischen 1 und 24 Stunden liegen.")
         sched["interval_hours"] = iv
 
-    cfg.config["auto_restart_schedule"] = sched
+    _conn_store(conn, "auto_restart_schedule", sched)
 
     if "after_purchase" in data:
-        cfg.config["auto_restart_after_purchase"] = bool(data["after_purchase"])
-
-    cfg.save_config()
+        _conn_store(conn, "auto_restart_after_purchase", bool(data["after_purchase"]))
     # Angekündigte Restarts zurücksetzen, damit die neue Zeit sauber greift
     try:
         bot._restart_announced.clear()
@@ -11433,7 +11494,10 @@ async def api_events(request: web.Request) -> web.Response:
         since = 0
     types = request.query.get("types")
     tlist = [t for t in types.split(",") if t] if types else None
-    snap = _ev_snapshot(since_id=since, types=tlist)
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    snap = _ev_snapshot(since_id=since, types=tlist, service_id=conn.service_id)
     return ok(snap)
 
 
@@ -11447,24 +11511,27 @@ async def api_event_types(request: web.Request) -> web.Response:
 #  Nutzt die vorhandenen async-Helfer ``_read_banlist``/``_write_banlist`` bzw.
 #  ``_read_whitelist``/``_write_whitelist`` des Bots.
 # ──────────────────────────────────────────────────────────────────────────
-async def _read(kind: str):
+async def _read(kind: str, conn: ServerConnection):
     fn = globals().get(f"_read_{kind}")
     if not callable(fn):
         return None
-    return await fn()  # (names, category, key)
+    return await fn(conn)  # (names, category, key)
 
 
-async def _write(kind: str, names, category, key):
+async def _write(kind: str, conn: ServerConnection, names, category, key):
     fn = globals().get(f"_write_{kind}")
     if not callable(fn):
         return False, "Funktion nicht verfügbar."
-    return await fn(names, category, key)
+    return await fn(conn, names, category, key)
 
 
 def _make_get(kind: str):
     async def handler(request: web.Request) -> web.Response:
+        conn, denied = _session_conn(request)
+        if denied is not None:
+            return denied
         try:
-            names, cat, key = await _read(kind)
+            names, cat, key = await _read(kind, conn)
         except Exception as e:  # noqa: BLE001
             return err(f"Nitrado nicht erreichbar: {e}", 502)
         return ok({"names": names, "category": cat, "key": key})
@@ -11477,13 +11544,16 @@ def _make_add(kind: str):
         player = str(data.get("player", "")).strip()
         if not player:
             return err("Spielername fehlt.")
+        conn, denied = _session_conn(request)
+        if denied is not None:
+            return denied
         try:
-            names, cat, key = await _read(kind)
+            names, cat, key = await _read(kind, conn)
         except Exception as e:  # noqa: BLE001
             return err(f"Nitrado nicht erreichbar: {e}", 502)
         if player.lower() not in [n.lower() for n in names]:
             names.append(player)
-            good, msg = await _write(kind, names, cat, key)
+            good, msg = await _write(kind, conn, names, cat, key)
             if not good:
                 return err(msg or "Speichern fehlgeschlagen.", 502)
         return ok({"names": names})
@@ -11493,13 +11563,16 @@ def _make_add(kind: str):
 def _make_remove(kind: str):
     async def handler(request: web.Request) -> web.Response:
         player = request.match_info["player"]
+        conn, denied = _session_conn(request)
+        if denied is not None:
+            return denied
         try:
-            names, cat, key = await _read(kind)
+            names, cat, key = await _read(kind, conn)
         except Exception as e:  # noqa: BLE001
             return err(f"Nitrado nicht erreichbar: {e}", 502)
         new = [n for n in names if n.lower() != player.lower()]
         if len(new) != len(names):
-            good, msg = await _write(kind, new, cat, key)
+            good, msg = await _write(kind, conn, new, cat, key)
             if not good:
                 return err(msg or "Speichern fehlgeschlagen.", 502)
         return ok({"names": new})
@@ -11546,10 +11619,15 @@ def _read_balances(guild_id: int, limit: int = 200):
 
 
 async def api_economy_balances(request: web.Request) -> web.Response:
+    erlaubt = _session_guilds(request)
     try:
-        gid = int(request.query.get("guild_id") or (cfg.config.get("guild_ids") or [0])[0])
+        gid = int(request.query.get("guild_id") or (erlaubt or [0])[0])
     except (TypeError, ValueError, IndexError):
         return err("Keine Guild angegeben.")
+    # Ohne diese Prüfung koennte man jede fremde Guild abfragen, indem man
+    # ihre ID einfach mitschickt.
+    if gid not in erlaubt:
+        return err("Dieser Discord-Server gehört nicht zu deinem Nitrado-Server.", 403)
     try:
         rows = await _dash_run(_read_balances, gid)
     except Exception as e:  # noqa: BLE001
@@ -11570,6 +11648,8 @@ async def api_economy_money(request: web.Request) -> web.Response:
         amount = int(data["amount"])
     except (KeyError, TypeError, ValueError):
         return err("guild_id, user_id und amount (Zahl) erforderlich.")
+    if gid not in _session_guilds(request):
+        return err("Dieser Discord-Server gehört nicht zu deinem Nitrado-Server.", 403)
     op = str(data.get("op", "add"))
     try:
         if op == "add":
@@ -11586,27 +11666,32 @@ async def api_economy_money(request: web.Request) -> web.Response:
 
 
 async def api_economy_get_config(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
     return ok({
-        "currency_name": cfg.config.get("currency_name"),
-        "currency_symbol": cfg.config.get("currency_symbol"),
-        "starting_balance": cfg.config.get("starting_balance"),
-        "economy": cfg.config.get("economy"),
-        "kill_reward": cfg.config.get("kill_reward"),
+        "currency_name": conn.get("currency_name"),
+        "currency_symbol": conn.get("currency_symbol"),
+        "starting_balance": conn.get("starting_balance"),
+        "economy": conn.get("economy"),
+        "kill_reward": conn.get("kill_reward"),
     })
 
 
 async def api_economy_set_config(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
     data = await body(request)
     for key in ("currency_name", "currency_symbol"):
         if key in data:
-            cfg.config[key] = str(data[key])
+            _conn_store(conn, key, str(data[key]))
     for key in ("starting_balance", "kill_reward"):
         if key in data:
             try:
-                cfg.config[key] = int(data[key])
+                _conn_store(conn, key, int(data[key]))
             except (TypeError, ValueError):
                 return err(f"{key} muss eine Zahl sein.")
-    cfg.save_config()
     return ok()
 
 
@@ -11629,13 +11714,35 @@ def _data() -> dict:
     return d
 
 
+def _ann_visible(request: web.Request) -> Tuple[List[dict], Optional[web.Response]]:
+    """Ankündigungen des eigenen Servers.
+
+    Alte Einträge ohne service_id gehören dem Hauptserver – so bleiben
+    bestehende Ankündigungen sichtbar, ohne bei Kunden aufzutauchen.
+    """
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return [], denied
+    primary = connections.primary()
+    eigen = []
+    for i, a in enumerate(_data()["announcements"]):
+        sid = str(a.get("service_id") or "")
+        if sid == conn.service_id or (not sid and primary is conn):
+            eigen.append({"index": i, **a})
+    return eigen, None
+
+
 async def list_announcements(request: web.Request) -> web.Response:
-    d = _data()
-    return ok({"announcements": [
-        {"index": i, **a} for i, a in enumerate(d["announcements"])]})
+    eigen, denied = _ann_visible(request)
+    if denied is not None:
+        return denied
+    return ok({"announcements": eigen})
 
 
 async def create_announcement(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
     d = _data()
     data = await body(request)
     day = str(data.get("day", "")).strip().lower()
@@ -11656,7 +11763,8 @@ async def create_announcement(request: web.Request) -> web.Response:
         return err("channel_id fehlt.")
 
     ann = {"day": day, "time": time_, "message": message,
-           "channel_id": int(channel_id), "repeat": repeat, "last_sent": None}
+           "channel_id": int(channel_id), "repeat": repeat, "last_sent": None,
+           "service_id": conn.service_id}
     d["announcements"].append(ann)
     save = save_announcements
     if callable(save):
@@ -11665,6 +11773,9 @@ async def create_announcement(request: web.Request) -> web.Response:
 
 
 async def delete_announcement(request: web.Request) -> web.Response:
+    eigen, denied = _ann_visible(request)
+    if denied is not None:
+        return denied
     d = _data()
     try:
         idx = int(request.match_info["index"])
@@ -11672,6 +11783,8 @@ async def delete_announcement(request: web.Request) -> web.Response:
         return err("Ungültiger Index.")
     if not 0 <= idx < len(d["announcements"]):
         return err("Ankündigung nicht gefunden.", 404)
+    if idx not in [a["index"] for a in eigen]:
+        return err("Diese Ankündigung gehört einem anderen Server.", 403)
     removed = d["announcements"].pop(idx)
     save = save_announcements
     if callable(save):

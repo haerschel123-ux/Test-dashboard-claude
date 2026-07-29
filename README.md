@@ -245,6 +245,25 @@ Der Bot kann mehrere Nitrado-Server bedienen. Jeder verbundene Server steht in
 Eine Guild kann immer nur **einen** Nitrado-Server verwalten; der Versuch, sie ein zweites
 Mal zu vergeben, wird mit Nennung des bisherigen Servers abgelehnt.
 
+### Abgrenzung im Dashboard
+
+Jeder Endpunkt hängt an der Verbindung der Anmeldung. Ein Kunde sieht und ändert
+ausschließlich seinen eigenen Server:
+
+| Bereich | Abgrenzung |
+|---|---|
+| Serverstatus, Steuerung, Karte, Zonen | Verbindung der Anmeldung |
+| Feeds, Rollen, Channels | nur die eigene Discord-Guild (`403` bei fremder Guild-ID) |
+| Bans, Whitelist | Nitrado-Einstellungen des eigenen Servers |
+| Economy (Guthaben, Einstellungen) | eigene Guild; eine mitgeschickte fremde `guild_id` wird mit `403` abgewiesen |
+| Ereignisse, Ankündigungen, Auto-Neustart | am eigenen Server hinterlegt |
+| Serverliste, Protokoll | nur mit Admin-Rolle (`403`) |
+
+**Noch nicht getrennt:** der Shop-Katalog (`shop_items.json`) gilt weiterhin für alle
+Server. Wer im Dashboard Artikel sieht oder anlegt, arbeitet auf einem gemeinsamen Katalog.
+Solange nur ein Betreiber Artikel pflegt, ist das unkritisch; für echten Mehrkundenbetrieb
+muss der Katalog noch pro Server abgelegt werden.
+
 ### Was pro Server getrennt läuft
 
 Die Trennung ist vollständig — jeder verbundene Server hat eigene:
