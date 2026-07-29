@@ -278,8 +278,15 @@ Eine Guild-ID, die schon zu einem anderen Server gehört, wird auf jedem Weg abg
 
 Die mittlere Stufe ist der Grund, warum ein neuer Kunde mit `Rubles`, 5000 Startguthaben und
 den Standard-Einsätzen anfängt statt mit dem, was der Betreiber für sich eingestellt hat —
-und warum eine spätere Änderung des Betreibers nicht bei allen Kunden mitwandert. Der
-Hauptserver behält beim ersten Start nach dem Update seine bisherigen Werte.
+und warum eine spätere Änderung des Betreibers nicht bei allen Kunden mitwandert.
+
+Damit der Betreiber dabei nicht seine eigenen Werte verliert, holt der Bot sie beim ersten
+Start nach dem Update **einmalig** aus der `config.json` in die Verbindung seines Servers —
+auch dann, wenn die `connections.json` schon existiert. Das betrifft ausdrücklich auch
+`admin_role_ids`: ohne die Übernahme stünde die Rolle auf der Vorgabe, und wer nicht
+Discord-Administrator ist, käme an die Admin-Befehle nicht mehr heran. Dass die Übernahme
+gelaufen ist, merkt sich die Verbindung (`_eigene_uebernommen`) — ein später bewusst
+gelöschter Wert kommt also nicht wieder.
 
 ### Abgrenzung im Dashboard
 

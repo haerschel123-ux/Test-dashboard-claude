@@ -686,6 +686,7 @@ class ConfigManager:
         # Verbundene Nitrado-Server laden. Beim ersten Start nach dem Update
         # wird daraus eine bestehende Einzelserver-Einrichtung uebernommen.
         connections.load()
+        _migriere_eigene_einstellungen()
         _migriere_ban_metadaten()
 
     def _merge_defaults(self, target: Dict, defaults: Dict) -> bool:
@@ -2476,7 +2477,7 @@ class ConnectionRegistry:
             # Update alte Log-Zeilen erneut als Ereignisse gepostet.
             "log_state": dict(cfg.log_state or {}),
         }
-        for key in tuple(_CONN_SERVER_FIELDS) + tuple(ServerConnection._EIGENE_EINSTELLUNGEN):
+        for key in _CONN_SERVER_FIELDS:
             if key in cfg.config:
                 data[key] = cfg.config[key]
 
@@ -3662,6 +3663,35 @@ def _bans_of(conn: Optional[ServerConnection]) -> Dict[str, Dict]:
         eimer = {}
         cfg.bans[sid] = eimer
     return eimer
+
+
+def _migriere_eigene_einstellungen() -> None:
+    """Einstellungen des Betreibers einmalig in die Verbindung seines Servers holen.
+
+    Fuer die Schluessel in ``_EIGENE_EINSTELLUNGEN`` ist die config.json seit der
+    Mandantentrennung keine Rueckfallebene mehr – sonst wanderte jede Aenderung
+    des Betreibers bei allen Kunden mit. Ohne diese Uebernahme faende der
+    Hauptserver nach einem Update seine EIGENEN Werte nicht mehr: Waehrung,
+    Startguthaben, Belohnungen und vor allem ``admin_role_ids`` staenden dann
+    auf der Auslieferungs-Vorgabe.
+
+    Laeuft genau einmal, auch wenn die connections.json schon existiert; das
+    Merkmal dafuer steht in der Verbindung selbst. So bleibt ein spaeter vom
+    Betreiber bewusst geloeschter Wert geloescht.
+    """
+    haupt = connections.primary()
+    if haupt is None or haupt.data.get("_eigene_uebernommen"):
+        return
+    uebernommen = []
+    for key in sorted(ServerConnection._EIGENE_EINSTELLUNGEN):
+        if key in cfg.config and key not in haupt.data:
+            haupt.data[key] = copy.deepcopy(cfg.config[key])
+            uebernommen.append(key)
+    haupt.data["_eigene_uebernommen"] = True
+    connections.save()
+    if uebernommen:
+        log.info(f"[CONN] Eigene Einstellungen des Hauptservers uebernommen: "
+                 f"{', '.join(uebernommen)}")
 
 
 def _migriere_ban_metadaten() -> None:
