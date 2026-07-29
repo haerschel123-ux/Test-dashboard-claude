@@ -259,10 +259,22 @@ ausschließlich seinen eigenen Server:
 | Ereignisse, Ankündigungen, Auto-Neustart | am eigenen Server hinterlegt |
 | Serverliste, Protokoll | nur mit Admin-Rolle (`403`) |
 
-**Noch nicht getrennt:** der Shop-Katalog (`shop_items.json`) gilt weiterhin für alle
-Server. Wer im Dashboard Artikel sieht oder anlegt, arbeitet auf einem gemeinsamen Katalog.
-Solange nur ein Betreiber Artikel pflegt, ist das unkritisch; für echten Mehrkundenbetrieb
-muss der Katalog noch pro Server abgelegt werden.
+### Shop-Katalog pro Server
+
+Jeder verbundene Server hat seinen **eigenen** Item-Katalog in
+`shop_items_<service-id>.json`. Preise, Bundles und Kategorien des einen Kunden tauchen
+nirgends beim anderen auf — weder in `/shop list` und im Autocomplete noch im Dashboard.
+
+* Der Server des Betreibers übernimmt beim ersten Start nach dem Update den bisherigen
+  gemeinsamen Bestand (`shop_items.json` bzw. `shop_items` aus der `config.json`). Die alte
+  Datei bleibt unangetastet liegen.
+* **Neue Kunden starten mit einem leeren Katalog.** Gefüllt wird er aus der `types.xml`
+  **ihres eigenen Servers**: der Bot holt sie per FTP, sobald er die Verzeichnisse erkannt
+  hat. Im Dashboard füllt der Knopf **„🔄 Items vom Server laden"** (Kategorie *Shop*) den
+  Katalog jederzeit neu.
+* Gesucht wird `<mission-verzeichnis>/db/types.xml`, ersatzweise `<mission>/types.xml`; ein
+  abweichender Pfad lässt sich als `types_xml_path` in der Verbindung hinterlegen.
+* Selbst angelegte Items und Bundles (`"custom": true`) überstehen jedes Neuerzeugen.
 
 ### Was pro Server getrennt läuft
 
@@ -272,7 +284,14 @@ Die Trennung ist vollständig — jeder verbundene Server hat eigene:
 |---|---|
 | Nitrado-Verbindung und FTP-Sitzung | `/neustart`, `/stoppen`, `/serverstatus`, `/ban`, `/whitelist` wirken auf den Server der aufrufenden Guild |
 | Log-Abfrage, Lese-Position und Parser | Kills, Builds und Positionen aus Server A erscheinen **nur** im Discord von Server A |
+| Shop-Katalog und Shop-Kategorien | `shop_items_<service-id>.json`, aus der eigenen `types.xml` |
 | Shop-Auslieferung (`cfgEffectArea.json`) | Käufe landen in der Mission des jeweiligen Servers |
+| Kill-Statistik und Spielzeit-Sitzungen | `/stats` und `/leaderboard` zeigen nur Spieler des eigenen Servers; ein Neustart beendet nur die eigenen Spielzeit-Sitzungen |
+| Kill-Belohnung und Kopfgelder | werden nur an Verknüpfungen in der Guild des Servers ausgezahlt, von dem das Log stammt |
+| Geplante Neustarts | jeder Server folgt seinem eigenen Zeitplan; die Ankündigung geht nur in seine Guild |
+| Ankündigungen | `/liste`, `/löschen` und `/edit ankuendigung` sehen nur die eigenen |
+| Währung, Startguthaben, Belohnungsbeträge | pro Server einstellbar (Dashboard → *Economy*) |
+| Ban-Angaben (Grund, Datum, Admin) | je Server in der `banlist.json`; gebannt wird ohnehin bei Nitrado |
 | Zonen, Karte, Server-IP und Query-Port | pro Server gepflegt, nicht global |
 
 Die Feeds folgen der Zuordnung: Ein Ereignis geht ausschließlich in die Guild, der sein
