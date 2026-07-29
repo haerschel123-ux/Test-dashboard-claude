@@ -1453,8 +1453,16 @@ def _location_field_value(pos_str: Optional[str]) -> Optional[str]:
 # ══════════════════════════════════════════════════════════════
 
 class DayZLogParser:
-    # Spieler-Positionen in-memory halten
-    player_positions: Dict[str, Dict] = {}
+    """Parst die ADM-Logzeilen EINES Servers.
+
+    Die Spieler-Positionen liegen bewusst auf der Instanz: als
+    Klassen-Attribut teilten sich alle verbundenen Server dasselbe Dict,
+    wodurch jeder Kunde die Positionen aller anderen sah und Zonen-Pings im
+    falschen Discord ausgeloest wurden.
+    """
+
+    def __init__(self):
+        self.player_positions: Dict[str, Dict] = {}
 
     # Spieler-Muster: Name + optionale Steam-ID.
     # Tolerant gegenüber dem echten Nitrado-Konsolen-ADM-Format:
@@ -1573,26 +1581,22 @@ class DayZLogParser:
         "loot":         "loot",
     }
 
-    @classmethod
-    def _players_found(cls, line: str) -> List[Dict[str, Optional[str]]]:
-        return [{"name": name, "id": pid or None} for name, pid in re.findall(cls.PLAYER, line)]
+    def _players_found(self, line: str) -> List[Dict[str, Optional[str]]]:
+        return [{"name": name, "id": pid or None} for name, pid in re.findall(self.PLAYER, line)]
 
-    @classmethod
-    def _set_position(cls, name: str, player_id: Optional[str], pos: str):
-        cls.player_positions[name] = {
+    def _set_position(self, name: str, player_id: Optional[str], pos: str):
+        self.player_positions[name] = {
             "id": player_id,
             "position": pos.strip(),
             "last_seen": datetime.now(timezone.utc).isoformat(),
         }
 
-    @classmethod
-    def _extract_ts(cls, line: str) -> str:
+    def _extract_ts(self, line: str) -> str:
         ts_m = re.match(r'^(\d{2}:\d{2}:\d{2})\s*\|?\s*', line)
         return ts_m.group(1) if ts_m else ""
 
-    @classmethod
-    def _generic_kill_event(cls, line: str, ts: str) -> Optional[Dict]:
-        players = cls._players_found(line)
+    def _generic_kill_event(self, line: str, ts: str) -> Optional[Dict]:
+        players = self._players_found(line)
         if len(players) < 2 or "killed by" not in line.lower():
             return None
 
@@ -1611,7 +1615,7 @@ class DayZLogParser:
 
         pos_m = re.search(r'pos=<([\d., \-]+)>', line, re.IGNORECASE)
         if pos_m:
-            cls._set_position(victim["name"], victim["id"], pos_m.group(1))
+            self._set_position(victim["name"], victim["id"], pos_m.group(1))
 
         return {
             "type": "kill_pvp",
@@ -1625,9 +1629,8 @@ class DayZLogParser:
             "raw": line,
         }
 
-    @classmethod
-    def _generic_damage_event(cls, line: str, ts: str) -> Optional[Dict]:
-        players = cls._players_found(line)
+    def _generic_damage_event(self, line: str, ts: str) -> Optional[Dict]:
+        players = self._players_found(line)
         if len(players) < 2 or "hit by" not in line.lower():
             return None
 
@@ -1657,7 +1660,7 @@ class DayZLogParser:
 
         pos_m = re.search(r'pos=<([\d., \-]+)>', line, re.IGNORECASE)
         if pos_m:
-            cls._set_position(victim["name"], victim["id"], pos_m.group(1))
+            self._set_position(victim["name"], victim["id"], pos_m.group(1))
 
         return {
             "type": "damage",
@@ -1673,10 +1676,9 @@ class DayZLogParser:
             "raw": line,
         }
 
-    @classmethod
-    def _generic_env_death_event(cls, line: str, ts: str) -> Optional[Dict]:
+    def _generic_env_death_event(self, line: str, ts: str) -> Optional[Dict]:
         """Tod ohne zweiten Spieler: Zombie, Explosion, Verbluten, Sturz usw."""
-        players = cls._players_found(line)
+        players = self._players_found(line)
         if not players:
             return None
         p = players[0]
@@ -1697,7 +1699,7 @@ class DayZLogParser:
 
         pos_m = re.search(r'pos\s*=\s*<([\d., \-]+)>', line, re.IGNORECASE)
         if pos_m:
-            cls._set_position(p["name"], p["id"], pos_m.group(1))
+            self._set_position(p["name"], p["id"], pos_m.group(1))
 
         return {
             "type": "kill_env",
@@ -1708,10 +1710,9 @@ class DayZLogParser:
             "raw": line,
         }
 
-    @classmethod
-    def _generic_env_damage_event(cls, line: str, ts: str) -> Optional[Dict]:
+    def _generic_env_damage_event(self, line: str, ts: str) -> Optional[Dict]:
         """Treffer ohne zweiten Spieler: Zombie, FallDamage, Explosion, Tier usw."""
-        players = cls._players_found(line)
+        players = self._players_found(line)
         if not players or "hit by" not in line.lower():
             return None
         victim = players[0]
@@ -1739,7 +1740,7 @@ class DayZLogParser:
 
         pos_m = re.search(r'pos\s*=\s*<([\d., \-]+)>', line, re.IGNORECASE)
         if pos_m:
-            cls._set_position(victim["name"], victim["id"], pos_m.group(1))
+            self._set_position(victim["name"], victim["id"], pos_m.group(1))
 
         return {
             "type": "damage",
@@ -1755,32 +1756,31 @@ class DayZLogParser:
             "raw": line,
         }
 
-    @classmethod
-    def parse_line(cls, line: str):
+    def parse_line(self, line: str):
         line = line.strip()
         if not line:
             return None
 
-        ts = cls._extract_ts(line)
+        ts = self._extract_ts(line)
 
         # Positionen immer tracken – Konsolen-Format zuerst (pro Spieler in
         # der eigenen id-Klammer), sonst altes Format als Fallback
         tracked = False
-        for pm in cls.P["position"].finditer(line):
-            cls._set_position(pm.group(1), pm.group(2), pm.group(3))
+        for pm in self.P["position"].finditer(line):
+            self._set_position(pm.group(1), pm.group(2), pm.group(3))
             tracked = True
         if not tracked:
-            pm = cls.P["position_legacy"].search(line)
+            pm = self.P["position_legacy"].search(line)
             if pm:
-                cls._set_position(pm.group(1), pm.group(2), pm.group(3))
+                self._set_position(pm.group(1), pm.group(2), pm.group(3))
 
         # Reihenfolge ist wichtig:
         # 1) Kill
-        m = cls.P["kill_pvp"].search(line)
+        m = self.P["kill_pvp"].search(line)
         if m:
             pos = m.group(7)
             if pos:
-                cls._set_position(m.group(1), m.group(2), pos)
+                self._set_position(m.group(1), m.group(2), pos)
             return {
                 "type": "kill_pvp",
                 "timestamp": ts,
@@ -1794,7 +1794,7 @@ class DayZLogParser:
             }
 
         # 2) Suicide
-        m = cls.P["suicide"].search(line)
+        m = self.P["suicide"].search(line)
         if m:
             return {
                 "type": "suicide",
@@ -1805,12 +1805,12 @@ class DayZLogParser:
             }
 
         # 3) Environment death
-        m = cls.P["kill_env"].search(line)
+        m = self.P["kill_env"].search(line)
         if m and "killed by player" not in line.lower():
             # Gruppe 3 = "by <Ursache>", Gruppe 5 = "due to <Ursache>"
             cause = m.group(3) or m.group(5)
             if not cause:
-                ev = cls._generic_env_death_event(line, ts)
+                ev = self._generic_env_death_event(line, ts)
                 if ev:
                     return ev
                 cause = "Unbekannte Ursache"
@@ -1824,11 +1824,11 @@ class DayZLogParser:
             }
 
         # 4) Damage
-        m = cls.P["damage"].search(line)
+        m = self.P["damage"].search(line)
         if m:
             pos = m.group(9)
             if pos:
-                cls._set_position(m.group(1), m.group(2), pos)
+                self._set_position(m.group(1), m.group(2), pos)
             return {
                 "type": "damage",
                 "timestamp": ts,
@@ -1844,11 +1844,11 @@ class DayZLogParser:
             }
 
         # 5) Verbindungen
-        m = cls.P["connect"].search(line)
+        m = self.P["connect"].search(line)
         if m:
             pos = m.group(3)
             if pos:
-                cls._set_position(m.group(1), m.group(2), pos)
+                self._set_position(m.group(1), m.group(2), pos)
             return {
                 "type": "connect",
                 "timestamp": ts,
@@ -1858,11 +1858,11 @@ class DayZLogParser:
                 "raw": line,
             }
 
-        m = cls.P["disconnect"].search(line)
+        m = self.P["disconnect"].search(line)
         if m:
             pos = m.group(3)
             if pos:
-                cls._set_position(m.group(1), m.group(2), pos)
+                self._set_position(m.group(1), m.group(2), pos)
             return {
                 "type": "disconnect",
                 "timestamp": ts,
@@ -1872,11 +1872,11 @@ class DayZLogParser:
                 "raw": line,
             }
 
-        m = cls.P["connecting"].search(line)
+        m = self.P["connecting"].search(line)
         if m:
             pos = m.group(3)
             if pos:
-                cls._set_position(m.group(1), m.group(2), pos)
+                self._set_position(m.group(1), m.group(2), pos)
             return {
                 "type": "connecting",
                 "timestamp": ts,
@@ -1887,7 +1887,7 @@ class DayZLogParser:
             }
 
         # 6) Chat
-        m = cls.P["chat"].search(line)
+        m = self.P["chat"].search(line)
         if m:
             return {
                 "type": "chat",
@@ -1899,7 +1899,7 @@ class DayZLogParser:
             }
 
         # 6b) Chat im Konsolen-Format: Chat("Name"(id=...)): Nachricht
-        m = cls.P["chat_console"].search(line)
+        m = self.P["chat_console"].search(line)
         if m:
             return {
                 "type": "chat",
@@ -1911,7 +1911,7 @@ class DayZLogParser:
             }
 
         # 7) Admin-Aktion
-        m = cls.P["admin_action"].search(line)
+        m = self.P["admin_action"].search(line)
         if m:
             return {
                 "type": "admin_action",
@@ -1923,7 +1923,7 @@ class DayZLogParser:
             }
 
         # 8) Basis-Bau
-        m = cls.P["basebuild"].search(line)
+        m = self.P["basebuild"].search(line)
         if m:
             return {
                 "type": "basebuild",
@@ -1935,7 +1935,7 @@ class DayZLogParser:
             }
 
         # 9) Fahrzeug
-        m = cls.P["vehicle"].search(line)
+        m = self.P["vehicle"].search(line)
         if m:
             return {
                 "type": "vehicle",
@@ -1944,7 +1944,7 @@ class DayZLogParser:
             }
 
         # 10) Loot
-        m = cls.P["loot"].search(line)
+        m = self.P["loot"].search(line)
         if m:
             return {
                 "type": "loot",
@@ -1961,7 +1961,7 @@ class DayZLogParser:
         # Suizid (z.B. mit "(DEAD)" oder Zusatztext zwischen Name und Schlüsselwort)
         if any(kw in low for kw in ("committed suicide", "killed themselves",
                                     "blew themselves up", "ended their life", "suicide")):
-            players = cls._players_found(line)
+            players = self._players_found(line)
             if players:
                 return {
                     "type": "suicide",
@@ -1973,32 +1973,32 @@ class DayZLogParser:
 
         # Kill: erst PvP (2 Spieler), sonst Umwelttod (Zombie, Explosion, ...)
         if "killed by" in low:
-            ev = cls._generic_kill_event(line, ts)
+            ev = self._generic_kill_event(line, ts)
             if ev:
                 return ev
-            ev = cls._generic_env_death_event(line, ts)
+            ev = self._generic_env_death_event(line, ts)
             if ev:
                 return ev
 
         # Treffer: erst PvP (2 Spieler), sonst Umwelt (Zombie, FallDamage, ...)
         if "hit by" in low:
-            ev = cls._generic_damage_event(line, ts)
+            ev = self._generic_damage_event(line, ts)
             if ev:
                 return ev
-            ev = cls._generic_env_damage_event(line, ts)
+            ev = self._generic_env_damage_event(line, ts)
             if ev:
                 return ev
 
         # Sonstige Todesarten ohne "killed by"
         if any(kw in low for kw in (" died", "bled out", "perished", "starved",
                                     "dehydrated", "drowned", "suffocated", "froze to death")):
-            ev = cls._generic_env_death_event(line, ts)
+            ev = self._generic_env_death_event(line, ts)
             if ev:
                 return ev
 
         # Join/Leave/Connecting – falls das Format erneut abweicht
         if "connect" in low:
-            players = cls._players_found(line)
+            players = self._players_found(line)
             if players:
                 p = players[0]
                 if "disconnect" in low:
@@ -2012,7 +2012,7 @@ class DayZLogParser:
                 if ctype:
                     pos_m = re.search(r'pos\s*=\s*<([\d., \-]+)>', line, re.IGNORECASE)
                     if pos_m:
-                        cls._set_position(p["name"], p["id"], pos_m.group(1))
+                        self._set_position(p["name"], p["id"], pos_m.group(1))
                     return {
                         "type": ctype,
                         "timestamp": ts,
@@ -2026,7 +2026,7 @@ class DayZLogParser:
         m_build = re.search(r'\b(placed|built|constructed|dismantled|repaired|attached|removed|folded|packed|deployed|mounted|unmounted)\s+(.+)$',
                             line, re.IGNORECASE)
         if m_build:
-            players = cls._players_found(line)
+            players = self._players_found(line)
             if players:
                 return {
                     "type": "basebuild",
@@ -2039,11 +2039,10 @@ class DayZLogParser:
 
         return None
 
-    @classmethod
-    def parse_lines(cls, content: str) -> List[Dict]:
+    def parse_lines(self, content: str) -> List[Dict]:
         events = []
         for line in content.splitlines():
-            ev = cls.parse_line(line)
+            ev = self.parse_line(line)
             if ev:
                 events.append(ev)
         return events
@@ -2058,12 +2057,13 @@ def _footer(ev: Dict) -> str:
 def _dist(d: str) -> str:
     return f"{d} m" if d != "?" else "Nah­kampf"
 
-def _add_location_field(e: discord.Embed, ev: Dict, player_key: str):
+def _add_location_field(e: discord.Embed, ev: Dict, player_key: str,
+                        positions: Optional[Dict[str, Dict]] = None):
     """Fügt das '📍 • Player Location'-Feld hinzu (gleiches Aussehen wie bei
     Connect/Disconnect): Position aus dem Event selbst oder die zuletzt
     getrackte Position des Spielers, als klickbarer iZurvive-Link."""
     name = ev.get(player_key) or ""
-    pos = ev.get("position") or DayZLogParser.player_positions.get(name, {}).get("position")
+    pos = ev.get("position") or (positions or {}).get(name, {}).get("position")
     loc_val = _location_field_value(pos)
     if loc_val:
         e.add_field(name="📍 • Player Location", value=loc_val, inline=False)
@@ -2071,7 +2071,8 @@ def _add_location_field(e: discord.Embed, ev: Dict, player_key: str):
 
 class EmbedBuilder:
     @staticmethod
-    def build(ev: Dict) -> Optional[discord.Embed]:
+    def build(ev: Dict,
+              positions: Optional[Dict[str, Dict]] = None) -> Optional[discord.Embed]:
         t = ev["type"]
         if t == "kill_pvp":
             e = discord.Embed(
@@ -2081,7 +2082,7 @@ class EmbedBuilder:
             )
             e.add_field(name="Waffe",       value=ev["weapon"],         inline=True)
             e.add_field(name="Distanz",     value=_dist(ev["distance"]),inline=True)
-            _add_location_field(e, ev, "victim")
+            _add_location_field(e, ev, "victim", positions)
             e.add_field(name="Killer ID",   value=f"`{ev['killer_id']}`",  inline=False)
             e.add_field(name="Opfer ID",    value=f"`{ev['victim_id']}`",  inline=False)
 
@@ -2091,7 +2092,7 @@ class EmbedBuilder:
                 description=f"**{ev['player']}** hat sein Leben beendet",
                 color=0x7F8C8D
             )
-            _add_location_field(e, ev, "player")
+            _add_location_field(e, ev, "player", positions)
             e.add_field(name="Steam-ID", value=f"`{ev['player_id']}`", inline=False)
 
         elif t == "kill_env":
@@ -2101,7 +2102,7 @@ class EmbedBuilder:
                 color=0xE67E22
             )
             e.add_field(name="Ursache",  value=ev["cause"],              inline=True)
-            _add_location_field(e, ev, "player")
+            _add_location_field(e, ev, "player", positions)
             e.add_field(name="Steam-ID", value=f"`{ev['player_id']}`",   inline=False)
 
         elif t == "damage":
@@ -2114,7 +2115,7 @@ class EmbedBuilder:
             e.add_field(name="Körperteil",  value=ev["hit_zone"],         inline=True)
             e.add_field(name="Waffe",       value=ev["weapon"],           inline=True)
             e.add_field(name="Distanz",     value=_dist(ev["distance"]),  inline=True)
-            _add_location_field(e, ev, "victim")
+            _add_location_field(e, ev, "victim", positions)
 
         elif t == "connect":
             e = discord.Embed(
@@ -2122,7 +2123,7 @@ class EmbedBuilder:
                 description=f"**{ev['player']}** connected to the game server.",
                 color=0x5865F2
             )
-            _add_location_field(e, ev, "player")
+            _add_location_field(e, ev, "player", positions)
             e.add_field(name="Steam-ID", value=f"`{ev['player_id']}`", inline=False)
 
         elif t == "disconnect":
@@ -2131,7 +2132,7 @@ class EmbedBuilder:
                 description=f"**{ev['player']}** left the game server.",
                 color=0xE74C3C
             )
-            _add_location_field(e, ev, "player")
+            _add_location_field(e, ev, "player", positions)
             e.add_field(name="Steam-ID", value=f"`{ev['player_id']}`", inline=False)
 
         elif t == "connecting":
@@ -2140,7 +2141,7 @@ class EmbedBuilder:
                 description=f"**{ev['player']}** verbindet sich...",
                 color=0x3498DB
             )
-            _add_location_field(e, ev, "player")
+            _add_location_field(e, ev, "player", positions)
             e.add_field(name="Steam-ID", value=f"`{ev['player_id']}`", inline=False)
 
         elif t == "chat":
@@ -2168,7 +2169,7 @@ class EmbedBuilder:
                 description=f"**{ev['player']}** hat gebaut: **{ev['item']}**",
                 color=0x8B4513
             )
-            _add_location_field(e, ev, "player")
+            _add_location_field(e, ev, "player", positions)
             e.add_field(name="Steam-ID", value=f"`{ev['player_id']}`", inline=False)
 
         elif t == "vehicle":
@@ -2911,7 +2912,7 @@ class DayZBot(discord.Client):
             # Zonen-Pings: frisch getrackte Positionen gegen /zone-Zonen prüfen
             await self._check_zones(conn)
             # Spielzeit-Belohnung für offene Sitzungen gutschreiben
-            await self._credit_playtime()
+            await self._credit_playtime(conn)
             await self._check_ftp_health(conn)
         except Exception as e:
             log.error(f"[POLL] {conn.name}: {e}")
@@ -3037,7 +3038,9 @@ class DayZBot(discord.Client):
             cooldown = max(0, int((_src.get("zone_ping_cooldown_seconds", 300) if _src
                                    else cfg.config.get("zone_ping_cooldown_seconds", 300))))
             now = time.time()
-            for pname, info in list(DayZLogParser.player_positions.items()):
+            _p = (conn.parser if conn is not None
+                  else (_src.parser if _src is not None else self.parser))
+            for pname, info in list((_p.player_positions if _p else {}).items()):
                 # Nur NEU eingetroffene Positions-Samples bewerten – alte Daten
                 # dürfen nach Zonen-Änderungen keine nachträglichen Pings auslösen
                 last_seen = str(info.get("last_seen") or "")
@@ -3281,7 +3284,8 @@ class DayZBot(discord.Client):
             pass
         # Kill-Statistik, Sessions, Kill-Belohnung & Bounties verarbeiten
         rewards = await self._process_event_rewards(ev)
-        embed = EmbedBuilder.build(ev)
+        _p = conn.parser if conn is not None else self.parser
+        embed = EmbedBuilder.build(ev, _p.player_positions if _p else None)
         if not embed:
             return
         targets = ([str(conn.guild_id)] if conn is not None and conn.guild_id
@@ -3356,7 +3360,7 @@ class DayZBot(discord.Client):
             log.error(f"[REWARD] Event-Verarbeitung fehlgeschlagen: {e}")
         return out
 
-    async def _credit_playtime(self):
+    async def _credit_playtime(self, conn: Optional[ServerConnection] = None):
         """Schreibt verlinkten Spielern volle Spielzeit-Blöcke gut
         (playtime_reward: amount pro interval_minutes, z.B. 500 pro 30 Min)."""
         conf = cfg.config.get("playtime_reward") or {}
@@ -3368,7 +3372,8 @@ class DayZBot(discord.Client):
         try:
             # Verpasste Connect-Events abfangen: verlinkte Spieler, die laut Log
             # gerade aktiv sind, aber keine offene Sitzung haben → Sitzung öffnen
-            positions = dict(DayZLogParser.player_positions)
+            positions = dict((conn.parser or self.parser).player_positions
+                             if conn is not None else self.parser.player_positions)
             await loop.run_in_executor(None, db.sync_sessions_from_positions, positions, 300)
             due = await loop.run_in_executor(None, db.playtime_credits_due, interval)
             for entry in due:
@@ -5079,7 +5084,10 @@ async def cmd_positions(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
 
-    positions = DayZLogParser.player_positions
+    _conn = await _require_conn(interaction)
+    if _conn is None:
+        return
+    positions = (_conn.parser.player_positions if _conn.parser else {})
     if not positions:
         return await interaction.response.send_message(
             "⚠️ Noch keine Positions-Daten verfügbar.\n"
@@ -5278,7 +5286,7 @@ async def cmd_test(interaction: discord.Interaction, zeilen: int = 500):
     # ── 2. Letzten N Zeilen parsen ────────────────────────────
     zeilen = max(50, min(zeilen, 2000))
     recent_lines = "\n".join(content.splitlines()[-zeilen:])
-    events = bot.parser.parse_lines(recent_lines)
+    events = (conn.parser or bot.parser).parse_lines(recent_lines)
 
     # ── 3. Pro Log-Typ das neueste Event merken ───────────────
     # Events kommen in Lesereihenfolge → letztes überschreibt → neuestes bleibt
@@ -5490,7 +5498,9 @@ async def cmd_log_status(interaction: discord.Interaction):
     embed.add_field(name="FTP-Host",
                     value=f"`{cfg.config.get('ftp_host', '–')}`",    inline=False)
     embed.add_field(name="Bekannte Spieler-Positionen",
-                    value=str(len(DayZLogParser.player_positions)),   inline=True)
+                    value=str(len(_conn.parser.player_positions
+                                  if _conn is not None and _conn.parser else {})),
+                    inline=True)
     embed.add_field(name="Lokale Bans",
                     value=str(len(cfg.bans)),                         inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -6421,12 +6431,19 @@ class EconomyDB:
             self._conn.commit()
             return int(cur.lastrowid)
 
-    def pending_purchases(self, created_before: Optional[float] = None) -> List[sqlite3.Row]:
+    def pending_purchases(self, created_before: Optional[float] = None,
+                          guild_id: Optional[int] = None) -> List[sqlite3.Row]:
+        """Offene Käufe. Ohne guild_id die aller Guilds – im Mehrkundenbetrieb
+        gehört deshalb IMMER eine Guild mitgegeben, sonst raeumt der Cleanup
+        eines Servers die Kaeufe fremder Kunden ab."""
         q = "SELECT * FROM purchases WHERE status='pending'"
         args: Tuple = ()
         if created_before is not None:
             q += " AND created_at <= ?"
             args = (created_before,)
+        if guild_id is not None:
+            q += " AND guild_id = ?"
+            args = args + (int(guild_id),)
         with self._lock:
             return list(self._conn.execute(q + " ORDER BY id", args).fetchall())
 
@@ -6966,7 +6983,7 @@ class ShopManager:
         if not path:
             return -1
         valid: set = set()
-        for r in db.pending_purchases():
+        for r in db.pending_purchases(guild_id=self.conn.guild_id):
             try:
                 valid.update(json.loads(r["area_names"] or "[]"))
             except Exception:
@@ -7007,7 +7024,7 @@ class ShopManager:
         if not path:
             report["status"] = "no_path"
             return report
-        pending = db.pending_purchases()
+        pending = db.pending_purchases(guild_id=self.conn.guild_id)
         report["pending"] = len(pending)
         async with self.lock:
             loop = asyncio.get_running_loop()
@@ -7129,7 +7146,8 @@ class ShopManager:
         # dürfen nicht als geliefert markiert werden
         restart_at = self._last_restart_at or time.time()
         cutoff = restart_at - grace
-        rows = db.pending_purchases(created_before=cutoff)
+        rows = db.pending_purchases(created_before=cutoff,
+                                    guild_id=self.conn.guild_id)
         if not rows:
             return
         if delayed:
@@ -7533,12 +7551,13 @@ async def cmd_leaderboard(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e)
 
 
-def _seen_in_logs(name: str, max_age_seconds: int = 900) -> Optional[Dict]:
+def _seen_in_logs(name: str, max_age_seconds: int = 900,
+                  positions: Optional[Dict[str, Dict]] = None) -> Optional[Dict]:
     """Prüft, ob der Spieler kürzlich in den ADM-Logs auftauchte (Positions-Tracking
     des Parsers). Gibt den Eintrag (mit 'id') zurück, sonst None."""
     target = name.lower()
     now = datetime.now(timezone.utc)
-    for pname, info in list(DayZLogParser.player_positions.items()):
+    for pname, info in list((positions or {}).items()):
         if pname.lower() != target:
             continue
         try:
@@ -7575,7 +7594,9 @@ async def cmd_link(interaction: discord.Interaction, playstation_name: str):
             f"Ein Admin kann das mit `/forcelink` korrigieren.", ephemeral=True)
     # Logs nach dem PSN-Namen prüfen: Ist der Spieler gerade auf dem Server,
     # startet der Spielzeit-Zähler sofort (kein neues Connect-Event nötig)
-    seen = _seen_in_logs(name)
+    _conn = _conn_of(interaction)
+    seen = _seen_in_logs(name, positions=(_conn.parser.player_positions
+                                          if _conn is not None and _conn.parser else {}))
     if seen:
         if seen.get("id"):
             db.update_link_id(name, str(seen["id"]))
@@ -8406,7 +8427,7 @@ shop_list.autocomplete("category")(_shop_category_autocomplete)
 async def shop_pending(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    rows = db.pending_purchases()
+    rows = db.pending_purchases(guild_id=interaction.guild_id)
     if not rows:
         return await interaction.response.send_message(
             "✅ No pending deliveries.", ephemeral=True)
@@ -8428,9 +8449,14 @@ async def shop_cleanup(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
     await interaction.response.defer(ephemeral=True)
-    if not bot.shop:
+    # Auf dem EIGENEN Server aufräumen – sonst würde ein Admin die offenen
+    # Käufe aller anderen Kunden als geliefert markieren.
+    _conn = await _require_conn(interaction, need_ftp=True)
+    if _conn is None:
+        return
+    if not _conn.shop:
         return await interaction.followup.send("❌ Shop manager not ready yet.", ephemeral=True)
-    rows = db.pending_purchases()
+    rows = db.pending_purchases(guild_id=interaction.guild_id)
     ids, names = [], []
     for r in rows:
         ids.append(int(r["id"]))
@@ -8439,17 +8465,17 @@ async def shop_cleanup(interaction: discord.Interaction):
         except Exception:
             pass
     if names:
-        ok = await bot.shop.remove_area_entries(names)
+        ok = await _conn.shop.remove_area_entries(names)
         if not ok:
             return await interaction.followup.send(
                 "❌ Could not clean cfgEffectArea.json (FTP/parse error) – nothing was changed.",
                 ephemeral=True)
     if ids:
         db.mark_delivered(ids)
-        bot.shop.cleanup_retry_needed = False
+        _conn.shop.cleanup_retry_needed = False
 
     # Selbstheilung: verwaiste SHOP_-Einträge ohne zugehörigen Kauf entfernen
-    orphans = await bot.shop.sweep_orphans()
+    orphans = await _conn.shop.sweep_orphans()
 
     parts = []
     if ids:
@@ -8470,9 +8496,12 @@ async def shop_check(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
     await interaction.response.defer(ephemeral=True)
-    if not bot.shop:
+    _conn = await _require_conn(interaction, need_ftp=True)
+    if _conn is None:
+        return
+    if not _conn.shop:
         return await interaction.followup.send("❌ Shop manager not ready yet.", ephemeral=True)
-    rep = await bot.shop.check_and_heal()
+    rep = await _conn.shop.check_and_heal()
 
     embed = discord.Embed(title="🩺 Shop-Delivery-Diagnose", color=0x5865F2)
     path = rep.get("path")
@@ -9103,12 +9132,18 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
             embed=_insufficient_embed(total, wallet), ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
-    if not bot.shop:
+    # Auslieferung IMMER über den Server dieser Guild. Vorher lief jeder Kauf
+    # über den Hauptserver: der Käufer zahlte, das Item spawnte woanders, und
+    # ein fremder Server wurde dafür neu gestartet.
+    _conn = await _require_conn(interaction, need_ftp=True)
+    if _conn is None:
+        return
+    if not _conn.shop:
         return await interaction.followup.send(
             "❌ Shop system is still starting up – try again in a moment.", ephemeral=True)
 
     # ── 4. Erst in cfgEffectArea.json schreiben ... ───────────
-    ok, err, area_names = await bot.shop.add_purchase_entries(
+    ok, err, area_names = await _conn.shop.add_purchase_entries(
         cls_list, int(amount), x, y_val, z)
     if not ok:
         return await interaction.followup.send(
@@ -9117,7 +9152,7 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
 
     # ── 5. ... dann Geld abbuchen (atomar). Bei Fehlschlag: Rollback ──
     if not db.try_spend_wallet(gid, uid, total):
-        rollback_ok = await bot.shop.remove_area_entries(area_names)   # Einträge zurückrollen
+        rollback_ok = await _conn.shop.remove_area_entries(area_names)   # Einträge zurückrollen
         if not rollback_ok:
             # Verwaiste Einträge würden bei jedem Neustart gratis spawnen → Admins warnen
             log.error(f"[SHOP] Rollback fehlgeschlagen – verwaiste Areas: {area_names}")
@@ -9139,7 +9174,7 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
 
     # ── 7. Auto-Restart oder Hinweis auf nächsten Neustart ────
     if cfg.config.get("auto_restart_after_purchase", False):
-        bot.shop.schedule_auto_restart()
+        _conn.shop.schedule_auto_restart()
         cooldown = int(cfg.config.get("restart_cooldown_seconds", 300))
         delivery_info = (f"🔄 A server restart has been scheduled – your items will spawn "
                          f"in about **{max(5, cooldown)} seconds** (plus boot time).")
@@ -11485,10 +11520,14 @@ async def api_map_meta(request: web.Request) -> web.Response:
 
 
 async def api_map_players(request: web.Request) -> web.Response:
-    parser = getattr(bot, "parser", None) if bot else None
+    # Positionen NUR des eigenen Servers – sonst saehe jeder Kunde auf der
+    # Karte die Live-Positionen der Spieler aller anderen.
+    _c, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    parser = _c.parser
     positions = getattr(parser, "player_positions", {}) if parser else {}
     nearest_fn = _nearest_location
-    _c = _conn_for_session(_sess_get(request))
     map_name = (_c.get("map_name", "ChernarusPlus") if _c
                 else cfg.config.get("map_name", "ChernarusPlus"))
     out = []
