@@ -9044,7 +9044,7 @@ async def shop_check(interaction: discord.Interaction):
             embed.colour = 0xE74C3C
     embed.add_field(name="Offene Käufe", value=str(pending), inline=True)
 
-    if pending and not conn.get("auto_restart_after_purchase", False):
+    if pending and not _conn.get("auto_restart_after_purchase", False):
         embed.add_field(
             name="Hinweis",
             value=("`auto_restart_after_purchase` ist **aus** – Items spawnen erst "
