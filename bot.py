@@ -33,6 +33,7 @@ import uuid
 import random
 import threading
 import functools
+import contextvars
 import glob
 import base64
 import zlib
@@ -684,6 +685,7 @@ class ConfigManager:
         # Verbundene Nitrado-Server laden. Beim ersten Start nach dem Update
         # wird daraus eine bestehende Einzelserver-Einrichtung uebernommen.
         connections.load()
+        _migriere_ban_metadaten()
 
     def _merge_defaults(self, target: Dict, defaults: Dict) -> bool:
         """Ergänzt fehlende Keys rekursiv, ohne vorhandene Werte zu überschreiben."""
@@ -2559,14 +2561,35 @@ PREMIUM_MISSING_TEXT = (
 )
 
 
+# Der Server, um den es im gerade laufenden Befehl bzw. Poll-Zyklus geht.
+# Damit lesen _cur_symbol/_fmt_money die Waehrung DIESES Kunden, ohne dass
+# jede der ueber 60 Aufrufstellen eine Verbindung durchreichen muesste.
+# contextvars sind pro asyncio-Task getrennt – ein Befehl beeinflusst also
+# nie die Anzeige eines gleichzeitig laufenden Befehls einer anderen Guild.
+_AKTUELLER_SERVER: "contextvars.ContextVar[Optional[ServerConnection]]" = \
+    contextvars.ContextVar("aktueller_server", default=None)
+
+
+def _setze_aktuellen_server(conn: Optional[ServerConnection]) -> None:
+    try:
+        _AKTUELLER_SERVER.set(conn)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _premium_check(interaction: discord.Interaction) -> bool:
     """Laeuft vor jedem Slash-Befehl (CommandTree.interaction_check).
 
     Ohne zugeordneten Nitrado-Server ist der Discord-Server nicht
     freigeschaltet. Die Pruefung darf niemals eine Ausnahme nach oben
     durchlassen – sonst waeren im Zweifel alle Befehle tot.
+    Nebenbei wird hier der Server des Befehls hinterlegt, damit Betraege in
+    der Waehrung dieses Kunden angezeigt werden.
     """
     try:
+        _setze_aktuellen_server(
+            connections.for_guild(interaction.guild_id)
+            if interaction.guild_id is not None else connections.primary())
         name = str(getattr(interaction.command, "qualified_name", "") or "")
         if name.split(" ")[0] in _PREMIUM_FREE_COMMANDS:
             return True
@@ -2815,6 +2838,8 @@ class DayZBot(discord.Client):
                 await self._check_ftp_health(conn)
 
     async def _poll_connection(self, conn: ServerConnection):
+        # Waehrung/Anzeige gehoeren zu DIESEM Server (siehe _cur_symbol)
+        _setze_aktuellen_server(conn)
         log_dir = conn.get("ftp_log_dir")
         if not log_dir:
             # Discovery beim Start fehlgeschlagen oder noch nicht gelaufen →
@@ -3000,7 +3025,7 @@ class DayZBot(discord.Client):
                 self._online_since = time.time()
         else:
             self._online_since = None
-        embed = self._build_status_embed(info)
+        embed = self._build_status_embed(info, conn)
         # Nur die Guild dieses Servers – sonst saehe jeder Discord-Server den
         # Status aller Kunden.
         targets = ([str(conn.guild_id)] if conn.guild_id else list(cfg.guilds.keys()))
@@ -3032,7 +3057,8 @@ class DayZBot(discord.Client):
     async def _before_status(self):
         await self.wait_until_ready()
 
-    def _build_status_embed(self, info: Optional[Dict]) -> discord.Embed:
+    def _build_status_embed(self, info: Optional[Dict],
+                            conn: Optional[ServerConnection] = None) -> discord.Embed:
         if info:
             e = discord.Embed(title="🟢 Server ONLINE", color=0x2ECC71)
             e.add_field(name="Server", value=str(info.get("name") or "?"), inline=False)
@@ -3050,7 +3076,7 @@ class DayZBot(discord.Client):
                 description=("Keine Antwort auf die A2S-Abfrage – Server ist aus, "
                              "startet gerade oder der Query-Port stimmt nicht."),
                 color=0xE74C3C)
-        nxt = self._next_scheduled_restart()
+        nxt = self._next_scheduled_restart(conn)
         if nxt:
             e.add_field(name="⏰ Nächster Auto-Restart", value=f"<t:{int(nxt)}:R>", inline=True)
         e.set_footer(text="Auto-Status · aktualisiert sich automatisch")
@@ -3139,9 +3165,14 @@ class DayZBot(discord.Client):
             await _post_feed(gid, "adminlog", e, content=content)
 
     # ── Geplante Neustarts (/auto restart) ────────────────────
-    def _next_scheduled_restart(self) -> Optional[float]:
-        """Nächster geplanter Restart-Zeitpunkt (lokale Serverzeit des Bots)."""
-        _c = connections.primary()
+    def _next_scheduled_restart(self,
+                                conn: Optional[ServerConnection] = None) -> Optional[float]:
+        """Nächster geplanter Restart-Zeitpunkt EINES Servers (lokale Botzeit).
+
+        Ohne Angabe gilt der Hauptserver – jeder Kunde hat seinen eigenen
+        Zeitplan, sonst wuerde der Plan des Betreibers fremde Server neu starten.
+        """
+        _c = conn if conn is not None else connections.primary()
         sched = ((_c.get("auto_restart_schedule") if _c
                   else cfg.config.get("auto_restart_schedule")) or {})
         if not sched.get("enabled"):
@@ -3169,15 +3200,28 @@ class DayZBot(discord.Client):
             log.error(f"[AUTO-RESTART] Fehler: {e}")
 
     async def _restart_scheduler_once(self):
-        nxt = self._next_scheduled_restart()
+        """Jeden verbundenen Server nach seinem eigenen Zeitplan neu starten."""
+        for conn in connections.all():
+            try:
+                await self._restart_scheduler_conn(conn)
+            except Exception as e:  # noqa: BLE001 – ein Server darf die anderen nicht stoppen
+                log.error(f"[AUTO-RESTART] {conn.name}: {e}")
+        # Alte Ankündigungs-Marker aufräumen
+        cutoff = time.time() - 3600
+        self._restart_announced = {k for k in self._restart_announced if k[1] > cutoff}
+
+    async def _restart_scheduler_conn(self, conn: ServerConnection):
+        sid = conn.service_id
+        nxt = self._next_scheduled_restart(conn)
         if nxt is None:
-            if self._restart_announced:
-                self._restart_announced.clear()
+            übrig = {k for k in self._restart_announced if k[0] != sid}
+            if übrig != self._restart_announced:
+                self._restart_announced = übrig
             return
         remaining = nxt - time.time()
         # Ankündigungen 15/5/1 Minuten vorher (45s-Fenster > 30s-Loop-Takt)
         for mins in (15, 5, 1):
-            key = (int(nxt), mins)
+            key = (sid, int(nxt), mins)
             if (mins * 60 - 45) < remaining <= mins * 60 and key not in self._restart_announced:
                 self._restart_announced.add(key)
                 e = discord.Embed(
@@ -3185,34 +3229,41 @@ class DayZBot(discord.Client):
                     description=(f"Geplanter Neustart um <t:{int(nxt)}:t> Uhr – "
                                  f"bitte sichere Position und Loot."),
                     color=0xE67E22 if mins <= 5 else 0xF1C40F)
-                await self._post_restart_feed(e)
+                await self._post_restart_feed(e, conn)
         # Restart auslösen
-        key0 = (int(nxt), 0)
+        key0 = (sid, int(nxt), 0)
         if remaining <= 30 and key0 not in self._restart_announced:
             self._restart_announced.add(key0)
+            if conn.api is None:
+                log.warning(f"[AUTO-RESTART] {conn.name}: keine Nitrado-Verbindung.")
+                return
             try:
-                ok, msg = await self.nitrado.restart()
-            except Exception as ex:
+                ok, msg = await conn.api.restart()
+            except Exception as ex:  # noqa: BLE001
                 ok, msg = False, str(ex)
-            log.info(f"[AUTO-RESTART] Geplanter Neustart ausgelöst: ok={ok} – {msg}")
+            log.info(f"[AUTO-RESTART] {conn.name}: Neustart ausgelöst: ok={ok} – {msg}")
             e = discord.Embed(
                 title="🔄 Server wird jetzt neu gestartet" if ok
                       else "❌ Geplanter Neustart fehlgeschlagen",
                 description=("Der geplante Neustart wurde über die Nitrado-API ausgelöst."
                              if ok else f"Nitrado-API-Fehler: {msg}"),
                 color=0x2ECC71 if ok else 0xE74C3C)
-            await self._post_restart_feed(e)
-        # Alte Ankündigungs-Marker aufräumen
-        cutoff = time.time() - 3600
-        self._restart_announced = {k for k in self._restart_announced if k[0] > cutoff}
+            await self._post_restart_feed(e, conn)
 
     @restart_scheduler.before_loop
     async def _before_restart_scheduler(self):
         await self.wait_until_ready()
 
-    async def _post_restart_feed(self, embed: discord.Embed):
-        """Postet in den restart-Feed; ohne konfigurierten Channel → adminlog."""
-        for gid_str in cfg.guilds:
+    async def _post_restart_feed(self, embed: discord.Embed,
+                                 conn: Optional[ServerConnection] = None):
+        """Postet in den restart-Feed; ohne konfigurierten Channel → adminlog.
+
+        Mit Verbindung nur in deren Guild – ein Neustart-Hinweis eines Servers
+        hat in fremden Discord-Servern nichts zu suchen.
+        """
+        ziele = ([str(conn.guild_id)] if conn is not None and conn.guild_id
+                 else ([] if conn is not None else list(cfg.guilds)))
+        for gid_str in ziele:
             gid = int(gid_str)
             lt = "restart" if cfg.get_channel(gid, "restart") else "adminlog"
             await _post_feed(gid, lt, embed)
@@ -3311,6 +3362,7 @@ class DayZBot(discord.Client):
         Mit Verbindung geht es nur in deren Guild – die Ereignisse eines
         Servers haben in fremden Discord-Servern nichts zu suchen.
         """
+        _setze_aktuellen_server(conn)
         log_type = DayZLogParser.EVENT_TO_LOG.get(ev["type"])
         if not log_type:
             return
@@ -3414,7 +3466,8 @@ class DayZBot(discord.Client):
     async def _credit_playtime(self, conn: Optional[ServerConnection] = None):
         """Schreibt verlinkten Spielern volle Spielzeit-Blöcke gut
         (playtime_reward: amount pro interval_minutes, z.B. 500 pro 30 Min)."""
-        conf = cfg.config.get("playtime_reward") or {}
+        conf = ((conn.get("playtime_reward") if conn is not None
+                 else cfg.config.get("playtime_reward")) or {})
         amount = max(0, int(conf.get("amount", 0)))
         if amount <= 0:
             return
@@ -3511,6 +3564,41 @@ def _conn_store(conn: ServerConnection, key: str, value: Any) -> None:
     if connections.primary() is conn:
         cfg.config[key] = value
         cfg.save_config()
+
+
+def _bans_of(conn: Optional[ServerConnection]) -> Dict[str, Dict]:
+    """Lokale Ban-Metadaten (Grund/Datum/von) EINES Servers.
+
+    Gebannt wird bei Nitrado – diese Datei haelt nur die Zusatzangaben fuer
+    ``/banlist``. Ohne die Trennung sähe ein Kunde Grund und Admin-Namen des
+    Bans eines anderen, sobald derselbe Spielername dort gesperrt ist.
+    """
+    sid = conn.service_id if conn is not None else ""
+    eimer = cfg.bans.get(sid)
+    if not isinstance(eimer, dict):
+        eimer = {}
+        cfg.bans[sid] = eimer
+    return eimer
+
+
+def _migriere_ban_metadaten() -> None:
+    """Alte flache banlist.json (Name → Angaben) dem Hauptserver zuordnen."""
+    daten = cfg.bans
+    if not isinstance(daten, dict) or not daten:
+        return
+    flach = {k: v for k, v in daten.items()
+             if isinstance(v, dict) and ("reason" in v or "banned_at" in v)}
+    if not flach:
+        return
+    haupt = connections.primary()
+    sid = haupt.service_id if haupt is not None else ""
+    eimer = daten.get(sid) if isinstance(daten.get(sid), dict) else {}
+    eimer.update(flach)
+    for k in flach:
+        daten.pop(k, None)
+    daten[sid] = eimer
+    cfg.save_bans()
+    log.info(f"[BAN] {len(flach)} lokale Ban-Angaben dem Server {sid or '-'} zugeordnet.")
 
 
 async def _require_conn(interaction: discord.Interaction,
@@ -4008,7 +4096,8 @@ async def cmd_status(interaction: discord.Interaction):
     src = []
     if info:   src.append("Nitrado API")
     if a2s:    src.append("Direkter Ping (A2S)")
-    embed.set_footer(text=f"Quellen: {', '.join(src) or '–'} | Service ID: {cfg.config.get('service_id','–')}")
+    embed.set_footer(text=f"Quellen: {', '.join(src) or '–'} | "
+                          f"Service ID: {conn.service_id or '–'}")
     await interaction.followup.send(embed=embed)
 
 
@@ -4055,12 +4144,15 @@ class AutoRestartView(discord.ui.View):
         if self.hour is None or self.minute is None:
             return await itx.response.send_message(
                 "❌ Bitte zuerst Stunde und Minute auswählen.", ephemeral=True)
+        conn = _conn_of(itx)
+        if conn is None:
+            return await itx.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
         first = f"{self.hour:02d}:{self.minute:02d}"
-        cfg.config["auto_restart_schedule"] = {
-            "enabled": True, "first_time": first, "interval_hours": self.interval_hours}
-        cfg.save_config()
-        bot._restart_announced.clear()
-        nxt = bot._next_scheduled_restart()
+        _conn_store(conn, "auto_restart_schedule", {
+            "enabled": True, "first_time": first, "interval_hours": self.interval_hours})
+        bot._restart_announced = {k for k in bot._restart_announced
+                                  if k[0] != conn.service_id}
+        nxt = bot._next_scheduled_restart(conn)
         for child in self.children:
             child.disabled = True
         e = discord.Embed(
@@ -4096,12 +4188,15 @@ async def auto_restart(interaction: discord.Interaction,
 async def auto_off(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    sched = dict(cfg.config.get("auto_restart_schedule") or {})
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+    sched = dict(conn.get("auto_restart_schedule") or {})
     was_on = bool(sched.get("enabled"))
     sched["enabled"] = False
-    cfg.config["auto_restart_schedule"] = sched
-    cfg.save_config()
-    bot._restart_announced.clear()
+    _conn_store(conn, "auto_restart_schedule", sched)
+    bot._restart_announced = {k for k in bot._restart_announced
+                              if k[0] != conn.service_id}
     await interaction.response.send_message(
         "⏹️ Geplante Neustarts deaktiviert." if was_on
         else "ℹ️ Es waren keine geplanten Neustarts aktiv.", ephemeral=True)
@@ -4109,11 +4204,14 @@ async def auto_off(interaction: discord.Interaction):
 
 @auto_group.command(name="status", description="📋 Zeigt den aktuellen Restart-Zeitplan")
 async def auto_status(interaction: discord.Interaction):
-    sched = cfg.config.get("auto_restart_schedule") or {}
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+    sched = conn.get("auto_restart_schedule") or {}
     if not sched.get("enabled"):
         return await interaction.response.send_message(
             "ℹ️ Keine geplanten Neustarts aktiv. Einrichten: `/auto restart`.", ephemeral=True)
-    nxt = bot._next_scheduled_restart()
+    nxt = bot._next_scheduled_restart(conn)
     e = discord.Embed(
         title="⏰ Auto-Restart Zeitplan",
         description=(f"Startzeit: **{sched.get('first_time', '?')} Uhr** · "
@@ -4577,9 +4675,10 @@ async def cmd_ban(interaction: discord.Interaction, spieler: str, grund: str = "
 
     # Lokale Metadaten (nur für die Anzeige in /banlist)
     now = datetime.now(timezone.utc).isoformat()
+    _eimer = _bans_of(conn)
     for n in added:
-        cfg.bans[n] = {"name": n, "reason": grund,
-                       "banned_by": str(interaction.user), "banned_at": now}
+        _eimer[n] = {"name": n, "reason": grund,
+                     "banned_by": str(interaction.user), "banned_at": now}
     if added:
         cfg.save_bans()
 
@@ -4633,8 +4732,9 @@ async def cmd_unban(interaction: discord.Interaction, spieler: str):
                 f"❌ Nitrado-Banliste konnte nicht gespeichert werden – nichts geändert.\n`{msg}`")
         sv = "✅ Von der Nitrado-Banliste entfernt"
         # Lokale Metadaten aufräumen (case-insensitive)
-        for local_key in [k for k in cfg.bans if k.lower() in wanted_lower]:
-            cfg.bans.pop(local_key, None)
+        _eimer = _bans_of(conn)
+        for local_key in [k for k in _eimer if k.lower() in wanted_lower]:
+            _eimer.pop(local_key, None)
         cfg.save_bans()
 
     embed = discord.Embed(title="✅ Ban aufgehoben", color=0x2ECC71)
@@ -4677,7 +4777,7 @@ async def cmd_banlist(interaction: discord.Interaction):
     # Metadaten (Grund/Datum/von) kommen aus der lokalen banlist.json, falls
     # der Ban über /ban gesetzt wurde – Einträge direkt aus dem Nitrado-
     # Webinterface haben keine Metadaten (case-insensitives Matching)
-    local = {k.lower(): v for k, v in cfg.bans.items()}
+    local = {k.lower(): v for k, v in _bans_of(conn).items()}
     lines = []
     for entry in sorted(all_bans, key=str.lower):
         info = local.get(entry.lower())
@@ -5538,26 +5638,32 @@ async def cmd_log_status(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
 
-    state = cfg.log_state.get("current", {})
+    _conn = _conn_of(interaction)
+    if _conn is None:
+        return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+    # Alles aus DIESER Verbindung – sonst zeigte der Befehl den Log-Pfad und
+    # FTP-Host des Betreibers, egal aus welchem Discord er kam.
+    state = _conn.log_state.get("current", {})
     embed = discord.Embed(title="📄 Log-Polling Status", color=0x5865F2)
+    embed.add_field(name="Server", value=_conn.name, inline=False)
     embed.add_field(name="Aktuelle Log-Datei",
                     value=f"`{state.get('file', 'Keine')}`",         inline=False)
     embed.add_field(name="Gelesene Bytes",
                     value=f"{state.get('offset', 0):,}",             inline=True)
     embed.add_field(name="Poll-Intervall",
-                    value=f"{cfg.config.get('log_poll_interval_seconds', 10)}s",inline=True)
+                    value=f"{_conn.get('log_poll_interval_seconds', 10)}s",inline=True)
     embed.add_field(name="Log-Verzeichnis",
-                    value=f"`{cfg.config.get('ftp_log_dir', '–')}`", inline=False)
+                    value=f"`{_conn.get('ftp_log_dir') or '–'}`", inline=False)
     embed.add_field(name="Banliste",
                     value="Nitrado-Servereinstellungen (via API)",     inline=False)
     embed.add_field(name="FTP-Host",
-                    value=f"`{cfg.config.get('ftp_host', '–')}`",    inline=False)
+                    value=f"`{_conn.get('ftp_host') or '–'}`",    inline=False)
     embed.add_field(name="Bekannte Spieler-Positionen",
                     value=str(len(_conn.parser.player_positions
-                                  if _conn is not None and _conn.parser else {})),
+                                  if _conn.parser else {})),
                     inline=True)
     embed.add_field(name="Lokale Bans",
-                    value=str(len(cfg.bans)),                         inline=True)
+                    value=str(len(_bans_of(_conn))),                  inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -5693,6 +5799,45 @@ except FileNotFoundError:
 def save_announcements():
     with open(ANNOUNCEMENTS_FILE, "w", encoding="utf-8") as f:
         json.dump(ann_data, f, ensure_ascii=False, indent=4)
+
+
+def _ann_eigene(conn: Optional["ServerConnection"]) -> List[Tuple[int, dict]]:
+    """Ankündigungen eines Servers als ``[(Position in der Datei, Eintrag)]``.
+
+    Alle Ankündigungen liegen in einer gemeinsamen Datei. Ohne diese Filterung
+    zeigte ``/liste`` jedem Kunden die Ankündigungen aller anderen – und
+    ``/löschen 0`` traf den erstbesten fremden Eintrag. Alt-Einträge ohne
+    ``service_id`` gehören dem Hauptserver.
+    """
+    if conn is None:
+        return []
+    haupt = connections.primary()
+    out: List[Tuple[int, dict]] = []
+    for i, ann in enumerate(ann_data.get("announcements", [])):
+        sid = str(ann.get("service_id") or "")
+        if sid == conn.service_id or (not sid and haupt is conn):
+            out.append((i, ann))
+    return out
+
+
+async def _ann_position(interaction: discord.Interaction,
+                        index: int) -> Optional[int]:
+    """Rechnet die in ``/liste`` angezeigte Nummer in die Dateiposition um.
+
+    Antwortet selbst, wenn die Nummer nicht zu einer eigenen Ankündigung
+    gehört – der Aufrufer bricht dann mit ``return`` ab.
+    """
+    conn = _conn_of(interaction)
+    if conn is None:
+        await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+        return None
+    eigene = _ann_eigene(conn)
+    if index < 0 or index >= len(eigene):
+        await interaction.response.send_message(
+            "❌ Ungültige Nummer – `/liste` zeigt die Ankündigungen dieses Servers.",
+            ephemeral=True)
+        return None
+    return eigene[index][0]
 
 
 def should_send_today(ann: dict, today: date) -> bool:
@@ -6041,6 +6186,7 @@ class AnnouncementModal(discord.ui.Modal):
                 ephemeral=True
             )
 
+        _conn = _conn_of(interaction)
         ann_data["announcements"].append({
             "message": self.msg.value,
             "channel_id": str(self.channel.value),
@@ -6048,7 +6194,9 @@ class AnnouncementModal(discord.ui.Modal):
             "time": self.time,
             "repeat": self.repeat_type,
             "image": self.image.value.strip() if self.image.value else None,
-            "last_sent": None  # Wird nach dem ersten Senden gesetzt
+            "last_sent": None,  # Wird nach dem ersten Senden gesetzt
+            # Gehoert zu genau einem Server, sonst sehen alle Kunden alles
+            "service_id": _conn.service_id if _conn is not None else "",
         })
 
         save_announcements()
@@ -6120,12 +6268,17 @@ async def cmd_ann_liste(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
 
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+    eigene = _ann_eigene(conn)
+
     embed = discord.Embed(
         title="📋 Ankündigungen",
         color=discord.Color.blue()
     )
 
-    if not ann_data["announcements"]:
+    if not eigene:
 
         embed.description = "Keine Ankündigungen gespeichert."
 
@@ -6144,7 +6297,7 @@ async def cmd_ann_liste(interaction: discord.Interaction):
             "saturday": "Samstag", "sunday": "Sonntag"
         }
 
-        for i, ann in enumerate(ann_data["announcements"]):
+        for i, (_pos, ann) in enumerate(eigene):
 
             last_sent_str = ann.get("last_sent")
             last_sent_display = (
@@ -6185,14 +6338,11 @@ async def cmd_ann_loeschen(
     if not _is_admin(interaction):
         return await _deny(interaction)
 
-    if index < 0 or index >= len(ann_data["announcements"]):
+    pos = await _ann_position(interaction, index)
+    if pos is None:
+        return
 
-        return await interaction.response.send_message(
-            "❌ Ungültiger Index",
-            ephemeral=True
-        )
-
-    ann_data["announcements"].pop(index)
+    ann_data["announcements"].pop(pos)
 
     save_announcements()
 
@@ -6416,8 +6566,17 @@ class EconomyDB:
 
     # ── Salden ────────────────────────────────────────────────
     def ensure_user(self, guild_id: int, user_id: int):
-        """Legt den User mit Startguthaben an, falls noch nicht vorhanden."""
-        start = int(cfg.config.get("starting_balance", 0))
+        """Legt den User mit Startguthaben an, falls noch nicht vorhanden.
+
+        Das Startguthaben kommt vom Server dieser Guild – jeder Kunde legt es
+        im Dashboard selbst fest.
+        """
+        try:
+            _c = connections.for_guild(int(guild_id))
+        except Exception:  # noqa: BLE001
+            _c = None
+        start = int((_c.get("starting_balance", 0) if _c is not None
+                     else cfg.config.get("starting_balance", 0)) or 0)
         with self._lock:
             self._conn.execute(
                 "INSERT OR IGNORE INTO balances (guild_id, user_id, wallet, bank) VALUES (?,?,?,0)",
@@ -6888,11 +7047,15 @@ db = EconomyDB()
 # ══════════════════════════════════════════════════════════════
 #  Economy-Hilfsfunktionen
 # ══════════════════════════════════════════════════════════════
-def _cur_symbol() -> str:
+def _cur_symbol(conn: Optional[ServerConnection] = None) -> str:
+    """Waehrungssymbol des gerade behandelten Servers."""
+    conn = conn if conn is not None else _AKTUELLER_SERVER.get()
+    if conn is not None:
+        return str(conn.get("currency_symbol", "₽") or "₽")
     return cfg.config.get("currency_symbol", "₽")
 
-def _fmt_money(n: int) -> str:
-    return f"{int(n):,} {_cur_symbol()}"
+def _fmt_money(n: int, conn: Optional[ServerConnection] = None) -> str:
+    return f"{int(n):,} {_cur_symbol(conn)}"
 
 def _cooldown_embed(action_label: str, remaining: float) -> discord.Embed:
     """Embed mit Discord-Relativzeit, wann der Befehl wieder nutzbar ist."""
@@ -7614,6 +7777,7 @@ async def cmd_economy_reload(interaction: discord.Interaction):
         return await _deny(interaction)
     ok = cfg.reload_config()
     if ok:
+        _conn_c = _conn_of(interaction)
         katalog = _catalog_of(interaction)   # nur der Katalog DIESES Servers
         if katalog is not None:
             katalog.load()
@@ -7625,7 +7789,8 @@ async def cmd_economy_reload(interaction: discord.Interaction):
             title="🔄 Config reloaded",
             description=(f"`config.json` was reloaded successfully.\n"
                          f"Catalog: {katalog_txt} · "
-                         f"Currency: **{cfg.config.get('currency_name', '?')} ({_cur_symbol()})**"),
+                         f"Currency: **{_conn_c.get('currency_name', '?') if _conn_c else '?'} "
+                         f"({_cur_symbol(_conn_c)})**"),
             color=0x2ECC71)
     else:
         embed = discord.Embed(
@@ -7761,8 +7926,10 @@ async def cmd_link(interaction: discord.Interaction, playstation_name: str):
     else:
         online_line = ("\nℹ️ Aktuell nicht in den Logs gesehen – der Spielzeit-Zähler "
                        "startet bei deinem nächsten Connect.")
-    reward   = int(cfg.config.get("kill_reward", 0))
-    pt       = cfg.config.get("playtime_reward") or {}
+    reward   = int((_conn.get("kill_reward", 0) if _conn is not None
+                    else cfg.config.get("kill_reward", 0)) or 0)
+    pt       = ((_conn.get("playtime_reward") if _conn is not None
+                 else cfg.config.get("playtime_reward")) or {})
     pt_line  = (f"\n⏱️ Spielzeit: **{_fmt_money(int(pt.get('amount', 0)))}** pro "
                 f"**{int(pt.get('interval_minutes', 30))} Min** auf dem Server"
                 if int(pt.get("amount", 0)) > 0 else "")
@@ -8428,7 +8595,13 @@ class ShopCatalog:
         self._by_key.clear()
         self.by_category.clear()
         self._ac_index = []
-        sym = _cur_symbol()
+        # Symbol des eigenen Servers – der Katalog wird ausserhalb eines
+        # Befehls geladen, der Kontext hilft hier also nicht weiter.
+        try:
+            _c = connections.for_service(self.service_id) if self.service_id else None
+        except Exception:  # noqa: BLE001
+            _c = None
+        sym = _cur_symbol(_c)
         for it in self.items:
             cls_list = _item_classnames(it)
             if not cls_list:
@@ -9074,14 +9247,11 @@ async def edit_ankuendigung(interaction: discord.Interaction, index: int):
     if not _is_admin(interaction):
         return await _deny(interaction)
 
-    if index < 0 or index >= len(ann_data["announcements"]):
+    pos = await _ann_position(interaction, index)
+    if pos is None:
+        return
 
-        return await interaction.response.send_message(
-            "❌ Ungültiger Index",
-            ephemeral=True
-        )
-
-    modal = EditAnnouncementModal(index)
+    modal = EditAnnouncementModal(pos)
 
     await interaction.response.send_modal(modal)
 
@@ -11473,13 +11643,13 @@ async def guild_channels(request: web.Request) -> web.Response:
 # ──────────────────────────────────────────────────────────────────────────
 #  Auto-Aufgaben: geplante Server-Neustarts (wie ``/auto restart|off|status``).
 # ──────────────────────────────────────────────────────────────────────────
-def _next_run():
-    """Nächster geplanter Restart-Zeitpunkt. Die Funktion ist eine METHODE der
-    Bot-Instanz (nicht des Moduls), daher am Bot-Objekt holen."""
+def _next_run(conn: Optional[ServerConnection] = None):
+    """Nächster geplanter Restart-Zeitpunkt DIESES Servers. Die Funktion ist
+    eine METHODE der Bot-Instanz (nicht des Moduls), daher am Bot-Objekt holen."""
     fn = getattr(bot, "_next_scheduled_restart", None)
     if callable(fn):
         try:
-            return fn()
+            return fn(conn)
         except Exception:
             return None
     return None
@@ -11491,12 +11661,12 @@ async def get_auto_restart(request: web.Request) -> web.Response:
         return denied
     sched = conn.get("auto_restart_schedule",
                      {"enabled": False, "first_time": "04:00", "interval_hours": 4})
-    nxt = _next_run()
+    nxt = _next_run(conn)
     return ok({
         "schedule": sched,
         "next_run_ts": nxt,
-        "after_purchase": bool(cfg.config.get("auto_restart_after_purchase", False)),
-        "restart_cooldown_seconds": int(cfg.config.get("restart_cooldown_seconds", 300)),
+        "after_purchase": bool(conn.get("auto_restart_after_purchase", False)),
+        "restart_cooldown_seconds": int(conn.get("restart_cooldown_seconds", 300) or 300),
     })
 
 
@@ -11528,13 +11698,15 @@ async def set_auto_restart(request: web.Request) -> web.Response:
 
     if "after_purchase" in data:
         _conn_store(conn, "auto_restart_after_purchase", bool(data["after_purchase"]))
-    # Angekündigte Restarts zurücksetzen, damit die neue Zeit sauber greift
+    # Angekündigte Restarts DIESES Servers zurücksetzen, damit die neue Zeit
+    # sauber greift – die Zeitpläne der anderen Kunden bleiben unberührt.
     try:
-        bot._restart_announced.clear()
+        bot._restart_announced = {k for k in bot._restart_announced
+                                  if k[0] != conn.service_id}
     except Exception:
         pass
 
-    return ok({"schedule": sched, "next_run_ts": _next_run()})
+    return ok({"schedule": sched, "next_run_ts": _next_run(conn)})
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -12088,12 +12260,15 @@ async def api_economy_balances(request: web.Request) -> web.Response:
         rows = await _dash_run(_read_balances, gid)
     except Exception as e:  # noqa: BLE001
         return err(f"db nicht lesbar: {e}", 500)
+    _conn_g = connections.for_guild(gid)
     return ok({
         "guild_id": str(gid),
         "balances": [{"user_id": str(r["user_id"]), "ingame": r["ingame"],
                       "wallet": r["wallet"], "bank": r["bank"]} for r in rows],
-        "currency": cfg.config.get("currency_name", "Rubles"),
-        "symbol": cfg.config.get("currency_symbol", "₽"),
+        "currency": _conn_g.get("currency_name", "Rubles") if _conn_g else
+                    cfg.config.get("currency_name", "Rubles"),
+        "symbol": _conn_g.get("currency_symbol", "₽") if _conn_g else
+                  cfg.config.get("currency_symbol", "₽"),
     })
 
 
