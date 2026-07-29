@@ -34,6 +34,7 @@ import random
 import threading
 import functools
 import contextvars
+import copy
 import glob
 import base64
 import zlib
@@ -2294,6 +2295,24 @@ class ServerConnection:
         "map_name", "auto_restart_schedule", "auto_restart_after_purchase",
     })
 
+    # Einstellungen, die jeder Kunde selbst festlegt. Rueckfallebene ist hier
+    # NICHT die config.json des Betreibers, sondern die mitgelieferte Vorgabe –
+    # sonst wuerde jede Aenderung des Betreibers (Waehrung, Belohnungen,
+    # Casino-Einsaetze, Liefer-Parameter) bei allen Kunden mitwandern, die den
+    # Wert noch nicht selbst gesetzt haben.
+    _EIGENE_EINSTELLUNGEN = frozenset({
+        "economy", "casino", "bounty",
+        "currency_name", "currency_symbol", "starting_balance",
+        "kill_reward", "playtime_reward",
+        "shop_default_price", "shop_category_prices", "shop_categories_custom",
+        "default_radius", "default_pos_y",
+        "delivery_grace_seconds", "delivery_cleanup_delay_seconds",
+        "delivery_online_wait_max_seconds",
+        "restart_cooldown_seconds", "zone_ping_cooldown_seconds",
+        "log_poll_interval_seconds", "ftp_fail_warn_cycles",
+        "admin_role_ids", "admin_role_name", "economy_admin_role_ids",
+    })
+
     def get(self, key: str, default: Any = None) -> Any:
         """Serverspezifischer Wert.
 
@@ -2305,6 +2324,9 @@ class ServerConnection:
             return self.data[key]
         if key in self._KEINE_RUECKFALL_SCHLUESSEL:
             return default
+        if key in self._EIGENE_EINSTELLUNGEN:
+            # Auslieferungs-Vorgabe statt der Einstellung des Betreibers
+            return copy.deepcopy(DEFAULT_CONFIG.get(key, default))
         return cfg.config.get(key, default)
 
     def set(self, key: str, value: Any) -> None:
@@ -2454,7 +2476,7 @@ class ConnectionRegistry:
             # Update alte Log-Zeilen erneut als Ereignisse gepostet.
             "log_state": dict(cfg.log_state or {}),
         }
-        for key in _CONN_SERVER_FIELDS:
+        for key in tuple(_CONN_SERVER_FIELDS) + tuple(ServerConnection._EIGENE_EINSTELLUNGEN):
             if key in cfg.config:
                 data[key] = cfg.config[key]
 
@@ -2767,7 +2789,8 @@ class DayZBot(discord.Client):
         for verbindung in ziele:
             if verbindung.shop is None and verbindung.ftp is not None:
                 verbindung.shop = ShopManager(self, verbindung)
-        self.shop = primary.shop
+        if only is None or only is primary:
+            self.shop = primary.shop
 
         # Auto-Discovery fuer JEDEN Server einzeln. Log-Verzeichnis,
         # Mission-Ordner und Shop-Katalog gehoeren jeweils zu genau einem
@@ -3036,6 +3059,8 @@ class DayZBot(discord.Client):
             await self._status_update_for(conn)
 
     async def _status_update_for(self, conn: ServerConnection):
+        if conn.guild_id is None:
+            return          # keine Guild → nichts anzuzeigen, also auch nicht abfragen
         ip = str(conn.get("server_ip") or "").split(":")[0].strip()
         qport = int(conn.get("query_port", 0) or 0)
         if not ip or not qport:
@@ -3050,10 +3075,7 @@ class DayZBot(discord.Client):
         embed = self._build_status_embed(info, conn)
         # Nur die Guild dieses Servers – sonst saehe jeder Discord-Server den
         # Status aller Kunden.
-        if conn.guild_id is None:
-            return          # keine Guild → nirgends posten, statt ueberall
-        targets = [str(conn.guild_id)]
-        for gid_str in targets:
+        for gid_str in [str(conn.guild_id)]:
             ch_id = cfg.get_channel(int(gid_str), "status")
             if not ch_id:
                 continue
@@ -3191,7 +3213,7 @@ class DayZBot(discord.Client):
         zone_ch = zone.get("channel_id")
         if zone_ch:
             await _post_feed(gid, "zone", e, content=content, channel_id=int(zone_ch))
-        elif gid is None or cfg.get_channel(gid, "zone"):
+        elif cfg.get_channel(gid, "zone"):
             await _post_feed(gid, "zone", e, content=content)
         else:
             await _post_feed(gid, "adminlog", e, content=content)
@@ -3774,10 +3796,23 @@ async def _finish_token_setup(token: str, service_id: str,
         warnings.append("⚠️ Gameserver-Infos konnten nicht geladen werden "
                         "(Nitrado-API-Fehler) – FTP/Karte nicht erkannt.")
 
-    # Ohne Zuordnung bliebe diese Guild ohne Premium – sie richtet hier ja
-    # gerade ihren eigenen Server ein.
+    # Freischalten ist Sache des Bot-Betreibers – wie im Dashboard wird die
+    # Guild hier nur vorgemerkt. Sonst gaebe sich jeder, der den Bot in seinen
+    # Discord einlaedt, mit /setup token selbst Premium.
+    freigeschaltet = False
     if guild_id and connections.for_guild(guild_id) is None:
-        connections.assign_guild(service_id, int(guild_id))
+        if await _discord_user_is_admin(int(actor_id or 0)):
+            connections.assign_guild(service_id, int(guild_id))
+            freigeschaltet = True
+        else:
+            conn.data["guild_id_requested"] = int(guild_id)
+            connections.save()
+            warnings.append(
+                f"⏳ Discord-Server `{guild_id}` ist vorgemerkt – der Bot-Betreiber "
+                f"schaltet ihn im Dashboard unter **Serverliste** frei. Bis dahin "
+                f"antworten die Befehle hier mit „du hast kein Premium“.")
+    elif guild_id and connections.for_guild(guild_id) is not None:
+        freigeschaltet = connections.for_guild(guild_id) is conn
 
     # Nitrado/FTP/Shop mit den neuen Daten (neu) initialisieren –
     # inklusive FTP-Auto-Discovery der Log-Verzeichnisse. NUR dieser Server,
@@ -3793,6 +3828,10 @@ async def _finish_token_setup(token: str, service_id: str,
         title="✅ Nitrado-Server eingerichtet",
         description=f"Der Bot arbeitet jetzt mit **{name}**.",
         color=0x2ECC71 if not warnings else 0xE67E22)
+    embed.add_field(name="Freischaltung",
+                    value=("✅ Dieser Discord-Server verwaltet ihn"
+                           if freigeschaltet else "⏳ Wartet auf den Bot-Betreiber"),
+                    inline=True)
     embed.add_field(name="Service-ID",      value=f"`{service_id}`", inline=True)
     embed.add_field(name="Aktive Karte",    value=conn.get("map_name", "–"), inline=True)
     embed.add_field(name="FTP-Host",        value=f"`{ftp_host}`",   inline=False)
@@ -11649,12 +11688,15 @@ def _zonen_ziel(request: web.Request, conn: ServerConnection,
                              "Nitrado-Server.", 403)
     else:
         gid = int((alt or {}).get("guild_id") or eigen or 0)
+        # Auch eine bestehende Zone kann noch auf eine Guild zeigen, die
+        # inzwischen einem anderen Server gehoert – dann nicht weiterschreiben.
+        if gid and gid != eigen and gid not in erlaubt:
+            return None, err("Diese Zone zeigt auf einen fremden Discord-Server. "
+                             "Trage die eigene Server-ID ein oder lege sie neu an.",
+                             403)
     if not gid:
         return None, err("Für diesen Server ist noch kein Discord-Server "
                          "zugeordnet – der Bot-Betreiber schaltet ihn frei.", 409)
-    if eigen and gid != eigen and gid not in erlaubt:
-        return None, err("Dieser Discord-Server gehört nicht zu deinem "
-                         "Nitrado-Server.", 403)
 
     g = bot.get_guild(gid) if bot else None
     ziel: Dict[str, Any] = {"guild_id": gid}
@@ -11670,13 +11712,18 @@ def _zonen_ziel(request: web.Request, conn: ServerConnection,
         except (TypeError, ValueError):
             return None, err(f"{feld}-ID muss eine Zahl sein.")
         # Channel/Rolle muessen in DIESER Guild liegen – sonst laesst sich der
-        # Alarm in einen fremden Discord umleiten.
-        if g is not None:
-            treffer = (g.get_channel(wert) if schluessel == "channel_id"
-                       else g.get_role(wert))
-            if treffer is None:
-                return None, err(f"Diese {feld}-ID gibt es in dem gewählten "
-                                 f"Discord-Server nicht.")
+        # Alarm in einen fremden Discord umleiten. Ist die Guild nicht
+        # erreichbar, laesst sich das nicht pruefen: dann lieber ablehnen als
+        # ungeprueft uebernehmen.
+        if g is None:
+            return None, err("Der Bot erreicht diesen Discord-Server gerade nicht – "
+                             f"die {feld} kann deshalb nicht geprüft werden. "
+                             "Ist der Bot dort eingeladen?", 409)
+        treffer = (g.get_channel(wert) if schluessel == "channel_id"
+                   else g.get_role(wert))
+        if treffer is None:
+            return None, err(f"Diese {feld}-ID gibt es in dem gewählten "
+                             f"Discord-Server nicht.")
         ziel[schluessel] = wert
     return ziel, None
 

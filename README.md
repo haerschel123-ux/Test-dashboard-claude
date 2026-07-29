@@ -253,13 +253,33 @@ als `guild_id_requested` an seiner Verbindung vermerkt, in seinen *Optionen* als
 „⏳ Angefragt" angezeigt und dir in der *Serverliste* zum Freischalten vorgelegt. Registriert
 werden die Slash-Befehle erst, wenn du im Stift-Dialog speicherst.
 
+Dasselbe gilt für **`/setup token` in Discord**: wer den Bot in seinen eigenen Server
+einlädt und dort seinen Nitrado-Token einträgt, bekommt „⏳ Wartet auf den Bot-Betreiber"
+zu sehen — die Guild wird nur vorgemerkt, nicht zugeordnet.
+
 Zwei Ausnahmen, beide beabsichtigt:
 
-* Wer die **Admin-Rolle** hat, trägt Guild-IDs weiter direkt ein (Kategorie *Guild IDs*).
+* Wer die **Admin-Rolle** hat, schaltet direkt frei — im Dashboard (Kategorie *Guild IDs*)
+  wie in Discord über `/setup token`.
 * Ist die eigene Guild bereits freigeschaltet, prüft der Button „Ja, habe ich" wie bisher
   erneut, ob die Befehle stehen — der Aufruf ist absichtlich wiederholbar.
 
-Eine Guild-ID, die schon zu einem anderen Server gehört, wird in beiden Wegen abgelehnt.
+Eine Guild-ID, die schon zu einem anderen Server gehört, wird auf jedem Weg abgelehnt.
+
+### Was ein Kunde erbt — und was nicht
+
+`ServerConnection.get()` kennt drei Stufen:
+
+| Schlüssel | Rückfallebene |
+|---|---|
+| Zugangsdaten und Serverkennungen (`nitrado_token`, `ftp_*`, `service_id`, `server_ip`, Ports, `map_name`, `zones`, Neustart-Zeitplan) | **keine** — fehlt der Wert, fehlt er |
+| Eigene Einstellungen (Währung, Startguthaben, Kill-/Spielzeit-Belohnung, `economy`, `casino`, `bounty`, Shop-Preise und -Kategorien, Liefer- und Neustart-Parameter, Admin-Rollen) | die **mitgelieferte Vorgabe**, nicht die `config.json` des Betreibers |
+| Alles Übrige (Texte, Grenzwerte, technische Schalter) | die globale `config.json` |
+
+Die mittlere Stufe ist der Grund, warum ein neuer Kunde mit `Rubles`, 5000 Startguthaben und
+den Standard-Einsätzen anfängt statt mit dem, was der Betreiber für sich eingestellt hat —
+und warum eine spätere Änderung des Betreibers nicht bei allen Kunden mitwandert. Der
+Hauptserver behält beim ersten Start nach dem Update seine bisherigen Werte.
 
 ### Abgrenzung im Dashboard
 
