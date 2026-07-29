@@ -3679,14 +3679,23 @@ def _migriere_eigene_einstellungen() -> None:
     Merkmal dafuer steht in der Verbindung selbst. So bleibt ein spaeter vom
     Betreiber bewusst geloeschter Wert geloescht.
     """
-    haupt = connections.primary()
+    # Bewusst NICHT connections.primary(): das faellt ohne service_id in der
+    # config.json auf die erste beliebige Verbindung zurueck – das waere dann
+    # ein Kunde, und die Werte des Betreibers laegen dauerhaft bei ihm.
+    haupt = connections.for_service(cfg.config.get("service_id"))
     if haupt is None or haupt.data.get("_eigene_uebernommen"):
         return
     uebernommen = []
     for key in sorted(ServerConnection._EIGENE_EINSTELLUNGEN):
-        if key in cfg.config and key not in haupt.data:
-            haupt.data[key] = copy.deepcopy(cfg.config[key])
-            uebernommen.append(key)
+        if key not in cfg.config or key in haupt.data:
+            continue
+        # Nur was der Betreiber wirklich angepasst hat. Bei einer Neuinstallation
+        # entspricht alles der Vorgabe – dann bleibt die Verbindung schlank und
+        # spaetere Aenderungen an DEFAULT_CONFIG erreichen sie weiterhin.
+        if cfg.config[key] == DEFAULT_CONFIG.get(key):
+            continue
+        haupt.data[key] = copy.deepcopy(cfg.config[key])
+        uebernommen.append(key)
     haupt.data["_eigene_uebernommen"] = True
     connections.save()
     if uebernommen:
@@ -3830,10 +3839,32 @@ async def _finish_token_setup(token: str, service_id: str,
     # Guild hier nur vorgemerkt. Sonst gaebe sich jeder, der den Bot in seinen
     # Discord einlaedt, mit /setup token selbst Premium.
     freigeschaltet = False
-    if guild_id and connections.for_guild(guild_id) is None:
-        if await _discord_user_is_admin(int(actor_id or 0)):
-            connections.assign_guild(service_id, int(guild_id))
-            freigeschaltet = True
+    if guild_id:
+        besitzer = connections.for_guild(guild_id)
+        if besitzer is conn:
+            freigeschaltet = True            # war schon freigeschaltet
+        elif besitzer is not None:
+            # Guild gehoert einem anderen Server – weder zuordnen noch vormerken
+            warnings.append(
+                f"❌ Dieser Discord-Server verwaltet bereits „{besitzer.name}“. "
+                f"Eine Guild kann nur einen Nitrado-Server verwalten.")
+        elif await _discord_user_is_admin(int(actor_id or 0)):
+            okay, meldung = connections.assign_guild(service_id, int(guild_id))
+            if okay:
+                freigeschaltet = True
+                # Wie im Dashboard: Zuordnung heisst Freischaltung, die Befehle
+                # sollen sofort in dieser Guild stehen.
+                ids = _configured_guild_ids()
+                if int(guild_id) not in ids:
+                    ids.append(int(guild_id))
+                    cfg.config["guild_ids"] = ids
+                    cfg.save_config()
+                try:
+                    await _register_guild_commands(int(guild_id))
+                except Exception as e:  # noqa: BLE001
+                    warnings.append(f"⚠️ Befehle konnten nicht registriert werden: {e}")
+            else:
+                warnings.append(f"❌ {meldung}")
         else:
             conn.data["guild_id_requested"] = int(guild_id)
             connections.save()
@@ -3841,8 +3872,6 @@ async def _finish_token_setup(token: str, service_id: str,
                 f"⏳ Discord-Server `{guild_id}` ist vorgemerkt – der Bot-Betreiber "
                 f"schaltet ihn im Dashboard unter **Serverliste** frei. Bis dahin "
                 f"antworten die Befehle hier mit „du hast kein Premium“.")
-    elif guild_id and connections.for_guild(guild_id) is not None:
-        freigeschaltet = connections.for_guild(guild_id) is conn
 
     # Nitrado/FTP/Shop mit den neuen Daten (neu) initialisieren –
     # inklusive FTP-Auto-Discovery der Log-Verzeichnisse. NUR dieser Server,
@@ -11741,12 +11770,24 @@ def _zonen_ziel(request: web.Request, conn: ServerConnection,
             wert = int(roh_id)
         except (TypeError, ValueError):
             return None, err(f"{feld}-ID muss eine Zahl sein.")
+        # Unveraenderter Wert einer bestehenden Zone: nichts Neues, nichts zu
+        # pruefen. Sonst liesse sich beim Bearbeiten nicht einmal mehr der
+        # Radius aendern, wenn das Formular Channel und Rolle mitschickt.
+        if alt is not None and alt.get(schluessel) == wert:
+            ziel[schluessel] = wert
+            continue
         # Channel/Rolle muessen in DIESER Guild liegen – sonst laesst sich der
-        # Alarm in einen fremden Discord umleiten. Ist die Guild nicht
-        # erreichbar, laesst sich das nicht pruefen: dann lieber ablehnen als
-        # ungeprueft uebernehmen.
+        # Alarm in einen fremden Discord umleiten.
         if g is None:
-            return None, err("Der Bot erreicht diesen Discord-Server gerade nicht – "
+            if bot is None or not bot.is_ready():
+                # Der Bot ist (noch) nicht bei Discord angemeldet, etwa in der
+                # Vorschau mit --dashboard-only. Dann ist "nicht gefunden" keine
+                # Aussage ueber die Guild – ein NEUES Ziel bleibt trotzdem
+                # ungeprueft und wird deshalb nicht angenommen.
+                return None, err("Der Bot ist gerade nicht bei Discord angemeldet – "
+                                 f"eine neue {feld} lässt sich erst prüfen, wenn er "
+                                 "wieder verbunden ist.", 409)
+            return None, err("Der Bot erreicht diesen Discord-Server nicht – "
                              f"die {feld} kann deshalb nicht geprüft werden. "
                              "Ist der Bot dort eingeladen?", 409)
         treffer = (g.get_channel(wert) if schluessel == "channel_id"
