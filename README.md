@@ -273,6 +273,22 @@ Beim Ändern des Tokens in den Optionen wird geprüft, ob der neue Token denselb
 kennt — ein Token vom falschen Nitrado-Konto wird abgelehnt, statt die Verbindung zu
 zerstören. Danach richtet sich der Bot sofort neu ein, ohne Neustart.
 
+### Token nur einmal eingeben
+
+Beim Discord-Login sieht der Bot nach, ob dieses Konto bereits einen Nitrado-Server besitzt.
+Wenn ja, wird die Sitzung direkt damit gefüllt und es geht ohne Token-Eingabe ins Dashboard —
+auch nach einem Bot-Neustart, dann genügt ein Klick auf „Mit Discord anmelden". Die
+Token-Eingabe erscheint nur noch für Konten **ohne** verbundenen Server.
+
+Der gespeicherte Token wird bei jedem Login einmal gegen die Nitrado-API geprüft. Wurde er
+dort zurückgezogen, landest du mit klarem Hinweis wieder bei der Eingabe. Ist Nitrado gerade
+nicht erreichbar, kommst du trotzdem durch — eine Störung bei Nitrado soll niemanden
+aussperren.
+
+Server aus der Migration und aus `/setup token` haben zunächst keinen Besitzer. Meldet sich
+jemand mit der Admin-Rolle an, werden sie ihm zugeschrieben; ohne die Rolle passiert das
+nicht, sonst könnte sich der erste beliebige Anmelder den Server des Betreibers aneignen.
+
 **Bestehende Installationen** werden beim ersten Start automatisch übernommen: Aus der
 `config.json` entsteht eine Verbindung, die der ersten echten Guild-ID zugeordnet wird —
 inklusive der bisherigen Log-Position, damit keine alten Ereignisse erneut gepostet werden.
@@ -306,6 +322,11 @@ nur die Kacheln brauchen Internet im Browser.
   Ein gültiger Token erzeugt eine **serverseitige** Session; der Browser bekommt nur eine
   zufällige Session-ID als Cookie (`dz_sess`, httponly, 12 h). Der Token selbst verlässt den
   Server nie.
+- **Nach dem Discord-Login wird der Nitrado-Token nicht erneut abgefragt.** Wer schon
+  einen Server verbunden hat, landet direkt im Dashboard — die Verbindung merkt sich das
+  Discord-Konto (`owner_discord_id`). Kehrseite: Wer Zugriff auf das Discord-Konto hat,
+  kommt damit ins Dashboard und kann den Token unter *Optionen* einblenden. Sichere das
+  Discord-Konto deshalb mit Zwei-Faktor-Authentifizierung.
 - **Über `http://` geht der Token im Klartext durchs Netz.** Rufst du das Dashboard über
   `https://` auf (derselbe Port, siehe oben), ist die Verbindung verschlüsselt — gegen
   Mitlesen unterwegs. Ein selbstsigniertes Zertifikat schützt allerdings nicht gegen einen
