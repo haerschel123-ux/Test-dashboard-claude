@@ -3592,12 +3592,16 @@ def _is_admin(interaction: discord.Interaction) -> bool:
     if interaction.user.guild_permissions.administrator:
         return True
     # Rollen kommen vom Server dieser Guild – so kann jeder Kunde seine
-    # eigenen Admin-Rollen festlegen statt die des Betreibers zu erben.
+    # eigenen Admin-Rollen festlegen statt die des Betreibers zu erben. Ohne
+    # zugeordneten Server gibt es auch keine Admin-Rolle: sonst koennte eine
+    # fremde Guild ohne Premium ueber einen Rollennamen wie "DayZ Admin"
+    # (die Auslieferungs-Vorgabe) /setup token als Admin ausfuehren.
     _c = _conn_of(interaction)
-    _get = _c.get if _c is not None else cfg.config.get
-    if _member_has_role_ids(interaction.user, _get("admin_role_ids", [])):
+    if _c is None:
+        return False
+    if _member_has_role_ids(interaction.user, _c.get("admin_role_ids", [])):
         return True
-    role_name = _get("admin_role_name", "")
+    role_name = _c.get("admin_role_name", "")
     if role_name and any(r.name == role_name for r in interaction.user.roles):
         return True
     return False
@@ -3609,8 +3613,9 @@ def _is_economy_admin(interaction: discord.Interaction) -> bool:
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return False
     _c = _conn_of(interaction)
-    _get = _c.get if _c is not None else cfg.config.get
-    return _member_has_role_ids(interaction.user, _get("economy_admin_role_ids", []))
+    if _c is None:
+        return False
+    return _member_has_role_ids(interaction.user, _c.get("economy_admin_role_ids", []))
 
 async def _deny(interaction: discord.Interaction):
     msg = ("❌ No permission. You need one of the configured admin roles "
@@ -5951,11 +5956,14 @@ async def cmd_hilfe(interaction: discord.Interaction):
         "`/edit ankuendigung <index>` — Nachricht/Bild einer Ankündigung ändern\n"
         "`/hackban <user_id> [grund]` — Discord-Nutzer per ID bannen"
     ), inline=False)
-    admin_ids = cfg.config.get("admin_role_ids", [])
+    _c_hilfe = _conn_of(interaction)
+    admin_ids = _c_hilfe.get("admin_role_ids", []) if _c_hilfe is not None else []
+    admin_name = (_c_hilfe.get("admin_role_name", "DayZ Admin") if _c_hilfe is not None
+                  else "DayZ Admin")
     footer = (f"Admin-Rollen-IDs: {', '.join(str(i) for i in admin_ids)}"
               if admin_ids else
-              f"Admin-Rolle: {cfg.config.get('admin_role_name', 'DayZ Admin')} "
-              f"(Tipp: admin_role_ids in config.json setzen)")
+              f"Admin-Rolle: {admin_name} "
+              f"(Tipp: admin_role_ids im Dashboard unter Optionen setzen)")
     embed.set_footer(text=footer)
     await interaction.response.send_message(embed=embed)
 
