@@ -3859,6 +3859,23 @@ def _gewaehlter_server(interaction: discord.Interaction) -> Optional[str]:
         return None
 
 
+def _ac_conns(interaction: discord.Interaction) -> List[ServerConnection]:
+    """Aus welchen Servern zieht eine Vervollstaendigung ihre Vorschlaege?
+
+    Ist ``server`` schon ausgefuellt, genau dieser eine. Sonst alle Server der
+    Guild – der Nutzer tippt oft zuerst den Gegenstand und erst danach den
+    Server, und dann darf die Liste nicht auf den Leitserver eingeengt sein.
+    """
+    gid = interaction.guild_id or 0
+    alle = connections.all_for_guild(gid)
+    wahl = _gewaehlter_server(interaction)
+    if wahl:
+        treffer = [c for c in alle if c.service_id == str(wahl)]
+        if treffer:
+            return treffer
+    return alle
+
+
 def _conn_store(conn: ServerConnection, key: str, value: Any) -> None:
     """Serverspezifischen Wert in der Verbindung ablegen.
 
@@ -3983,16 +4000,18 @@ async def _require_conn(interaction: discord.Interaction,
 setup_group = app_commands.Group(name="setup", description="⚙️ Log-Channels konfigurieren")
 
 @setup_group.command(name="feeds", description="⚙️ Feed-Channel für einen Log-Typ festlegen")
-@app_commands.describe(feed="Welcher Feed?", channel="Ziel-Channel für diesen Feed")
+@app_commands.describe(feed="Welcher Feed?", channel="Ziel-Channel für diesen Feed",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 @app_commands.choices(feed=[
     app_commands.Choice(name=LOG_TYPES[k][:100], value=k) for k in LOG_TYPES
 ])
 async def setup_feeds(interaction: discord.Interaction,
                       feed: app_commands.Choice[str],
-                      channel: discord.TextChannel):
+                      channel: discord.TextChannel,
+                      server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    _conn, _fehler = _conn_waehlen(interaction, None)
+    _conn, _fehler = _conn_waehlen(interaction, server)
     if _conn is None:
         return await interaction.response.send_message(
             _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
@@ -4003,13 +4022,16 @@ async def setup_feeds(interaction: discord.Interaction,
 
 
 @setup_group.command(name="uebersicht", description="📋 Zeigt alle konfigurierten Channels")
-async def setup_overview(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def setup_overview(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    guild_cfg = cfg.guilds.get(str(interaction.guild_id), {})
-    embed = discord.Embed(title="📋 Aktuelle Channel-Konfiguration", color=0x5865F2)
+    _conn, _fehler = _conn_waehlen(interaction, server)
+    if _conn is None:
+        return await interaction.response.send_message(_fehler, ephemeral=True)
+    embed = discord.Embed(title=f"📋 Channel-Konfiguration – {_conn.name}", color=0x5865F2)
     for lt, desc in LOG_TYPES.items():
-        ch_id = guild_cfg.get(lt)
+        ch_id = cfg.get_channel(interaction.guild_id, lt, _conn.service_id)
         embed.add_field(
             name=desc,
             value=f"<#{ch_id}>" if ch_id else "❌ Nicht gesetzt",
@@ -4267,10 +4289,11 @@ bot.tree.add_command(setup_group)
 #  /show_feeds – Alle Feed-Channels auf einen Blick
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="show_feeds", description="📡 Zeigt alle Feed-Channels und ihren Status")
-async def cmd_show_feeds(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_show_feeds(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    _conn_show, _fehler = _conn_waehlen(interaction, None)
+    _conn_show, _fehler = _conn_waehlen(interaction, server)
     if _conn_show is None:
         return await interaction.response.send_message(
             _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
@@ -4283,7 +4306,7 @@ async def cmd_show_feeds(interaction: discord.Interaction):
     inactive   = [lt for lt in LOG_TYPES if lt not in active]
 
     embed = discord.Embed(
-        title="📡 Feed-Channel Übersicht",
+        title=f"📡 Feed-Channel Übersicht – {_conn_show.name}",
         description=(
             f"**{len(active)}** Feed{'s' if len(active) != 1 else ''} aktiv  •  "
             f"**{len(inactive)}** nicht konfiguriert"
@@ -4328,16 +4351,18 @@ async def cmd_show_feeds(interaction: discord.Interaction):
 )
 @app_commands.describe(
     feed="Welcher Feed soll geändert werden? (Tippe um zu filtern)",
-    channel="Neuer Channel – leer lassen zum Deaktivieren"
+    channel="Neuer Channel – leer lassen zum Deaktivieren",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)"
 )
 async def cmd_edit_feeds(
     interaction: discord.Interaction,
     feed: str,
     channel: Optional[discord.TextChannel] = None,
+    server: Optional[str] = None,
 ):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    _conn_feeds, _fehler = _conn_waehlen(interaction, None)
+    _conn_feeds, _fehler = _conn_waehlen(interaction, server)
     if _conn_feeds is None:
         return await interaction.response.send_message(
             _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
@@ -4390,8 +4415,10 @@ async def _feed_autocomplete(
     current: str,
 ) -> List[app_commands.Choice[str]]:
     """Autocomplete: zeigt alle passenden Feed-Typen mit ihrem aktuellen Channel."""
-    _c_ac, _ = _conn_waehlen(interaction, _gewaehlter_server(interaction))
-    _sid_ac = _c_ac.service_id if _c_ac is not None else None
+    # Ohne ausgefuelltes `server` der Leitserver – sonst staende ueberall ❌,
+    # obwohl die Feeds gesetzt sind.
+    _ac = _ac_conns(interaction)
+    _sid_ac = _ac[0].service_id if _ac else None
     results   = []
     for lt, desc in LOG_TYPES.items():
         if current.lower() in lt.lower() or current.lower() in desc.lower() or not current:
@@ -4407,14 +4434,22 @@ async def _feed_autocomplete(
     return results[:25]
 
 
+setup_feeds.autocomplete("server")(_server_autocomplete)
+setup_overview.autocomplete("server")(_server_autocomplete)
+cmd_show_feeds.autocomplete("server")(_server_autocomplete)
+cmd_edit_feeds.autocomplete("server")(_server_autocomplete)
+
+
 # ══════════════════════════════════════════════════════════════
 #  /neustart – Server Neustart
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="neustart", description="🔄 Startet den DayZ Server neu")
-async def cmd_neustart(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_neustart(interaction: discord.Interaction,
+                       server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = await _require_conn(interaction)
+    conn = await _require_conn(interaction, server=server)
     if conn is None:
         return
     await interaction.response.defer()
@@ -4432,10 +4467,12 @@ async def cmd_neustart(interaction: discord.Interaction):
 #  /stoppen – Server stoppen
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="stoppen", description="⏹️ Stoppt den DayZ Server")
-async def cmd_stoppen(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_stoppen(interaction: discord.Interaction,
+                      server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = await _require_conn(interaction)
+    conn = await _require_conn(interaction, server=server)
     if conn is None:
         return
     await interaction.response.defer()
@@ -4453,10 +4490,12 @@ async def cmd_stoppen(interaction: discord.Interaction):
 #  /serverstatus – Status abrufen (Nitrado API + direkter A2S-Ping)
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="serverstatus", description="📊 Zeigt den aktuellen Server-Status")
-async def cmd_status(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_status(interaction: discord.Interaction,
+                     server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = await _require_conn(interaction)
+    conn = await _require_conn(interaction, server=server)
     if conn is None:
         return
     await interaction.response.defer()
@@ -4613,12 +4652,14 @@ class AutoRestartView(discord.ui.View):
 
 @auto_group.command(name="restart",
                     description="⏰ Plant automatische Neustarts (Startzeit per Dropdown + Intervall)")
-@app_commands.describe(intervall="Abstand in Stunden, z.B. 2 = alle 2 Stunden (1–24)")
+@app_commands.describe(intervall="Abstand in Stunden, z.B. 2 = alle 2 Stunden (1–24)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def auto_restart(interaction: discord.Interaction,
-                       intervall: app_commands.Range[int, 1, 24]):
+                       intervall: app_commands.Range[int, 1, 24],
+                       server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    _conn_ar, _fehler = _conn_waehlen(interaction, None)
+    _conn_ar, _fehler = _conn_waehlen(interaction, server)
     if _conn_ar is None:
         return await interaction.response.send_message(
             _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
@@ -4633,12 +4674,15 @@ async def auto_restart(interaction: discord.Interaction,
 
 
 @auto_group.command(name="off", description="⏹️ Deaktiviert die geplanten Neustarts")
-async def auto_off(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def auto_off(interaction: discord.Interaction,
+                   server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = _conn_of(interaction)
+    conn, _fehler = _conn_waehlen(interaction, server)
     if conn is None:
-        return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+        return await interaction.response.send_message(
+            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
     sched = dict(conn.get("auto_restart_schedule") or {})
     was_on = bool(sched.get("enabled"))
     sched["enabled"] = False
@@ -4651,10 +4695,13 @@ async def auto_off(interaction: discord.Interaction):
 
 
 @auto_group.command(name="status", description="📋 Zeigt den aktuellen Restart-Zeitplan")
-async def auto_status(interaction: discord.Interaction):
-    conn = _conn_of(interaction)
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def auto_status(interaction: discord.Interaction,
+                      server: Optional[str] = None):
+    conn, _fehler = _conn_waehlen(interaction, server)
     if conn is None:
-        return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+        return await interaction.response.send_message(
+            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
     sched = conn.get("auto_restart_schedule") or {}
     if not sched.get("enabled"):
         return await interaction.response.send_message(
@@ -4670,6 +4717,16 @@ async def auto_status(interaction: discord.Interaction):
 
 
 bot.tree.add_command(auto_group)
+
+# Server-Auswahl fuer die Server-Verwaltung (nur noetig ab zwei Servern)
+cmd_neustart.autocomplete("server")(_server_autocomplete)
+cmd_stoppen.autocomplete("server")(_server_autocomplete)
+cmd_status.autocomplete("server")(_server_autocomplete)
+auto_restart.autocomplete("server")(_server_autocomplete)
+auto_off.autocomplete("server")(_server_autocomplete)
+auto_status.autocomplete("server")(_server_autocomplete)
+
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -4748,9 +4805,19 @@ def _zone_summary(z: Dict) -> str:
 
 async def _zone_name_autocomplete(interaction: discord.Interaction, current: str):
     cur = (current or "").lower()
-    return [app_commands.Choice(name=str(z["name"]), value=str(z["name"]))
-            for z in _zones(_conn_of(interaction))
-            if isinstance(z, dict) and z.get("name") and cur in str(z["name"]).lower()][:25]
+    conns = _ac_conns(interaction)
+    mehrere = len(conns) > 1
+    out: List[app_commands.Choice] = []
+    for c in conns:
+        for z in _zones(c):
+            if not (isinstance(z, dict) and z.get("name")):
+                continue
+            nm = str(z["name"])
+            if cur not in nm.lower():
+                continue
+            out.append(app_commands.Choice(
+                name=f"{nm} – {c.name}"[:100] if mehrere else nm, value=nm))
+    return out[:25]
 
 def _validate_zone_geometry(x: float, z: float, radius: float) -> Optional[str]:
     """Gibt eine Fehlermeldung zurück oder None, wenn alles ok ist."""
@@ -4770,14 +4837,18 @@ def _validate_zone_geometry(x: float, z: float, radius: float) -> Optional[str]:
     name="Name der Zone (frei wählbar, einmalig)",
     radius="Radius in Metern, in dem der Bot nach Spielern schaut",
     channel="Optional: Channel, in den die Warnungen dieser Zone gepostet werden",
-    rolle="Optional: Rolle, die beim Ping mit @ markiert wird")
+    rolle="Optional: Rolle, die beim Ping mit @ markiert wird",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def zone_create(interaction: discord.Interaction, x: float, z: float,
                       name: str, radius: float,
                       channel: Optional[discord.TextChannel] = None,
-                      rolle: Optional[discord.Role] = None):
+                      rolle: Optional[discord.Role] = None,
+                      server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    _c = _conn_of(interaction)
+    _c, _fehler = _conn_waehlen(interaction, server)
+    if _c is None:
+        return await interaction.response.send_message(_fehler, ephemeral=True)
     name = name.strip()
     if not name or len(name) > 60:
         return await interaction.response.send_message(
@@ -4815,11 +4886,15 @@ async def zone_create(interaction: discord.Interaction, x: float, z: float,
 
 @zone_group.command(name="remove",
                     description="🗑️ Zone entfernen – dort wird nicht mehr gesucht (Admin)")
-@app_commands.describe(name="Name der Zone (Autocomplete)")
-async def zone_remove(interaction: discord.Interaction, name: str):
+@app_commands.describe(name="Name der Zone (Autocomplete)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def zone_remove(interaction: discord.Interaction, name: str,
+                      server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    _c = _conn_of(interaction)
+    _c, _fehler = _conn_waehlen(interaction, server)
+    if _c is None:
+        return await interaction.response.send_message(_fehler, ephemeral=True)
     zone = _find_zone(name, _c)
     if not zone:
         return await interaction.response.send_message(
@@ -4839,10 +4914,13 @@ zone_remove.autocomplete("name")(_zone_name_autocomplete)
 
 
 @zone_group.command(name="list", description="📋 Alle aktiven Zonen anzeigen (Admin)")
-async def zone_list(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def zone_list(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    _c = _conn_of(interaction)
+    _c, _fehler = _conn_waehlen(interaction, server)
+    if _c is None:
+        return await interaction.response.send_message(_fehler, ephemeral=True)
     zones = [z for z in _zones(_c) if isinstance(z, dict) and z.get("name")]
     if not zones:
         return await interaction.response.send_message(
@@ -4867,7 +4945,8 @@ async def zone_list(interaction: discord.Interaction):
     channel="Optional: neuer Channel für die Warnungen dieser Zone",
     channel_entfernen="True = eigenen Zonen-Channel entfernen (Fallback: Feed zone/adminlog)",
     rolle="Optional: neue Rolle für den Ping",
-    rolle_entfernen="True = Rollen-Ping ausschalten")
+    rolle_entfernen="True = Rollen-Ping ausschalten",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def zone_edit(interaction: discord.Interaction, name: str,
                     neuer_name: Optional[str] = None,
                     x: Optional[float] = None, z: Optional[float] = None,
@@ -4875,10 +4954,13 @@ async def zone_edit(interaction: discord.Interaction, name: str,
                     channel: Optional[discord.TextChannel] = None,
                     channel_entfernen: bool = False,
                     rolle: Optional[discord.Role] = None,
-                    rolle_entfernen: bool = False):
+                    rolle_entfernen: bool = False,
+                    server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    _c = _conn_of(interaction)
+    _c, _fehler = _conn_waehlen(interaction, server)
+    if _c is None:
+        return await interaction.response.send_message(_fehler, ephemeral=True)
     zone = _find_zone(name, _c)
     if not zone:
         return await interaction.response.send_message(
@@ -4946,11 +5028,15 @@ allowlist_group = app_commands.Group(
     description="🙈 Spieler zur Ignorier-Liste einer Zone hinzufügen (Admin)")
 @app_commands.describe(
     zone="Name der Zone (Autocomplete)",
-    spieler="PlayStation-/Ingame-Name, der nicht mehr gemeldet werden soll")
-async def zone_allowlist_add(interaction: discord.Interaction, zone: str, spieler: str):
+    spieler="PlayStation-/Ingame-Name, der nicht mehr gemeldet werden soll",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def zone_allowlist_add(interaction: discord.Interaction, zone: str, spieler: str,
+                             server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    _c = _conn_of(interaction)
+    _c, _fehler = _conn_waehlen(interaction, server)
+    if _c is None:
+        return await interaction.response.send_message(_fehler, ephemeral=True)
     z = _find_zone(zone, _c)
     if not z:
         return await interaction.response.send_message(
@@ -4978,11 +5064,15 @@ zone_allowlist_add.autocomplete("zone")(_zone_name_autocomplete)
     description="🔔 Spieler wieder melden – von der Ignorier-Liste entfernen (Admin)")
 @app_commands.describe(
     zone="Name der Zone (Autocomplete)",
-    spieler="Name, der wieder gemeldet werden soll")
-async def zone_allowlist_remove(interaction: discord.Interaction, zone: str, spieler: str):
+    spieler="Name, der wieder gemeldet werden soll",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def zone_allowlist_remove(interaction: discord.Interaction, zone: str, spieler: str,
+                                server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    _c = _conn_of(interaction)
+    _c, _fehler = _conn_waehlen(interaction, server)
+    if _c is None:
+        return await interaction.response.send_message(_fehler, ephemeral=True)
     z = _find_zone(zone, _c)
     if not z:
         return await interaction.response.send_message(
@@ -5007,11 +5097,15 @@ zone_allowlist_remove.autocomplete("zone")(_zone_name_autocomplete)
 @allowlist_group.command(
     name="show",
     description="📋 Ignorierte Spieler einer Zone anzeigen (Admin)")
-@app_commands.describe(zone="Name der Zone (Autocomplete)")
-async def zone_allowlist_show(interaction: discord.Interaction, zone: str):
+@app_commands.describe(zone="Name der Zone (Autocomplete)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def zone_allowlist_show(interaction: discord.Interaction, zone: str,
+                              server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    _c = _conn_of(interaction)
+    _c, _fehler = _conn_waehlen(interaction, server)
+    if _c is None:
+        return await interaction.response.send_message(_fehler, ephemeral=True)
     z = _find_zone(zone, _c)
     if not z:
         return await interaction.response.send_message(
@@ -5032,6 +5126,14 @@ async def zone_allowlist_show(interaction: discord.Interaction, zone: str):
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 zone_allowlist_show.autocomplete("zone")(_zone_name_autocomplete)
+
+zone_create.autocomplete("server")(_server_autocomplete)
+zone_remove.autocomplete("server")(_server_autocomplete)
+zone_list.autocomplete("server")(_server_autocomplete)
+zone_edit.autocomplete("server")(_server_autocomplete)
+zone_allowlist_add.autocomplete("server")(_server_autocomplete)
+zone_allowlist_remove.autocomplete("server")(_server_autocomplete)
+zone_allowlist_show.autocomplete("server")(_server_autocomplete)
 
 
 bot.tree.add_command(zone_group)
@@ -5095,12 +5197,14 @@ def _split_names(raw: str) -> List[str]:
                   description="🔨 Fügt Spieler zur Banliste in den Nitrado-Servereinstellungen hinzu")
 @app_commands.describe(
     spieler="Name(n) – mehrere per Komma getrennt",
-    grund="Grund für den Ban (optional)"
+    grund="Grund für den Ban (optional)",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)"
 )
-async def cmd_ban(interaction: discord.Interaction, spieler: str, grund: str = "Kein Grund angegeben"):
+async def cmd_ban(interaction: discord.Interaction, spieler: str,
+                  grund: str = "Kein Grund angegeben", server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = await _require_conn(interaction)
+    conn = await _require_conn(interaction, server=server)
     if conn is None:
         return
     await interaction.response.defer()
@@ -5156,11 +5260,13 @@ async def cmd_ban(interaction: discord.Interaction, spieler: str, grund: str = "
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="ban_entfernen",
                   description="✅ Entfernt Spieler von der Banliste in den Nitrado-Servereinstellungen")
-@app_commands.describe(spieler="Name(n) – mehrere per Komma getrennt")
-async def cmd_unban(interaction: discord.Interaction, spieler: str):
+@app_commands.describe(spieler="Name(n) – mehrere per Komma getrennt",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_unban(interaction: discord.Interaction, spieler: str,
+                    server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = await _require_conn(interaction)
+    conn = await _require_conn(interaction, server=server)
     if conn is None:
         return
     await interaction.response.defer()
@@ -5209,10 +5315,11 @@ async def cmd_unban(interaction: discord.Interaction, spieler: str):
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="banlist",
                   description="📋 Zeigt die Banliste aus den Nitrado-Servereinstellungen")
-async def cmd_banlist(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_banlist(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = await _require_conn(interaction)
+    conn = await _require_conn(interaction, server=server)
     if conn is None:
         return
     await interaction.response.defer(ephemeral=True)
@@ -5313,11 +5420,13 @@ whitelist_group = app_commands.Group(
 @whitelist_group.command(
     name="add",
     description="✅ Spieler zur Whitelist hinzufügen (mehrere per Komma/Zeile)")
-@app_commands.describe(spieler="PlayStation-Name(n) – mehrere per Komma getrennt")
-async def whitelist_add(interaction: discord.Interaction, spieler: str):
+@app_commands.describe(spieler="PlayStation-Name(n) – mehrere per Komma getrennt",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def whitelist_add(interaction: discord.Interaction, spieler: str,
+                        server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = await _require_conn(interaction)
+    conn = await _require_conn(interaction, server=server)
     if conn is None:
         return
     await interaction.response.defer()
@@ -5359,11 +5468,13 @@ async def whitelist_add(interaction: discord.Interaction, spieler: str):
 @whitelist_group.command(
     name="remove",
     description="🗑️ Spieler von der Whitelist entfernen (mehrere per Komma/Zeile)")
-@app_commands.describe(spieler="PlayStation-Name(n) – mehrere per Komma getrennt")
-async def whitelist_remove(interaction: discord.Interaction, spieler: str):
+@app_commands.describe(spieler="PlayStation-Name(n) – mehrere per Komma getrennt",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def whitelist_remove(interaction: discord.Interaction, spieler: str,
+                           server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = await _require_conn(interaction)
+    conn = await _require_conn(interaction, server=server)
     if conn is None:
         return
     await interaction.response.defer()
@@ -5405,10 +5516,11 @@ async def whitelist_remove(interaction: discord.Interaction, spieler: str):
 @whitelist_group.command(
     name="show",
     description="📋 Zeigt die aktuellen Spieler auf der Whitelist (Admin)")
-async def whitelist_show(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def whitelist_show(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = await _require_conn(interaction)
+    conn = await _require_conn(interaction, server=server)
     if conn is None:
         return
     await interaction.response.defer(ephemeral=True)
@@ -5699,14 +5811,16 @@ send_whitelist_group = app_commands.Group(
     description="📩 Whitelist-Anfrage-Panel in einen Channel senden (Admin)")
 @app_commands.describe(
     panel_channel="Channel, in dem das Panel für die Spieler erscheint",
-    admin_channel="Staff-Channel, in dem die Anfragen zur Freigabe landen")
+    admin_channel="Staff-Channel, in dem die Anfragen zur Freigabe landen",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def send_whitelist_panel(interaction: discord.Interaction,
                                panel_channel: discord.TextChannel,
-                               admin_channel: discord.TextChannel):
+                               admin_channel: discord.TextChannel,
+                               server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
 
-    _conn, _fehler = _conn_waehlen(interaction, None)
+    _conn, _fehler = _conn_waehlen(interaction, server)
     if _conn is None:
         return await interaction.response.send_message(
             _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
@@ -5740,11 +5854,12 @@ bot.tree.add_command(send_group)
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="admin_position",
                   description="📍 Letzte bekannte Positionen aller Spieler aus den Logs")
-async def cmd_positions(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_positions(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
 
-    _conn = await _require_conn(interaction)
+    _conn = await _require_conn(interaction, server=server)
     if _conn is None:
         return
     positions = (_conn.parser.player_positions if _conn.parser else {})
@@ -5790,11 +5905,13 @@ async def cmd_positions(interaction: discord.Interaction):
 #  /spieler_suche – Spieler in Logs suchen
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="spieler_suche", description="🔍 Sucht einen Spieler in den aktuellen Logs")
-@app_commands.describe(name="Ingame-Name oder Steam64-ID")
-async def cmd_search(interaction: discord.Interaction, name: str):
+@app_commands.describe(name="Ingame-Name oder Steam64-ID",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_search(interaction: discord.Interaction, name: str,
+                     server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = await _require_conn(interaction, need_ftp=True)
+    conn = await _require_conn(interaction, need_ftp=True, server=server)
     if conn is None:
         return
     await interaction.response.defer(ephemeral=True)
@@ -5828,14 +5945,26 @@ async def cmd_search(interaction: discord.Interaction, name: str):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+cmd_ban.autocomplete("server")(_server_autocomplete)
+cmd_unban.autocomplete("server")(_server_autocomplete)
+cmd_banlist.autocomplete("server")(_server_autocomplete)
+whitelist_add.autocomplete("server")(_server_autocomplete)
+whitelist_remove.autocomplete("server")(_server_autocomplete)
+whitelist_show.autocomplete("server")(_server_autocomplete)
+send_whitelist_panel.autocomplete("server")(_server_autocomplete)
+cmd_positions.autocomplete("server")(_server_autocomplete)
+cmd_search.autocomplete("server")(_server_autocomplete)
+
+
 # ══════════════════════════════════════════════════════════════
 #  /ftp_scan – FTP-Verzeichnisse neu scannen
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="ftp_scan", description="🔎 Scannt FTP-Server erneut nach Log-Verzeichnissen")
-async def cmd_ftp_scan(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_ftp_scan(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = await _require_conn(interaction, need_ftp=True)
+    conn = await _require_conn(interaction, need_ftp=True, server=server)
     if conn is None:
         return
     await interaction.response.defer(ephemeral=True)
@@ -5871,11 +6000,13 @@ async def cmd_ftp_scan(interaction: discord.Interaction):
 #  nicht gepostet werden – zeigt das exakte Log-Format.
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="raw_log", description="🔍 Zeigt die letzten Zeilen des ADM-Logs (Debug)")
-@app_commands.describe(zeilen="Anzahl der Zeilen (Standard: 20, max. 40)")
-async def cmd_raw_log(interaction: discord.Interaction, zeilen: int = 20):
+@app_commands.describe(zeilen="Anzahl der Zeilen (Standard: 20, max. 40)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_raw_log(interaction: discord.Interaction, zeilen: int = 20,
+                      server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = await _require_conn(interaction, need_ftp=True)
+    conn = await _require_conn(interaction, need_ftp=True, server=server)
     if conn is None:
         return
     await interaction.response.defer(ephemeral=True)
@@ -5918,11 +6049,13 @@ async def cmd_raw_log(interaction: discord.Interaction, zeilen: int = 20):
     name="test",
     description="🧪 Postet das letzte Log-Event jedes Typs in die jeweiligen Channels"
 )
-@app_commands.describe(zeilen="Zu durchsuchende Log-Zeilen (Standard: 500, max: 2000)")
-async def cmd_test(interaction: discord.Interaction, zeilen: int = 500):
+@app_commands.describe(zeilen="Zu durchsuchende Log-Zeilen (Standard: 500, max: 2000)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_test(interaction: discord.Interaction, zeilen: int = 500,
+                   server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    conn = await _require_conn(interaction, need_ftp=True)
+    conn = await _require_conn(interaction, need_ftp=True, server=server)
     if conn is None:
         return
     await interaction.response.defer(ephemeral=True)
@@ -6051,11 +6184,12 @@ async def cmd_test(interaction: discord.Interaction, zeilen: int = 500):
 
 
 @bot.tree.command(name="ftp_status", description="🔌 Testet die FTP-Verbindung zum Nitrado-Server")
-async def cmd_ftp_status(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_ftp_status(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
     await interaction.response.defer(ephemeral=True)
-    conn = await _require_conn(interaction, need_ftp=True)
+    conn = await _require_conn(interaction, need_ftp=True, server=server)
     if conn is None:
         return
 
@@ -6139,13 +6273,14 @@ async def cmd_ftp_status(interaction: discord.Interaction):
 #  /log_status – Polling-Status anzeigen
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="log_status", description="📄 Zeigt den aktuellen Log-Polling Status")
-async def cmd_log_status(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_log_status(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
 
-    _conn = _conn_of(interaction)
+    _conn, _fehler = _conn_waehlen(interaction, server)
     if _conn is None:
-        return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+        return await interaction.response.send_message(_fehler, ephemeral=True)
     # Alles aus DIESER Verbindung – sonst zeigte der Befehl den Log-Pfad und
     # FTP-Host des Betreibers, egal aus welchem Discord er kam.
     state = _conn.log_state.get("current", {})
@@ -6170,6 +6305,13 @@ async def cmd_log_status(interaction: discord.Interaction):
     embed.add_field(name="Lokale Bans",
                     value=str(len(_bans_of(_conn))),                  inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+cmd_ftp_scan.autocomplete("server")(_server_autocomplete)
+cmd_raw_log.autocomplete("server")(_server_autocomplete)
+cmd_test.autocomplete("server")(_server_autocomplete)
+cmd_ftp_status.autocomplete("server")(_server_autocomplete)
+cmd_log_status.autocomplete("server")(_server_autocomplete)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -8385,16 +8527,27 @@ async def cmd_economy_reload(interaction: discord.Interaction):
 async def _player_name_ac(interaction: discord.Interaction,
                           current: str) -> List[app_commands.Choice[str]]:
     """Autocomplete: bekannte Spielernamen aus Kills + Sitzungen dieses Servers."""
-    conn = _conn_of(interaction)
-    if conn is None:
+    conns = _ac_conns(interaction)
+    if not conns:
         return []
     loop = asyncio.get_running_loop()
-    try:
-        names = await loop.run_in_executor(None, db.known_player_names,
-                                           conn.service_id, current, 25)
-    except Exception:
-        names = []
-    return [app_commands.Choice(name=n[:100], value=n[:100]) for n in names[:25]]
+    out: List[app_commands.Choice] = []
+    gesehen = set()
+    for conn in conns:
+        try:
+            names = await loop.run_in_executor(None, db.known_player_names,
+                                               conn.service_id, current, 25)
+        except Exception:  # noqa: BLE001
+            names = []
+        for n in names:
+            key = n[:100]
+            if key in gesehen:
+                continue        # derselbe Spieler auf beiden Servern → einmal
+            gesehen.add(key)
+            out.append(app_commands.Choice(name=key, value=key))
+            if len(out) >= 25:
+                return out
+    return out
 
 
 @bot.tree.command(name="stats", description="📊 Kill-Statistiken eines Spielers (Kills, Tode, K/D, Waffe)")
@@ -9277,19 +9430,30 @@ def _make_item_autocomplete(only_enabled: bool):
     """Autocomplete über den vorberechneten Index (max. 25 Treffer, Substring-Suche)."""
     async def _ac(interaction: discord.Interaction,
                   current: str) -> List[app_commands.Choice[str]]:
-        cat = _catalog_of(interaction)
-        if cat is None:
+        conns = _ac_conns(interaction)
+        if not conns:
             return []            # kein zugeordneter Server → nichts vorschlagen
+        mehrere = len(conns) > 1
         cur = current.strip().lower()
         out: List[app_commands.Choice] = []
-        for search, label, value, enabled in cat._ac_index:
-            if only_enabled and not enabled:
+        gesehen = set()
+        for c in conns:
+            cat = c.catalog
+            if cat is None:
                 continue
-            if cur and cur not in search:
-                continue
-            out.append(app_commands.Choice(name=label, value=value))
-            if len(out) >= 25:
-                break
+            for search, label, value, enabled in cat._ac_index:
+                if only_enabled and not enabled:
+                    continue
+                if cur and cur not in search:
+                    continue
+                if value in gesehen:
+                    continue      # gleiches Item in beiden Katalogen → einmal zeigen
+                gesehen.add(value)
+                out.append(app_commands.Choice(
+                    name=f"{label} – {c.name}"[:100] if mehrere else label,
+                    value=value))
+                if len(out) >= 25:
+                    return out
         return out
     return _ac
 
@@ -9298,18 +9462,23 @@ _shop_buy_autocomplete  = _make_item_autocomplete(only_enabled=True)    # /buy
 
 async def _shop_category_autocomplete(interaction: discord.Interaction,
                                       current: str) -> List[app_commands.Choice[str]]:
-    katalog = _catalog_of(interaction)
-    if katalog is None:
-        return []
+    conns = _ac_conns(interaction)
     cur = current.strip().lower()
+    zaehler: Dict[str, int] = {}
+    for c in conns:
+        katalog = c.catalog
+        if katalog is None:
+            continue
+        for cat in katalog.by_category:
+            if cur and cur not in cat.lower():
+                continue
+            n = sum(1 for i in katalog.by_category[cat] if i.get("enabled", True))
+            if n:
+                zaehler[cat] = zaehler.get(cat, 0) + n
     out: List[app_commands.Choice] = []
-    for cat in sorted(katalog.by_category):
-        if cur and cur not in cat.lower():
-            continue
-        n = sum(1 for i in katalog.by_category[cat] if i.get("enabled", True))
-        if n == 0:
-            continue
-        out.append(app_commands.Choice(name=f"{cat} ({n} items)"[:100], value=cat))
+    for cat in sorted(zaehler):
+        out.append(app_commands.Choice(name=f"{cat} ({zaehler[cat]} items)"[:100],
+                                       value=cat))
         if len(out) >= 25:
             break
     return out
@@ -9344,9 +9513,11 @@ class ShopListView(discord.ui.View):
 shop_group = app_commands.Group(name="shop", description="🛒 Item shop")
 
 @shop_group.command(name="list", description="🛒 Show the shop catalog (all items or one category)")
-@app_commands.describe(category="Category to list – leave empty for the overview")
-async def shop_list(interaction: discord.Interaction, category: Optional[str] = None):
-    katalog = await _require_catalog(interaction)
+@app_commands.describe(category="Category to list – leave empty for the overview",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_list(interaction: discord.Interaction, category: Optional[str] = None,
+                    server: Optional[str] = None):
+    katalog = await _require_catalog(interaction, server=server)
     if katalog is None:
         return
     enabled_items = [it for it in katalog.items if it.get("enabled", True)]
@@ -9416,10 +9587,11 @@ shop_list.autocomplete("category")(_shop_category_autocomplete)
 
 
 @shop_group.command(name="pending", description="📦 Show purchases waiting for delivery (admin)")
-async def shop_pending(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_pending(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    _conn, _fehler = _conn_waehlen(interaction, None)
+    _conn, _fehler = _conn_waehlen(interaction, server)
     if _conn is None:
         return await interaction.response.send_message(
             _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
@@ -9442,13 +9614,14 @@ async def shop_pending(interaction: discord.Interaction):
 
 @shop_group.command(name="cleanup",
                     description="🧹 Mark ALL pending purchases as delivered and clean cfgEffectArea.json (admin)")
-async def shop_cleanup(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_cleanup(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
     await interaction.response.defer(ephemeral=True)
     # Auf dem EIGENEN Server aufräumen – sonst würde ein Admin die offenen
     # Käufe aller anderen Kunden als geliefert markieren.
-    _conn = await _require_conn(interaction, need_ftp=True)
+    _conn = await _require_conn(interaction, need_ftp=True, server=server)
     if _conn is None:
         return
     if not _conn.shop:
@@ -9490,11 +9663,12 @@ async def shop_cleanup(interaction: discord.Interaction):
 
 @shop_group.command(name="check",
                     description="🩺 Delivery-Diagnose: prüft cfgEffectArea.json & repariert fehlende Einträge (admin)")
-async def shop_check(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_check(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
     await interaction.response.defer(ephemeral=True)
-    _conn = await _require_conn(interaction, need_ftp=True)
+    _conn = await _require_conn(interaction, need_ftp=True, server=server)
     if _conn is None:
         return
     if not _conn.shop:
@@ -9554,12 +9728,14 @@ async def shop_check(interaction: discord.Interaction):
 
 
 @shop_group.command(name="setprice", description="💲 Change the price of a shop item (admin)")
-@app_commands.describe(item="Item name", price="New price")
+@app_commands.describe(item="Item name", price="New price",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def shop_setprice(interaction: discord.Interaction,
-                        item: str, price: app_commands.Range[int, 0]):
+                        item: str, price: app_commands.Range[int, 0],
+                        server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    katalog = await _require_catalog(interaction)
+    katalog = await _require_catalog(interaction, server=server)
     if katalog is None:
         return
     it = katalog.find(item)
@@ -9578,11 +9754,13 @@ shop_setprice.autocomplete("item")(_shop_item_autocomplete)
 
 
 @shop_group.command(name="enable", description="🔧 Enable or disable a shop item (admin)")
-@app_commands.describe(item="Item name", enabled="True = buyable, False = hidden from the shop")
-async def shop_enable(interaction: discord.Interaction, item: str, enabled: bool):
+@app_commands.describe(item="Item name", enabled="True = buyable, False = hidden from the shop",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_enable(interaction: discord.Interaction, item: str, enabled: bool,
+                      server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    katalog = await _require_catalog(interaction)
+    katalog = await _require_catalog(interaction, server=server)
     if katalog is None:
         return
     it = katalog.find(item)
@@ -9601,11 +9779,13 @@ shop_enable.autocomplete("item")(_shop_item_autocomplete)
 
 @shop_group.command(name="removeitem",
                     description="🗑️ Remove an item/bundle from the shop catalog (admin)")
-@app_commands.describe(item="Item name")
-async def shop_removeitem(interaction: discord.Interaction, item: str):
+@app_commands.describe(item="Item name",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_removeitem(interaction: discord.Interaction, item: str,
+                          server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    katalog = await _require_catalog(interaction)
+    katalog = await _require_catalog(interaction, server=server)
     if katalog is None:
         return
     it = katalog.find(item)
@@ -9623,6 +9803,14 @@ async def shop_removeitem(interaction: discord.Interaction, item: str):
 
 shop_removeitem.autocomplete("item")(_shop_item_autocomplete)
 
+shop_list.autocomplete("server")(_server_autocomplete)
+shop_pending.autocomplete("server")(_server_autocomplete)
+shop_cleanup.autocomplete("server")(_server_autocomplete)
+shop_check.autocomplete("server")(_server_autocomplete)
+shop_setprice.autocomplete("server")(_server_autocomplete)
+shop_enable.autocomplete("server")(_server_autocomplete)
+shop_removeitem.autocomplete("server")(_server_autocomplete)
+
 bot.tree.add_command(shop_group)
 
 
@@ -9638,15 +9826,17 @@ add_group = app_commands.Group(name="add", description="➕ Add entries to the s
     price="Price for the item / the whole bundle",
     name="Display name (optional – default: the classname itself)",
     category="Shop category (optional – default: Custom, bundles: Bundles)",
-    max_amount="Max amount per purchase (optional – default: 5, bundles: 1)")
+    max_amount="Max amount per purchase (optional – default: 5, bundles: 1)",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def add_shopitem(interaction: discord.Interaction, classnames: str,
                        price: app_commands.Range[int, 0],
                        name: Optional[str] = None,
                        category: Optional[str] = None,
-                       max_amount: Optional[app_commands.Range[int, 1]] = None):
+                       max_amount: Optional[app_commands.Range[int, 1]] = None,
+                       server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    katalog = await _require_catalog(interaction)
+    katalog = await _require_catalog(interaction, server=server)
     if katalog is None:
         return
 
@@ -9716,6 +9906,7 @@ async def add_shopitem(interaction: discord.Interaction, classnames: str,
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 add_shopitem.autocomplete("category")(_shop_category_autocomplete)
+add_shopitem.autocomplete("server")(_server_autocomplete)
 
 bot.tree.add_command(add_group)
 
@@ -9733,16 +9924,18 @@ edit_group = app_commands.Group(name="edit", description="✏️ Edit entries of
     price="New price (optional)",
     name="New display name (optional)",
     category="New category (optional)",
-    max_amount="New max amount per purchase (optional)")
+    max_amount="New max amount per purchase (optional)",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def edit_shopitem(interaction: discord.Interaction, item: str,
                         classnames: Optional[str] = None,
                         price: Optional[app_commands.Range[int, 0]] = None,
                         name: Optional[str] = None,
                         category: Optional[str] = None,
-                        max_amount: Optional[app_commands.Range[int, 1]] = None):
+                        max_amount: Optional[app_commands.Range[int, 1]] = None,
+                        server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    katalog = await _require_catalog(interaction)
+    katalog = await _require_catalog(interaction, server=server)
     if katalog is None:
         return
     it = katalog.find(item)
@@ -9829,6 +10022,7 @@ async def edit_shopitem(interaction: discord.Interaction, item: str,
 
 edit_shopitem.autocomplete("item")(_shop_item_autocomplete)
 edit_shopitem.autocomplete("category")(_shop_category_autocomplete)
+edit_shopitem.autocomplete("server")(_server_autocomplete)
 
 @edit_group.command(name="ankuendigung",
                     description="✏️ Bearbeitet eine geplante Ankündigung (Nachricht/Bild)")
@@ -10076,10 +10270,11 @@ bundle_group = app_commands.Group(
 @bundle_group.command(
     name="add",
     description="📦 Create a bundle via a form: several items, sold as one purchase (admin)")
-async def bundle_add(interaction: discord.Interaction):
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def bundle_add(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    katalog = await _require_catalog(interaction)
+    katalog = await _require_catalog(interaction, server=server)
     if katalog is None:
         return
     embed = discord.Embed(
@@ -10094,6 +10289,8 @@ async def bundle_add(interaction: discord.Interaction):
         embed=embed, view=BundleCategoryView(katalog), ephemeral=True)
 
 
+bundle_add.autocomplete("server")(_server_autocomplete)
+
 bot.tree.add_command(bundle_group)
 
 
@@ -10105,19 +10302,28 @@ bot.tree.add_command(bundle_group)
     amount="How many to buy",
     x="iZurvive X coordinate (East – the FIRST number on iZurvive)",
     z="iZurvive Y coordinate (North – the SECOND number on iZurvive)",
-    y="Height / altitude (OPTIONAL – leave empty for default ground level)")
+    y="Height / altitude (OPTIONAL – leave empty for default ground level)",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_buy(interaction: discord.Interaction, item: str,
                   amount: app_commands.Range[int, 1], x: float, z: float,
-                  y: Optional[float] = None):
+                  y: Optional[float] = None, server: Optional[str] = None):
     if not await _require_guild(interaction):
         return
     gid, uid = interaction.guild_id, interaction.user.id
 
-    # ── 1. Item & Menge validieren (Katalog DIESES Servers) ───
-    katalog_conn = _conn_of(interaction)
-    katalog = await _require_catalog(interaction)
+    # ── 1. Server EINMAL aufloesen – Katalog, Lieferung, Neustart und
+    #       Karte muessen zwingend derselbe Server sein. Frueher wurde hier
+    #       viermal unabhaengig aufgeloest: der Katalog kam von A, das Item
+    #       spawnte auf B und neu gestartet wurde ein dritter Server.
+    _conn, _fehler = _conn_waehlen(interaction, server)
+    if _conn is None:
+        return await interaction.response.send_message(
+            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
+    katalog_conn = _conn
+    katalog = _conn.catalog
     if katalog is None:
-        return
+        return await interaction.response.send_message(
+            PREMIUM_MISSING_TEXT, ephemeral=True)
     it = katalog.find(item)
     if not it or not it.get("enabled", True):
         return await interaction.response.send_message(
@@ -10155,12 +10361,13 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
             embed=_insufficient_embed(total, wallet), ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
-    # Auslieferung IMMER über den Server dieser Guild. Vorher lief jeder Kauf
-    # über den Hauptserver: der Käufer zahlte, das Item spawnte woanders, und
-    # ein fremder Server wurde dafür neu gestartet.
-    _conn = await _require_conn(interaction, need_ftp=True)
-    if _conn is None:
-        return
+    # Auslieferung auf genau dem oben gewaehlten Server – hier wird nur noch
+    # geprueft, ob er einsatzbereit ist, nicht neu aufgeloest.
+    if _conn.api is None or _conn.ftp is None:
+        return await interaction.followup.send(
+            "❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn kann nichts "
+            "ausgeliefert werden.\n`/ftp_scan` versucht die Erkennung erneut.",
+            ephemeral=True)
     if not _conn.shop:
         return await interaction.followup.send(
             "❌ Shop system is still starting up – try again in a moment.", ephemeral=True)
@@ -10206,9 +10413,7 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
         delivery_info = "⏳ Your items will spawn at the **next scheduled server restart**."
 
     # ── 8. Bestätigung an den Käufer (Ort + iZurvive-Link) ────
-    _conn = _conn_of(interaction)
-    map_name = (_conn.get("map_name", "ChernarusPlus") if _conn is not None
-                else cfg.config.get("map_name", "ChernarusPlus"))
+    map_name = _conn.get("map_name", "ChernarusPlus")
     loc_url  = _izurvive_url(x, z, map_name)
     near     = _nearest_location(x, z, map_name)
     near_txt = f"\n*(Near {near})*" if near else ""
@@ -10237,6 +10442,7 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
     await _post_feed(gid, "shop_log", feed, service_id=_conn.service_id)
 
 cmd_buy.autocomplete("item")(_shop_buy_autocomplete)
+cmd_buy.autocomplete("server")(_server_autocomplete)
 
 
 # ══════════════════════════════════════════════════════════════
