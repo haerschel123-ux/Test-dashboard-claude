@@ -731,13 +731,74 @@ class ConfigManager:
     def save_log_state(self):self.save(LOG_STATE_FILE, self.log_state)
     def save_whitelist_reqs(self): self.save(WHITELIST_REQ_FILE, self.whitelist_reqs)
 
-    def get_channel(self, guild_id: int, log_type: str) -> Optional[int]:
-        return self.guilds.get(str(guild_id), {}).get(log_type)
+    def server_feeds(self, guild_id: int, service_id: str,
+                     anlegen: bool = False) -> Dict[str, Any]:
+        """Die Feed-Ebene EINES Nitrado-Servers innerhalb einer Guild.
 
-    def set_channel(self, guild_id: int, log_type: str, channel_id: int):
+        Aufbau: ``guilds[gid]["servers"][service_id][log_type] = channel_id``.
+        Die alten flachen Werte auf Guild-Ebene bleiben als Rueckfall stehen,
+        solange die Guild nur einen Server hat (siehe ``get_channel``).
+        """
         gid = str(guild_id)
-        self.guilds.setdefault(gid, {})[log_type] = channel_id
+        if anlegen:
+            eimer = self.guilds.setdefault(gid, {}).setdefault("servers", {})
+            return eimer.setdefault(str(service_id), {})
+        eimer = (self.guilds.get(gid) or {}).get("servers") or {}
+        wert = eimer.get(str(service_id))
+        return wert if isinstance(wert, dict) else {}
+
+    def _guild_hat_mehrere_server(self, guild_id: int) -> bool:
+        try:
+            return len(connections.all_for_guild(guild_id)) > 1
+        except Exception:  # noqa: BLE001 – Registry evtl. noch nicht geladen
+            return False
+
+    def get_channel(self, guild_id: int, log_type: str,
+                    service_id: Optional[str] = None) -> Optional[int]:
+        """Feed-Channel eines Log-Typs – bevorzugt der des genannten Servers.
+
+        Der Rueckfall auf die Guild-Ebene gilt nur, solange die Guild GENAU
+        EINEN Server hat. Ab zwei Servern wuerde er beide in denselben Channel
+        posten – genau das soll die Trennung verhindern. Der Bestandsserver
+        behaelt seine Channels durch die Migration in ``uebernimm_guild_feeds``.
+        """
+        if service_id:
+            eigen = self.server_feeds(guild_id, service_id).get(log_type)
+            if eigen:
+                return eigen
+            if self._guild_hat_mehrere_server(guild_id):
+                return None
+        return (self.guilds.get(str(guild_id)) or {}).get(log_type)
+
+    def set_channel(self, guild_id: int, log_type: str, channel_id: int,
+                    service_id: Optional[str] = None):
+        gid = str(guild_id)
+        if service_id:
+            self.server_feeds(guild_id, service_id, anlegen=True)[log_type] = channel_id
+        else:
+            self.guilds.setdefault(gid, {})[log_type] = channel_id
         self.save_guilds()
+
+    def uebernimm_guild_feeds(self, guild_id: int, service_id: str) -> bool:
+        """Die flachen Guild-Feeds diesem Server zuschreiben.
+
+        Wird aufgerufen, sobald eine Guild ihren ZWEITEN Server bekommt: der
+        bisherige behaelt alles, was bis dahin guild-weit eingestellt war, und
+        der neue startet mit leeren Feeds statt in dieselben Channels zu posten.
+        """
+        gid = str(guild_id)
+        oben = self.guilds.get(gid) or {}
+        umzug = {k: v for k, v in oben.items()
+                 if k in LOG_TYPES or k in ("whitelist_request", "status_message_id")}
+        if not umzug:
+            return False
+        eigen = self.server_feeds(guild_id, service_id, anlegen=True)
+        for k, v in umzug.items():
+            eigen.setdefault(k, v)
+        self.save_guilds()
+        log.info(f"[FEED] Guild {gid}: {len(umzug)} Feed-Einstellungen an Server "
+                 f"{service_id} uebergeben.")
+        return True
 
     def is_valid(self) -> Tuple[bool, List[str]]:
         # Nur der Discord-Bot-Token ist Pflicht. Der Nitrado-Token wird per
@@ -2713,7 +2774,13 @@ class DayZBot(discord.Client):
         # Persistente Views registrieren, damit Panel-/Freigabe-Buttons einen
         # Bot-Neustart überleben (timeout=None + feste custom_ids)
         try:
+            # Alt-Panels ohne Server-Endung weiter bedienen …
             self.add_view(WhitelistPanelView())
+            # … und je verbundenem Server eine eigene, damit die Anfrage weiss,
+            # fuer welchen Nitrado-Server sie gilt.
+            for _c in connections.all():
+                if _c.service_id:
+                    self.add_view(WhitelistPanelView(_c.service_id))
             for reqid in list(cfg.whitelist_reqs.keys()):
                 self.add_view(WhitelistApprovalView(reqid))
             if cfg.whitelist_reqs:
@@ -3025,7 +3092,8 @@ class DayZBot(discord.Client):
                                      f"dieser Zeit werden nicht nachgepostet, um die Feeds nicht zu "
                                      f"fluten (Grenze: `max_backlog_minutes` in config.json)."),
                         color=0x95A5A6)
-                    await _post_feed(conn.guild_id, "adminlog", info)
+                    await _post_feed(conn.guild_id, "adminlog", info,
+                                     service_id=conn.service_id)
                 await self._check_ftp_health(conn)
                 return
 
@@ -3109,14 +3177,18 @@ class DayZBot(discord.Client):
         # Nur die Guild dieses Servers – sonst saehe jeder Discord-Server den
         # Status aller Kunden.
         for gid_str in [str(conn.guild_id)]:
-            ch_id = cfg.get_channel(int(gid_str), "status")
+            ch_id = cfg.get_channel(int(gid_str), "status", conn.service_id)
             if not ch_id:
                 continue
             ch = await self._resolve_channel(int(ch_id))
             if not ch:
                 continue
+            # Die Status-Nachricht gehoert dem Server, nicht der Guild – sonst
+            # editieren zwei Server derselben Guild im Minutentakt dieselbe
+            # Nachricht und die Anzeige springt zwischen ihnen hin und her.
+            eigen = cfg.server_feeds(int(gid_str), conn.service_id, anlegen=True)
             msg = None
-            msg_id = cfg.guilds.get(gid_str, {}).get("status_message_id")
+            msg_id = eigen.get("status_message_id")
             if msg_id:
                 try:
                     msg = await ch.fetch_message(int(msg_id))
@@ -3127,7 +3199,7 @@ class DayZBot(discord.Client):
                     await msg.edit(embed=embed)
                 else:
                     msg = await ch.send(embed=embed)
-                    cfg.guilds.setdefault(gid_str, {})["status_message_id"] = msg.id
+                    eigen["status_message_id"] = msg.id
                     cfg.save_guilds()
             except Exception as e:
                 log.error(f"[STATUS] Guild {gid_str}: {e}")
@@ -3218,11 +3290,12 @@ class DayZBot(discord.Client):
                     if now - self._zone_last_ping.get(zkey, 0.0) < cooldown:
                         continue     # Wiederhol-Intervall noch nicht abgelaufen
                     self._zone_last_ping[zkey] = now
-                    await self._post_zone_ping(zone, pname, info)
+                    await self._post_zone_ping(zone, pname, info, _src)
         except Exception as e:
             log.error(f"[ZONE] Zonen-Prüfung fehlgeschlagen: {e}")
 
-    async def _post_zone_ping(self, zone: Dict, player: str, info: Dict):
+    async def _post_zone_ping(self, zone: Dict, player: str, info: Dict,
+                              conn: Optional[ServerConnection] = None):
         e = discord.Embed(
             title="🛡️ • Ping On Detection",
             description=f"**{player}** was located within the zone **{zone['name']}**.",
@@ -3243,13 +3316,15 @@ class DayZBot(discord.Client):
             # ALLE konfigurierten Discord-Server.
             log.warning(f"[ZONE] {zone.get('name')}: keine guild_id – Ping unterdrueckt.")
             return
+        sid = conn.service_id if conn is not None else None
         zone_ch = zone.get("channel_id")
         if zone_ch:
-            await _post_feed(gid, "zone", e, content=content, channel_id=int(zone_ch))
-        elif cfg.get_channel(gid, "zone"):
-            await _post_feed(gid, "zone", e, content=content)
+            await _post_feed(gid, "zone", e, content=content,
+                             channel_id=int(zone_ch), service_id=sid)
+        elif cfg.get_channel(gid, "zone", sid):
+            await _post_feed(gid, "zone", e, content=content, service_id=sid)
         else:
-            await _post_feed(gid, "adminlog", e, content=content)
+            await _post_feed(gid, "adminlog", e, content=content, service_id=sid)
 
     # ── Geplante Neustarts (/auto restart) ────────────────────
     def _next_scheduled_restart(self,
@@ -3352,8 +3427,9 @@ class DayZBot(discord.Client):
                  else ([] if conn is not None else list(cfg.guilds)))
         for gid_str in ziele:
             gid = int(gid_str)
-            lt = "restart" if cfg.get_channel(gid, "restart") else "adminlog"
-            await _post_feed(gid, lt, embed)
+            _sid = conn.service_id if conn is not None else None
+            lt = ("restart" if cfg.get_channel(gid, "restart", _sid) else "adminlog")
+            await _post_feed(gid, lt, embed, service_id=_sid)
 
     async def _try_refresh_ftp_credentials(self, conn: ServerConnection) -> bool:
         """Selbstheilung bei FTP-Dauerausfall: Zugangsdaten fuer DIESEN Server
@@ -3422,7 +3498,8 @@ class DayZBot(discord.Client):
                                      "hat die Zugangsdaten über den Nitrado-Token neu "
                                      "geholt und die Verbindung neu aufgebaut."),
                         color=0x2ECC71)
-                    await _post_feed(conn.guild_id, "adminlog", embed)
+                    await _post_feed(conn.guild_id, "adminlog", embed,
+                                     service_id=conn.service_id)
                     return
                 conn.ftp_warn_active = True
                 embed = discord.Embed(
@@ -3433,7 +3510,8 @@ class DayZBot(discord.Client):
                                  f"Mögliche Ursachen: FTP-Passwort geändert, Nitrado-Wartung.\n"
                                  f"Letzter Fehler: `{ftp.last_error or 'unbekannt'}`"),
                     color=0xE74C3C)
-                await _post_feed(conn.guild_id, "adminlog", embed)
+                await _post_feed(conn.guild_id, "adminlog", embed,
+                                 service_id=conn.service_id)
         elif fails == 0 and conn.ftp_warn_active:
             conn.ftp_warn_active = False
             conn.ftp_warned_ts   = 0.0
@@ -3441,7 +3519,8 @@ class DayZBot(discord.Client):
                 title="✅ FTP-Verbindung wiederhergestellt",
                 description="Der FTP-Zugriff funktioniert wieder – die Feeds laufen normal weiter.",
                 color=0x2ECC71)
-            await _post_feed(conn.guild_id, "adminlog", embed)
+            await _post_feed(conn.guild_id, "adminlog", embed,
+                             service_id=conn.service_id)
 
     async def _resolve_channel(self, channel_id: int):
         ch = self.get_channel(channel_id)
@@ -3485,8 +3564,9 @@ class DayZBot(discord.Client):
             return
         targets = ([str(conn.guild_id)] if conn is not None
                    else list(cfg.guilds))
+        _sid = conn.service_id if conn is not None else None
         for gid_str in targets:
-            ch_id = cfg.get_channel(int(gid_str), log_type)
+            ch_id = cfg.get_channel(int(gid_str), log_type, _sid)
             if not ch_id:
                 continue
             send_embed = embed
@@ -3888,7 +3968,12 @@ async def setup_feeds(interaction: discord.Interaction,
                       channel: discord.TextChannel):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    cfg.set_channel(interaction.guild_id, feed.value, channel.id)
+    _conn, _fehler = _conn_waehlen(interaction, None)
+    if _conn is None:
+        return await interaction.response.send_message(
+            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
+    cfg.set_channel(interaction.guild_id, feed.value, channel.id,
+                    service_id=_conn.service_id)
     await interaction.response.send_message(
         f"✅ **{LOG_TYPES[feed.value]}** → {channel.mention}", ephemeral=True)
 
@@ -4144,8 +4229,16 @@ bot.tree.add_command(setup_group)
 async def cmd_show_feeds(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    guild_cfg  = cfg.guilds.get(str(interaction.guild_id), {})
-    active     = {lt: ch for lt, ch in guild_cfg.items() if ch and lt in LOG_TYPES}
+    _conn_show, _fehler = _conn_waehlen(interaction, None)
+    if _conn_show is None:
+        return await interaction.response.send_message(
+            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
+    _sid_show = _conn_show.service_id
+    active = {}
+    for lt in LOG_TYPES:
+        ch = cfg.get_channel(interaction.guild_id, lt, _sid_show)
+        if ch:
+            active[lt] = ch
     inactive   = [lt for lt in LOG_TYPES if lt not in active]
 
     embed = discord.Embed(
@@ -4203,6 +4296,10 @@ async def cmd_edit_feeds(
 ):
     if not _is_admin(interaction):
         return await _deny(interaction)
+    _conn_feeds, _fehler = _conn_waehlen(interaction, None)
+    if _conn_feeds is None:
+        return await interaction.response.send_message(
+            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
 
     # Ungültigen Feed-Key abfangen (falls jemand manuell eingibt)
     if feed not in LOG_TYPES:
@@ -4216,9 +4313,16 @@ async def cmd_edit_feeds(
 
     if channel is None:
         # Feed deaktivieren
+        eigen = cfg.server_feeds(interaction.guild_id,
+                                 _conn_feeds.service_id, anlegen=True)
         gid = str(interaction.guild_id)
+        entfernt = eigen.pop(feed, None) is not None
+        # Alt-Bestand auf Guild-Ebene ebenfalls raeumen, sonst greift er wieder
+        # als Rueckfall, solange die Guild nur einen Server hat.
         if gid in cfg.guilds and feed in cfg.guilds[gid]:
             del cfg.guilds[gid][feed]
+            entfernt = True
+        if entfernt:
             cfg.save_guilds()
         embed = discord.Embed(
             title="⚪ Feed deaktiviert",
@@ -4227,7 +4331,8 @@ async def cmd_edit_feeds(
         )
     else:
         # Feed auf neuen Channel setzen
-        cfg.set_channel(interaction.guild_id, feed, channel.id)
+        cfg.set_channel(interaction.guild_id, feed, channel.id,
+                        service_id=_conn_feeds.service_id)
         embed = discord.Embed(
             title="✅ Feed geändert",
             description=f"**{desc}**\n╰ {channel.mention}",
@@ -4244,11 +4349,12 @@ async def _feed_autocomplete(
     current: str,
 ) -> List[app_commands.Choice[str]]:
     """Autocomplete: zeigt alle passenden Feed-Typen mit ihrem aktuellen Channel."""
-    guild_cfg = cfg.guilds.get(str(interaction.guild_id), {})
+    _c_ac, _ = _conn_waehlen(interaction, _gewaehlter_server(interaction))
+    _sid_ac = _c_ac.service_id if _c_ac is not None else None
     results   = []
     for lt, desc in LOG_TYPES.items():
         if current.lower() in lt.lower() or current.lower() in desc.lower() or not current:
-            ch_id  = guild_cfg.get(lt)
+            ch_id  = cfg.get_channel(interaction.guild_id, lt, _sid_ac)
             status = "✅" if ch_id else "❌"
             # Channel-Name im Label anzeigen wenn möglich
             ch_name = ""
@@ -4647,7 +4753,8 @@ async def zone_create(interaction: discord.Interaction, x: float, z: float,
     e = discord.Embed(title="🛡️ Zone angelegt",
                       description=f"**{name}**\n{_zone_summary(zone)}",
                       color=0x2ECC71)
-    if not channel and not cfg.get_channel(interaction.guild_id, "zone"):
+    if not channel and not cfg.get_channel(interaction.guild_id, "zone",
+                                           _c.service_id if _c else None):
         e.add_field(name="ℹ️ Hinweis",
                     value="Kein Channel gesetzt – Pings gehen in den **adminlog**. "
                           "Gib bei `/zone create` das Feld `channel` an oder setze mit "
@@ -5311,8 +5418,9 @@ def _whitelist_request_embed(requester_id: int, psn: str) -> discord.Embed:
 class WhitelistRequestModal(discord.ui.Modal, title="🎮 PSN Name eintragen"):
     """Formular, in das der Spieler seinen PlayStation-Namen einträgt."""
 
-    def __init__(self):
+    def __init__(self, service_id: Optional[str] = None):
         super().__init__()
+        self.service_id = str(service_id or "")
         self.psn_in = discord.ui.TextInput(
             label="Dein PlayStation Name",
             placeholder="z.B. DeinPSNName",
@@ -5330,7 +5438,20 @@ class WhitelistRequestModal(discord.ui.Modal, title="🎮 PSN Name eintragen"):
                 "❌ Bitte nur **einen** Namen eintragen (ohne Komma).", ephemeral=True)
 
         gid = interaction.guild_id
-        admin_ch_id = cfg.get_channel(gid, "whitelist_request")
+        # Der Server steckt im Panel-Knopf; fehlt er (Alt-Panel), gilt der
+        # einzige Server der Guild – bei mehreren bricht die Anfrage ab.
+        sid = self.service_id
+        if not sid:
+            eigene = connections.all_for_guild(gid)
+            if len(eigene) == 1:
+                sid = eigene[0].service_id
+            elif len(eigene) > 1:
+                return await interaction.response.send_message(
+                    "❌ Dieser Discord-Server verwaltet mehrere Nitrado-Server. "
+                    "Ein Admin muss das Whitelist-Panel mit `/send whitelist panel` "
+                    "neu senden, damit klar ist, für welchen Server es gilt.",
+                    ephemeral=True)
+        admin_ch_id = cfg.get_channel(gid, "whitelist_request", sid or None)
         if not admin_ch_id:
             return await interaction.response.send_message(
                 "❌ Das Whitelist-System ist noch nicht eingerichtet. "
@@ -5355,6 +5476,7 @@ class WhitelistRequestModal(discord.ui.Modal, title="🎮 PSN Name eintragen"):
             "requester_name":   str(interaction.user),
             "psn":              psn,
             "guild_id":         gid,
+            "service_id":       sid,
             "admin_channel_id": int(admin_ch_id),
             "message_id":       None,
             "created_at":       datetime.now(timezone.utc).isoformat(),
@@ -5384,18 +5506,43 @@ class WhitelistRequestModal(discord.ui.Modal, title="🎮 PSN Name eintragen"):
             await interaction.response.send_message(msg, ephemeral=True)
 
 
+def _whitelist_conn(req: Dict[str, Any],
+                    interaction: discord.Interaction) -> Optional[ServerConnection]:
+    """Der Nitrado-Server, zu dem eine Whitelist-Anfrage gehoert.
+
+    Bevorzugt die in der Anfrage vermerkte Service-ID. Alt-Anfragen ohne das
+    Feld fallen auf den einzigen Server ihrer Guild zurueck; gibt es dort
+    mehrere, ist die Zuordnung nicht mehr rekonstruierbar und die Freigabe
+    wird abgelehnt, statt auf gut Glueck den falschen Server zu treffen.
+    """
+    sid = str((req or {}).get("service_id") or "")
+    if sid:
+        return connections.for_service(sid)
+    eigene = connections.all_for_guild((req or {}).get("guild_id")
+                                       or interaction.guild_id)
+    return eigene[0] if len(eigene) == 1 else None
+
+
 class WhitelistPanelView(discord.ui.View):
-    """Persistentes Panel mit dem Button, der das PSN-Eingabe-Modal öffnet."""
+    """Persistentes Panel mit dem Button, der das PSN-Eingabe-Modal öffnet.
 
-    def __init__(self):
+    Die ``custom_id`` traegt die Service-ID, damit eine Anfrage auch nach einem
+    Bot-Neustart noch weiss, fuer WELCHEN Nitrado-Server sie gilt. Panels aus
+    der Zeit davor haben keine Endung und werden weiter bedient.
+    """
+
+    def __init__(self, service_id: Optional[str] = None):
         super().__init__(timeout=None)
+        self.service_id = str(service_id or "")
+        cid = f"wl_panel_open:{self.service_id}" if self.service_id else "wl_panel_open"
+        knopf = discord.ui.Button(label="PSN Name eintragen", emoji="🎮",
+                                  style=discord.ButtonStyle.primary, custom_id=cid)
+        knopf.callback = self._open_modal
+        self.add_item(knopf)
 
-    @discord.ui.button(label="PSN Name eintragen", emoji="🎮",
-                       style=discord.ButtonStyle.primary,
-                       custom_id="wl_panel_open")
-    async def open_modal(self, interaction: discord.Interaction,
-                         button: discord.ui.Button):
-        await interaction.response.send_modal(WhitelistRequestModal())
+    async def _open_modal(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            WhitelistRequestModal(self.service_id or None))
 
 
 class WhitelistApprovalView(discord.ui.View):
@@ -5425,13 +5572,16 @@ class WhitelistApprovalView(discord.ui.View):
             return await interaction.response.send_message(
                 "ℹ️ Diese Anfrage wurde bereits bearbeitet.", ephemeral=True)
 
-        conn = _conn_of(interaction)
+        # Der Server steht in der Anfrage – die Buttons ueberleben Neustarts,
+        # und bei mehreren Servern derselben Guild waere _conn_of geraten.
+        conn = _whitelist_conn(req, interaction)
         if conn is None or conn.api is None:
             cfg.whitelist_reqs[self.reqid] = req
             cfg.save_whitelist_reqs()
             return await interaction.response.send_message(
-                "❌ Für diesen Discord-Server ist kein Nitrado-Server eingerichtet – "
-                "die Anfrage bleibt offen.", ephemeral=True)
+                "❌ Für diese Anfrage ist kein Nitrado-Server eingerichtet – "
+                "sie bleibt offen. Ein Admin kann das Whitelist-Panel mit "
+                "`/send whitelist panel` neu senden.", ephemeral=True)
 
         await interaction.response.defer()
         try:
@@ -5506,15 +5656,21 @@ async def send_whitelist_panel(interaction: discord.Interaction,
     if not _is_admin(interaction):
         return await _deny(interaction)
 
-    # Anfrage-Channel pro Guild merken (das Modal liest ihn beim Absenden aus)
-    cfg.set_channel(interaction.guild_id, "whitelist_request", admin_channel.id)
+    _conn, _fehler = _conn_waehlen(interaction, None)
+    if _conn is None:
+        return await interaction.response.send_message(
+            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
+    # Anfrage-Channel je Server merken (das Modal liest ihn beim Absenden aus)
+    cfg.set_channel(interaction.guild_id, "whitelist_request", admin_channel.id,
+                    service_id=_conn.service_id)
 
     panel_embed = discord.Embed(
         title="✅ Whitelist-Anmeldung",
         description=WHITELIST_PANEL_TEXT,
         color=0x5865F2)
     try:
-        await panel_channel.send(embed=panel_embed, view=WhitelistPanelView())
+        await panel_channel.send(embed=panel_embed,
+                                 view=WhitelistPanelView(_conn.service_id))
     except discord.Forbidden:
         return await interaction.response.send_message(
             f"❌ Ich darf in {panel_channel.mention} nicht schreiben. "
@@ -6757,8 +6913,12 @@ class EconomyDB:
                 action   TEXT    NOT NULL,
                 ready_at REAL    NOT NULL,
                 PRIMARY KEY (guild_id, user_id, action))""")
+            # service_id: auf WELCHEM Nitrado-Server das Item spawnen soll.
+            # Eine Guild kann mehrere Server verwalten - ohne diese Spalte
+            # raeumte Server A beim Neustart die Kaeufe von Server B ab.
             c.execute("""CREATE TABLE IF NOT EXISTS purchases (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id   TEXT NOT NULL DEFAULT '',
                 guild_id     INTEGER NOT NULL,
                 user_id      INTEGER NOT NULL,
                 user_name    TEXT,
@@ -6839,11 +6999,26 @@ class EconomyDB:
             alt_id = haupt.service_id if haupt is not None else ""
         except Exception:  # noqa: BLE001 – Registry evtl. noch nicht geladen
             alt_id = ""
-        for tabelle in ("kills", "sessions"):
+        for tabelle in ("kills", "sessions", "purchases"):
             spalten = {r["name"] for r in c.execute(f"PRAGMA table_info({tabelle})")}
             if not spalten or "service_id" in spalten:
                 continue
-            if tabelle == "sessions":
+            if tabelle == "purchases":
+                # Offene Kaeufe gehoeren dem Server, der ihre Guild bedient –
+                # vor dem Mehrserverbetrieb war das je Guild genau einer.
+                c.execute("ALTER TABLE purchases "
+                          "ADD COLUMN service_id TEXT NOT NULL DEFAULT ''")
+                try:
+                    for zeile in c.execute(
+                            "SELECT DISTINCT guild_id FROM purchases").fetchall():
+                        gid = zeile["guild_id"] if isinstance(zeile, sqlite3.Row) else zeile[0]
+                        ziel = connections.for_guild(gid)
+                        if ziel is not None:
+                            c.execute("UPDATE purchases SET service_id=? WHERE guild_id=?",
+                                      (ziel.service_id, gid))
+                except Exception as e:  # noqa: BLE001 – Registry evtl. noch leer
+                    log.warning(f"[ECON] Kaeufe konnten nicht zugeordnet werden: {e}")
+            elif tabelle == "sessions":
                 # Primaerschluessel aendert sich → Tabelle neu aufbauen
                 c.execute("ALTER TABLE sessions RENAME TO sessions_alt")
                 c.execute("""CREATE TABLE sessions (
@@ -6980,25 +7155,31 @@ class EconomyDB:
             self._conn.commit()
 
     # ── Käufe / Delivery-Tracking ─────────────────────────────
-    def create_purchase(self, guild_id: int, user_id: int, user_name: str,
+    def create_purchase(self, service_id: str, guild_id: int, user_id: int,
+                        user_name: str,
                         item_name: str, classname: str, amount: int, total_price: int,
                         x: float, y: float, z: float, area_names: List[str]) -> int:
         with self._lock:
             cur = self._conn.execute(
                 """INSERT INTO purchases
-                   (guild_id, user_id, user_name, item_name, classname, amount,
-                    total_price, x, y, z, area_names, status, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending',?)""",
-                (guild_id, user_id, user_name, item_name, classname, amount,
+                   (service_id, guild_id, user_id, user_name, item_name, classname,
+                    amount, total_price, x, y, z, area_names, status, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)""",
+                (str(service_id or ""), guild_id, user_id, user_name, item_name,
+                 classname, amount,
                  total_price, x, y, z, json.dumps(area_names), time.time()))
             self._conn.commit()
             return int(cur.lastrowid)
 
     def pending_purchases(self, created_before: Optional[float] = None,
-                          guild_id: Optional[int] = None) -> List[sqlite3.Row]:
-        """Offene Käufe. Ohne guild_id die aller Guilds – im Mehrkundenbetrieb
-        gehört deshalb IMMER eine Guild mitgegeben, sonst raeumt der Cleanup
-        eines Servers die Kaeufe fremder Kunden ab."""
+                          guild_id: Optional[int] = None,
+                          service_id: Optional[str] = None) -> List[sqlite3.Row]:
+        """Offene Käufe eines Servers.
+
+        ``guild_id`` grenzt gegen fremde Kunden ab, ``service_id`` gegen die
+        anderen Server derselben Guild – sonst liefert Server A die Kaeufe von
+        Server B aus, markiert sie als geliefert und der Kaeufer bekommt nichts.
+        """
         q = "SELECT * FROM purchases WHERE status='pending'"
         args: Tuple = ()
         if created_before is not None:
@@ -7012,6 +7193,12 @@ class EconomyDB:
             return []
         q += " AND guild_id = ?"
         args = args + (int(guild_id),)
+        if service_id is not None:
+            # Alt-Kaeufe ohne service_id gehoeren dem Server, der sie damals
+            # als einziger der Guild bedient hat – die Migration hat sie ihm
+            # bereits zugeschrieben, leere Werte bleiben trotzdem sichtbar.
+            q += " AND (service_id = ? OR service_id = '')"
+            args = args + (str(service_id),)
         with self._lock:
             return list(self._conn.execute(q + " ORDER BY id", args).fetchall())
 
@@ -7409,11 +7596,14 @@ def _validate_bet(bet: int, conf: Dict) -> Optional[str]:
     return None
 
 async def _post_feed(guild_id: Optional[int], log_type: str, embed: discord.Embed,
-                     content: Optional[str] = None, channel_id: Optional[int] = None):
+                     content: Optional[str] = None, channel_id: Optional[int] = None,
+                     service_id: Optional[str] = None):
     """Postet ein Embed in den konfigurierten Feed-Channel (eine Guild oder alle).
     content: optionaler Nachrichtentext vor dem Embed (z. B. Rollen-Ping bei Zonen).
     channel_id: optionaler Ziel-Channel, der die Feed-Konfiguration überschreibt
-    (z. B. eigener Warn-Channel einer Zone)."""
+    (z. B. eigener Warn-Channel einer Zone).
+    service_id: von welchem Nitrado-Server das Ereignis stammt – entscheidet bei
+    mehreren Servern derselben Guild, in welchen Channel es geht."""
     async def _send(ch_id: int, tag: str):
         ch = await bot._resolve_channel(int(ch_id))
         if not ch:
@@ -7432,7 +7622,7 @@ async def _post_feed(guild_id: Optional[int], log_type: str, embed: discord.Embe
         return
     gids = [str(guild_id)] if guild_id else list(cfg.guilds.keys())
     for gid in gids:
-        ch_id = cfg.get_channel(int(gid), log_type)
+        ch_id = cfg.get_channel(int(gid), log_type, service_id)
         if not ch_id:
             continue
         await _send(ch_id, f"{log_type} → Guild {gid}")
@@ -7440,10 +7630,16 @@ async def _post_feed(guild_id: Optional[int], log_type: str, embed: discord.Embe
 
 async def _notify_link_change(guild_id: Optional[int], embed: discord.Embed):
     """Meldet /link- und /unlink-Aktionen an die Admins:
-    bevorzugt im adminlog-Feed, sonst im economy_log-Feed."""
-    if guild_id and cfg.get_channel(int(guild_id), "adminlog"):
-        return await _post_feed(guild_id, "adminlog", embed)
-    await _post_feed(guild_id, "economy_log", embed)
+    bevorzugt im adminlog-Feed, sonst im economy_log-Feed.
+
+    Verknuepfungen gehoeren der Guild, nicht einem einzelnen Server – als
+    Zielkanal gilt deshalb der des Leitservers.
+    """
+    _leit = connections.for_guild(guild_id) if guild_id else None
+    sid = _leit.service_id if _leit is not None else None
+    if guild_id and cfg.get_channel(int(guild_id), "adminlog", sid):
+        return await _post_feed(guild_id, "adminlog", embed, service_id=sid)
+    await _post_feed(guild_id, "economy_log", embed, service_id=sid)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -7612,7 +7808,8 @@ class ShopManager:
         if not path:
             return -1
         valid: set = set()
-        for r in db.pending_purchases(guild_id=self.conn.guild_id):
+        for r in db.pending_purchases(guild_id=self.conn.guild_id,
+                                      service_id=self.conn.service_id):
             try:
                 valid.update(json.loads(r["area_names"] or "[]"))
             except Exception:
@@ -7653,7 +7850,8 @@ class ShopManager:
         if not path:
             report["status"] = "no_path"
             return report
-        pending = db.pending_purchases(guild_id=self.conn.guild_id)
+        pending = db.pending_purchases(guild_id=self.conn.guild_id,
+                                       service_id=self.conn.service_id)
         report["pending"] = len(pending)
         async with self.lock:
             loop = asyncio.get_running_loop()
@@ -7776,7 +7974,8 @@ class ShopManager:
         restart_at = self._last_restart_at or time.time()
         cutoff = restart_at - grace
         rows = db.pending_purchases(created_before=cutoff,
-                                    guild_id=self.conn.guild_id)
+                                    guild_id=self.conn.guild_id,
+                                    service_id=self.conn.service_id)
         if not rows:
             return
         if delayed:
@@ -7828,7 +8027,8 @@ class ShopManager:
                                  "every restart. The bot retries automatically – admins can "
                                  "also run `/shop cleanup`."),
                     color=0xE67E22)
-                await _post_feed(warn_gid, "shop_log", warn)
+                await _post_feed(warn_gid, "shop_log", warn,
+                                 service_id=self.conn.service_id)
             return
         db.mark_delivered(ids)
         for r in rows:
@@ -7838,7 +8038,8 @@ class ShopManager:
                              f"spawned after the server restart."),
                 color=0x2ECC71)
             embed.set_footer(text=f"Purchase #{r['id']}")
-            await _post_feed(int(r["guild_id"]), "shop_log", embed)
+            await _post_feed(int(r["guild_id"]), "shop_log", embed,
+                             service_id=self.conn.service_id)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -8041,7 +8242,9 @@ async def _post_economy_admin_log(interaction: discord.Interaction, title: str,
                      f"Amount: **{amount_text}**"),
         color=color)
     embed.set_footer(text=f"New wallet: {_fmt_money(wallet)}")
-    await _post_feed(interaction.guild_id, "economy_log", embed)
+    _leit = connections.for_guild(interaction.guild_id)
+    await _post_feed(interaction.guild_id, "economy_log", embed,
+                     service_id=_leit.service_id if _leit else None)
 
 
 @bot.tree.command(name="addmoney", description="💰 Add money to a member's wallet (admin)")
@@ -8467,7 +8670,9 @@ async def cmd_pay(interaction: discord.Interaction,
         description=(f"**{interaction.user.display_name}** → **{user.display_name}**\n"
                      f"Betrag: **{_fmt_money(betrag)}**"),
         color=0x3498DB)
-    await _post_feed(interaction.guild_id, "economy_log", log_embed)
+    _leit = connections.for_guild(interaction.guild_id)
+    await _post_feed(interaction.guild_id, "economy_log", log_embed,
+                     service_id=_leit.service_id if _leit else None)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -9164,7 +9369,12 @@ shop_list.autocomplete("category")(_shop_category_autocomplete)
 async def shop_pending(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    rows = db.pending_purchases(guild_id=interaction.guild_id)
+    _conn, _fehler = _conn_waehlen(interaction, None)
+    if _conn is None:
+        return await interaction.response.send_message(
+            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
+    rows = db.pending_purchases(guild_id=interaction.guild_id,
+                                service_id=_conn.service_id)
     if not rows:
         return await interaction.response.send_message(
             "✅ No pending deliveries.", ephemeral=True)
@@ -9193,7 +9403,8 @@ async def shop_cleanup(interaction: discord.Interaction):
         return
     if not _conn.shop:
         return await interaction.followup.send("❌ Shop manager not ready yet.", ephemeral=True)
-    rows = db.pending_purchases(guild_id=interaction.guild_id)
+    rows = db.pending_purchases(guild_id=interaction.guild_id,
+                                service_id=_conn.service_id)
     ids, names = [], []
     for r in rows:
         ids.append(int(r["id"]))
@@ -9924,14 +10135,15 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
                              "`cfgEffectArea.json`. Run `/shop cleanup` to remove the "
                              "orphaned entries, otherwise the items respawn on every restart."),
                 color=0xE67E22)
-            await _post_feed(gid, "shop_log", warn)
+            await _post_feed(gid, "shop_log", warn, service_id=_conn.service_id)
         wallet, _bank = db.get_balance(gid, uid)
         return await interaction.followup.send(
             embed=_insufficient_embed(total, wallet), ephemeral=True)
 
     # ── 6. Kauf als pending speichern ─────────────────────────
     purchase_id = db.create_purchase(
-        gid, uid, str(interaction.user), it["name"], "+".join(cls_list),
+        _conn.service_id, gid, uid, str(interaction.user), it["name"],
+        "+".join(cls_list),
         int(amount), total, x, y_val, z, area_names)
 
     # ── 7. Auto-Restart oder Hinweis auf nächsten Neustart ────
@@ -9972,7 +10184,7 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
     feed.add_field(name="Location", value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=True)
     feed.add_field(name="Status",   value="⏳ pending (spawns after restart)", inline=False)
     feed.set_footer(text=(f"Purchase #{purchase_id} · " + "+".join(cls_list))[:100])
-    await _post_feed(gid, "shop_log", feed)
+    await _post_feed(gid, "shop_log", feed, service_id=_conn.service_id)
 
 cmd_buy.autocomplete("item")(_shop_buy_autocomplete)
 
@@ -11253,7 +11465,8 @@ async def api_admin_guilds(request: web.Request) -> web.Response:
             "name": (guild.name if guild is not None else None),
             "available": guild is not None,
             "members": (guild.member_count if guild is not None else None),
-            "feeds": len(cfg.guilds.get(str(gid), {}) or {}),
+            "feeds": sum(1 for k in (cfg.guilds.get(str(gid), {}) or {})
+                         if k in LOG_TYPES),
         })
     return ok({"guilds": out, "bot_online": bool(
         bot is not None and getattr(bot, "user", None) is not None)})
