@@ -3698,7 +3698,7 @@ def _migriere_eigene_einstellungen() -> None:
         uebernommen.append(key)
     haupt.data["_eigene_uebernommen"] = True
     connections.save()
-    if uebernommen:
+    if uebernommen:  # noqa: SIM102 – Logzeile nur bei tatsaechlicher Uebernahme
         log.info(f"[CONN] Eigene Einstellungen des Hauptservers uebernommen: "
                  f"{', '.join(uebernommen)}")
 
@@ -3843,6 +3843,17 @@ async def _finish_token_setup(token: str, service_id: str,
         besitzer = connections.for_guild(guild_id)
         if besitzer is conn:
             freigeschaltet = True            # war schon freigeschaltet
+            # Auch hier sicherstellen, dass die Befehle wirklich dort stehen –
+            # sonst meldet das Embed Erfolg, in der Guild ist aber nichts.
+            ids = _configured_guild_ids()
+            if int(guild_id) not in ids:
+                ids.append(int(guild_id))
+                cfg.config["guild_ids"] = ids
+                cfg.save_config()
+                try:
+                    await _register_guild_commands(int(guild_id))
+                except Exception as e:  # noqa: BLE001
+                    warnings.append(f"⚠️ Befehle konnten nicht registriert werden: {e}")
         elif besitzer is not None:
             # Guild gehoert einem anderen Server – weder zuordnen noch vormerken
             warnings.append(
@@ -3852,6 +3863,7 @@ async def _finish_token_setup(token: str, service_id: str,
             okay, meldung = connections.assign_guild(service_id, int(guild_id))
             if okay:
                 freigeschaltet = True
+                conn.data.pop("guild_id_requested", None)   # Anfrage erledigt
                 # Wie im Dashboard: Zuordnung heisst Freischaltung, die Befehle
                 # sollen sofort in dieser Guild stehen.
                 ids = _configured_guild_ids()
@@ -11770,10 +11782,15 @@ def _zonen_ziel(request: web.Request, conn: ServerConnection,
             wert = int(roh_id)
         except (TypeError, ValueError):
             return None, err(f"{feld}-ID muss eine Zahl sein.")
-        # Unveraenderter Wert einer bestehenden Zone: nichts Neues, nichts zu
-        # pruefen. Sonst liesse sich beim Bearbeiten nicht einmal mehr der
-        # Radius aendern, wenn das Formular Channel und Rolle mitschickt.
-        if alt is not None and alt.get(schluessel) == wert:
+        # Unveraenderter Wert einer bestehenden Zone bei UNVERAENDERTER Guild:
+        # nichts Neues, nichts zu pruefen. Sonst liesse sich beim Bearbeiten
+        # nicht einmal mehr der Radius aendern, wenn das Formular Channel und
+        # Rolle mitschickt.
+        # Die Guild MUSS mitverglichen werden: nach einem Guild-Wechsel waere
+        # der alte Channel sonst ungeprueft fuer die neue Guild gueltig – und
+        # _post_feed stellt bei gesetzter channel_id ohne Guild-Bezug zu.
+        if (alt is not None and alt.get(schluessel) == wert
+                and int(alt.get("guild_id") or 0) == gid):
             ziel[schluessel] = wert
             continue
         # Channel/Rolle muessen in DIESER Guild liegen – sonst laesst sich der
@@ -11785,8 +11802,8 @@ def _zonen_ziel(request: web.Request, conn: ServerConnection,
                 # Aussage ueber die Guild – ein NEUES Ziel bleibt trotzdem
                 # ungeprueft und wird deshalb nicht angenommen.
                 return None, err("Der Bot ist gerade nicht bei Discord angemeldet – "
-                                 f"eine neue {feld} lässt sich erst prüfen, wenn er "
-                                 "wieder verbunden ist.", 409)
+                                 f"eine neue {feld}-ID lässt sich erst prüfen, wenn "
+                                 "er wieder verbunden ist.", 409)
             return None, err("Der Bot erreicht diesen Discord-Server nicht – "
                              f"die {feld} kann deshalb nicht geprüft werden. "
                              "Ist der Bot dort eingeladen?", 409)
