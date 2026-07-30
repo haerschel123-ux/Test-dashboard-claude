@@ -2651,17 +2651,41 @@ class ConnectionRegistry:
         return conn
 
     def assign_guild(self, service_id: Any, guild_id: Optional[int]) -> Tuple[bool, str]:
-        """Guild einem Server zuordnen. Eine Guild kann nur einen Server verwalten."""
+        """Guild einem Server zuordnen.
+
+        Eine Guild darf MEHRERE Nitrado-Server verwalten. Wer das darf, pruefen
+        die Aufrufer: der Betreiber frei, ein Kunde nur in einer Guild, in der
+        ihm schon ein Server gehoert – sonst koennte er sich per zweitem Server
+        in einen fremden Discord einklinken.
+        """
         conn = self.for_service(service_id)
         if conn is None:
             return False, "Dieser Server ist nicht (mehr) verbunden."
+
+        neu_in_guild = False
+        bestehende: List[ServerConnection] = []
         if guild_id:
-            other = self.for_guild(guild_id)
-            if other is not None and other.service_id != conn.service_id:
-                return False, (f"Diese Guild verwaltet bereits „{other.name}“. "
-                               f"Eine Guild kann nur einen Server verwalten.")
+            bestehende = [c for c in self.all_for_guild(guild_id)
+                          if c.service_id != conn.service_id]
+            neu_in_guild = conn.guild_id != int(guild_id)
+
         conn.data["guild_id"] = int(guild_id) if guild_id else None
         self.save()
+
+        # Bekommt die Guild damit ihren ZWEITEN Server, gehen die bisher
+        # guildweiten Feed-Einstellungen an den Bestandsserver ueber. Sonst
+        # wuerde der neue Server ueber den Rueckfall in dieselben Channels
+        # posten – genau das soll die Trennung verhindern.
+        if guild_id and neu_in_guild and len(bestehende) == 1:
+            try:
+                cfg.uebernimm_guild_feeds(int(guild_id), bestehende[0].service_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"[FEED] Uebergabe an {bestehende[0].service_id} "
+                            f"fehlgeschlagen: {e}")
+
+        if guild_id and len(bestehende) >= 1:
+            return True, (f"Zuordnung gespeichert – diese Guild verwaltet jetzt "
+                          f"{len(bestehende) + 1} Server.")
         return True, ("Zuordnung gespeichert." if guild_id else "Zuordnung entfernt.")
 
     def remove(self, service_id: Any) -> bool:
@@ -3993,6 +4017,19 @@ async def setup_overview(interaction: discord.Interaction):
         )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
+def _panel_view_registrieren(conn: "ServerConnection") -> None:
+    """Persistente Whitelist-Panel-View fuer diesen Server anmelden.
+
+    Noetig fuer Server, die zur Laufzeit dazukommen – ohne das reagiert ihr
+    Panel-Knopf erst nach dem naechsten Bot-Neustart.
+    """
+    try:
+        if conn.service_id and bot is not None and getattr(bot, "user", None):
+            bot.add_view(WhitelistPanelView(conn.service_id))
+    except Exception as e:  # noqa: BLE001 – doppelte Anmeldung ist harmlos
+        log.debug(f"[WL] Panel-View {conn.service_id}: {e}")
+
+
 async def _finish_token_setup(token: str, service_id: str,
                               service: Dict,
                               actor_id: Optional[str] = None,
@@ -4045,8 +4082,13 @@ async def _finish_token_setup(token: str, service_id: str,
     # Discord einlaedt, mit /setup token selbst Premium.
     freigeschaltet = False
     if guild_id:
-        besitzer = connections.for_guild(guild_id)
-        if besitzer is conn:
+        _bestand = connections.all_for_guild(guild_id)
+        # Wie im Dashboard: wer hier schon einen eigenen Server hat, darf einen
+        # weiteren anschliessen – sonst entscheidet der Betreiber.
+        _eigener_bestand = bool(actor_id) and any(
+            str(c.data.get("owner_discord_id") or "") == str(actor_id)
+            for c in _bestand)
+        if conn in _bestand and conn.guild_id == int(guild_id):
             freigeschaltet = True            # war schon freigeschaltet
             # Auch hier sicherstellen, dass die Befehle wirklich dort stehen –
             # sonst meldet das Embed Erfolg, in der Guild ist aber nichts.
@@ -4059,12 +4101,10 @@ async def _finish_token_setup(token: str, service_id: str,
                     await _register_guild_commands(int(guild_id))
                 except Exception as e:  # noqa: BLE001
                     warnings.append(f"⚠️ Befehle konnten nicht registriert werden: {e}")
-        elif besitzer is not None:
-            # Guild gehoert einem anderen Server – weder zuordnen noch vormerken
-            warnings.append(
-                f"❌ Dieser Discord-Server verwaltet bereits „{besitzer.name}“. "
-                f"Eine Guild kann nur einen Nitrado-Server verwalten.")
-        elif await _discord_user_is_admin(int(actor_id or 0)):
+        elif await _discord_user_is_admin(int(actor_id or 0)) or _eigener_bestand:
+            # Betreiber – oder ein Kunde, dem in dieser Guild schon ein Server
+            # gehoert – darf direkt zuordnen. Eine Guild kann mehrere Server
+            # verwalten.
             okay, meldung = connections.assign_guild(service_id, int(guild_id))
             if okay:
                 freigeschaltet = True
@@ -4094,6 +4134,7 @@ async def _finish_token_setup(token: str, service_id: str,
     # inklusive FTP-Auto-Discovery der Log-Verzeichnisse. NUR dieser Server,
     # damit die Verbindungen der anderen Kunden nicht neu aufgebaut werden.
     await bot.init_nitrado(force=True, only=conn)
+    _panel_view_registrieren(conn)
     ftp_host = conn.get("ftp_host") or "❌ Nicht gefunden"
     log_dir  = conn.get("ftp_log_dir") or "❌ Nicht gefunden"
     if not conn.get("ftp_host"):
@@ -4509,10 +4550,14 @@ class AutoRestartView(discord.ui.View):
     """Uhrzeit-Auswahl für /auto restart: Stunde (0–23) + Minute (:00/:30).
     Zwei Dropdowns, weil Discord max. 25 Optionen pro Select erlaubt."""
 
-    def __init__(self, interaction: discord.Interaction, interval_hours: int):
+    def __init__(self, interaction: discord.Interaction, interval_hours: int,
+                 service_id: Optional[str] = None):
         super().__init__(timeout=180)
         self.author_id      = interaction.user.id
         self.interval_hours = interval_hours
+        # Der Server wird beim Aufruf festgehalten: zwischen Dropdown und
+        # Bestaetigen koennte sich die Zuordnung sonst geaendert haben.
+        self.service_id     = str(service_id or "")
         self.hour:   Optional[int] = None
         self.minute: Optional[int] = None
 
@@ -4542,7 +4587,8 @@ class AutoRestartView(discord.ui.View):
         if self.hour is None or self.minute is None:
             return await itx.response.send_message(
                 "❌ Bitte zuerst Stunde und Minute auswählen.", ephemeral=True)
-        conn = _conn_of(itx)
+        conn = (connections.for_service(self.service_id) if self.service_id
+                else _conn_of(itx))
         if conn is None:
             return await itx.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
         first = f"{self.hour:02d}:{self.minute:02d}"
@@ -4572,7 +4618,11 @@ async def auto_restart(interaction: discord.Interaction,
                        intervall: app_commands.Range[int, 1, 24]):
     if not _is_admin(interaction):
         return await _deny(interaction)
-    view = AutoRestartView(interaction, int(intervall))
+    _conn_ar, _fehler = _conn_waehlen(interaction, None)
+    if _conn_ar is None:
+        return await interaction.response.send_message(
+            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
+    view = AutoRestartView(interaction, int(intervall), _conn_ar.service_id)
     e = discord.Embed(
         title="⏰ Auto-Restart einrichten",
         description=(f"Intervall: **alle {int(intervall)} Stunde(n)**\n\n"
@@ -11773,6 +11823,7 @@ async def post_select_server(request: web.Request) -> web.Response:
     # nur fuer den gerade gewaehlten Server
     try:
         await bot.init_nitrado(force=True, only=conn)
+        _panel_view_registrieren(conn)
     except Exception as e:  # noqa: BLE001
         warnings.append(f"Init-Warnung: {e}")
 
@@ -11933,16 +11984,18 @@ async def post_setup_guild(request: web.Request) -> web.Response:
         return err("Das ist die Beispiel-ID aus der Anleitung, nicht die deines Servers.")
 
     sess = _sess_get(request) or {}
-    schon_meine = connections.for_guild(gid) is conn
+    bestand = connections.all_for_guild(gid)
+    schon_meine = conn in bestand
+    # Wer in dieser Guild bereits einen eigenen Server hat, darf dort einen
+    # weiteren anschliessen. Ohne diese Klammer waere das Wegfallen der
+    # Kollisionspruefung eine Rechteausweitung: ein Kunde koennte sich per
+    # zweitem Server in einen fremden Discord einklinken.
+    meine = str((sess.get("discord") or {}).get("id") or "")
+    eigener_bestand = bool(meine) and any(
+        str(c.data.get("owner_discord_id") or "") == meine for c in bestand)
 
-    if not (sess.get("is_admin") or schon_meine):
-        # Freischalten ist Sache des Bot-Betreibers (Kategorie „Serverliste“).
-        # Hier wird die genannte Guild nur vorgemerkt – sonst koennte sich
-        # jeder Kunde selbst Premium geben.
-        fremd = connections.for_guild(gid)
-        if fremd is not None:
-            return err(f"Diese Guild verwaltet bereits „{fremd.name}“. "
-                       f"Eine Guild kann nur einen Server verwalten.")
+    if not (sess.get("is_admin") or schon_meine or eigener_bestand):
+        # Freischalten ist sonst Sache des Bot-Betreibers (Serverliste).
         conn.data["guild_id_requested"] = gid
         connections.save()
         _audit_add("dashboard", _audit_actor(sess),
@@ -11957,7 +12010,17 @@ async def post_setup_guild(request: web.Request) -> web.Response:
             "invite_url": _discord_invite_url(),
         })
 
-    # Betreiber (Admin-Rolle) oder bereits freigeschaltete eigene Guild:
+    # Ab hier darf zugeordnet werden: Betreiber, eigene bereits freigeschaltete
+    # Guild, oder eine Guild, in der dem Konto schon ein Server gehoert.
+    if not schon_meine:
+        okay, meldung = connections.assign_guild(conn.service_id, gid)
+        if not okay:
+            return err(meldung)
+        conn.data.pop("guild_id_requested", None)   # Anfrage erledigt
+        connections.save()
+        _audit_add("dashboard", _audit_actor(sess),
+                   "Discord-Server zugeordnet", f"Guild {gid} → {conn.name}")
+
     # Ergänzen statt ersetzen – vorhandene Discord-Server bleiben angebunden.
     # Platzhalter fliegen dabei raus, sonst scheitert setup_hook() beim nächsten
     # Start an der Beispiel-ID.
