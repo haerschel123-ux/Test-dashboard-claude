@@ -2493,18 +2493,46 @@ class ConnectionRegistry:
     def for_service(self, service_id: Any) -> Optional[ServerConnection]:
         return self._conns.get(str(service_id or ""))
 
-    def for_guild(self, guild_id: Any) -> Optional[ServerConnection]:
-        """Die Verbindung, die diese Discord-Guild verwalten darf."""
+    def all_for_guild(self, guild_id: Any) -> List[ServerConnection]:
+        """ALLE Server, die diese Discord-Guild verwalten darf.
+
+        Eine Guild kann mehrere Nitrado-Server betreuen. Die Reihenfolge ist
+        stabil: der Leitserver zuerst, danach alphabetisch. Ohne diese feste
+        Reihenfolge haenge die Frage „welcher Server gilt, wenn keiner genannt
+        wurde?" von der Reihenfolge in der connections.json ab.
+        """
         try:
             gid = int(guild_id or 0)
         except (TypeError, ValueError):
-            return None
+            return []
         if not gid:
-            return None
-        for conn in self._conns.values():
-            if conn.guild_id == gid:
-                return conn
-        return None
+            return []
+        treffer = [c for c in self._conns.values() if c.guild_id == gid]
+        treffer.sort(key=lambda c: (not bool(c.data.get("guild_primary")),
+                                    c.name.lower()))
+        return treffer
+
+    def for_guild(self, guild_id: Any) -> Optional[ServerConnection]:
+        """Der **Leitserver** dieser Discord-Guild.
+
+        Guild-weite Dinge – Waehrung, Startguthaben, Admin-Rollen, Economy –
+        haengen an ihm, denn ``balances`` und ``links`` gehoeren der Guild, nicht
+        dem einzelnen Server. Fuer serverbezogene Befehle NICHT verwenden:
+        dort loest ``_conn_waehlen`` ueber den ``server``-Parameter auf.
+        """
+        treffer = self.all_for_guild(guild_id)
+        return treffer[0] if treffer else None
+
+    def set_guild_primary(self, service_id: Any) -> bool:
+        """Diesen Server zum Leitserver seiner Guild machen."""
+        conn = self.for_service(service_id)
+        if conn is None or conn.guild_id is None:
+            return False
+        for other in self.all_for_guild(conn.guild_id):
+            other.data.pop("guild_primary", None)
+        conn.data["guild_primary"] = True
+        self.save()
+        return True
 
     def for_owner(self, discord_id: Any) -> List[ServerConnection]:
         """Alle Server, die diesem Discord-Konto gehoeren.
@@ -2619,6 +2647,9 @@ async def _premium_check(interaction: discord.Interaction) -> bool:
     der Waehrung dieses Kunden angezeigt werden.
     """
     try:
+        # Vorbelegung fuer die Waehrungsanzeige. Verwaltet die Guild MEHRERE
+        # Server, waere jede Wahl hier geraten – dann gilt der Leitserver, und
+        # _conn_waehlen setzt spaeter den tatsaechlich gemeinten Server.
         _setze_aktuellen_server(
             connections.for_guild(interaction.guild_id)
             if interaction.guild_id is not None else connections.primary())
@@ -2627,7 +2658,8 @@ async def _premium_check(interaction: discord.Interaction) -> bool:
             return True
         if interaction.guild_id is None:
             return True                      # Direktnachricht: nichts zu sperren
-        if connections.for_guild(interaction.guild_id) is not None:
+        # Freigeschaltet ist die Guild, sobald ihr MINDESTENS ein Server gehoert.
+        if connections.all_for_guild(interaction.guild_id):
             return True
     except Exception:  # noqa: BLE001
         return True
@@ -3591,19 +3623,23 @@ def _is_admin(interaction: discord.Interaction) -> bool:
         return False
     if interaction.user.guild_permissions.administrator:
         return True
-    # Rollen kommen vom Server dieser Guild – so kann jeder Kunde seine
+    # Rollen kommen von den Servern dieser Guild – so kann jeder Kunde seine
     # eigenen Admin-Rollen festlegen statt die des Betreibers zu erben. Ohne
     # zugeordneten Server gibt es auch keine Admin-Rolle: sonst koennte eine
     # fremde Guild ohne Premium ueber einen Rollennamen wie "DayZ Admin"
     # (die Auslieferungs-Vorgabe) /setup token als Admin ausfuehren.
-    _c = _conn_of(interaction)
-    if _c is None:
-        return False
-    if _member_has_role_ids(interaction.user, _c.get("admin_role_ids", [])):
-        return True
-    role_name = _c.get("admin_role_name", "")
-    if role_name and any(r.name == role_name for r in interaction.user.roles):
-        return True
+    #
+    # Bei mehreren Servern an derselben Guild zaehlt die VEREINIGUNG ihrer
+    # Rollen. Nur den ersten zu fragen waere von der Reihenfolge in der
+    # connections.json abhaengig – und diese Pruefung laeuft VOR der
+    # Server-Auswahl des Befehls, kann den `server`-Parameter also gar nicht
+    # kennen.
+    for _c in _conns_of(interaction):
+        if _member_has_role_ids(interaction.user, _c.get("admin_role_ids", [])):
+            return True
+        role_name = _c.get("admin_role_name", "")
+        if role_name and any(r.name == role_name for r in interaction.user.roles):
+            return True
     return False
 
 def _is_economy_admin(interaction: discord.Interaction) -> bool:
@@ -3612,10 +3648,10 @@ def _is_economy_admin(interaction: discord.Interaction) -> bool:
         return True
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return False
-    _c = _conn_of(interaction)
-    if _c is None:
-        return False
-    return _member_has_role_ids(interaction.user, _c.get("economy_admin_role_ids", []))
+    # Wie bei _is_admin: Vereinigung ueber alle Server dieser Guild.
+    return any(_member_has_role_ids(interaction.user,
+                                    _c.get("economy_admin_role_ids", []))
+               for _c in _conns_of(interaction))
 
 async def _deny(interaction: discord.Interaction):
     msg = ("❌ No permission. You need one of the configured admin roles "
@@ -3640,6 +3676,83 @@ def _conn_of(interaction: discord.Interaction) -> Optional[ServerConnection]:
         eigene = connections.for_owner(interaction.user.id)
         return eigene[0] if eigene else None
     return connections.for_guild(interaction.guild_id)
+
+
+def _conns_of(interaction: discord.Interaction) -> List[ServerConnection]:
+    """ALLE Server, die diese Guild (bzw. dieses Konto per DM) verwalten darf."""
+    if interaction.guild_id is None:
+        return connections.for_owner(interaction.user.id)
+    return connections.all_for_guild(interaction.guild_id)
+
+
+def _conn_waehlen(interaction: discord.Interaction, server: Optional[str] = None
+                  ) -> Tuple[Optional[ServerConnection], Optional[str]]:
+    """Den gemeinten Nitrado-Server bestimmen: ``(Verbindung, Fehlermeldung)``.
+
+    Verwaltet eine Guild nur einen Server, bleibt alles wie bisher – der
+    ``server``-Parameter ist dann entbehrlich. Ab zwei Servern ist er Pflicht:
+    ein stiller Standard koennte sonst ``/stoppen`` auf dem falschen Server
+    ausloesen.
+    """
+    verfuegbar = _conns_of(interaction)
+    if not verfuegbar:
+        return None, PREMIUM_MISSING_TEXT
+
+    wahl = (server or "").strip()
+    if wahl:
+        gesucht = wahl.lower()
+        treffer = next((c for c in verfuegbar if c.service_id == wahl), None)
+        if treffer is None:
+            treffer = next((c for c in verfuegbar if c.name.lower() == gesucht), None)
+        if treffer is None:
+            passend = [c for c in verfuegbar if gesucht in c.name.lower()]
+            treffer = passend[0] if len(passend) == 1 else None
+        if treffer is None:
+            return None, (f"❌ Kein Server namens `{wahl}` an diesem Discord-Server.\n"
+                          + _server_liste(verfuegbar))
+        _setze_aktuellen_server(treffer)
+        return treffer, None
+
+    if len(verfuegbar) == 1:
+        _setze_aktuellen_server(verfuegbar[0])
+        return verfuegbar[0], None
+
+    return None, ("❌ Dieser Discord-Server verwaltet mehrere Nitrado-Server – "
+                  "gib mit `server:` an, welchen du meinst.\n"
+                  + _server_liste(verfuegbar))
+
+
+def _server_liste(conns: List[ServerConnection]) -> str:
+    """Aufzaehlung fuer Fehlermeldungen: Name und Service-ID je Zeile."""
+    return "\n".join(f"• **{c.name}** (`{c.service_id}`)" for c in conns[:10])
+
+
+async def _server_autocomplete(interaction: discord.Interaction,
+                               current: str) -> List[app_commands.Choice[str]]:
+    """Vorschlaege fuer den ``server``-Parameter: die Server dieser Guild."""
+    cur = (current or "").strip().lower()
+    out: List[app_commands.Choice] = []
+    for conn in _conns_of(interaction):
+        if cur and cur not in conn.name.lower() and cur not in conn.service_id:
+            continue
+        out.append(app_commands.Choice(name=f"{conn.name} ({conn.service_id})"[:100],
+                                       value=conn.service_id))
+        if len(out) >= 25:
+            break
+    return out
+
+
+def _gewaehlter_server(interaction: discord.Interaction) -> Optional[str]:
+    """Der bereits eingetippte ``server``-Wert – fuer die anderen Autocompletes.
+
+    Discord stellt die schon ausgefuellten Optionen unter ``namespace`` bereit.
+    Damit zeigt z. B. die Zonen-Vervollstaendigung die Zonen des gewaehlten
+    Servers statt die des Leitservers.
+    """
+    try:
+        return getattr(interaction.namespace, "server", None)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _conn_store(conn: ServerConnection, key: str, value: Any) -> None:
@@ -3729,20 +3842,22 @@ def _migriere_ban_metadaten() -> None:
 
 
 async def _require_conn(interaction: discord.Interaction,
-                        need_ftp: bool = False) -> Optional[ServerConnection]:
-    """Die einsatzbereite Verbindung dieser Guild – sonst None.
+                        need_ftp: bool = False,
+                        server: Optional[str] = None) -> Optional[ServerConnection]:
+    """Die einsatzbereite Verbindung dieses Befehls – sonst None.
 
     Ersetzt das fruehere _require_nitrado: statt einer globalen Verbindung
     loest jeder Befehl jetzt den Server auf, der zu seiner Guild gehoert.
+    ``server`` waehlt bei mehreren Servern derselben Guild den gemeinten aus.
     Bei None hat der Aufrufer bereits eine Antwort bekommen und bricht mit
     `return` ab.
     """
-    conn = _conn_of(interaction)
+    conn, auswahlfehler = _conn_waehlen(interaction, server)
     if conn is not None and conn.api is not None and (not need_ftp or conn.ftp is not None):
         return conn
 
     if conn is None:
-        msg = PREMIUM_MISSING_TEXT
+        msg = auswahlfehler or PREMIUM_MISSING_TEXT
     elif conn.api is None:
         msg = ("❌ Nitrado ist für diesen Server noch nicht eingerichtet.\n"
                "Führe `/setup token <dein-nitrado-token>` aus und wähle "
@@ -8858,25 +8973,28 @@ class ShopCatalog:
             return False
 
 
-def _catalog_of(interaction: discord.Interaction) -> Optional["ShopCatalog"]:
-    """Der Item-Katalog des Servers, den diese Guild verwalten darf.
+def _catalog_of(interaction: discord.Interaction,
+                server: Optional[str] = None) -> Optional["ShopCatalog"]:
+    """Der Item-Katalog des gemeinten Servers.
 
     Es gibt bewusst KEINEN globalen Katalog mehr: ohne zugeordneten Server
     gibt es auch keine Items, sonst sähe jede Guild den Shop des Betreibers.
     """
-    conn = _conn_of(interaction)
+    conn, _fehler = _conn_waehlen(interaction, server)
     return conn.catalog if conn is not None else None
 
 
-async def _require_catalog(interaction: discord.Interaction) -> Optional["ShopCatalog"]:
-    """Wie ``_catalog_of``, antwortet aber selbst, wenn kein Server zugeordnet ist."""
-    cat = _catalog_of(interaction)
-    if cat is not None:
-        return cat
+async def _require_catalog(interaction: discord.Interaction,
+                           server: Optional[str] = None) -> Optional["ShopCatalog"]:
+    """Wie ``_catalog_of``, antwortet aber selbst, wenn die Auswahl scheitert."""
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is not None:
+        return conn.catalog
+    msg = fehler or PREMIUM_MISSING_TEXT
     if interaction.response.is_done():
-        await interaction.followup.send(PREMIUM_MISSING_TEXT, ephemeral=True)
+        await interaction.followup.send(msg, ephemeral=True)
     else:
-        await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+        await interaction.response.send_message(msg, ephemeral=True)
     return None
 
 def _item_classnames(it: Dict) -> List[str]:
