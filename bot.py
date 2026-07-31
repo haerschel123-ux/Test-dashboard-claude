@@ -2631,10 +2631,20 @@ class ConnectionRegistry:
 
         Uebergangsloesung, solange Log-Abruf und Shop noch nicht pro Server
         laufen (Stufe 4 des Umbaus).
+
+        Ist in der config.json eine ``service_id`` **festgeschrieben**, gilt sie
+        allein: findet sich dazu keine Verbindung, gibt es keinen Hauptserver.
+        Ohne diese Klammer rueckte beim Entfernen eines Servers der naechste
+        nach – und erbte still den gesamten Altbestand ohne ``service_id``
+        (Ankuendigungen, Ereignisse, shop_items.json, Ban-Angaben). Steht dort
+        nichts, bleibt es beim bisherigen Rueckfall auf die erste Verbindung.
         """
-        conn = self.for_service(cfg.config.get("service_id"))
+        festgeschrieben = str(cfg.config.get("service_id") or "").strip()
+        conn = self.for_service(festgeschrieben)
         if conn is not None:
             return conn
+        if festgeschrieben:
+            return None
         return next(iter(self._conns.values()), None)
 
     # ── Aendern ──
@@ -2689,7 +2699,15 @@ class ConnectionRegistry:
         return True, ("Zuordnung gespeichert." if guild_id else "Zuordnung entfernt.")
 
     def remove(self, service_id: Any) -> bool:
-        return self._conns.pop(str(service_id), None) is not None
+        """Eine Verbindung entfernen und die connections.json zurueckschreiben.
+
+        Ohne das ``save()`` waere der Server nach dem naechsten Neustart wieder
+        da – wie bei ``upsert`` und ``assign_guild`` gehoert das Speichern hierher.
+        """
+        entfernt = self._conns.pop(str(service_id), None) is not None
+        if entfernt:
+            self.save()
+        return entfernt
 
 
 connections = ConnectionRegistry()
@@ -2814,7 +2832,15 @@ class DayZBot(discord.Client):
             log.error(f"[BOT] Persistente Whitelist-Views konnten nicht registriert werden: {e}")
 
         guild_ids = cfg.config.get("guild_ids", [])
-        if not guild_ids:
+        if not guild_ids and connections.all():
+            # Verbindungen da, aber keine davon freigeschaltet – etwa nachdem
+            # die letzte Zuordnung zurueckgenommen wurde. Global registrieren
+            # wuerde die Befehle in JEDER Guild anzeigen, in der der Bot
+            # Mitglied ist; gesperrt sind sie zwar, sichtbar aber trotzdem.
+            log.warning("[BOT] Keine Guild freigeschaltet – es werden keine "
+                        "Slash-Befehle registriert. Ordne im Dashboard unter "
+                        "Serverliste einem Server eine Discord-Guild zu.")
+        elif not guild_ids:
             log.warning("[BOT] Keine guild_ids konfiguriert – Befehle werden global registriert (24h Verzögerung).")
             await self.tree.sync()
         else:
