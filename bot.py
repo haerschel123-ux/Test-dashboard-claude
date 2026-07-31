@@ -11705,6 +11705,10 @@ def _audit_label(method: str, path: str) -> str:
         return "Whitelist-Eintrag entfernt"
     if path.startswith("/api/announcements/"):
         return "Ankündigung gelöscht"
+    if path.startswith("/api/admin/servers/"):
+        if method == "DELETE":
+            return "Server entfernt"
+        return "Guild zugeordnet"
     return f"{method} {path}"
 
 
@@ -11850,8 +11854,15 @@ async def post_admin_server_guild(request: web.Request) -> web.Response:
     raw = str(data.get("guild_id", "")).strip()
 
     if not raw:                                   # leer = Zuordnung entfernen
+        # Die bisherige Guild VOR dem Zuordnen lesen – danach ist sie None.
+        _alt = connections.for_service(service_id)
+        alte_gid = _alt.guild_id if _alt is not None else None
         okay, msg = connections.assign_guild(service_id, None)
-        return ok({"message": msg}) if okay else err(msg)
+        if not okay:
+            return err(msg)
+        result = await _guild_aufraeumen(alte_gid)
+        result["message"] = msg
+        return ok(result)
     if not raw.isdigit() or not (17 <= len(raw) <= 20):
         return err("Das sieht nicht nach einer Discord-Server-ID aus – sie besteht "
                    "nur aus Ziffern (Rechtsklick auf den Server → Server-ID kopieren).")
@@ -11875,6 +11886,71 @@ async def post_admin_server_guild(request: web.Request) -> web.Response:
         cfg.save_config()
     result = await _register_guild_commands(gid)
     result["message"] = msg
+    return ok(result)
+
+
+async def delete_admin_server(request: web.Request) -> web.Response:
+    """Einen Nitrado-Server aus der Verwaltung entfernen.
+
+    Entfernt **nur die Verbindung** – Zonen, Shop, Feeds, Kills, Käufe und
+    Banliste bleiben gespeichert. Wird derselbe Server später erneut verbunden,
+    findet er alles wieder vor.
+    """
+    denied = _require_admin(request)
+    if denied is not None:
+        return denied
+    service_id = str(request.match_info["service_id"])
+    conn = connections.for_service(service_id)
+    if conn is None:
+        return err("Diesen Server gibt es nicht (mehr).", 404)
+
+    name = conn.name
+    alte_gid = conn.guild_id
+    war_primary = connections.primary() is conn
+
+    # Den Hauptserver festschreiben, BEVOR die Verbindung verschwindet.
+    # Sonst rueckt die naechste Verbindung nach und erbt still den gesamten
+    # Altbestand ohne service_id: Ankuendigungen, Ereignisse, den gemeinsamen
+    # shop_items.json und die Ban-Angaben. War der Geloeschte selbst der
+    # Hauptserver, wird seine eigene ID festgeschrieben – dann gibt es
+    # vorerst keinen, und niemand erbt etwas.
+    if not str(cfg.config.get("service_id") or "").strip():
+        haupt = connections.primary()
+        cfg.config["service_id"] = (service_id if war_primary or haupt is None
+                                    else haupt.service_id)
+        cfg.save_config()
+
+    try:
+        await conn.close()
+    except Exception as e:  # noqa: BLE001 – ein Rest darf das Entfernen nicht aufhalten
+        dash_log.warning(f"[ADMIN] Verbindung {service_id} liess sich nicht sauber "
+                         f"schliessen: {e}")
+    connections.remove(service_id)
+
+    # Sitzungen, die auf diesen Server zeigen, ins Leere laufen lassen statt
+    # abzumelden: der Nitrado-Token gehoert dem Konto, nicht der Verbindung.
+    # Danach greift der vorhandene 409 aus _session_conn, und der Umschalter
+    # bietet einen anderen Server an.
+    gelöst = 0
+    for sess in _SESS_STORE.values():
+        if str(sess.get("service_id") or "") == service_id:
+            sess["service_id"] = None
+            sess["map_name"] = None
+            gelöst += 1
+
+    result = await _guild_aufraeumen(alte_gid)
+
+    # bot.nitrado/bot.ftp/bot.shop hingen am Hauptserver – nach dem Schliessen
+    # zeigten sie auf ein totes Objekt.
+    if war_primary and bot is not None:
+        try:
+            await bot.init_nitrado(force=True)
+        except Exception as e:  # noqa: BLE001
+            dash_log.warning(f"[ADMIN] Neubindung nach dem Entfernen fehlgeschlagen: {e}")
+
+    log.info(f"[ADMIN] Server {service_id} ({name}) entfernt – Daten bleiben gespeichert.")
+    result.update({"message": f"„{name}“ wurde entfernt. Die Daten bleiben gespeichert.",
+                   "service_id": service_id, "sessions_geloest": gelöst})
     return ok(result)
 
 
@@ -12267,6 +12343,75 @@ async def _register_guild_commands(gid: int) -> dict:
     log.info(f"[BOT] Slash-Befehle für Guild {gid} über das Dashboard registriert "
              f"({len(synced)} Befehle).")
     return result
+
+
+async def _unregister_guild_commands(gid: int) -> dict:
+    """Slash-Befehle einer Guild wieder entfernen – das Gegenstück zur Freischaltung.
+
+    Ohne das blieben nach dem Zurücknehmen tote Befehle im Discord stehen, die
+    nur noch „du hast kein Premium“ antworten. Der Aufrufer muss vorher prüfen,
+    dass die Guild **keinen** Server mehr hat – sonst nimmt man den übrigen
+    Servern derselben Guild ihre Befehle weg.
+    """
+    result = {"guild_id": str(gid), "unregistered": False,
+              "bot_online": bool(bot is not None and getattr(bot, "user", None) is not None),
+              "note": ""}
+    if bot is None or getattr(bot, "user", None) is None:
+        result["note"] = ("Der Bot ist gerade nicht bei Discord eingeloggt – die Befehle "
+                          "verschwinden beim nächsten Bot-Start.")
+        return result
+
+    guild_obj = discord.Object(id=gid)
+    try:
+        bot.tree.clear_commands(guild=guild_obj)
+        await bot.tree.sync(guild=guild_obj)
+    except discord.Forbidden:
+        result["note"] = "Der Bot ist nicht mehr auf diesem Discord-Server."
+        return result
+    except discord.NotFound:
+        result["note"] = "Diese Server-ID kennt Discord nicht (mehr)."
+        return result
+    except discord.HTTPException as e:
+        result["note"] = f"Discord hat das Entfernen abgelehnt: {e}"
+        return result
+    except Exception as e:  # noqa: BLE001 – lieber eine Meldung als ein 500er
+        dash_log.warning(f"[BOT] Befehle für Guild {gid} nicht entfernbar: {e}")
+        result["note"] = f"Entfernen fehlgeschlagen: {e}"
+        return result
+
+    result["unregistered"] = True
+    log.info(f"[BOT] Slash-Befehle für Guild {gid} entfernt – kein Server mehr zugeordnet.")
+    return result
+
+
+async def _guild_aufraeumen(gid: Optional[int]) -> dict:
+    """Nach dem Wegfall einer Zuordnung: Guild aus der Konfiguration lösen.
+
+    Nur wenn die Guild danach **gar keinen** Server mehr hat. Erst speichern,
+    dann synchronisieren – ein Discord-Ausfall darf das Zurücknehmen nicht
+    scheitern lassen.
+    """
+    if not gid:
+        return {}
+    if connections.all_for_guild(int(gid)):
+        return {}                       # andere Server dieser Guild bleiben
+
+    # Gezielt diesen einen Eintrag streichen. Die Liste durch
+    # _configured_guild_ids() zu ersetzen wuerde Platzhalter und
+    # String-Eintraege stillschweigend wegwerfen.
+    ids = cfg.config.get("guild_ids") or []
+    rest = []
+    for eintrag in ids:
+        try:
+            if int(eintrag) == int(gid):
+                continue
+        except (TypeError, ValueError):
+            pass
+        rest.append(eintrag)
+    if len(rest) != len(ids):
+        cfg.config["guild_ids"] = rest
+        cfg.save_config()
+    return await _unregister_guild_commands(int(gid))
 
 
 async def post_setup_guild(request: web.Request) -> web.Response:
@@ -13634,6 +13779,7 @@ def build_app() -> web.Application:
     r.add_get("/api/admin/guilds", api_admin_guilds)
     r.add_get("/api/admin/servers", api_admin_servers)
     r.add_post("/api/admin/servers/{service_id}/guild", post_admin_server_guild)
+    r.add_delete("/api/admin/servers/{service_id}", delete_admin_server)
     r.add_post("/api/auth/logout", post_logout)
     r.add_get("/api/session", api_get_session)
 
