@@ -12554,10 +12554,19 @@ def _guild_payload(gid: int, service_id: Optional[str] = None) -> dict:
 
 
 async def get_feeds(request: web.Request) -> web.Response:
-    guild_ids = _session_guilds(request)
+    """Die Feeds des Discord-Servers, zu dem der gewaehlte Nitrado-Server gehoert.
+
+    Bewusst NICHT ueber ``_session_guilds``: das ist die Berechtigungsgrenze und
+    liefert dem Betreiber alle konfigurierten Guilds. Angezeigt wurden dadurch
+    auch Guild-Karten, deren Kanaele ``set_feed`` anschliessend mit 403 ablehnt –
+    die Zuordnung Feed → Server haengt am gewaehlten Server. Wer eine andere
+    Guild einrichten will, wechselt oben den Server; ueber ``/api/servers/mine``
+    erreicht der Betreiber weiterhin jeden.
+    """
     sess = _sess_get(request)
     conn = _conn_for_session(sess)
     sid = conn.service_id if conn is not None else None
+    guild_ids = [int(conn.guild_id)] if (conn is not None and conn.guild_id) else []
     return ok({
         "log_types": [{"key": k, "label": v} for k, v in LOG_TYPES.items()],
         "guilds": [_guild_payload(int(gid), sid) for gid in guild_ids],
@@ -12848,9 +12857,15 @@ async def remove_allowlist(request: web.Request) -> web.Response:
 
 # ── Rollen/Channels für Picker ────────────────────────────────
 async def guild_roles(request: web.Request) -> web.Response:
-    if int(request.match_info["guild_id"]) not in _session_guilds(request):
+    # Ohne freigeschalteten Server steht im Frontend kein gid bereit; dann kam
+    # hier "null" an und int() liess den Aufruf mit 500 platzen.
+    try:
+        gid = int(request.match_info["guild_id"])
+    except (TypeError, ValueError):
+        return err("Keine gültige Discord-Server-ID.", 400)
+    if gid not in _session_guilds(request):
         return err("Dieser Discord-Server gehört nicht zu deinem Nitrado-Server.", 403)
-    g = bot.get_guild(int(request.match_info["guild_id"])) if bot else None
+    g = bot.get_guild(gid) if bot else None
     if g is None:
         return ok({"roles": []})
     roles = [{"id": str(r.id), "name": r.name}
@@ -12859,9 +12874,13 @@ async def guild_roles(request: web.Request) -> web.Response:
 
 
 async def guild_channels(request: web.Request) -> web.Response:
-    if int(request.match_info["guild_id"]) not in _session_guilds(request):
+    try:
+        gid = int(request.match_info["guild_id"])
+    except (TypeError, ValueError):
+        return err("Keine gültige Discord-Server-ID.", 400)
+    if gid not in _session_guilds(request):
         return err("Dieser Discord-Server gehört nicht zu deinem Nitrado-Server.", 403)
-    g = bot.get_guild(int(request.match_info["guild_id"])) if bot else None
+    g = bot.get_guild(gid) if bot else None
     if g is None:
         return ok({"channels": []})
     channels = [{"id": str(c.id), "name": c.name} for c in g.text_channels]
