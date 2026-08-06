@@ -11404,6 +11404,28 @@ def _discord_app_id() -> Optional[int]:
         return None
 
 
+def _bot_identity() -> Optional[Dict[str, Optional[str]]]:
+    """Name und Profilbild des Bots – so, wie Discord sie kennt.
+
+    Bewusst live aus ``bot.user`` statt fest im Dashboard eingetragen: benennt
+    der Betreiber den Bot in Discord um oder tauscht das Bild, zieht die
+    Kopfzeile beim naechsten Laden von selbst nach.
+
+    Gibt ``None`` zurueck, solange der Bot nicht bei Discord angemeldet ist –
+    dann bleibt in der Kopfzeile die bisherige Beschriftung stehen.
+    """
+    try:
+        user = getattr(bot, "user", None) if bot is not None else None
+        if user is None:
+            return None
+        avatar = getattr(user, "display_avatar", None)
+        name = getattr(user, "display_name", None) or getattr(user, "name", None)
+        return {"name": str(name) if name else None,
+                "avatar_url": str(avatar.url) if avatar is not None else None}
+    except Exception:  # noqa: BLE001 – die Kopfzeile darf nichts zum Absturz bringen
+        return None
+
+
 def _discord_login_enabled() -> bool:
     """Der Login ist genau dann aktiv, wenn ein Client-Secret hinterlegt ist."""
     return bool(str(cfg.config.get("discord_client_secret") or "").strip())
@@ -12500,6 +12522,7 @@ async def api_get_session(request: web.Request) -> web.Response:
                    "guild_configured": guild_configured,
                    "discord_login": login_required,
                    "discord": discord_user, "is_admin": False,
+                   "bot": _bot_identity(),
                    "token_invalid": bool((sess or {}).get("token_invalid"))})
     return ok({
         "authed": bool(sess.get("token")),
@@ -12507,6 +12530,9 @@ async def api_get_session(request: web.Request) -> web.Response:
         "server_name": (lambda c: c.name if c else None)(_conn_for_session(sess)),
         "discord_login": login_required,
         "discord": discord_user,
+        # Name und Bild des Bots fuer die Kopfzeile – oeffentliche Discord-Angaben,
+        # kein Token und keine Application-ID.
+        "bot": _bot_identity(),
         "is_admin": bool(sess.get("is_admin")),
         # Bewusst OHNE Rueckfall auf die config.json: sonst saehe jede
         # Anmeldung ohne eigenen Server die Kennung des Betreibers.
