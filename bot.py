@@ -11699,6 +11699,7 @@ _AUDIT_LABELS = {
     ("POST", "/api/shop/items"): "Shop-Item angelegt",
     ("POST", "/api/shop/categories"): "Shop-Kategorie angelegt",
     ("POST", "/api/shop/refresh-types"): "Shop-Katalog aus types.xml erneuert",
+    ("POST", "/api/shop/import"): "Shop-Katalog importiert",
     ("POST", "/api/economy/money"): "Guthaben geändert",
     ("POST", "/api/economy/config"): "Economy-Einstellungen geändert",
     ("POST", "/api/bans"): "Spieler gebannt",
@@ -13275,6 +13276,135 @@ async def api_shop_refresh_types(request: web.Request) -> web.Response:
                "source": conn.catalog.source, "server": conn.name})
 
 
+# Kennung in der Exportdatei – daran erkennt der Import, dass die Datei aus
+# einem Dashboard stammt und nicht irgendein JSON ist.
+_SHOP_EXPORT_FORMAT = "dayz-dashboard-shop"
+_SHOP_IMPORT_MAX = 5000
+
+
+async def api_shop_export(request: web.Request) -> web.Response:
+    """Den kompletten Katalog dieses Servers zum Weitergeben.
+
+    Bewusst OHNE ``service_id``, Nitrado-Token und Guild-ID: die Datei ist zum
+    Teilen mit Fremden gedacht. Der Servername bleibt als Herkunftsangabe drin –
+    der steht ohnehin in jeder DayZ-Serverliste.
+
+    Immer der ganze Katalog, unabhaengig von Suche und Kategoriefilter der
+    Oberflaeche – eine halbe Preisliste weiterzugeben waere die schlechtere
+    Ueberraschung.
+    """
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
+    items = [_item_view(it) for it in conn.catalog.items]
+    return ok({
+        "format": _SHOP_EXPORT_FORMAT,
+        "version": 1,
+        "exported": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "server": conn.name,
+        "count": len(items),
+        "items": items,
+    })
+
+
+async def api_shop_import(request: web.Request) -> web.Response:
+    """Items aus einer fremden Exportdatei in den eigenen Katalog uebernehmen.
+
+    Nimmt sowohl die Export-Huelle als auch eine blosse ``{"items": [...]}``-Datei –
+    damit laesst sich auch eine rohe ``shop_items_<id>.json`` einlesen.
+
+    **Vorhandene Items bleiben unangetastet.** Ein Name, den es schon gibt, wird
+    uebersprungen und gemeldet; dadurch ist derselbe Import gefahrlos
+    wiederholbar. Ueberschrieben wird nie.
+    """
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
+    katalog = conn.catalog
+    data = await body(request)
+    roh = data.get("items")
+    if not isinstance(roh, list):
+        return err("Die Datei enthält keine Item-Liste. Erwartet wird eine "
+                   "Exportdatei aus dem Shop oder eine shop_items-Datei.")
+    if len(roh) > _SHOP_IMPORT_MAX:
+        return err(f"Die Datei enthält {len(roh)} Einträge – erlaubt sind "
+                   f"höchstens {_SHOP_IMPORT_MAX}.")
+
+    standard = int(conn.get("shop_default_price", 100) or 100)
+    kategorie_preise = conn.get("shop_category_prices") or {}
+    vorhandene_kategorien = set(getattr(katalog, "by_category", {}) or {})
+
+    neu: List[Dict] = []
+    uebersprungen: List[str] = []
+    ungueltig = 0
+    gesehen = set()          # Doppelte INNERHALB der Datei – der Index waechst
+                             # erst beim Speichern mit.
+
+    for eintrag in roh:
+        if not isinstance(eintrag, dict):
+            ungueltig += 1
+            continue
+        parts = _split_classnames(eintrag.get("classnames") or eintrag.get("classname"))
+        if not parts:
+            ungueltig += 1
+            continue
+        is_bundle = len(parts) > 1
+        name = (str(eintrag.get("name") or "").strip()
+                or (f"{parts[0]} Bundle ({len(parts)} items)" if is_bundle else parts[0]))
+        name = name[:100]
+        if name.lower() in gesehen or katalog.find(name) is not None:
+            uebersprungen.append(name)
+            continue
+
+        cat = str(eintrag.get("category", "")).strip() or ("Bundles" if is_bundle else "Custom")
+        try:
+            preis = int(eintrag.get("price"))
+        except (TypeError, ValueError):
+            preis = int(kategorie_preise.get(cat, standard))
+        if preis < 0:
+            ungueltig += 1
+            continue
+        try:
+            mx = int(eintrag.get("max_amount_per_buy") or eintrag.get("limit")
+                     or (1 if is_bundle else 5))
+        except (TypeError, ValueError):
+            mx = 1 if is_bundle else 5
+
+        it: Dict[str, Any] = {
+            "name": name,
+            "price": preis,
+            "category": cat,
+            "enabled": bool(eintrag.get("enabled", True)),
+            "max_amount_per_buy": max(1, mx),
+            # Importiertes ist loeschbar – ein versehentlicher Import laesst sich
+            # ueber den Muelleimer wieder loswerden.
+            "custom": True,
+        }
+        if is_bundle:
+            it["classnames"] = parts
+        else:
+            it["classname"] = parts[0]
+        gesehen.add(name.lower())
+        neu.append(it)
+
+    saved = True
+    if neu:
+        katalog.items.extend(neu)
+        saved = _shop_persist(katalog)
+        for cat in sorted({str(it["category"]) for it in neu} - vorhandene_kategorien):
+            _remember_category(conn, cat)
+
+    teile = [f"{len(neu)} hinzugefügt"]
+    if uebersprungen:
+        teile.append(f"{len(uebersprungen)} übersprungen (schon vorhanden)")
+    if ungueltig:
+        teile.append(f"{ungueltig} unbrauchbar")
+    return ok({"hinzugefuegt": len(neu), "uebersprungen": uebersprungen,
+               "ungueltig": ungueltig, "saved": saved,
+               "quelle": str(data.get("server") or "") or None,
+               "message": ", ".join(teile) + "."})
+
+
 # ──────────────────────────────────────────────────────────────────────────
 #  Karte & Events: Kartendaten, Live-Spielerpositionen, letzte Events.
 # ──────────────────────────────────────────────────────────────────────────
@@ -13794,7 +13924,12 @@ async def _dash_static(request: web.Request) -> web.Response:
 
 
 def build_app() -> web.Application:
-    app = web.Application(middlewares=[_dash_auth_middleware])
+    # 8 MB statt aiohttps Vorgabe von 1 MB: ein vollstaendiger Katalog aus der
+    # types.xml (~1700 Items) liegt als eingerueckte Importdatei darueber. Ohne
+    # die Anhebung verschluckt ``body()`` den 413 zu einem leeren Dict und der
+    # Import meldete faelschlich "keine Item-Liste".
+    app = web.Application(middlewares=[_dash_auth_middleware],
+                          client_max_size=8 * 1024 * 1024)
     r = app.router
 
     # ── Seite & Statisches ──
@@ -13856,6 +13991,8 @@ def build_app() -> web.Application:
     r.add_delete("/api/shop/items/{name}", delete_item)
     r.add_post("/api/shop/categories", add_category)
     r.add_post("/api/shop/refresh-types", api_shop_refresh_types)
+    r.add_get("/api/shop/export", api_shop_export)
+    r.add_post("/api/shop/import", api_shop_import)
 
     # ── Karte / Events ──
     r.add_get("/api/map/meta", api_map_meta)
