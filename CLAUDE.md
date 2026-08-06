@@ -28,9 +28,12 @@ Pushen – es bezieht sich auf die Arbeit, nicht auf das Veröffentlichen.
 
 ## Git
 
-* Entwicklung und Push auf **`claude/verbindung-infos-xd83nr`**.
 * Repo: `https://github.com/haerschel123-ux/Test-dashboard-claude`
+* **Standard-Ziel für „commit und push": `claude/new-session-we1my2`.**
+  Dorthin wird committet und gepusht, solange Brigarde nichts anderes sagt.
 * Kein Pull Request ohne ausdrückliche Bitte.
+* Ein anderer Branch nur auf ausdrückliche Nennung – dann gilt er für diese
+  eine Aufgabe, nicht als neuer Standard.
 
 ---
 
