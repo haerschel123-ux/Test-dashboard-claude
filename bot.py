@@ -11583,6 +11583,35 @@ def _discord_user_view(user: dict) -> dict:
     return {"id": uid, "name": name, "avatar_url": avatar_url}
 
 
+async def _discord_konto_kurz(uid: Any) -> Optional[Dict[str, Optional[str]]]:
+    """Name und Bild eines Discord-Kontos anhand seiner ID – fuer die Serverliste.
+
+    Bewusst live nachgeschlagen statt beim Verbinden dauerhaft gespeichert: ein
+    Nutzername kann sich aendern, und Bestandsverbindungen kennen ohnehin nur
+    die ID. Schlaegt der Abruf fehl (Bot offline, Konto geloescht, kein Netz),
+    bleibt nur die ID uebrig – besser als eine leere Zelle.
+    """
+    text = str(uid or "").strip()
+    if not text:
+        return None
+    try:
+        rid = int(text)
+    except (TypeError, ValueError):
+        return None
+    if bot is None:
+        return {"id": text, "name": None, "avatar_url": None}
+    user = bot.get_user(rid)
+    if user is None:
+        try:
+            user = await bot.fetch_user(rid)
+        except Exception:  # noqa: BLE001 – Konto geloescht, Rate-Limit, kein Netz
+            return {"id": text, "name": None, "avatar_url": None}
+    name = getattr(user, "display_name", None) or getattr(user, "name", None)
+    avatar = getattr(user, "display_avatar", None)
+    return {"id": text, "name": str(name) if name else None,
+            "avatar_url": str(avatar.url) if avatar is not None else None}
+
+
 async def api_discord_start(request: web.Request) -> web.Response:
     """Liefert die Discord-Anmeldeadresse (das Frontend leitet dorthin weiter)."""
     if not _discord_login_enabled():
@@ -11937,6 +11966,7 @@ async def api_admin_servers(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     out = []
+    konten: Dict[str, Optional[Dict[str, Optional[str]]]] = {}
     for conn in connections.all():
         await _refresh_server_name(conn)
         view = conn.view()
@@ -11944,6 +11974,16 @@ async def api_admin_servers(request: web.Request) -> web.Response:
                  if (bot is not None and conn.guild_id) else None)
         view["guild_name"] = (guild.name if guild is not None else None)
         view["guild_available"] = guild is not None
+        # Wer diesen Server verbunden bzw. die Freischaltung angefragt hat.
+        # Je Konto nur einmal nachschlagen – ein Kunde mit mehreren Servern
+        # soll nicht mehrfach dieselbe Discord-Anfrage auslösen.
+        besitzer = str(conn.data.get("owner_discord_id") or "").strip()
+        if besitzer:
+            if besitzer not in konten:
+                konten[besitzer] = await _discord_konto_kurz(besitzer)
+            view["owner"] = konten[besitzer]
+        else:
+            view["owner"] = None
         out.append(view)
     out.sort(key=lambda v: (v["guild_id"] is None, v["name"].lower()))
     return ok({"servers": out})
