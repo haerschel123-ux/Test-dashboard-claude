@@ -11880,9 +11880,16 @@ DASHBOARD_PREMIUM_TEXT = (
     "Du hast kein Premium. Dieser Nitrado-Server ist noch keinem Discord-Server "
     "zugeordnet – der Bot-Betreiber schaltet ihn frei.")
 
-# Was auch ohne Premium erreichbar bleibt: der Serverstatus fuer die Kopfzeile.
-# Sonst staende dort dauerhaft ein Fehler, obwohl es der eigene Server ist.
-_PREMIUM_FREIE_PFADE = ("/api/server/status",)
+# Was auch ohne Premium erreichbar bleibt:
+#  - der Serverstatus fuer die Kopfzeile (sonst staende dort dauerhaft ein
+#    Fehler, obwohl es der eigene Server ist)
+#  - das Anfragen/Zuordnen einer Guild-ID (der "Ja, habe ich"-Schritt im
+#    Onboarding): GENAU das ist der Weg, Premium ueberhaupt erst zu bekommen.
+#    Eine Sperre davor waere ein Henne-Ei-Problem - niemand ohne Premium
+#    koennte je danach fragen. post_setup_guild prueft seine heikle Aktion
+#    (die eigentliche Zuordnung) ohnehin selbst ab; der Anfrage-Zweig
+#    schreibt nur die eigene guild_id_requested, nichts Fremdes.
+_PREMIUM_FREIE_PFADE = ("/api/server/status", "/api/auth/guild")
 
 
 def _sitzung_hat_premium(sess: Optional[Dict[str, Any]],
