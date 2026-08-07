@@ -408,6 +408,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Dashboard zusätzlich die Kategorien "Logs" und "Guild IDs".
     # Leer = niemand sieht sie.
     "dashboard_admin_role_id": "1530653925575753838",
+    # Premium-Rolle: Wird einem Kundenserver eine Discord-Guild zugeordnet
+    # (= Freischaltung), bekommt der Kunde diese Rolle im Betreiber-Discord.
+    # Wird die Freischaltung zurueckgenommen oder der Server entfernt, geht sie
+    # wieder ab – es sei denn, der Kunde hat noch einen anderen freien Server.
+    # Beide Felder leer = die Funktion ist aus.
+    "premium_role_guild_id": "1534352039713439855",
+    "premium_role_id":       "1534356139758588097",
     # Optionale Leaflet-Kachel-URLs je Karte, z. B.
     #   {"ChernarusPlus": "https://.../{z}/{x}/{y}.png"}
     "dashboard_map_tiles":   {},
@@ -11927,10 +11934,17 @@ async def post_admin_server_guild(request: web.Request) -> web.Response:
         # Die bisherige Guild VOR dem Zuordnen lesen – danach ist sie None.
         _alt = connections.for_service(service_id)
         alte_gid = _alt.guild_id if _alt is not None else None
+        besitzer = _alt.data.get("owner_discord_id") if _alt is not None else None
         okay, msg = connections.assign_guild(service_id, None)
         if not okay:
             return err(msg)
         result = await _guild_aufraeumen(alte_gid)
+        # Erst NACH assign_guild pruefen – sonst zaehlt der gerade entzogene
+        # Server noch als Premium und die Rolle bliebe stehen.
+        if not _hat_noch_premium(besitzer):
+            hinweis = await _premium_rolle(besitzer, False)
+            if hinweis:
+                result["premium_rolle"] = hinweis
         result["message"] = msg
         return ok(result)
     if not raw.isdigit() or not (17 <= len(raw) <= 20):
@@ -11955,8 +11969,83 @@ async def post_admin_server_guild(request: web.Request) -> web.Response:
         cfg.config["guild_ids"] = ids
         cfg.save_config()
     result = await _register_guild_commands(gid)
+    # Freischaltung heisst Premium – der Kunde bekommt die Premium-Rolle im
+    # Betreiber-Discord. Ein Fehlschlag steht als Hinweis in der Antwort, macht
+    # die Freischaltung selbst aber nicht rueckgaengig.
+    hinweis = await _premium_rolle(
+        _ziel.data.get("owner_discord_id") if _ziel is not None else None, True)
+    if hinweis:
+        result["premium_rolle"] = hinweis
     result["message"] = msg
     return ok(result)
+
+
+def _hat_noch_premium(owner_id: Any) -> bool:
+    """Hat dieses Discord-Konto noch einen ANDEREN freigeschalteten Server?
+
+    Verhindert, dass jemandem mit mehreren Servern die Premium-Rolle abgezogen
+    wird, nur weil einer davon entfaellt.
+    """
+    uid = str(owner_id or "").strip()
+    if not uid:
+        return False
+    return any(str(c.data.get("owner_discord_id") or "") == uid and c.guild_id
+               for c in connections.all())
+
+
+async def _premium_rolle(owner_id: Any, geben: bool) -> str:
+    """Die Premium-Rolle im Betreiber-Discord vergeben oder wieder abziehen.
+
+    Gibt eine kurze Meldung fuer das Dashboard zurueck ("" = nichts zu tun).
+    Scheitern ist NIE hart: eine Freischaltung darf nicht daran haengen, dass
+    Discord klemmt oder der Kunde dem Betreiber-Discord nicht beigetreten ist.
+    """
+    uid = str(owner_id or "").strip()
+    gid = str(cfg.config.get("premium_role_guild_id") or "").strip()
+    rid = str(cfg.config.get("premium_role_id") or "").strip()
+    if not (uid and gid and rid):
+        return ""
+    if bot is None or getattr(bot, "user", None) is None:
+        return "Premium-Rolle: Bot ist nicht bei Discord angemeldet."
+    try:
+        guild = bot.get_guild(int(gid))
+    except (TypeError, ValueError):
+        return "Premium-Rolle: premium_role_guild_id ist keine gültige ID."
+    if guild is None:
+        return ("Premium-Rolle: Der Bot ist nicht in dem Discord-Server "
+                f"{gid} – Rolle nicht vergeben.")
+    try:
+        rolle = guild.get_role(int(rid))
+    except (TypeError, ValueError):
+        return "Premium-Rolle: premium_role_id ist keine gültige ID."
+    if rolle is None:
+        return f"Premium-Rolle: Rolle {rid} gibt es in „{guild.name}“ nicht."
+
+    try:
+        member = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
+    except discord.NotFound:
+        return f"Premium-Rolle: Der Kunde ist nicht in „{guild.name}“."
+    except discord.HTTPException as e:
+        return f"Premium-Rolle: Discord antwortete nicht ({e})."
+    except (TypeError, ValueError):
+        return "Premium-Rolle: Die gespeicherte Kunden-ID ist unbrauchbar."
+
+    hat = any(int(r.id) == rolle.id for r in getattr(member, "roles", []))
+    if hat == geben:
+        return ""                                  # schon im gewuenschten Zustand
+    try:
+        if geben:
+            await member.add_roles(rolle, reason="Premium freigeschaltet (Dashboard)")
+            log.info(f"[PREMIUM] {member} hat „{rolle.name}“ bekommen.")
+            return f"„{rolle.name}“ an {member} vergeben."
+        await member.remove_roles(rolle, reason="Premium zurückgenommen (Dashboard)")
+        log.info(f"[PREMIUM] {member} hat „{rolle.name}“ verloren.")
+        return f"„{rolle.name}“ bei {member} entfernt."
+    except discord.Forbidden:
+        return (f"Premium-Rolle: Dem Bot fehlt das Recht „Rollen verwalten“, oder "
+                f"„{rolle.name}“ steht über seiner eigenen Rolle.")
+    except discord.HTTPException as e:
+        return f"Premium-Rolle: Discord lehnte die Änderung ab ({e})."
 
 
 async def delete_admin_server(request: web.Request) -> web.Response:
@@ -11976,6 +12065,7 @@ async def delete_admin_server(request: web.Request) -> web.Response:
 
     name = conn.name
     alte_gid = conn.guild_id
+    besitzer = conn.data.get("owner_discord_id")
     war_primary = connections.primary() is conn
 
     # Den Hauptserver festschreiben, BEVOR die Verbindung verschwindet.
@@ -12009,6 +12099,13 @@ async def delete_admin_server(request: web.Request) -> web.Response:
             gelöst += 1
 
     result = await _guild_aufraeumen(alte_gid)
+
+    # War das sein letzter freigeschalteter Server, geht die Premium-Rolle ab.
+    # Erst NACH connections.remove() – sonst zaehlt der Geloeschte noch mit.
+    if alte_gid and not _hat_noch_premium(besitzer):
+        hinweis = await _premium_rolle(besitzer, False)
+        if hinweis:
+            result["premium_rolle"] = hinweis
 
     # bot.nitrado/bot.ftp/bot.shop hingen am Hauptserver – nach dem Schliessen
     # zeigten sie auf ein totes Objekt.
