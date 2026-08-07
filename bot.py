@@ -390,6 +390,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # false = wie früher ausschließlich HTTP.
     "dashboard_https":       True,
 
+    # ─────────── CLOUDFLARE TUNNEL (eigene Domain ohne Port) ───────────
+    # Leer = Feature aus, alles läuft wie bisher nur über dashboard_https.
+    # Einrichten (einmalig, im Cloudflare-Konto):
+    #   1. Zero Trust → Networks → Tunnels → "Create a tunnel" → Cloudflared
+    #   2. Den angezeigten Connector-Token hier eintragen (NICHT den
+    #      OS-spezifischen Installationsbefehl - nur die lange Zeichenkette
+    #      nach "service install" bzw. "run --token").
+    #   3. Im selben Assistenten unter "Public Hostname": die eigene Domain
+    #      eintragen, als Ziel "HTTP" + "localhost:<Port>" (der Port steht im
+    #      PebbleHost-Panel unter Network/Allocations, siehe README).
+    # Der Bot lädt cloudflared bei Bedarf selbst herunter (nach
+    # dashboard_web/, wie das Zertifikat) und hält die Verbindung am Leben -
+    # es ist keine Installation auf dem Server nötig.
+    "cloudflare_tunnel_token": "",
+
     # ─────────── DISCORD-LOGIN FÜRS DASHBOARD ───────────
     # Solange discord_client_secret leer ist, bleibt der Login AUS und das
     # Dashboard verhält sich wie bisher. Das ist Absicht: ein Update darf ein
@@ -14924,6 +14939,139 @@ def _dash_resolve_port() -> int:
     return 8080
 
 
+# ──────────────────────────────────────────────────────────────────────────
+#  Cloudflare Tunnel – optionale eigene Domain ohne Port, ohne Installation
+#  auf dem Server. Der Connector-Token kommt aus dem Cloudflare-Konto (Zero
+#  Trust → Tunnels), Ziel und Ingress-Regeln stehen dort in der Cloud - hier
+#  wird nur der Client-Prozess heruntergeladen, gestartet und am Leben
+#  gehalten. Ein Fehlschlag darf NIE den Bot betreffen, das Dashboard läuft
+#  in jedem Fall weiter über http(s)://…:<Port>.
+# ──────────────────────────────────────────────────────────────────────────
+_cloudflared_proc: Optional["asyncio.subprocess.Process"] = None
+_cloudflared_task: Optional[asyncio.Task] = None
+_cloudflared_stopping = False
+_CLOUDFLARED_BACKOFF_START = 5    # Sekunden; verdoppelt sich bis 60 – als
+_CLOUDFLARED_BACKOFF_MAX = 60     # Modulkonstanten, damit Tests sie verkürzen können.
+
+
+def _cloudflared_asset() -> Optional[str]:
+    """Name der passenden Cloudflare-Veröffentlichung für dieses System.
+
+    PebbleHost-Container sind Linux/x86_64 - andere Systeme (macOS, Windows)
+    unterstützt diese automatische Einrichtung bewusst nicht; dort bleibt nur
+    die manuelle Installation von cloudflared laut Cloudflare-Anleitung.
+    """
+    if platform.system().lower() != "linux":
+        return None
+    arch = platform.machine().lower()
+    if arch in ("x86_64", "amd64"):
+        return "cloudflared-linux-amd64"
+    if arch in ("aarch64", "arm64"):
+        return "cloudflared-linux-arm64"
+    if arch.startswith("arm"):
+        return "cloudflared-linux-arm"
+    return None
+
+
+def _cloudflared_pfad() -> str:
+    return os.path.join(_DASH_DIR, "cloudflared")
+
+
+async def _cloudflared_sicherstellen() -> Optional[str]:
+    """cloudflared besorgen, falls es noch nicht da ist. None bei Fehlschlag."""
+    pfad = _cloudflared_pfad()
+    if os.path.exists(pfad) and os.access(pfad, os.X_OK):
+        return pfad
+    asset = _cloudflared_asset()
+    if not asset:
+        dash_log.warning("[TUNNEL] Cloudflare Tunnel wird auf diesem System nicht "
+                         "automatisch eingerichtet (kein Linux). Siehe README.")
+        return None
+    url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}"
+    try:
+        os.makedirs(_DASH_DIR, exist_ok=True)
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
+                if r.status != 200:
+                    dash_log.warning(f"[TUNNEL] cloudflared-Download fehlgeschlagen "
+                                     f"(HTTP {r.status}).")
+                    return None
+                data = await r.read()
+        with open(pfad, "wb") as f:
+            f.write(data)
+        os.chmod(pfad, 0o755)
+        dash_log.info("[TUNNEL] cloudflared heruntergeladen.")
+        return pfad
+    except Exception as e:  # noqa: BLE001 – optionales Feature, darf nie stören
+        dash_log.warning(f"[TUNNEL] cloudflared konnte nicht geladen werden: {e}")
+        return None
+
+
+async def _cloudflared_ueberwachen(pfad: str, token: str) -> None:
+    """Hält den Tunnel am Leben: startet ihn neu, wenn der Prozess endet.
+
+    Wartezeit steigt nach jedem Fehlschlag (5s → … → 60s) und wird nach einem
+    erfolgreichen Start zurückgesetzt - kein Dauerfeuer bei einer echten
+    Störung, aber schnelle Wiederkehr nach einem kurzen Netzwerk-Hänger.
+    """
+    global _cloudflared_proc
+    wartezeit = _CLOUDFLARED_BACKOFF_START
+    while not _cloudflared_stopping:
+        try:
+            _cloudflared_proc = await asyncio.create_subprocess_exec(
+                pfad, "tunnel", "--no-autoupdate", "run", "--token", token,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            dash_log.info("[TUNNEL] Cloudflare Tunnel gestartet.")
+            wartezeit = _CLOUDFLARED_BACKOFF_START
+            async for zeile in _cloudflared_proc.stdout:
+                text = zeile.decode(errors="replace").strip()
+                if text:
+                    dash_log.info(f"[TUNNEL] {text}")
+            await _cloudflared_proc.wait()
+        except FileNotFoundError:
+            dash_log.warning("[TUNNEL] cloudflared-Datei fehlt – Tunnel angehalten.")
+            return
+        except Exception as e:  # noqa: BLE001 – Überwachungsschleife, darf nicht sterben
+            dash_log.warning(f"[TUNNEL] Fehler: {e}")
+        _cloudflared_proc = None
+        if _cloudflared_stopping:
+            return
+        dash_log.warning(f"[TUNNEL] Verbindung beendet – neuer Versuch in {wartezeit}s.")
+        await asyncio.sleep(wartezeit)
+        wartezeit = min(wartezeit * 2, _CLOUDFLARED_BACKOFF_MAX)
+
+
+async def _cloudflared_starten() -> None:
+    """Aus start_dashboard() aufgerufen - kein Token, kein Tunnel, kein Aufwand."""
+    global _cloudflared_task, _cloudflared_stopping
+    token = str(cfg.config.get("cloudflare_tunnel_token") or "").strip()
+    if not token:
+        return
+    _cloudflared_stopping = False
+    pfad = await _cloudflared_sicherstellen()
+    if not pfad:
+        return
+    _cloudflared_task = asyncio.create_task(_cloudflared_ueberwachen(pfad, token))
+
+
+async def _cloudflared_stoppen() -> None:
+    global _cloudflared_proc, _cloudflared_task, _cloudflared_stopping
+    _cloudflared_stopping = True
+    if _cloudflared_proc is not None:
+        try:
+            _cloudflared_proc.terminate()
+            await asyncio.wait_for(_cloudflared_proc.wait(), timeout=5)
+        except Exception:  # noqa: BLE001 – Abschalten, keine Ausnahme darf hier stören
+            try:
+                _cloudflared_proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        _cloudflared_proc = None
+    if _cloudflared_task is not None:
+        _cloudflared_task.cancel()
+        _cloudflared_task = None
+
+
 async def start_dashboard(bot: Any) -> None:
     """Bindet den Bot ans Dashboard und startet den Web-Server (idempotent)."""
     global _dash_runner, _dash_site, _DASH_BOUND
@@ -15009,10 +15157,12 @@ async def start_dashboard(bot: Any) -> None:
                       f"{port} öffnen – 127.0.0.1 und 0.0.0.0 sind nur lokale Adressen. "
                       f"Trage die Adresse als \"dashboard_public_host\" in die config.json "
                       f"ein, dann steht hier direkt der fertige Link.")
+    await _cloudflared_starten()
 
 
 async def stop_dashboard() -> None:
     global _dash_runner, _dash_site
+    await _cloudflared_stoppen()
     if _dash_site is not None:
         await _dash_site.stop()
         _dash_site = None
