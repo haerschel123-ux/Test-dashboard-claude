@@ -10355,6 +10355,17 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
         return await interaction.response.send_message(
             f"❌ Item `{item}` is not available. Use `/shop list` to see the catalog.",
             ephemeral=True)
+    # ── 1b. Rollen-Beschraenkung: leer heisst, alle duerfen kaufen ──
+    #        Vor allen weiteren Pruefungen, damit niemand ueber die
+    #        Fehlermeldungen erfaehrt, was er ohnehin nicht kaufen darf.
+    noetig = _item_role_ids(it)
+    if noetig and not (isinstance(interaction.user, discord.Member)
+                       and _member_has_role_ids(interaction.user, noetig)):
+        return await interaction.response.send_message(
+            f"❌ Du hast nicht die erforderliche Rolle, um **{it['name']}** zu kaufen.\n"
+            "Benötigt wird: " + ", ".join(f"<@&{r}>" for r in noetig),
+            ephemeral=True)
+
     max_amount = int(it.get("max_amount_per_buy", 1))
     if amount > max_amount:
         return await interaction.response.send_message(
@@ -10562,6 +10573,21 @@ def generate_shop_items_from_types(input_path: str = TYPES_XML_FILE,
     for it in items:
         if name_counts.get(it["name"].lower(), 0) > 1:
             it["name"] = f"{it['name']} ({it['classname']})"
+
+    # Bewusst entfernte Items bleiben entfernt – sonst holt jedes "Items vom
+    # Server laden" den ganzen aufgeraeumten Katalog wieder zurueck. Erst NACH
+    # der Kollisionsauflösung, weil die Merkliste den angezeigten Namen kennt.
+    if conn is not None:
+        gestrichen = {str(n).strip().lower() for n in _geloeschte_items(conn)}
+        if gestrichen:
+            vorher = len(items)
+            items = [i for i in items
+                     if i["name"].lower() not in gestrichen
+                     and str(i.get("classname", "")).lower() not in gestrichen]
+            if vorher != len(items):
+                log.info(f"[GEN] {vorher - len(items)} zuvor entfernte Items "
+                         f"nicht wieder aufgenommen.")
+
     items.sort(key=lambda i: (i["category"].lower(), i["name"].lower()))
 
     # Manuell angelegte Items (/add shopitem, "custom": true) aus einer
@@ -10577,6 +10603,27 @@ def generate_shop_items_from_types(input_path: str = TYPES_XML_FILE,
                         if isinstance(i, dict) and i.get("custom")
                         and str(i.get("name", "")).lower() not in gen_names]
                 items.extend(keep)
+                # Rollen-Beschraenkungen an erzeugten Items ueberleben das
+                # Neuaufbauen: sie stehen nicht in der types.xml und waeren
+                # sonst bei jedem "Items vom Server laden" weg.
+                # Zuordnung ueber Name UND Classname – der Anzeigename wird aus
+                # dem Classname erzeugt und kann sich mit den Regeln aendern,
+                # der Classname bleibt.
+                alte_rollen: Dict[str, List] = {}
+                for i in old_items:
+                    if not (isinstance(i, dict) and i.get("role_ids")):
+                        continue
+                    for s in [str(i.get("name", ""))] + _item_classnames(i):
+                        if s.strip():
+                            alte_rollen.setdefault(s.strip().lower(), i["role_ids"])
+                if alte_rollen:
+                    for i in items:
+                        if i.get("role_ids"):
+                            continue
+                        rollen = (alte_rollen.get(str(i.get("name", "")).lower())
+                                  or alte_rollen.get(str(i.get("classname", "")).lower()))
+                        if rollen:
+                            i["role_ids"] = rollen
         except Exception as e:
             log.warning(f"[GEN] Bestehende {out_file} nicht lesbar ({e}) - "
                         f"Custom-Items nicht uebernommen.")
@@ -13006,6 +13053,26 @@ def _shop_persist(katalog: "ShopCatalog") -> bool:
     return bool(katalog.save())
 
 
+def _item_role_ids(it: dict) -> List[int]:
+    """Rollen, die dieses Item kaufen duerfen – leer heisst: alle duerfen.
+
+    Wird von ``/buy`` und vom Dashboard gelesen. Unbrauchbare Eintraege werden
+    still uebergangen: eine kaputte Zahl darf kein Item unverkaeuflich machen.
+    """
+    roh = it.get("role_ids")
+    if not isinstance(roh, list):
+        return []
+    out: List[int] = []
+    for r in roh:
+        try:
+            rid = int(r)
+        except (TypeError, ValueError):
+            continue
+        if rid and rid not in out:
+            out.append(rid)
+    return out
+
+
 def _item_view(it: dict) -> dict:
     cls = _classnames(it)
     return {
@@ -13017,6 +13084,9 @@ def _item_view(it: dict) -> dict:
         "enabled": bool(it.get("enabled", True)),
         "max_amount_per_buy": int(it.get("max_amount_per_buy", 1)),
         "custom": bool(it.get("custom", False)),
+        # Als Zeichenketten: Discord-IDs sind 19-stellig und verlieren als
+        # JavaScript-Zahl die letzten Stellen.
+        "role_ids": [str(r) for r in _item_role_ids(it)],
     }
 
 
@@ -13108,6 +13178,27 @@ def _split_classnames(raw) -> List[str]:
     return parts
 
 
+def _rollen_aus_daten(roh) -> List[int]:
+    """Rollen-IDs aus dem, was das Dashboard schickt (Liste oder Text).
+
+    Discord-IDs kommen als Zeichenketten herein – als JavaScript-Zahl waeren
+    die letzten Stellen schon verloren. Unbrauchbares wird uebergangen, eine
+    leere Liste bedeutet ausdruecklich „keine Beschraenkung".
+    """
+    if roh is None:
+        return []
+    toks = roh if isinstance(roh, list) else re.split(r"[,;\s]+", str(roh))
+    out: List[int] = []
+    for t in toks:
+        try:
+            rid = int(str(t).strip())
+        except (TypeError, ValueError):
+            continue
+        if rid > 0 and rid not in out:
+            out.append(rid)
+    return out
+
+
 async def create_item(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request)
     if fehler is not None:
@@ -13150,6 +13241,9 @@ async def create_item(request: web.Request) -> web.Response:
         "max_amount_per_buy": mx,
         "custom": True,
     }
+    rollen = _rollen_aus_daten(data.get("role_ids"))
+    if rollen:
+        it["role_ids"] = rollen
     if is_bundle:
         it["classnames"] = parts
     else:
@@ -13160,6 +13254,9 @@ async def create_item(request: web.Request) -> web.Response:
 
     katalog.items.append(it)
     saved = _shop_persist(katalog)
+    # Wieder angelegt – also von der Streichliste nehmen, sonst faellt es beim
+    # naechsten "Items vom Server laden" erneut heraus.
+    _vergiss_geloescht(conn, it["name"], *parts)
     # neue Kategorie ggf. als custom merken
     if cat not in (getattr(katalog, "by_category", {}) or {}):
         _remember_category(conn, cat)
@@ -13192,6 +13289,14 @@ async def update_item(request: web.Request) -> web.Response:
         _remember_category(conn, it["category"])
     if "enabled" in data:
         it["enabled"] = bool(data["enabled"])
+    if "role_ids" in data:
+        # Leere Liste = Beschraenkung aufheben. Der Schluessel verschwindet dann
+        # ganz, damit ein Katalog ohne Beschraenkungen sauber bleibt.
+        rollen = _rollen_aus_daten(data.get("role_ids"))
+        if rollen:
+            it["role_ids"] = rollen
+        else:
+            it.pop("role_ids", None)
     if "max_amount_per_buy" in data or "limit" in data:
         try:
             it["max_amount_per_buy"] = max(1, int(data.get("max_amount_per_buy") or data.get("limit")))
@@ -13213,6 +13318,11 @@ async def update_item(request: web.Request) -> web.Response:
 
 
 async def delete_item(request: web.Request) -> web.Response:
+    """Ein Item aus dem Katalog dieses Servers entfernen – auch ein erzeugtes.
+
+    Der Name wandert auf die Streichliste (``_merke_geloescht``), damit
+    „Items vom Server laden" ihn nicht aus der types.xml zurueckholt.
+    """
     conn, fehler = _session_conn(request)
     if fehler is not None:
         return fehler
@@ -13224,6 +13334,7 @@ async def delete_item(request: web.Request) -> web.Response:
         katalog.items.remove(it)
     except ValueError:
         pass
+    _merke_geloescht(conn, it)
     saved = _shop_persist(katalog)
     return ok({"removed": str(it.get("name")), "saved": saved})
 
@@ -13247,6 +13358,49 @@ def _remember_category(conn: "ServerConnection", cat: str) -> None:
     lst = _eigene_kategorien(conn)
     if cat and cat not in lst:
         lst.append(cat)
+        connections.save()
+
+
+def _geloeschte_items(conn: "ServerConnection") -> List[str]:
+    """Was auf **diesem** Server bewusst aus dem Katalog entfernt wurde.
+
+    „Items vom Server laden" baut den Katalog vollstaendig aus der types.xml
+    neu. Ohne diese Merkliste kaeme jedes geloeschte Item beim naechsten Laden
+    zurueck und der aufgeraeumte Katalog waere wieder voll.
+
+    Bewusst ueber ``conn.data`` statt ``conn.get`` – eine Rueckfallebene wuerde
+    einem neuen Kunden die Streichliste des Betreibers vererben.
+    """
+    lst = conn.data.get("shop_geloescht")
+    if not isinstance(lst, list):
+        lst = []
+        conn.data["shop_geloescht"] = lst
+    return lst
+
+
+def _merke_geloescht(conn: "ServerConnection", it: dict) -> None:
+    """Name **und** Classname vormerken – die types.xml haengt bei doppelten
+    Anzeigenamen den Classname an, dann passt der reine Name nicht mehr."""
+    lst = _geloeschte_items(conn)
+    schluessel = [str(it.get("name") or "")] + _classnames(it)
+    neu = False
+    for s in schluessel:
+        s = s.strip().lower()
+        if s and s not in lst:
+            lst.append(s)
+            neu = True
+    if neu:
+        connections.save()
+
+
+def _vergiss_geloescht(conn: "ServerConnection", *namen: str) -> None:
+    """Wieder angelegt oder importiert – dann gehoert es nicht mehr auf die
+    Streichliste, sonst verschwaende es beim naechsten Laden erneut."""
+    lst = _geloeschte_items(conn)
+    weg = {str(n).strip().lower() for n in namen if str(n).strip()}
+    rest = [n for n in lst if str(n).strip().lower() not in weg]
+    if len(rest) != len(lst):
+        conn.data["shop_geloescht"] = rest
         connections.save()
 
 
@@ -13296,7 +13450,11 @@ async def api_shop_export(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request)
     if fehler is not None:
         return fehler
-    items = [_item_view(it) for it in conn.catalog.items]
+    # Rollen-Beschraenkungen bleiben draussen: Rollen-IDs gelten nur in EINER
+    # Discord-Guild. Beim Empfaenger wuerden sie auf nichts zeigen und das Item
+    # still unverkaeuflich machen.
+    items = [{k: v for k, v in _item_view(it).items() if k != "role_ids"}
+             for it in conn.catalog.items]
     return ok({
         "format": _SHOP_EXPORT_FORMAT,
         "version": 1,
@@ -13379,6 +13537,8 @@ async def api_shop_import(request: web.Request) -> web.Response:
             # Importiertes ist loeschbar – ein versehentlicher Import laesst sich
             # ueber den Muelleimer wieder loswerden.
             "custom": True,
+            # role_ids werden BEWUSST nicht uebernommen: sie gelten nur in der
+            # Guild des Absenders und wuerden hier auf nichts zeigen.
         }
         if is_bundle:
             it["classnames"] = parts
@@ -13391,6 +13551,9 @@ async def api_shop_import(request: web.Request) -> web.Response:
     if neu:
         katalog.items.extend(neu)
         saved = _shop_persist(katalog)
+        # Importiertes gehoert nicht mehr auf die Streichliste.
+        _vergiss_geloescht(conn, *[str(it["name"]) for it in neu],
+                           *[c for it in neu for c in _classnames(it)])
         for cat in sorted({str(it["category"]) for it in neu} - vorhandene_kategorien):
             _remember_category(conn, cat)
 
