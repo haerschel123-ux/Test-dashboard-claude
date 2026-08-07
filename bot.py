@@ -11847,6 +11847,32 @@ def _conn_for_session(sess: Optional[Dict[str, Any]]) -> Optional[ServerConnecti
     return connections.for_service((sess or {}).get("service_id"))
 
 
+DASHBOARD_PREMIUM_TEXT = (
+    "Du hast kein Premium. Dieser Nitrado-Server ist noch keinem Discord-Server "
+    "zugeordnet – der Bot-Betreiber schaltet ihn frei.")
+
+# Was auch ohne Premium erreichbar bleibt: der Serverstatus fuer die Kopfzeile.
+# Sonst staende dort dauerhaft ein Fehler, obwohl es der eigene Server ist.
+_PREMIUM_FREIE_PFADE = ("/api/server/status",)
+
+
+def _sitzung_hat_premium(sess: Optional[Dict[str, Any]],
+                         conn: Optional[ServerConnection]) -> bool:
+    """Ist der Server DIESER Anmeldung freigeschaltet?
+
+    Freischaltung heisst: dem Nitrado-Server ist eine Discord-Guild zugeordnet –
+    dieselbe Bedingung, an der auch ``_premium_check`` die Slash-Befehle haengt.
+    Bewusst pro gewaehltem Server: wer zwei Server hat, von denen nur einer frei
+    ist, soll beim anderen auch kein Dashboard bekommen.
+
+    Der Betreiber (Dashboard-Admin-Rolle) kommt immer durch – sonst koennte er
+    die Freischaltung gar nicht erst vornehmen.
+    """
+    if (sess or {}).get("is_admin"):
+        return True
+    return bool(conn is not None and conn.guild_id)
+
+
 def _session_conn(request: web.Request) -> Tuple[Optional[ServerConnection],
                                                  Optional[web.Response]]:
     """``(verbindung, fehlerantwort)`` für Endpunkte, die auf einen Server gehören.
@@ -11861,6 +11887,8 @@ def _session_conn(request: web.Request) -> Tuple[Optional[ServerConnection],
     conn = _conn_for_session(sess)
     if conn is None:
         return None, err("Für diese Anmeldung ist kein Nitrado-Server ausgewählt.", 409)
+    if not _sitzung_hat_premium(sess, conn) and request.path not in _PREMIUM_FREIE_PFADE:
+        return None, err(DASHBOARD_PREMIUM_TEXT, 403)
     return conn, None
 
 
@@ -12669,10 +12697,18 @@ async def api_get_session(request: web.Request) -> web.Response:
                    "discord": discord_user, "is_admin": False,
                    "bot": _bot_identity(),
                    "token_invalid": bool((sess or {}).get("token_invalid"))})
+    _conn = _conn_for_session(sess)
     return ok({
         "authed": bool(sess.get("token")),
         "token_invalid": bool(sess.get("token_invalid")),
-        "server_name": (lambda c: c.name if c else None)(_conn_for_session(sess)),
+        "server_name": _conn.name if _conn else None,
+        # Ist der gewaehlte Server freigeschaltet? Danach richtet sich, welche
+        # Seiten das Dashboard ueberhaupt oeffnet.
+        "premium": _sitzung_hat_premium(sess, _conn),
+        "premium_text": DASHBOARD_PREMIUM_TEXT,
+        "guild_id_requested": (str(_conn.data.get("guild_id_requested"))
+                               if _conn is not None
+                               and _conn.data.get("guild_id_requested") else None),
         "discord_login": login_required,
         "discord": discord_user,
         # Name und Bild des Bots fuer die Kopfzeile – oeffentliche Discord-Angaben,
