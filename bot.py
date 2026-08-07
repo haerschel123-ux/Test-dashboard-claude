@@ -379,7 +379,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Port oder als https://… wird der Wert genau so übernommen (z. B. hinter
     # einem Reverse-Proxy). Leer lassen = nur lokaler Hinweis.
     # Die Umgebungsvariable DASHBOARD_PUBLIC_HOST hat Vorrang.
-    "dashboard_public_host": "testdashboard.my.pebble.host",
+    "dashboard_public_host": "brigardekillfeed.my.pebble.host",
     # HTTPS: Das Dashboard nimmt auf DEMSELBEN Port zusätzlich TLS an, weil
     # Browser getippte Adressen oft von sich aus auf https:// hochstufen – ohne
     # TLS endet das in ERR_SSL_PROTOCOL_ERROR und die Seite ist gar nicht
@@ -397,7 +397,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Einrichten: Discord Developer Portal → deine App → OAuth2 →
     #   1. "Client Secret" kopieren und hier eintragen
     #   2. unter "Redirects" die Dashboard-Adresse + /api/auth/discord/callback
-    #      eintragen, z. B. http://testdashboard.my.pebble.host:25590/api/auth/discord/callback
+    #      eintragen, z. B. http://brigardekillfeed.my.pebble.host:25590/api/auth/discord/callback
     #      (am besten zusätzlich die https://-Variante)
     # Danach muss sich jeder erst mit Discord anmelden, bevor er den
     # Nitrado-Token eingeben kann.

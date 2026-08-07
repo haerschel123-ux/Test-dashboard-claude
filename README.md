@@ -91,20 +91,20 @@ Die Allocation dieses Servers ist **`45.143.198.35:25590`**, die Subdomain zeigt
 IP. Das Dashboard ist deshalb hier erreichbar:
 
 ```
-http://testdashboard.my.pebble.host:25590
+http://brigardekillfeed.my.pebble.host:25590
 ```
 
 Diese Adresse steht beim Start auch direkt im Log:
 
 ```
-[DASHBOARD] ✅ Dashboard läuft:  http://testdashboard.my.pebble.host:25590
-[DASHBOARD]    …oder verschlüsselt: https://testdashboard.my.pebble.host:25590
+[DASHBOARD] ✅ Dashboard läuft:  http://brigardekillfeed.my.pebble.host:25590
+[DASHBOARD]    …oder verschlüsselt: https://brigardekillfeed.my.pebble.host:25590
 [DASHBOARD]    (Das Zertifikat ist selbstsigniert – der Browser warnt einmalig: "Erweitert" → "Weiter".)
 [DASHBOARD]    (lokal auf diesem Rechner: http://127.0.0.1:25590)
 ```
 
 Sie kommt aus dem Feld **`dashboard_public_host`** in der `config.json` (Standard:
-`testdashboard.my.pebble.host`); die Umgebungsvariable `DASHBOARD_PUBLIC_HOST` hat Vorrang.
+`brigardekillfeed.my.pebble.host`); die Umgebungsvariable `DASHBOARD_PUBLIC_HOST` hat Vorrang.
 Ohne Portangabe wird der tatsächliche Port automatisch angehängt. Trägst du dort einen Port
 ein oder eine `https://…`-Adresse, wird der Wert unverändert übernommen — so stimmt der Link
 auch hinter einem Reverse-Proxy. Das Feld beeinflusst **nur die Anzeige**; gebunden wird
@@ -142,7 +142,7 @@ Zertifikat lesen und brach ab:
 
 ```
 Diese Website kann keine sichere Verbindung bereitstellen
-testdashboard.my.pebble.host hat eine ungültige Antwort gesendet.
+brigardekillfeed.my.pebble.host hat eine ungültige Antwort gesendet.
 ERR_SSL_PROTOCOL_ERROR
 ```
 
