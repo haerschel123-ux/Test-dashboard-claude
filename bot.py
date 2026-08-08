@@ -586,6 +586,10 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
                            "emoji": "🔄", "farbe": 0xE67E22},
     "zone":               {"label": "Zonen-Ping",          "gruppe": "Bot",
                            "emoji": "🛡️", "farbe": 0xE74C3C},
+    # Aus der .RPT erkannt: jeder Serverstart legt eine neue an. Meldet auch
+    # Neustarts, die NICHT vom eigenen Zeitplan kommen (Absturz, Nitrado).
+    "server_restart":     {"label": "Server Restart (erkannt)", "gruppe": "Bot",
+                           "emoji": "♻️", "farbe": 0x2ECC71},
 }
 
 # Die Feed-Typen, die aus Log-Ereignissen entstehen. Genau diese werden bei der
@@ -1527,6 +1531,32 @@ class FTPManager:
             self._full_path(directory, f)
             for f in raw
             if f.split("/")[-1].lower().endswith(".adm")
+        ])
+
+    def list_rpt_files(self, directory: str) -> List[str]:
+        """Die .RPT-Dateien im Log-Ordner.
+
+        Jeder Serverstart legt eine neue an, der Name traegt Datum und
+        Uhrzeit (DayZServer_..._20260808_142104.RPT). Mehr wird fuer die
+        Neustart-Erkennung nicht gebraucht – die Datei selbst (mehrere MB,
+        fast nur Motor-Meldungen) wird bewusst NICHT geladen.
+        """
+        def op(ftp):
+            raw: List[str] = []
+            ftp.cwd(directory)
+            ftp.retrlines("NLST", raw.append)
+            return raw
+        try:
+            raw = self._with_conn(op)
+        except ftplib.error_perm:
+            return []
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"[FTP] list_rpt_files({directory}): {e}")
+            return []
+        return sorted([
+            self._full_path(directory, f)
+            for f in raw
+            if f.split("/")[-1].lower().endswith(".rpt")
         ])
 
     def list_dir(self, directory: str) -> List[str]:
@@ -2648,6 +2678,16 @@ class EmbedBuilder:
                 description=f"**{ev.get('item','Unbekannt')}** → {ev.get('action','?')}",
                 color=0x9B59B6
             )
+        elif t == "server_restart":
+            e = discord.Embed(
+                title="♻️ SERVER NEU GESTARTET",
+                description="Der Gameserver wurde neu gestartet.",
+                color=0x2ECC71
+            )
+            if ev.get("gestartet"):
+                e.add_field(name="Startzeit", value=ev["gestartet"], inline=True)
+            e.add_field(name="Logdatei", value=f"`{ev.get('datei', '?')}`", inline=False)
+
         elif t in ("unconscious", "conscious"):
             bewusstlos = t == "unconscious"
             e = discord.Embed(
@@ -3462,6 +3502,7 @@ class DayZBot(discord.Client):
                 return
         try:
             loop = asyncio.get_running_loop()
+            await self._pruefe_neustart(conn, log_dir, loop)
             adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
             if not adm_files:
                 await self._check_ftp_health(conn)
@@ -3926,6 +3967,49 @@ class DayZBot(discord.Client):
             self.ftp = conn.ftp
         log.info(f"[NITRADO] 🔄 {conn.name}: FTP-Zugangsdaten über die API erneuert.")
         return True
+
+    async def _pruefe_neustart(self, conn: ServerConnection, log_dir: str, loop):
+        """Neue .RPT-Datei erkannt = der Gameserver wurde neu gestartet.
+
+        Jeder Serverstart legt eine neue RPT an, deren Name Datum und Uhrzeit
+        traegt (``DayZServer_..._20260808_142104.RPT``). Erkannt wird allein
+        am Dateinamen – die Datei selbst wird NIE geladen: sie ist mehrere
+        Megabyte gross und enthaelt fuer die Feeds nichts, was nicht schon in
+        der .ADM steht.
+
+        Das ergaenzt den eigenen Neustart-Zeitplan um die Faelle, die er nicht
+        kennt: Abstuerze und Neustarts von Nitrado-Seite.
+        """
+        try:
+            rpt = await loop.run_in_executor(None, conn.ftp.list_rpt_files, log_dir)
+        except Exception as e:  # noqa: BLE001 – Zugabe, darf den Poll nie kippen
+            log.debug(f"[POLL] RPT-Liste ({conn.name}): {e}")
+            return
+        if not rpt:
+            return
+        neueste = rpt[-1].split("/")[-1]
+        bekannt = conn.log_state.get("rpt_neueste")
+        if bekannt == neueste:
+            return
+        conn.log_state["rpt_neueste"] = neueste
+        connections.save()
+        if not bekannt:
+            # Erster Durchlauf: nur merken. Sonst meldete jeder Bot-Start
+            # einen Server-Neustart, den es gar nicht gab.
+            log.info(f"[POLL] {conn.name}: RPT-Stand gemerkt ({neueste}).")
+            return
+        # Aus DayZServer_PS4_x64_20260808_142104.RPT wird 08.08.2026 14:21:04
+        gestartet = ""
+        m = re.search(r"(\d{8})_(\d{6})", neueste)
+        if m:
+            d, u = m.group(1), m.group(2)
+            gestartet = f"{d[6:8]}.{d[4:6]}.{d[0:4]} {u[0:2]}:{u[2:4]}:{u[4:6]}"
+        log.info(f"[POLL] {conn.name}: Server-Neustart erkannt ({neueste}).")
+        await self._dispatch({"type": "server_restart",
+                              "timestamp": gestartet,
+                              "gestartet": gestartet,
+                              "datei": neueste,
+                              "raw": neueste}, conn)
 
     async def _check_ftp_health(self, conn: Optional[ServerConnection] = None):
         """Warnt im Adminlog-Feed, wenn das FTP-Polling dauerhaft fehlschlägt
@@ -11338,18 +11422,36 @@ def _read_asset(rel: str) -> Optional[bytes]:
     return _asset_from_memory(rel)
 
 
-def _asset_response(rel: str, fallback_text: str = "") -> web.Response:
+def _asset_response(rel: str, fallback_text: str = "",
+                    request: Optional[web.Request] = None) -> web.Response:
+    """Eine Frontend-Datei ausliefern – mit Revalidierung beim Browser.
+
+    Ohne Cache-Angaben behielt Chrome eine alte ``app.js`` und schickte sie
+    gegen ein bereits aktualisiertes Backend. Das Ergebnis war eine halb
+    aufgebaute Seite: das alte Skript fragte Felder ab, die es nicht mehr
+    gibt, und brach mitten im Aufbau ab.
+
+    ``no-cache`` heisst NICHT "nicht zwischenspeichern", sondern "vor jeder
+    Benutzung nachfragen". Zusammen mit dem ETag bleibt der Verkehr klein:
+    unveraenderte Dateien beantwortet der Server mit 304 statt sie erneut zu
+    senden.
+    """
     data = _read_asset(rel)
     if data is None:
         if fallback_text:
             return web.Response(text=fallback_text, status=500)
         return web.Response(status=404)
+    etag = f'"{_asset_digest(data)[:32]}"'
+    kopf = {"Cache-Control": "no-cache, must-revalidate", "ETag": etag}
+    # Kennt der Browser die Fassung schon, reicht ein 304 ohne Inhalt.
+    if request is not None and request.headers.get("If-None-Match") == etag:
+        return web.Response(status=304, headers=kopf)
     ctype, _enc = mimetypes.guess_type(rel)
     ctype = ctype or "application/octet-stream"
     textish = ctype.startswith("text/") or ctype in (
         "application/javascript", "application/json")
     return web.Response(body=data, content_type=ctype,
-                        charset="utf-8" if textish else None)
+                        charset="utf-8" if textish else None, headers=kopf)
 
 
 _ASSET_MANIFEST = ".assets.json"
@@ -14946,7 +15048,8 @@ _dash_site: Optional[Any] = None
 
 async def _dash_index(request: web.Request) -> web.Response:
     return _asset_response("index.html",
-                           fallback_text="Dashboard-Frontend fehlt (index.html).")
+                           fallback_text="Dashboard-Frontend fehlt (index.html).",
+                           request=request)
 
 
 async def _dash_health(request: web.Request) -> web.Response:
@@ -14971,7 +15074,7 @@ async def _dash_static(request: web.Request) -> web.Response:
     """
     tail = request.match_info.get("tail", "")
     prefix = "vendor/" if request.path.startswith("/vendor/") else ""
-    return _asset_response(prefix + tail)
+    return _asset_response(prefix + tail, request=request)
 
 
 def build_app() -> web.Application:
