@@ -1045,6 +1045,33 @@ class ConfigManager:
         except Exception:  # noqa: BLE001 – Registry evtl. noch nicht geladen
             return False
 
+    SEEN_PLAYERS_MAX = 1000
+
+    def seen_players(self, guild_id: int) -> List[str]:
+        """Ingame-Namen, die auf den Servern dieser Guild schon gesehen
+        wurden – Grundlage für die Allowlist-Autofill bei Zonen."""
+        eintrag = self.guilds.get(str(guild_id)) or {}
+        werte = eintrag.get("seen_players")
+        return werte if isinstance(werte, list) else []
+
+    def record_seen_player(self, guild_id: int, name: str) -> None:
+        """Merkt sich einen Ingame-Namen dieser Guild (case-insensitiv
+        dedupliziert, auf die letzten SEEN_PLAYERS_MAX gedeckelt)."""
+        name = (name or "").strip()
+        if not name:
+            return
+        eintrag = self.guilds.setdefault(str(guild_id), {})
+        seen = eintrag.get("seen_players")
+        if not isinstance(seen, list):
+            seen = []
+        if name.lower() in {str(n).lower() for n in seen}:
+            return
+        seen.append(name)
+        if len(seen) > self.SEEN_PLAYERS_MAX:
+            seen = seen[-self.SEEN_PLAYERS_MAX:]
+        eintrag["seen_players"] = seen
+        self.save_guilds()
+
     def get_channel(self, guild_id: int, log_type: str,
                     service_id: Optional[str] = None) -> Optional[int]:
         """Feed-Channel eines Log-Typs – bevorzugt der des genannten Servers.
@@ -3773,16 +3800,20 @@ class DayZBot(discord.Client):
                 except ValueError:
                     continue
                 for zone in zones:
-                    try:
-                        zx = float(zone.get("x", 0.0))
-                        zz = float(zone.get("z", 0.0))
-                        zr = float(zone.get("radius", 0.0))
-                    except (TypeError, ValueError):
-                        continue
-                    zkey = (_sid, str(zone["name"]).strip().lower(), pname)
-                    inside = (px - zx) ** 2 + (pz - zz) ** 2 <= zr * zr
+                    if zone.get("type") == "polygon":
+                        pts = zone.get("points")
+                        inside = isinstance(pts, list) and _point_in_polygon(px, pz, pts)
+                    else:
+                        try:
+                            zx = float(zone.get("x", 0.0))
+                            zz = float(zone.get("z", 0.0))
+                            zr = float(zone.get("radius", 0.0))
+                        except (TypeError, ValueError):
+                            continue
+                        inside = (px - zx) ** 2 + (pz - zz) ** 2 <= zr * zr
                     if not inside:
                         continue
+                    zkey = (_sid, str(zone["name"]).strip().lower(), pname)
                     if _player_in_allowlist(zone, pname):
                         continue     # Allowlist: nie pingen
                     if now - self._zone_last_ping.get(zkey, 0.0) < cooldown:
@@ -3801,13 +3832,15 @@ class DayZBot(discord.Client):
         loc = _location_field_value(info.get("position"))
         if loc:
             e.add_field(name="📍 • Player Location", value=loc, inline=False)
-        e.add_field(name="🎯 Zone",
-                    value=f"`{zone.get('x')}, {zone.get('z')}` · Radius **{zone.get('radius')} m**",
-                    inline=False)
+        if zone.get("type") == "polygon":
+            zone_val = f"Polygon · {len(zone.get('points') or [])} Punkte"
+        else:
+            zone_val = f"`{zone.get('x')}, {zone.get('z')}` · Radius **{zone.get('radius')} m**"
+        e.add_field(name="🎯 Zone", value=zone_val, inline=False)
         e.set_footer(text=f"Zone: {zone['name']}")
         e.timestamp = datetime.now(timezone.utc)
-        role_id = zone.get("role_id")
-        content = f"<@&{int(role_id)}>" if role_id else None
+        role_ids = _zone_ping_role_ids(zone)
+        content = " ".join(f"<@&{r}>" for r in role_ids) or None
         gid = int(zone["guild_id"]) if zone.get("guild_id") else None
         if gid is None:
             # Ohne Guild ginge der Alarm samt Spielername und Koordinaten an
@@ -4086,6 +4119,12 @@ class DayZBot(discord.Client):
             # Chat und Positionen eines Servers landeten dann bei fremden
             # Kunden, und Belohnungen wurden guilduebergreifend ausgezahlt.
             return
+        # Fuer die Allowlist-Autofill der Zonen: unabhaengig davon, ob fuer
+        # "connect" ueberhaupt ein Feed eingerichtet ist, sonst wuerden nur
+        # Namen von Servern mit aktivem Connect-Feed gemerkt.
+        if ev.get("type") == "connect" and ev.get("player"):
+            for gid_str in ([str(conn.guild_id)] if conn is not None else list(cfg.guilds)):
+                cfg.record_seen_player(int(gid_str), ev["player"])
         # Die feine Zuordnung (Zombie Death statt "Umwelttod") entscheidet, in
         # welchen Feed das Ereignis geht. EVENT_TO_LOG bleibt als Rueckfall
         # fuer Ereignisse ohne feinen Typ.
@@ -4561,48 +4600,6 @@ async def _require_conn(interaction: discord.Interaction,
 # ══════════════════════════════════════════════════════════════
 #  /setup – Alle Log-Channels konfigurieren
 # ══════════════════════════════════════════════════════════════
-setup_group = app_commands.Group(name="setup", description="⚙️ Log-Channels konfigurieren")
-
-@setup_group.command(name="feeds", description="⚙️ Feed-Channel für einen Log-Typ festlegen")
-@app_commands.describe(feed="Welcher Feed?", channel="Ziel-Channel für diesen Feed",
-                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
-@app_commands.choices(feed=[
-    app_commands.Choice(name=LOG_TYPES[k][:100], value=k) for k in LOG_TYPES
-])
-async def setup_feeds(interaction: discord.Interaction,
-                      feed: app_commands.Choice[str],
-                      channel: discord.TextChannel,
-                      server: Optional[str] = None):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
-    _conn, _fehler = _conn_waehlen(interaction, server)
-    if _conn is None:
-        return await interaction.response.send_message(
-            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
-    cfg.set_channel(interaction.guild_id, feed.value, channel.id,
-                    service_id=_conn.service_id)
-    await interaction.response.send_message(
-        f"✅ **{LOG_TYPES[feed.value]}** → {channel.mention}", ephemeral=True)
-
-
-@setup_group.command(name="uebersicht", description="📋 Zeigt alle konfigurierten Channels")
-@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
-async def setup_overview(interaction: discord.Interaction, server: Optional[str] = None):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
-    _conn, _fehler = _conn_waehlen(interaction, server)
-    if _conn is None:
-        return await interaction.response.send_message(_fehler, ephemeral=True)
-    embed = discord.Embed(title=f"📋 Channel-Konfiguration – {_conn.name}", color=0x5865F2)
-    for lt, desc in LOG_TYPES.items():
-        ch_id = cfg.get_channel(interaction.guild_id, lt, _conn.service_id)
-        embed.add_field(
-            name=desc,
-            value=f"<#{ch_id}>" if ch_id else "❌ Nicht gesetzt",
-            inline=False
-        )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
 def _panel_view_registrieren(conn: "ServerConnection") -> None:
     """Persistente Whitelist-Panel-View fuer diesen Server anmelden.
 
@@ -4616,237 +4613,6 @@ def _panel_view_registrieren(conn: "ServerConnection") -> None:
         log.debug(f"[WL] Panel-View {conn.service_id}: {e}")
 
 
-async def _finish_token_setup(token: str, service_id: str,
-                              service: Dict,
-                              actor_id: Optional[str] = None,
-                              guild_id: Optional[int] = None) -> discord.Embed:
-    """Wendet Token + Server-Auswahl aus /setup token an: speichert beides,
-    erkennt FTP-Zugang & aktuelle Karte, initialisiert Nitrado/FTP/Shop neu
-    und gibt ein Ergebnis-Embed zurück."""
-    # Die globale config.json wird bewusst NICHT mehr umgeschrieben: sonst
-    # wuerde der Server des zuletzt einrichtenden Kunden zum Hauptserver, und
-    # seine FTP-Zugangsdaten laegen dort fuer alle anderen bereit.
-    vorhandene = connections.for_service(service_id)
-    if vorhandene is not None and vorhandene.token != token:
-        for k in ("ftp_log_dir", "ftp_ban_file", "ftp_profile_dir",
-                  "ftp_mission_dir", "cfg_effect_area_path", "server_ip"):
-            vorhandene.set(k, "")
-        vorhandene.data["log_state"] = {}
-        log.info(f"[SETUP] Neuer Token für Service {service_id}: "
-                 f"FTP-Pfade und Log-Position zurückgesetzt.")
-
-    api = NitradoAPI(token=token, service_id=service_id,
-                     base=cfg.config.get("nitrado_api_base", "https://api.nitrado.net"))
-    try:
-        info = await api.get_info()
-    finally:
-        await api.close()
-
-    details  = service.get("details") or {}
-    name     = details.get("name") or details.get("game") or f"Service {service_id}"
-
-    # Verbindung anlegen bzw. auffrischen. Bewusst OHNE die Werte aus der
-    # globalen config zu kopieren – ein neuer Kunde soll nicht die FTP-Pfade,
-    # Zonen und Zeitpläne des Betreibers erben.
-    # Besitzer mitschreiben: dieselbe Person erkennt das Dashboard beim
-    # Discord-Login wieder und fragt den Token nicht erneut ab.
-    fields = {"nitrado_token": token, "name": name}
-    if actor_id:
-        fields["owner_discord_id"] = str(actor_id)
-    conn = connections.upsert(service_id, **fields)
-
-    warnings = []
-    if info:
-        _apply_gameserver_info(info, conn)
-        connections.save()
-    else:
-        warnings.append("⚠️ Gameserver-Infos konnten nicht geladen werden "
-                        "(Nitrado-API-Fehler) – FTP/Karte nicht erkannt.")
-
-    # Freischalten ist Sache des Bot-Betreibers – wie im Dashboard wird die
-    # Guild hier nur vorgemerkt. Sonst gaebe sich jeder, der den Bot in seinen
-    # Discord einlaedt, mit /setup token selbst Premium.
-    freigeschaltet = False
-    if guild_id:
-        _bestand = connections.all_for_guild(guild_id)
-        # Wie im Dashboard: wer hier schon einen eigenen Server hat, darf einen
-        # weiteren anschliessen – sonst entscheidet der Betreiber.
-        _eigener_bestand = bool(actor_id) and any(
-            str(c.data.get("owner_discord_id") or "") == str(actor_id)
-            for c in _bestand)
-        if conn in _bestand and conn.guild_id == int(guild_id):
-            freigeschaltet = True            # war schon freigeschaltet
-            # Auch hier sicherstellen, dass die Befehle wirklich dort stehen –
-            # sonst meldet das Embed Erfolg, in der Guild ist aber nichts.
-            ids = _configured_guild_ids()
-            if int(guild_id) not in ids:
-                ids.append(int(guild_id))
-                cfg.config["guild_ids"] = ids
-                cfg.save_config()
-                try:
-                    await _register_guild_commands(int(guild_id))
-                except Exception as e:  # noqa: BLE001
-                    warnings.append(f"⚠️ Befehle konnten nicht registriert werden: {e}")
-        elif await _discord_user_is_admin(int(actor_id or 0)) or _eigener_bestand:
-            # Betreiber – oder ein Kunde, dem in dieser Guild schon ein Server
-            # gehoert – darf direkt zuordnen. Eine Guild kann mehrere Server
-            # verwalten.
-            okay, meldung = connections.assign_guild(service_id, int(guild_id))
-            if okay:
-                freigeschaltet = True
-                conn.data.pop("guild_id_requested", None)   # Anfrage erledigt
-                # Wie im Dashboard: Zuordnung heisst Freischaltung, die Befehle
-                # sollen sofort in dieser Guild stehen.
-                ids = _configured_guild_ids()
-                if int(guild_id) not in ids:
-                    ids.append(int(guild_id))
-                    cfg.config["guild_ids"] = ids
-                    cfg.save_config()
-                try:
-                    await _register_guild_commands(int(guild_id))
-                except Exception as e:  # noqa: BLE001
-                    warnings.append(f"⚠️ Befehle konnten nicht registriert werden: {e}")
-            else:
-                warnings.append(f"❌ {meldung}")
-        else:
-            conn.data["guild_id_requested"] = int(guild_id)
-            connections.save()
-            warnings.append(
-                f"⏳ Discord-Server `{guild_id}` ist vorgemerkt – der Bot-Betreiber "
-                f"schaltet ihn im Dashboard unter **Serverliste** frei. Bis dahin "
-                f"antworten die Befehle hier mit „du hast kein Premium“.")
-
-    # Nitrado/FTP/Shop mit den neuen Daten (neu) initialisieren –
-    # inklusive FTP-Auto-Discovery der Log-Verzeichnisse. NUR dieser Server,
-    # damit die Verbindungen der anderen Kunden nicht neu aufgebaut werden.
-    await bot.init_nitrado(force=True, only=conn)
-    _panel_view_registrieren(conn)
-    ftp_host = conn.get("ftp_host") or "❌ Nicht gefunden"
-    log_dir  = conn.get("ftp_log_dir") or "❌ Nicht gefunden"
-    if not conn.get("ftp_host"):
-        warnings.append("⚠️ Keine FTP-Zugangsdaten gefunden – Log-Feeds und "
-                        "Shop-Lieferung funktionieren so nicht.")
-
-    embed = discord.Embed(
-        title="✅ Nitrado-Server eingerichtet",
-        description=f"Der Bot arbeitet jetzt mit **{name}**.",
-        color=0x2ECC71 if not warnings else 0xE67E22)
-    embed.add_field(name="Freischaltung",
-                    value=("✅ Dieser Discord-Server verwaltet ihn"
-                           if freigeschaltet else "⏳ Wartet auf den Bot-Betreiber"),
-                    inline=True)
-    embed.add_field(name="Service-ID",      value=f"`{service_id}`", inline=True)
-    embed.add_field(name="Aktive Karte",    value=conn.get("map_name", "–"), inline=True)
-    embed.add_field(name="FTP-Host",        value=f"`{ftp_host}`",   inline=False)
-    embed.add_field(name="Log-Verzeichnis", value=f"`{log_dir}`",    inline=False)
-    if warnings:
-        embed.add_field(name="Hinweise", value="\n".join(warnings), inline=False)
-    embed.set_footer(text="Alle Werte wurden in connections.json gespeichert – "
-                          "beim nächsten Start ist kein /setup token nötig.")
-    return embed
-
-
-class NitradoServerSelectView(discord.ui.View):
-    """Server-Auswahl für /setup token: Dropdown der über den Token
-    verfügbaren Nitrado-Server + Bestätigen-Button."""
-
-    def __init__(self, interaction: discord.Interaction, token: str,
-                 services: List[Dict]):
-        super().__init__(timeout=180)
-        self.author_id = interaction.user.id
-        self.token     = token
-        self.selected: Optional[str] = None
-        self._services = {str(s.get("id")): s for s in services}
-        options = []
-        for s in services[:25]:   # Discord erlaubt max. 25 Optionen pro Dropdown
-            details = s.get("details") or {}
-            label = str(details.get("name") or details.get("game")
-                        or f"Service {s.get('id')}")[:100]
-            desc  = " · ".join(x for x in (str(details.get("game") or "")[:50],
-                                           str(s.get("status") or ""),
-                                           f"ID {s.get('id')}") if x)[:100]
-            options.append(discord.SelectOption(label=label,
-                                                value=str(s.get("id")),
-                                                description=desc or None))
-        self.sel_server.options = options
-
-    async def interaction_check(self, itx: discord.Interaction) -> bool:
-        if itx.user.id != self.author_id:
-            await itx.response.send_message(
-                "❌ Nur wer den Befehl aufgerufen hat, kann hier auswählen.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.select(placeholder="🖥️ Nitrado-Server auswählen",
-                       options=[discord.SelectOption(label="wird geladen…", value="0")])
-    async def sel_server(self, itx: discord.Interaction, select: discord.ui.Select):
-        self.selected = select.values[0]
-        await itx.response.defer()
-
-    @discord.ui.button(label="✅ Server bestätigen", style=discord.ButtonStyle.success)
-    async def confirm(self, itx: discord.Interaction, button: discord.ui.Button):
-        if self.selected is None:
-            return await itx.response.send_message(
-                "❌ Bitte zuerst einen Server im Dropdown auswählen.", ephemeral=True)
-        for child in self.children:
-            child.disabled = True
-        await itx.response.edit_message(
-            content="🔧 Richte den Server ein (FTP-Zugang, Karte, Log-Verzeichnisse)…",
-            embed=None, view=self)
-        try:
-            embed = await _finish_token_setup(
-                self.token, self.selected, self._services.get(self.selected) or {},
-                actor_id=str(itx.user.id), guild_id=itx.guild_id)
-        except Exception as e:
-            log.error(f"[SETUP] /setup token fehlgeschlagen: {e}")
-            embed = discord.Embed(
-                title="❌ Einrichtung fehlgeschlagen",
-                description=f"Unerwarteter Fehler: `{e}`\nBitte erneut versuchen.",
-                color=0xE74C3C)
-        await itx.edit_original_response(content=None, embed=embed, view=self)
-        self.stop()
-
-
-@setup_group.command(name="token",
-                     description="🔑 Nitrado-Token setzen & Server per Dropdown auswählen")
-@app_commands.describe(token="Dein Nitrado Long-Life-Token (Nitrado → Benutzereinstellungen → API-Schlüssel)")
-async def setup_token(interaction: discord.Interaction, token: str):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
-    await interaction.response.defer(ephemeral=True)
-
-    token = token.strip()
-    api = NitradoAPI(token=token, service_id="",
-                     base=cfg.config.get("nitrado_api_base", "https://api.nitrado.net"))
-    try:
-        services = await api.list_services()
-    finally:
-        await api.close()
-
-    gameservers = [s for s in services
-                   if str(s.get("type", "")).lower() == "gameserver"]
-    if not gameservers:
-        return await interaction.followup.send(
-            "❌ Über diesen Token wurden keine Gameserver gefunden.\n"
-            "Prüfe, ob der Token korrekt kopiert wurde "
-            "(Nitrado → Benutzereinstellungen → API-Schlüssel, Long-Life-Token "
-            "mit Berechtigung für deine Services).", ephemeral=True)
-
-    desc = (f"Token akzeptiert – **{len(gameservers)} Server** gefunden.\n"
-            "Wähle im Dropdown den Server aus, mit dem der Bot arbeiten soll, "
-            "und bestätige. FTP-Zugang und die aktive Karte werden dann "
-            "automatisch erkannt.")
-    if len(gameservers) > 25:
-        desc += "\n⚠️ Es werden nur die ersten 25 Server angezeigt."
-    embed = discord.Embed(title="🔑 Nitrado-Server auswählen",
-                          description=desc, color=0x5865F2)
-    await interaction.followup.send(
-        embed=embed,
-        view=NitradoServerSelectView(interaction, token, gameservers),
-        ephemeral=True)
-
-
-bot.tree.add_command(setup_group)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -4901,107 +4667,11 @@ async def cmd_show_feeds(interaction: discord.Interaction, server: Optional[str]
             inline=False,
         )
 
-    embed.set_footer(text="Nutze /edit_feeds um einzelne Feeds zu ändern")
+    embed.set_footer(text="Feeds werden im Dashboard unter „Feeds“ geändert")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ══════════════════════════════════════════════════════════════
-#  /edit_feeds – Einzelnen Feed-Channel ändern
-#  Wähle den Feed-Typ per Autocomplete, dann den neuen Channel
-# ══════════════════════════════════════════════════════════════
-@bot.tree.command(
-    name="edit_feeds",
-    description="✏️ Feed-Channel ändern oder deaktivieren"
-)
-@app_commands.describe(
-    feed="Welcher Feed soll geändert werden? (Tippe um zu filtern)",
-    channel="Neuer Channel – leer lassen zum Deaktivieren",
-    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)"
-)
-async def cmd_edit_feeds(
-    interaction: discord.Interaction,
-    feed: str,
-    channel: Optional[discord.TextChannel] = None,
-    server: Optional[str] = None,
-):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
-    _conn_feeds, _fehler = _conn_waehlen(interaction, server)
-    if _conn_feeds is None:
-        return await interaction.response.send_message(
-            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
-
-    # Ungültigen Feed-Key abfangen (falls jemand manuell eingibt)
-    if feed not in LOG_TYPES:
-        choices = ", ".join(f"`{k}`" for k in LOG_TYPES)
-        return await interaction.response.send_message(
-            f"❌ Unbekannter Feed `{feed}`.\nGültige Feeds: {choices}",
-            ephemeral=True,
-        )
-
-    desc = LOG_TYPES[feed]
-
-    if channel is None:
-        # Feed deaktivieren
-        eigen = cfg.server_feeds(interaction.guild_id,
-                                 _conn_feeds.service_id, anlegen=True)
-        gid = str(interaction.guild_id)
-        entfernt = eigen.pop(feed, None) is not None
-        # Alt-Bestand auf Guild-Ebene ebenfalls raeumen, sonst greift er wieder
-        # als Rueckfall, solange die Guild nur einen Server hat.
-        if gid in cfg.guilds and feed in cfg.guilds[gid]:
-            del cfg.guilds[gid][feed]
-            entfernt = True
-        if entfernt:
-            cfg.save_guilds()
-        embed = discord.Embed(
-            title="⚪ Feed deaktiviert",
-            description=f"**{desc}**\nwird nicht mehr gepostet.",
-            color=0x95A5A6,
-        )
-    else:
-        # Feed auf neuen Channel setzen
-        cfg.set_channel(interaction.guild_id, feed, channel.id,
-                        service_id=_conn_feeds.service_id)
-        embed = discord.Embed(
-            title="✅ Feed geändert",
-            description=f"**{desc}**\n╰ {channel.mention}",
-            color=0x2ECC71,
-        )
-
-    embed.set_footer(text="Nutze /show_feeds für eine Gesamtübersicht")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-@cmd_edit_feeds.autocomplete("feed")
-async def _feed_autocomplete(
-    interaction: discord.Interaction,
-    current: str,
-) -> List[app_commands.Choice[str]]:
-    """Autocomplete: zeigt alle passenden Feed-Typen mit ihrem aktuellen Channel."""
-    # Ohne ausgefuelltes `server` der Leitserver – sonst staende ueberall ❌,
-    # obwohl die Feeds gesetzt sind.
-    _ac = _ac_conns(interaction)
-    _sid_ac = _ac[0].service_id if _ac else None
-    results   = []
-    for lt, desc in LOG_TYPES.items():
-        if current.lower() in lt.lower() or current.lower() in desc.lower() or not current:
-            ch_id  = cfg.get_channel(interaction.guild_id, lt, _sid_ac)
-            status = "✅" if ch_id else "❌"
-            # Channel-Name im Label anzeigen wenn möglich
-            ch_name = ""
-            if ch_id and interaction.guild:
-                ch = interaction.guild.get_channel(int(ch_id))
-                ch_name = f" → #{ch.name}" if ch else f" → <#{ch_id}>"
-            label = f"{status} {desc.strip()}{ch_name}"[:100]
-            results.append(app_commands.Choice(name=label, value=lt))
-    return results[:25]
-
-
-setup_feeds.autocomplete("server")(_server_autocomplete)
-setup_overview.autocomplete("server")(_server_autocomplete)
 cmd_show_feeds.autocomplete("server")(_server_autocomplete)
-cmd_edit_feeds.autocomplete("server")(_server_autocomplete)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -5361,9 +5031,94 @@ def _reset_zone_state(zone_name: str, conn: Optional[ServerConnection] = None):
         k: v for k, v in bot._zone_last_ping.items()
         if not (k[1] == zk and (sid is None or k[0] == sid))}
 
+def _zone_ping_role_ids(zone: Dict) -> List[int]:
+    """Rollen, die beim Ping markiert werden – Liste `ping_role_ids`, sonst
+    (Altbestand) das frühere einzelne `role_id`."""
+    ids = zone.get("ping_role_ids")
+    if isinstance(ids, list):
+        out = []
+        for r in ids:
+            try:
+                out.append(int(r))
+            except (TypeError, ValueError):
+                continue
+        return out
+    legacy = zone.get("role_id")
+    return [int(legacy)] if legacy else []
+
+
+def _zone_payload(z: Dict) -> Dict:
+    """Liest eine Zone rückwärtskompatibel: Altbestand ohne `type` gilt als
+    `circular`, ein einzelnes altes `role_id` erscheint zusätzlich als Liste
+    `ping_role_ids`. Der gespeicherte Eintrag wird dabei NICHT umgeschrieben."""
+    out = dict(z)
+    out["type"] = z.get("type") or "circular"
+    out["ping_role_ids"] = _zone_ping_role_ids(z)
+    manage = z.get("manage_role_ids")
+    out["manage_role_ids"] = manage if isinstance(manage, list) else []
+    if out["type"] == "polygon":
+        pts = z.get("points")
+        out["points"] = pts if isinstance(pts, list) else []
+    return out
+
+
+def _ensure_zone_ids(zones: List[Dict]) -> bool:
+    """Vergibt fortlaufende `id`-Felder an Zonen, die noch keins haben (reiner
+    Anzeigewert, die Ansprache über die API läuft weiter über `name`).
+    Gibt True zurück, wenn etwas ergänzt wurde (dann muss gespeichert werden)."""
+    changed = False
+    next_id = 1 + max([int(z.get("id", 0)) for z in zones if isinstance(z, dict)] or [0])
+    for z in zones:
+        if isinstance(z, dict) and not z.get("id"):
+            z["id"] = next_id
+            next_id += 1
+            changed = True
+    return changed
+
+
+def _point_in_polygon(px: float, pz: float, points: List[Dict]) -> bool:
+    """Ray-Casting-Test: True, wenn (px, pz) innerhalb des Polygons liegt."""
+    n = len(points)
+    if n < 3:
+        return False
+    inside = False
+    try:
+        x1, z1 = float(points[-1]["x"]), float(points[-1]["z"])
+        for p in points:
+            x2, z2 = float(p["x"]), float(p["z"])
+            if (z1 > pz) != (z2 > pz):
+                x_schnitt = (x2 - x1) * (pz - z1) / (z2 - z1) + x1
+                if px < x_schnitt:
+                    inside = not inside
+            x1, z1 = x2, z2
+    except (TypeError, ValueError, KeyError, ZeroDivisionError):
+        return False
+    return inside
+
+
+def _validate_zone_points(points: Any) -> Optional[str]:
+    """Gibt eine Fehlermeldung zurück oder None, wenn die Polygon-Punkte ok sind."""
+    if not isinstance(points, list) or len(points) < 3:
+        return "❌ Ein Polygon braucht mindestens 3 Koordinatenpunkte."
+    for p in points:
+        if not isinstance(p, dict):
+            return "❌ Jeder Polygon-Punkt braucht `x` und `z`."
+        try:
+            px, pz = float(p.get("x")), float(p.get("z"))
+        except (TypeError, ValueError):
+            return "❌ Jeder Polygon-Punkt braucht Zahlen für `x` und `z`."
+        if not (0.0 <= px <= 20000.0 and 0.0 <= pz <= 20000.0):
+            return "❌ Ein Polygon-Punkt liegt außerhalb der Map."
+    return None
+
+
 def _zone_summary(z: Dict) -> str:
-    role = f" · Ping: <@&{int(z['role_id'])}>" if z.get("role_id") else ""
+    roles = _zone_ping_role_ids(z)
+    role = f" · Ping: {' '.join(f'<@&{r}>' for r in roles)}" if roles else ""
     chan = f" · Channel: <#{int(z['channel_id'])}>" if z.get("channel_id") else ""
+    if z.get("type") == "polygon":
+        pts = z.get("points") or []
+        return f"Polygon mit {len(pts)} Punkten{role}{chan}"
     return (f"Zentrum `{z.get('x')}, {z.get('z')}` (x=Ost, z=Nord) · "
             f"Radius **{z.get('radius')} m**{role}{chan}")
 
@@ -5393,90 +5148,6 @@ def _validate_zone_geometry(x: float, z: float, radius: float) -> Optional[str]:
     return None
 
 
-@zone_group.command(name="create",
-                    description="🛡️ Zone anlegen – pingt alle 5 Min, solange ein Spieler darin steht (Admin)")
-@app_commands.describe(
-    x="X-Koordinate des Zentrums (iZurvive, Ost)",
-    z="Z-Koordinate des Zentrums (iZurvive, Nord)",
-    name="Name der Zone (frei wählbar, einmalig)",
-    radius="Radius in Metern, in dem der Bot nach Spielern schaut",
-    channel="Optional: Channel, in den die Warnungen dieser Zone gepostet werden",
-    rolle="Optional: Rolle, die beim Ping mit @ markiert wird",
-    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
-async def zone_create(interaction: discord.Interaction, x: float, z: float,
-                      name: str, radius: float,
-                      channel: Optional[discord.TextChannel] = None,
-                      rolle: Optional[discord.Role] = None,
-                      server: Optional[str] = None):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
-    _c, _fehler = _conn_waehlen(interaction, server)
-    if _c is None:
-        return await interaction.response.send_message(_fehler, ephemeral=True)
-    name = name.strip()
-    if not name or len(name) > 60:
-        return await interaction.response.send_message(
-            "❌ Zonen-Name fehlt oder ist länger als 60 Zeichen.", ephemeral=True)
-    if _find_zone(name, _c):
-        return await interaction.response.send_message(
-            f"❌ Zone **{name}** existiert bereits – `/zone edit` zum Ändern "
-            f"oder `/zone remove` zum Löschen.", ephemeral=True)
-    err = _validate_zone_geometry(x, z, radius)
-    if err:
-        return await interaction.response.send_message(err, ephemeral=True)
-    zone = {
-        "name":       name,
-        "x":          round(float(x), 1),
-        "z":          round(float(z), 1),
-        "radius":     round(float(radius), 1),
-        "role_id":    int(rolle.id) if rolle else None,
-        "channel_id": int(channel.id) if channel else None,
-        "guild_id":   int(interaction.guild_id),
-    }
-    _zones(_c).append(zone)
-    _zones_save(_c)
-    e = discord.Embed(title="🛡️ Zone angelegt",
-                      description=f"**{name}**\n{_zone_summary(zone)}",
-                      color=0x2ECC71)
-    if not channel and not cfg.get_channel(interaction.guild_id, "zone",
-                                           _c.service_id if _c else None):
-        e.add_field(name="ℹ️ Hinweis",
-                    value="Kein Channel gesetzt – Pings gehen in den **adminlog**. "
-                          "Gib bei `/zone create` das Feld `channel` an oder setze mit "
-                          "`/setup feeds` den Feed **zone**.",
-                    inline=False)
-    await interaction.response.send_message(embed=e, ephemeral=True)
-
-
-@zone_group.command(name="remove",
-                    description="🗑️ Zone entfernen – dort wird nicht mehr gesucht (Admin)")
-@app_commands.describe(name="Name der Zone (Autocomplete)",
-                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
-async def zone_remove(interaction: discord.Interaction, name: str,
-                      server: Optional[str] = None):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
-    _c, _fehler = _conn_waehlen(interaction, server)
-    if _c is None:
-        return await interaction.response.send_message(_fehler, ephemeral=True)
-    zone = _find_zone(name, _c)
-    if not zone:
-        return await interaction.response.send_message(
-            f"❌ Keine Zone namens **{name.strip()}** gefunden – `/zone list` zeigt alle.",
-            ephemeral=True)
-    _zones(_c).remove(zone)
-    _zones_save(_c)
-    _reset_zone_state(str(zone["name"]), _c)
-    await interaction.response.send_message(
-        embed=discord.Embed(
-            title="🗑️ Zone entfernt",
-            description=f"**{zone['name']}** wird nicht mehr überwacht.\n{_zone_summary(zone)}",
-            color=0xE74C3C),
-        ephemeral=True)
-
-zone_remove.autocomplete("name")(_zone_name_autocomplete)
-
-
 @zone_group.command(name="list", description="📋 Alle aktiven Zonen anzeigen (Admin)")
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def zone_list(interaction: discord.Interaction, server: Optional[str] = None):
@@ -5488,7 +5159,7 @@ async def zone_list(interaction: discord.Interaction, server: Optional[str] = No
     zones = [z for z in _zones(_c) if isinstance(z, dict) and z.get("name")]
     if not zones:
         return await interaction.response.send_message(
-            "ℹ️ Keine Zonen angelegt. Mit `/zone create` eine Zone einrichten.",
+            "ℹ️ Keine Zonen angelegt. Im Dashboard unter „Zonen“ eine Zone einrichten.",
             ephemeral=True)
     e = discord.Embed(title=f"🛡️ Aktive Zonen ({len(zones)})", color=0x3498DB)
     for z in zones[:25]:
@@ -5496,88 +5167,6 @@ async def zone_list(interaction: discord.Interaction, server: Optional[str] = No
     if len(zones) > 25:
         e.set_footer(text=f"… und {len(zones) - 25} weitere (Embed-Limit)")
     await interaction.response.send_message(embed=e, ephemeral=True)
-
-
-@zone_group.command(name="edit",
-                    description="✏️ Zone bearbeiten – nur die angegebenen Felder werden geändert (Admin)")
-@app_commands.describe(
-    name="Name der Zone, die bearbeitet werden soll (Autocomplete)",
-    neuer_name="Optional: neuer Name der Zone",
-    x="Optional: neue X-Koordinate (iZurvive, Ost)",
-    z="Optional: neue Z-Koordinate (iZurvive, Nord)",
-    radius="Optional: neuer Radius in Metern",
-    channel="Optional: neuer Channel für die Warnungen dieser Zone",
-    channel_entfernen="True = eigenen Zonen-Channel entfernen (Fallback: Feed zone/adminlog)",
-    rolle="Optional: neue Rolle für den Ping",
-    rolle_entfernen="True = Rollen-Ping ausschalten",
-    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
-async def zone_edit(interaction: discord.Interaction, name: str,
-                    neuer_name: Optional[str] = None,
-                    x: Optional[float] = None, z: Optional[float] = None,
-                    radius: Optional[float] = None,
-                    channel: Optional[discord.TextChannel] = None,
-                    channel_entfernen: bool = False,
-                    rolle: Optional[discord.Role] = None,
-                    rolle_entfernen: bool = False,
-                    server: Optional[str] = None):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
-    _c, _fehler = _conn_waehlen(interaction, server)
-    if _c is None:
-        return await interaction.response.send_message(_fehler, ephemeral=True)
-    zone = _find_zone(name, _c)
-    if not zone:
-        return await interaction.response.send_message(
-            f"❌ Keine Zone namens **{name.strip()}** gefunden – `/zone list` zeigt alle.",
-            ephemeral=True)
-    if (neuer_name is None and x is None and z is None and radius is None
-            and rolle is None and not rolle_entfernen
-            and channel is None and not channel_entfernen):
-        return await interaction.response.send_message(
-            "❌ Nichts zu ändern – mindestens ein Feld angeben "
-            "(`neuer_name`, `x`, `z`, `radius`, `channel`, `channel_entfernen`, "
-            "`rolle`, `rolle_entfernen`).",
-            ephemeral=True)
-    new_x = float(x)      if x      is not None else float(zone.get("x", 0.0))
-    new_z = float(z)      if z      is not None else float(zone.get("z", 0.0))
-    new_r = float(radius) if radius is not None else float(zone.get("radius", 0.0))
-    err = _validate_zone_geometry(new_x, new_z, new_r)
-    if err:
-        return await interaction.response.send_message(err, ephemeral=True)
-    if neuer_name is not None:
-        neuer_name = neuer_name.strip()
-        if not neuer_name or len(neuer_name) > 60:
-            return await interaction.response.send_message(
-                "❌ Neuer Name fehlt oder ist länger als 60 Zeichen.", ephemeral=True)
-        existing = _find_zone(neuer_name, _c)
-        if existing is not None and existing is not zone:
-            return await interaction.response.send_message(
-                f"❌ Es gibt bereits eine Zone namens **{neuer_name}**.", ephemeral=True)
-    old_name = str(zone["name"])
-    if neuer_name is not None:
-        zone["name"] = neuer_name
-    zone["x"], zone["z"], zone["radius"] = round(new_x, 1), round(new_z, 1), round(new_r, 1)
-    if rolle_entfernen:
-        zone["role_id"] = None
-    elif rolle is not None:
-        zone["role_id"] = int(rolle.id)
-    if channel_entfernen:
-        zone["channel_id"] = None
-    elif channel is not None:
-        zone["channel_id"] = int(channel.id)
-    _zones_save(_c)
-    # Alten UND neuen Zustand verwerfen: Geometrie/Name haben sich evtl. geändert,
-    # die nächste frische Position bewertet die Zone komplett neu
-    _reset_zone_state(old_name, _c)
-    _reset_zone_state(str(zone["name"]), _c)
-    await interaction.response.send_message(
-        embed=discord.Embed(
-            title="✏️ Zone aktualisiert",
-            description=f"**{zone['name']}**\n{_zone_summary(zone)}",
-            color=0x2ECC71),
-        ephemeral=True)
-
-zone_edit.autocomplete("name")(_zone_name_autocomplete)
 
 
 # ── /zone allowlist – Spieler in einer Zone ignorieren (Admin) ──
@@ -5691,10 +5280,7 @@ async def zone_allowlist_show(interaction: discord.Interaction, zone: str,
 
 zone_allowlist_show.autocomplete("zone")(_zone_name_autocomplete)
 
-zone_create.autocomplete("server")(_server_autocomplete)
-zone_remove.autocomplete("server")(_server_autocomplete)
 zone_list.autocomplete("server")(_server_autocomplete)
-zone_edit.autocomplete("server")(_server_autocomplete)
 zone_allowlist_add.autocomplete("server")(_server_autocomplete)
 zone_allowlist_remove.autocomplete("server")(_server_autocomplete)
 zone_allowlist_show.autocomplete("server")(_server_autocomplete)
@@ -10291,32 +9877,6 @@ async def shop_check(interaction: discord.Interaction, server: Optional[str] = N
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@shop_group.command(name="setprice", description="💲 Change the price of a shop item (admin)")
-@app_commands.describe(item="Item name", price="New price",
-                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
-async def shop_setprice(interaction: discord.Interaction,
-                        item: str, price: app_commands.Range[int, 0],
-                        server: Optional[str] = None):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
-    katalog = await _require_catalog(interaction, server=server)
-    if katalog is None:
-        return
-    it = katalog.find(item)
-    if not it:
-        return await interaction.response.send_message(
-            f"❌ Item `{item}` not found in the shop catalog.", ephemeral=True)
-    old = int(it.get("price", 0))
-    it["price"] = int(price)
-    saved = katalog.save()
-    note = "" if saved else f"\n⚠️ Could not persist to `{katalog.source}` – change is in memory only."
-    await interaction.response.send_message(
-        f"💲 **{it['name']}**: {_fmt_money(old)} → **{_fmt_money(int(price))}**{note}",
-        ephemeral=True)
-
-shop_setprice.autocomplete("item")(_shop_item_autocomplete)
-
-
 @shop_group.command(name="enable", description="🔧 Enable or disable a shop item (admin)")
 @app_commands.describe(item="Item name", enabled="True = buyable, False = hidden from the shop",
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
@@ -10340,253 +9900,19 @@ async def shop_enable(interaction: discord.Interaction, item: str, enabled: bool
 
 shop_enable.autocomplete("item")(_shop_item_autocomplete)
 
-
-@shop_group.command(name="removeitem",
-                    description="🗑️ Remove an item/bundle from the shop catalog (admin)")
-@app_commands.describe(item="Item name",
-                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
-async def shop_removeitem(interaction: discord.Interaction, item: str,
-                          server: Optional[str] = None):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
-    katalog = await _require_catalog(interaction, server=server)
-    if katalog is None:
-        return
-    it = katalog.find(item)
-    if not it:
-        return await interaction.response.send_message(
-            f"❌ Item `{item}` not found in the shop catalog.", ephemeral=True)
-    try:
-        katalog.items.remove(it)
-    except ValueError:
-        pass
-    saved = katalog.save()
-    note = "" if saved else f"\n⚠️ Could not persist to `{katalog.source}` – change is in memory only."
-    await interaction.response.send_message(
-        f"🗑️ **{it.get('name', item)}** was removed from the catalog.{note}", ephemeral=True)
-
-shop_removeitem.autocomplete("item")(_shop_item_autocomplete)
-
 shop_list.autocomplete("server")(_server_autocomplete)
 shop_pending.autocomplete("server")(_server_autocomplete)
 shop_cleanup.autocomplete("server")(_server_autocomplete)
 shop_check.autocomplete("server")(_server_autocomplete)
-shop_setprice.autocomplete("server")(_server_autocomplete)
 shop_enable.autocomplete("server")(_server_autocomplete)
-shop_removeitem.autocomplete("server")(_server_autocomplete)
 
 bot.tree.add_command(shop_group)
-
-
-# ══════════════════════════════════════════════════════════════
-#  /add shopitem – Items/Bundles zur Laufzeit in den Katalog
-# ══════════════════════════════════════════════════════════════
-add_group = app_commands.Group(name="add", description="➕ Add entries to the shop catalog")
-
-@add_group.command(name="shopitem",
-                   description="➕ Add an item or bundle to the shop catalog (admin)")
-@app_commands.describe(
-    classnames="One classname, or several separated by comma/space = bundle (e.g. M4A1, Mag_STANAG_60Rnd)",
-    price="Price for the item / the whole bundle",
-    name="Display name (optional – default: the classname itself)",
-    category="Shop category (optional – default: Custom, bundles: Bundles)",
-    max_amount="Max amount per purchase (optional – default: 5, bundles: 1)",
-    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
-async def add_shopitem(interaction: discord.Interaction, classnames: str,
-                       price: app_commands.Range[int, 0],
-                       name: Optional[str] = None,
-                       category: Optional[str] = None,
-                       max_amount: Optional[app_commands.Range[int, 1]] = None,
-                       server: Optional[str] = None):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
-    katalog = await _require_catalog(interaction, server=server)
-    if katalog is None:
-        return
-
-    # Classnames parsen: Komma/Semikolon/Leerzeichen, Reihenfolge behalten, Duplikate raus
-    parts: List[str] = []
-    seen: set = set()
-    for tok in re.split(r"[,;\s]+", classnames.strip()):
-        if tok and tok.lower() not in seen:
-            seen.add(tok.lower())
-            parts.append(tok)
-    if not parts:
-        return await interaction.response.send_message(
-            "❌ No classname given. Example: `M4A1` or `M4A1, Mag_STANAG_60Rnd` for a bundle.",
-            ephemeral=True)
-
-    is_bundle = len(parts) > 1
-    # Anforderung: der Classname IST der Anzeigename in /shop list (Bundles brauchen einen eigenen)
-    display = (name or "").strip() or (f"{parts[0]} Bundle ({len(parts)} items)" if is_bundle else parts[0])
-    if katalog.find(display):
-        return await interaction.response.send_message(
-            f"❌ `{display}` already exists in the catalog. Pick a different `name` or "
-            f"remove the existing entry first (`/shop removeitem`).", ephemeral=True)
-
-    # Tippfehler-Schutz VOR dem Einfügen: unbekannte Classnames melden (nicht blockierend)
-    unknown = [c for c in parts if katalog.find(c) is None]
-
-    cat = (category or "").strip() or ("Bundles" if is_bundle else "Custom")
-    mx  = int(max_amount) if max_amount is not None else (1 if is_bundle else 5)
-
-    it: Dict[str, Any] = {
-        "name":               display[:100],
-        "price":              int(price),
-        "category":           cat,
-        "enabled":            True,
-        "max_amount_per_buy": mx,
-        "custom":             True,   # übersteht die automatische Katalog-Regenerierung
-    }
-    if is_bundle:
-        it["classnames"] = parts
-    else:
-        it["classname"] = parts[0]
-
-    katalog.items.append(it)
-    saved = katalog.save()
-
-    embed = discord.Embed(
-        title="➕ Shop bundle added" if is_bundle else "➕ Shop item added",
-        description=f"**{display}** — {_fmt_money(int(price))}",
-        color=0x2ECC71)
-    cls_txt = ", ".join(f"`{c}`" for c in parts)
-    if len(cls_txt) > 1000:
-        cls_txt = cls_txt[:997] + "…"
-    embed.add_field(name="Classnames" if is_bundle else "Classname", value=cls_txt, inline=False)
-    embed.add_field(name="Category", value=cat,     inline=True)
-    embed.add_field(name="Max/buy",  value=str(mx), inline=True)
-    if unknown:
-        embed.add_field(
-            name="⚠️ Not found in the types.xml catalog",
-            value=(", ".join(f"`{c}`" for c in unknown))[:900] +
-                  "\nCheck the spelling – an unknown classname will NOT spawn in game.",
-            inline=False)
-    if not saved:
-        embed.add_field(name="⚠️ Warning",
-                        value=f"Could not persist to `{katalog.source}` – item is in memory only.",
-                        inline=False)
-    embed.set_footer(text=f"Catalog: {katalog.source} · buy it with /buy {display[:40]}")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-add_shopitem.autocomplete("category")(_shop_category_autocomplete)
-add_shopitem.autocomplete("server")(_server_autocomplete)
-
-bot.tree.add_command(add_group)
 
 
 # ══════════════════════════════════════════════════════════════
 #  /edit shopitem – Classnames, Preis, Name usw. eines Items ändern
 # ══════════════════════════════════════════════════════════════
 edit_group = app_commands.Group(name="edit", description="✏️ Edit entries of the shop catalog")
-
-@edit_group.command(name="shopitem",
-                    description="✏️ Edit a shop item/bundle – change classnames, price, name, … (admin)")
-@app_commands.describe(
-    item="Item to edit (pick from the autocomplete list)",
-    classnames="New classname(s) – several separated by comma/space = bundle (optional)",
-    price="New price (optional)",
-    name="New display name (optional)",
-    category="New category (optional)",
-    max_amount="New max amount per purchase (optional)",
-    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
-async def edit_shopitem(interaction: discord.Interaction, item: str,
-                        classnames: Optional[str] = None,
-                        price: Optional[app_commands.Range[int, 0]] = None,
-                        name: Optional[str] = None,
-                        category: Optional[str] = None,
-                        max_amount: Optional[app_commands.Range[int, 1]] = None,
-                        server: Optional[str] = None):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
-    katalog = await _require_catalog(interaction, server=server)
-    if katalog is None:
-        return
-    it = katalog.find(item)
-    if not it:
-        return await interaction.response.send_message(
-            f"❌ Item `{item}` not found in the shop catalog.", ephemeral=True)
-    if classnames is None and price is None and name is None \
-            and category is None and max_amount is None:
-        return await interaction.response.send_message(
-            "❌ Nothing to change – set at least one of `classnames`, `price`, "
-            "`name`, `category`, `max_amount`.", ephemeral=True)
-
-    changes: List[str] = []
-    unknown: List[str] = []
-
-    # ── Classnames ändern (einer = Einzelitem, mehrere = Bundle) ──
-    if classnames is not None:
-        parts: List[str] = []
-        seen: set = set()
-        for tok in re.split(r"[,;\s]+", classnames.strip()):
-            if tok and tok.lower() not in seen:
-                seen.add(tok.lower())
-                parts.append(tok)
-        if not parts:
-            return await interaction.response.send_message(
-                "❌ No valid classname given. Example: `M4A1` or `M4A1, Mag_STANAG_60Rnd`.",
-                ephemeral=True)
-        old_cls = " + ".join(_item_classnames(it)) or "—"
-        if len(parts) > 1:
-            it["classnames"] = parts
-            it.pop("classname", None)
-        else:
-            it["classname"] = parts[0]
-            it.pop("classnames", None)
-        # Tippfehler-Schutz: unbekannte Classnames nur melden, nicht blockieren
-        unknown = [c for c in parts if katalog.find(c) is None]
-        changes.append(f"Classnames: `{old_cls}` → `{' + '.join(parts)}`")
-
-    # ── Preis ─────────────────────────────────────────────────
-    if price is not None:
-        old_price = int(it.get("price", 0))
-        it["price"] = int(price)
-        changes.append(f"Price: {_fmt_money(old_price)} → **{_fmt_money(int(price))}**")
-
-    # ── Anzeigename (Kollision mit anderem Eintrag abfangen) ──
-    if name is not None:
-        new_name = name.strip()[:100]
-        if not new_name:
-            return await interaction.response.send_message(
-                "❌ `name` must not be empty.", ephemeral=True)
-        existing = katalog.find(new_name)
-        if existing is not None and existing is not it:
-            return await interaction.response.send_message(
-                f"❌ `{new_name}` is already used by another catalog entry.", ephemeral=True)
-        changes.append(f"Name: **{it.get('name', '?')}** → **{new_name}**")
-        it["name"] = new_name
-
-    # ── Kategorie / Max-Menge ─────────────────────────────────
-    if category is not None and category.strip():
-        changes.append(f"Category: {it.get('category', 'Misc')} → **{category.strip()}**")
-        it["category"] = category.strip()
-    if max_amount is not None:
-        changes.append(f"Max/buy: {int(it.get('max_amount_per_buy', 1))} → **{int(max_amount)}**")
-        it["max_amount_per_buy"] = int(max_amount)
-
-    saved = katalog.save()   # persistiert + Index/Autocomplete neu aufbauen
-
-    embed = discord.Embed(
-        title="✏️ Shop item updated",
-        description=f"**{it.get('name', item)}**\n" + "\n".join(f"• {c}" for c in changes),
-        color=0x5865F2)
-    if unknown:
-        embed.add_field(
-            name="⚠️ Not found in the types.xml catalog",
-            value=(", ".join(f"`{c}`" for c in unknown))[:900] +
-                  "\nCheck the spelling – an unknown classname will NOT spawn in game.",
-            inline=False)
-    if not saved:
-        embed.add_field(name="⚠️ Warning",
-                        value=f"Could not persist to `{katalog.source}` – change is in memory only.",
-                        inline=False)
-    embed.set_footer(text=f"Catalog: {katalog.source}")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-edit_shopitem.autocomplete("item")(_shop_item_autocomplete)
-edit_shopitem.autocomplete("category")(_shop_category_autocomplete)
-edit_shopitem.autocomplete("server")(_server_autocomplete)
 
 @edit_group.command(name="ankuendigung",
                     description="✏️ Bearbeitet eine geplante Ankündigung (Nachricht/Bild)")
@@ -10605,257 +9931,6 @@ async def edit_ankuendigung(interaction: discord.Interaction, index: int):
 
 bot.tree.add_command(edit_group)
 
-
-# ══════════════════════════════════════════════════════════════
-#  /bundle add – Bundle über ein Modal anlegen (mehrere Items,
-#  ein Kauf). Eingabe pro Zeile: "<Menge>x<Classname>", z. B.
-#      1xAKM
-#      2xMag_AKM_30Rnd
-#  Da Discord-Modals keine Dropdowns erlauben, wird die Kategorie
-#  über ein vorgeschaltetes Select-Menü gewählt; danach öffnet
-#  das Modal mit den restlichen Feldern.
-# ══════════════════════════════════════════════════════════════
-MAX_BUNDLE_PIECES = 60   # Sicherheitslimit: so viele Einzelstücke max. pro Bundle
-
-# Zeilenformat: optionaler Mengen-Präfix "<zahl>x" / "<zahl> * " vor dem Classname.
-_BUNDLE_LINE_RE = re.compile(r"^\s*(?:(\d+)\s*[x×*]\s*)?(\S.*?)\s*$", re.IGNORECASE)
-
-
-def _parse_bundle_items(text: str) -> Tuple[List[str], List[Tuple[int, str]], List[str]]:
-    """Parst die Modal-Eingabe (eine Zeile je Position, Format ``2xClassname``).
-
-    Rückgabe: (expanded, summary, errors)
-      * expanded – Classname-Liste MIT Wiederholung (2xMag → zweimal Mag);
-        genau diese Liste landet als ``classnames`` im Katalog und spawnt
-        pro Eintrag ein Stück (siehe ShopManager.add_purchase_entries).
-      * summary  – [(menge, classname)] je Zeile, für die Bestätigungsanzeige.
-      * errors   – menschenlesbare Fehler (leere/kaputte Zeilen, Menge <1)."""
-    expanded: List[str] = []
-    summary: List[Tuple[int, str]] = []
-    errors: List[str] = []
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        m = _BUNDLE_LINE_RE.match(line)
-        if not m:
-            errors.append(f"`{line[:60]}` – not understood (use `2xClassname`).")
-            continue
-        count_txt, classname = m.group(1), m.group(2).strip()
-        # Nur der reine Classname (keine Leerzeichen) – nimm das erste Token.
-        classname = classname.split()[0] if classname else ""
-        if not classname:
-            errors.append(f"`{line[:60]}` – no classname found.")
-            continue
-        try:
-            count = int(count_txt) if count_txt else 1
-        except ValueError:
-            count = 1
-        if count < 1:
-            errors.append(f"`{line[:60]}` – amount must be at least 1.")
-            continue
-        summary.append((count, classname))
-        expanded.extend([classname] * count)
-    return expanded, summary, errors
-
-
-def _bundle_category_options(katalog: Optional["ShopCatalog"] = None,
-                             preselect: str = "Bundles") -> List[discord.SelectOption]:
-    """Kategorie-Optionen fürs Dropdown: 'Bundles' zuerst, dann die Kategorien
-    aus dem Katalog **dieses** Servers (Discord erlaubt max. 25 Optionen)."""
-    opts: List[discord.SelectOption] = [
-        discord.SelectOption(label="Bundles", value="Bundles", emoji="📦",
-                             description="Default category for bundles",
-                             default=(preselect == "Bundles")),
-    ]
-    for cat in sorted((katalog.by_category if katalog is not None else {})):
-        if cat.lower() == "bundles":
-            continue
-        opts.append(discord.SelectOption(label=cat[:100], value=cat[:100],
-                                         default=(cat == preselect)))
-        if len(opts) >= 25:
-            break
-    return opts
-
-
-class BundleAddModal(discord.ui.Modal, title="📦 Create shop bundle"):
-    """Modal mit den Bundle-Feldern. Die Kategorie kommt aus dem vorgelagerten
-    Dropdown und wird hier nur noch mitgeführt."""
-
-    def __init__(self, category: str):
-        super().__init__()
-        self.category = category or "Bundles"
-        self.items_in = discord.ui.TextInput(
-            label="Items – one per line: 2xClassname",
-            style=discord.TextStyle.paragraph,
-            placeholder="1xAKM\n2xMag_AKM_30Rnd\n1xNVGoggles",
-            required=True, max_length=1500)
-        self.name_in = discord.ui.TextInput(
-            label="Name in the shop",
-            placeholder="e.g. AKM Starter Bundle",
-            required=True, max_length=100)
-        self.price_in = discord.ui.TextInput(
-            label="Price (for the whole bundle)",
-            placeholder="e.g. 2500", required=True, max_length=15)
-        self.max_in = discord.ui.TextInput(
-            label="Max amount per purchase",
-            placeholder="1", required=False, default="1", max_length=6)
-        for comp in (self.items_in, self.name_in, self.price_in, self.max_in):
-            self.add_item(comp)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        # Admin-Recht erneut prüfen (Modal kann verzögert abgeschickt werden)
-        if not _is_admin(interaction):
-            return await _deny(interaction)
-        # Der Katalog wird erst hier aufgelöst: zwischen Dropdown und Absenden
-        # kann sich die Server-Zuordnung geändert haben.
-        katalog = await _require_catalog(interaction)
-        if katalog is None:
-            return
-
-        # ── Items parsen ─────────────────────────────────────────
-        expanded, summary, errors = _parse_bundle_items(str(self.items_in.value))
-        if not summary:
-            return await interaction.response.send_message(
-                "❌ No valid items. Enter one per line, e.g. `1xAKM` or "
-                "`2xMag_AKM_30Rnd`." +
-                ("\n" + "\n".join(f"• {e}" for e in errors[:5]) if errors else ""),
-                ephemeral=True)
-        if len(expanded) > MAX_BUNDLE_PIECES:
-            return await interaction.response.send_message(
-                f"❌ Too many pieces ({len(expanded)}). A bundle may contain at "
-                f"most **{MAX_BUNDLE_PIECES}** individual items.", ephemeral=True)
-
-        # ── Preis parsen (Tausenderpunkte/-kommas tolerieren) ────
-        price_digits = re.sub(r"[^\d]", "", str(self.price_in.value))
-        if not price_digits:
-            return await interaction.response.send_message(
-                "❌ Price must be a whole number, e.g. `2500`.", ephemeral=True)
-        price = int(price_digits)
-
-        # ── Max-Menge parsen ─────────────────────────────────────
-        max_digits = re.sub(r"[^\d]", "", str(self.max_in.value or "")) or "1"
-        max_amount = max(1, int(max_digits))
-
-        # ── Name / Kollision ─────────────────────────────────────
-        display = str(self.name_in.value).strip()[:100]
-        if not display:
-            return await interaction.response.send_message(
-                "❌ The shop name must not be empty.", ephemeral=True)
-        if katalog.find(display):
-            return await interaction.response.send_message(
-                f"❌ `{display}` already exists in the catalog. Pick a different "
-                f"name or remove the existing entry first (`/shop removeitem`).",
-                ephemeral=True)
-
-        # Tippfehler-Schutz: unbekannte Classnames melden (nicht blockierend)
-        seen_unknown: set = set()
-        unknown: List[str] = []
-        for _, cn in summary:
-            if katalog.find(cn) is None and cn.lower() not in seen_unknown:
-                seen_unknown.add(cn.lower())
-                unknown.append(cn)
-
-        # ── Katalog-Eintrag bauen (immer als Bundle: classnames-Liste) ──
-        it: Dict[str, Any] = {
-            "name":               display,
-            "price":              price,
-            "category":           self.category,
-            "enabled":            True,
-            "max_amount_per_buy": max_amount,
-            "classnames":         expanded,
-            "custom":             True,   # übersteht die Katalog-Regenerierung
-        }
-        katalog.items.append(it)
-        saved = katalog.save()
-
-        # ── Bestätigung ──────────────────────────────────────────
-        sym = _cur_symbol()
-        total_pieces = len(expanded)
-        embed = discord.Embed(
-            title="📦 Shop bundle added",
-            description=f"**{display}** — {_fmt_money(price)}",
-            color=0x2ECC71)
-        content_lines = [f"• **{cnt}×** `{cn}`" for cnt, cn in summary]
-        content_txt = "\n".join(content_lines)
-        if len(content_txt) > 1000:
-            content_txt = content_txt[:997] + "…"
-        embed.add_field(name=f"Contents ({total_pieces} pieces)",
-                        value=content_txt, inline=False)
-        embed.add_field(name="Category", value=self.category, inline=True)
-        embed.add_field(name="Max/buy",  value=str(max_amount), inline=True)
-        if unknown:
-            embed.add_field(
-                name="⚠️ Not found in the types.xml catalog",
-                value=(", ".join(f"`{c}`" for c in unknown))[:900] +
-                      "\nCheck the spelling – an unknown classname will NOT spawn in game.",
-                inline=False)
-        if not saved:
-            embed.add_field(
-                name="⚠️ Warning",
-                value=f"Could not persist to `{katalog.source}` – bundle is in memory only.",
-                inline=False)
-        embed.set_footer(text=f"Catalog: {katalog.source} · buy it with /buy {display[:40]}")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception):
-        log.error(f"[SHOP] Bundle-Modal-Fehler: {error}")
-        msg = "❌ Something went wrong while creating the bundle. Please try again."
-        if interaction.response.is_done():
-            await interaction.followup.send(msg, ephemeral=True)
-        else:
-            await interaction.response.send_message(msg, ephemeral=True)
-
-
-class BundleCategorySelect(discord.ui.Select):
-    """Dropdown zur Kategorie-Wahl; öffnet danach das Bundle-Modal."""
-
-    def __init__(self, katalog: Optional["ShopCatalog"] = None):
-        super().__init__(placeholder="📂 Choose a category for the bundle…",
-                         min_values=1, max_values=1,
-                         options=_bundle_category_options(katalog))
-
-    async def callback(self, interaction: discord.Interaction):
-        if not _is_admin(interaction):
-            return await _deny(interaction)
-        await interaction.response.send_modal(BundleAddModal(self.values[0]))
-
-
-class BundleCategoryView(discord.ui.View):
-    def __init__(self, katalog: Optional["ShopCatalog"] = None):
-        super().__init__(timeout=300)
-        self.add_item(BundleCategorySelect(katalog))
-
-
-bundle_group = app_commands.Group(
-    name="bundle", description="📦 Create shop bundles (several items, one purchase)")
-
-
-@bundle_group.command(
-    name="add",
-    description="📦 Create a bundle via a form: several items, sold as one purchase (admin)")
-@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
-async def bundle_add(interaction: discord.Interaction, server: Optional[str] = None):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
-    katalog = await _require_catalog(interaction, server=server)
-    if katalog is None:
-        return
-    embed = discord.Embed(
-        title="📦 Create a shop bundle",
-        description=("Choose a **category** below – then a form opens where you "
-                     "enter the items, name, price and max amount.\n\n"
-                     "**Items:** one per line as `<amount>x<classname>`, e.g.\n"
-                     "```\n1xAKM\n2xMag_AKM_30Rnd\n1xNVGoggles\n```\n"
-                     "All items of the bundle spawn together on a single `/buy`."),
-        color=0x5865F2)
-    await interaction.response.send_message(
-        embed=embed, view=BundleCategoryView(katalog), ephemeral=True)
-
-
-bundle_add.autocomplete("server")(_server_autocomplete)
-
-bot.tree.add_command(bundle_group)
 
 
 @bot.tree.command(
@@ -12053,9 +11128,8 @@ def require_nitrado(request: Optional[web.Request] = None):
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Onboarding: Nitrado-Token prüfen → Server wählen → Karte erkennen.
-#
-#  Spiegelt den Discord-Flow ``/setup token`` (bot.py ~3003) +
-#  ``_finish_token_setup`` (bot.py ~2879), nur über HTTP.
+#  Das ist inzwischen der einzige Weg, den Token einzutragen (Optionen im
+#  Dashboard) – der frühere Discord-Befehl ``/setup token`` wurde entfernt.
 # ──────────────────────────────────────────────────────────────────────────
 def _server_view(svc: dict) -> dict:
     d = svc.get("details") or {}
@@ -13198,7 +12272,7 @@ async def post_select_server(request: web.Request) -> web.Response:
     token = sess["token"]
     _apply = _apply_gameserver_info
 
-    # --- Kern von _finish_token_setup (ohne Discord-Embed) ---
+    # --- Server anlegen/auffrischen und Nitrado/FTP/Shop initialisieren ---
     # Die globale config.json bleibt unangetastet: sonst wuerde der zuletzt
     # eingerichtete Kunde zum Hauptserver und seine FTP-Zugangsdaten laegen
     # dort als Rueckfallebene fuer alle anderen bereit.
@@ -13716,11 +12790,15 @@ async def set_feed(request: web.Request) -> web.Response:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-#  Zonen verwalten (wie ``/zone create|edit|remove|list`` + Allowlist).
+#  Zonen verwalten (Dashboard – die Discord-Befehle ``/zone create|edit|
+#  remove`` gibt es nicht mehr, ``/zone list`` und ``/zone allowlist`` schon).
 #
-#  Zonen liegen in ``config.json["zones"]``. Schema:
-#  ``{name, x, z, radius, role_id?, channel_id?, guild_id, allowlist?}`` –
-#  x = Ost (iZurvive), z = Nord.
+#  Zonen liegen in ``config.json["zones"]``. Schema (rückwärtskompatibel,
+#  siehe ``_zone_payload``):
+#  ``{id, name, type: "circular"|"polygon", x?, z?, radius?, points?,
+#     channel_id?, ping_role_ids?, manage_role_ids?, guild_id, allowlist?}`` –
+#  x = Ost (iZurvive), z = Nord. `x`/`z`/`radius` nur bei `circular`,
+#  `points` (Liste aus `{x, z}`, mindestens 3) nur bei `polygon`.
 # ──────────────────────────────────────────────────────────────────────────
 def _find(name: str, conn: Optional[ServerConnection] = None):
     n = (name or "").strip().lower()
@@ -13806,6 +12884,39 @@ def _zonen_ziel(request: web.Request, conn: ServerConnection,
             return None, err(f"Diese {feld}-ID gibt es in dem gewählten "
                              f"Discord-Server nicht.")
         ziel[schluessel] = wert
+
+    # Mehrfachauswahl (Ping Roles, Allowlist Roles) – dieselbe Prüfung wie
+    # oben, nur je Eintrag einer Liste statt eines einzelnen Werts.
+    for schluessel, feld in (("ping_role_ids", "Ping-Rolle"),
+                             ("manage_role_ids", "Allowlist-Rolle")):
+        if schluessel not in data:
+            continue
+        roh_liste = data.get(schluessel)
+        if not isinstance(roh_liste, list):
+            return None, err(f"{schluessel} muss eine Liste sein.")
+        werte = []
+        for roh_id in roh_liste:
+            try:
+                werte.append(int(roh_id))
+            except (TypeError, ValueError):
+                return None, err(f"{feld}-ID muss eine Zahl sein.")
+        alt_liste = (alt or {}).get(schluessel)
+        unveraendert = (isinstance(alt_liste, list) and sorted(alt_liste) == sorted(werte)
+                       and int((alt or {}).get("guild_id") or 0) == gid)
+        if werte and not unveraendert:
+            if g is None:
+                if bot is None or not bot.is_ready():
+                    return None, err("Der Bot ist gerade nicht bei Discord angemeldet – "
+                                     f"neue {feld}n lassen sich erst prüfen, wenn er "
+                                     "wieder verbunden ist.", 409)
+                return None, err("Der Bot erreicht diesen Discord-Server nicht – "
+                                 f"{feld}n können deshalb nicht geprüft werden. "
+                                 "Ist der Bot dort eingeladen?", 409)
+            for wert in werte:
+                if g.get_role(wert) is None:
+                    return None, err(f"Diese {feld}-ID gibt es in dem gewählten "
+                                     f"Discord-Server nicht.")
+        ziel[schluessel] = werte
     return ziel, None
 
 
@@ -13814,7 +12925,9 @@ async def list_zones(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     zones = [z for z in _zones(_c) if isinstance(z, dict) and z.get("name")]
-    return ok({"zones": zones,
+    if _ensure_zone_ids(zones):
+        _zones_save(_c)
+    return ok({"zones": [_zone_payload(z) for z in zones],
                "map_name": _c.get("map_name", "ChernarusPlus")})
 
 
@@ -13828,30 +12941,42 @@ async def create_zone(request: web.Request) -> web.Response:
         return err("Zonen-Name fehlt oder ist länger als 60 Zeichen.")
     if _find(name, _c):
         return err(f"Zone '{name}' existiert bereits.")
-    try:
-        x = float(data["x"]); z = float(data["z"]); radius = float(data["radius"])
-    except (KeyError, TypeError, ValueError):
-        return err("x, z und radius müssen Zahlen sein.")
 
-    validate = _validate_zone_geometry
-    if validate:
-        geo_err = validate(x, z, radius)
+    ztype = str(data.get("type") or "circular").strip().lower()
+    if ztype not in ("circular", "polygon"):
+        return err("type muss 'circular' oder 'polygon' sein.")
+
+    zone: Dict[str, Any] = {"name": name, "type": ztype}
+    if ztype == "polygon":
+        points = data.get("points")
+        pts_err = _validate_zone_points(points)
+        if pts_err:
+            return err(pts_err.replace("❌", "").strip())
+        zone["points"] = [{"x": round(float(p["x"]), 1), "z": round(float(p["z"]), 1)}
+                          for p in points]
+    else:
+        try:
+            x = float(data["x"]); z = float(data["z"]); radius = float(data["radius"])
+        except (KeyError, TypeError, ValueError):
+            return err("x, z und radius müssen Zahlen sein.")
+        geo_err = _validate_zone_geometry(x, z, radius)
         if geo_err:
             return err(geo_err.replace("❌", "").strip())
+        zone["x"], zone["z"], zone["radius"] = round(x, 1), round(z, 1), round(radius, 1)
 
     ziel, denied = _zonen_ziel(request, _c, data)
     if denied is not None:
         return denied
-    zone = {
-        "name": name,
-        "x": round(x, 1), "z": round(z, 1), "radius": round(radius, 1),
-        "role_id": ziel.get("role_id"),
-        "channel_id": ziel.get("channel_id"),
-        "guild_id": ziel["guild_id"],
-    }
-    _zones(_c).append(zone)
+    zone["channel_id"] = ziel.get("channel_id")
+    zone["ping_role_ids"] = ziel.get("ping_role_ids", [])
+    zone["manage_role_ids"] = ziel.get("manage_role_ids", [])
+    zone["guild_id"] = ziel["guild_id"]
+
+    zones = _zones(_c)
+    zones.append(zone)
+    _ensure_zone_ids(zones)
     _zones_save(_c)
-    return ok(zone)
+    return ok(_zone_payload(zone))
 
 
 async def update_zone(request: web.Request) -> web.Response:
@@ -13866,31 +12991,58 @@ async def update_zone(request: web.Request) -> web.Response:
     new_name = str(data.get("name", zone["name"])).strip() or zone["name"]
     if new_name.lower() != str(zone["name"]).lower() and _find(new_name, _c):
         return err(f"Zone '{new_name}' existiert bereits.")
-    try:
-        x = float(data.get("x", zone["x"]))
-        z = float(data.get("z", zone["z"]))
-        radius = float(data.get("radius", zone["radius"]))
-    except (TypeError, ValueError):
-        return err("x, z und radius müssen Zahlen sein.")
 
-    validate = _validate_zone_geometry
-    if validate:
-        geo_err = validate(x, z, radius)
+    ztype = str(data.get("type") or zone.get("type") or "circular").strip().lower()
+    if ztype not in ("circular", "polygon"):
+        return err("type muss 'circular' oder 'polygon' sein.")
+
+    new_points = None
+    if ztype == "polygon":
+        points = data.get("points", zone.get("points"))
+        pts_err = _validate_zone_points(points)
+        if pts_err:
+            return err(pts_err.replace("❌", "").strip())
+        new_points = [{"x": round(float(p["x"]), 1), "z": round(float(p["z"]), 1)}
+                     for p in points]
+    else:
+        try:
+            x = float(data.get("x", zone.get("x", 0.0)))
+            z = float(data.get("z", zone.get("z", 0.0)))
+            radius = float(data.get("radius", zone.get("radius", 0.0)))
+        except (TypeError, ValueError):
+            return err("x, z und radius müssen Zahlen sein.")
+        geo_err = _validate_zone_geometry(x, z, radius)
         if geo_err:
             return err(geo_err.replace("❌", "").strip())
 
     ziel, denied = _zonen_ziel(request, _c, data, zone)
     if denied is not None:
         return denied
+
+    old_name = str(zone["name"])
     zone["name"] = new_name
-    zone["x"], zone["z"], zone["radius"] = round(x, 1), round(z, 1), round(radius, 1)
+    zone["type"] = ztype
+    if ztype == "polygon":
+        zone["points"] = new_points
+        zone.pop("x", None); zone.pop("z", None); zone.pop("radius", None)
+    else:
+        zone["x"], zone["z"], zone["radius"] = round(x, 1), round(z, 1), round(radius, 1)
+        zone.pop("points", None)
     zone["guild_id"] = ziel["guild_id"]
-    if "role_id" in ziel:
-        zone["role_id"] = ziel["role_id"]
     if "channel_id" in ziel:
         zone["channel_id"] = ziel["channel_id"]
+    if "ping_role_ids" in ziel:
+        zone["ping_role_ids"] = ziel["ping_role_ids"]
+        zone.pop("role_id", None)
+    if "manage_role_ids" in ziel:
+        zone["manage_role_ids"] = ziel["manage_role_ids"]
     _zones_save(_c)
-    return ok(zone)
+    # Name/Geometrie/Typ koennen sich geaendert haben – die naechste frische
+    # Position bewertet die Zone dann komplett neu, kein Nachzieh-Ping aus
+    # dem alten Zustand.
+    _reset_zone_state(old_name, _c)
+    _reset_zone_state(new_name, _c)
+    return ok(_zone_payload(zone))
 
 
 async def delete_zone(request: web.Request) -> web.Response:
@@ -13986,6 +13138,18 @@ async def guild_channels(request: web.Request) -> web.Response:
         return ok({"channels": []})
     channels = [{"id": str(c.id), "name": c.name} for c in g.text_channels]
     return ok({"channels": channels})
+
+
+async def guild_seen_players(request: web.Request) -> web.Response:
+    """Ingame-Namen dieser Guild (aus Connect-Events) – Grundlage für die
+    Allowlist-Autofill im Zonen-Formular."""
+    try:
+        gid = int(request.match_info["guild_id"])
+    except (TypeError, ValueError):
+        return err("Keine gültige Discord-Server-ID.", 400)
+    if gid not in _session_guilds(request):
+        return err("Dieser Discord-Server gehört nicht zu deinem Nitrado-Server.", 403)
+    return ok({"players": sorted(cfg.seen_players(gid), key=str.lower)})
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -15170,6 +14334,7 @@ def build_app() -> web.Application:
     r.add_delete("/api/zones/{name}/allowlist/{player}", remove_allowlist)
     r.add_get("/api/guild/{guild_id}/roles", guild_roles)
     r.add_get("/api/guild/{guild_id}/channels", guild_channels)
+    r.add_get("/api/guild/{guild_id}/seen-players", guild_seen_players)
 
     # ── Auto-Aufgaben ──
     r.add_get("/api/auto-restart", get_auto_restart)
@@ -15816,6 +14981,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "32c617179befba15e57c08dde154cfe8218983afdfe44481701bb307cef91a15",
         "57fc2c0b3589d7fe1807402f57280f4865442466fdb602546598c55b3e48c5aa",
         "e66066c8c0e169191ec3a36040fd867816b765c4ebbdfb3c224fcf8a4801a4df",
+        "e429b2bb614a8920d84cafcb5cbbf25d6e7aa139159efbde2f5c72fcfafd596f",
     ),
     "app.js": (
         "ec14b8b4a90c6553d11b22eb5f76c732b47c827e8bf4359e9f2fb793f8ca1b79",
@@ -15838,6 +15004,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "8cb2695d935af7edba0d89ff049fd780c5c3f4d06f9622ebd5844884e6b98b4e",
         "198aab677dc5c771fe5fd7ad773320fc7927226a4d96878d5ad024f53fba32fc",
         "4f4e0c9024847b6c4c2c70d5627037bd82de6c2c6914dda6a056829e6b7c6f81",
+        "c4afe21969e46dd40f6bd1af69093e368e567e3e4fab0569c06f24bed5ebe7c9",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
@@ -15906,387 +15073,430 @@ _EMBEDDED_ASSETS: Dict[str, str] = {
         "tby0CeTXElMF8usRTxXJr8c73fvzbyWjCuH/h41cX7c2Dl5LQh35tpEyHFDUW3e3U0HZKN46k31brmpuDPUkjzO4Xj5Z/RuVjyzBuBHjpaHlX6bAobcZ"
         "5pKhzrCB+xMRVD72T3v+BzE74/A="
     ),
-    # styles.css  (16.013 Bytes roh → 6.732 Bytes base64)
+    # styles.css  (17.387 Bytes roh → 7.232 Bytes base64)
     "styles.css": (
-        "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"
-        "GrI="
+        "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"
+        "vmYP1nTgAyuDtpqpCSEzF0f+L0udDeI="
     ),
-    # app.js  (92.517 Bytes roh → 32.012 Bytes base64)
+    # app.js  (108.348 Bytes roh → 36.944 Bytes base64)
     "app.js": (
-        "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"
+        "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"
     ),
-    # map.js  (8.934 Bytes roh → 4.372 Bytes base64)
+    # map.js  (12.586 Bytes roh → 5.548 Bytes base64)
     "map.js": (
-        "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"
+        "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"
+        "uS9Tv7N7t2FwBVvU4gr6/QsDewcd"
     ),
     # vendor/leaflet.css  (14.806 Bytes roh → 4.680 Bytes base64)
     "vendor/leaflet.css": (
