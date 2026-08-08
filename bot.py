@@ -11422,6 +11422,40 @@ def _read_asset(rel: str) -> Optional[bytes]:
     return _asset_from_memory(rel)
 
 
+# Verweise auf eigene Frontend-Dateien in der index.html.
+_ASSET_URL_RE = re.compile(rb'(/(?:static|vendor)/[A-Za-z0-9_./-]+\.(?:js|css))')
+
+
+def _mit_versionsstempel(html: bytes) -> bytes:
+    """Jeder Frontend-Datei in der index.html ihre Pruefsumme anhaengen.
+
+    Hinter einem CDN nuetzt ein ``no-cache`` vom Server wenig: Cloudflare
+    schreibt seine eigene Haltbarkeit darueber (``max-age=14400``) und
+    liefert stundenlang die alte Datei aus – der Bot wird dabei nicht einmal
+    gefragt. Genau daran hing eine halb aufgebaute Feeds-Seite: neues
+    Backend, alte app.js.
+
+    ``/static/app.js?v=<pruefsumme>`` ist bei jeder Aenderung eine NEUE
+    Adresse. Die kennt kein Cache – weder Cloudflare noch der Browser –,
+    also kommt zwingend die neue Fassung. Die index.html selbst wird nicht
+    zwischengespeichert (``cf-cache-status: DYNAMIC``), deshalb greift das
+    ohne Zutun und ohne Cache-Leeren.
+    """
+    def ersetze(m):
+        pfad = m.group(1)
+        # Aus dem URL-Pfad den Asset-Schluessel machen – dieselbe Regel wie in
+        # _dash_static: /static/app.js -> "app.js", /vendor/x.js -> "vendor/x.js".
+        rel = pfad.decode().lstrip("/")
+        if rel.startswith("static/"):
+            rel = rel[len("static/"):]
+        # Bewusst _read_asset: genau die Bytes, die auch ausgeliefert werden.
+        data = _read_asset(rel)
+        if data is None:
+            return pfad
+        return pfad + b"?v=" + _asset_digest(data)[:12].encode()
+    return _ASSET_URL_RE.sub(ersetze, html)
+
+
 def _asset_response(rel: str, fallback_text: str = "",
                     request: Optional[web.Request] = None) -> web.Response:
     """Eine Frontend-Datei ausliefern – mit Revalidierung beim Browser.
@@ -11441,6 +11475,9 @@ def _asset_response(rel: str, fallback_text: str = "",
         if fallback_text:
             return web.Response(text=fallback_text, status=500)
         return web.Response(status=404)
+    if rel == "index.html":
+        # VOR dem ETag: gestempelt wird genau das, was rausgeht.
+        data = _mit_versionsstempel(data)
     etag = f'"{_asset_digest(data)[:32]}"'
     kopf = {"Cache-Control": "no-cache, must-revalidate", "ETag": etag}
     # Kennt der Browser die Fassung schon, reicht ein 304 ohne Inhalt.
