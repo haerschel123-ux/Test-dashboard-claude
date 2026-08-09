@@ -21,10 +21,16 @@ Pushen – es bezieht sich auf die Arbeit, nicht auf das Veröffentlichen.
 ## Arbeitsweise
 
 * **Bei Unklarheiten fragen** statt zu raten oder anzunehmen.
-* **Agents zur Prüfung einsetzen**, wenn etwas vollständig abgesichert sein soll.
+* **Agents zur Prüfung nur, wenn Brigarde es ausdrücklich verlangt.** Nicht von selbst
+  vorschlagen oder starten, auch nicht bei sicherheitsrelevanten Änderungen.
 * Behauptungen belegen: mit echten Testläufen, nicht durch Lesen des Codes. Was nicht
   ausgeführt wurde, gilt als ungeprüft.
 * Fehler offen benennen, auch eigene.
+* **So token-sparend wie möglich arbeiten, ohne an Gründlichkeit zu verlieren.** Keine
+  überflüssigen Zwischenschritte, keine doppelten Testläufe, keine Erklärungen, die
+  länger sind als nötig. **Ausgenommen: Screenshots bleiben Pflicht bei großen
+  Änderungen an der Oberfläche (siehe „Vor jedem Commit") und immer, wenn Brigarde
+  danach fragt** – daran spart nicht.
 
 ## Git
 
