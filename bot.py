@@ -1774,8 +1774,18 @@ class FTPManager:
         und 0 ist eine gueltige Groesse. Manche FTP-Server beantworten ``SIZE``
         im ASCII-Modus mit einem Fehler; das darf der Aufrufer nicht als
         "Datei ist leer" missverstehen.
+
+        TYPE I wird HIER nochmal erzwungen, nicht nur einmal in ``_connect``:
+        ``list_adm_files`` (NLST) laeuft ueber ``ftp.retrlines()``, und die
+        schickt laut ftplib-Quellcode **unbedingt** ``TYPE A`` vor jeder
+        Zeilen-Uebertragung – das hebt den Binaermodus aus ``_connect`` bei
+        JEDEM Poll-Zyklus wieder auf, noch bevor diese Methode drankommt.
+        Ohne das hier waere die Verbindung beim SIZE-Aufruf wieder im
+        ASCII-Modus (siehe Docstring oben) und manche Server (bestaetigt:
+        "550 SIZE not allowed in ASCII mode") lehnen SIZE dort komplett ab.
         """
         def op(ftp):
+            ftp.voidcmd("TYPE I")
             return ftp.size(path)
         try:
             wert = self._with_conn(op)
