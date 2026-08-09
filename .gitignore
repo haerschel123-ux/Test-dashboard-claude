@@ -13,6 +13,7 @@ bot_audit.json
 economy.db
 economy.db-*
 economy.db.bak-*
+backups/
 
 # Generierter Shop-Katalog (aus types.xml) & Server-Dateien
 shop_items.json
