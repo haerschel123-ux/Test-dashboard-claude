@@ -221,7 +221,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "rcon_port":   2310,
 
     "admin_role_name":           "DayZ Admin",
-    "log_poll_interval_seconds": 10,
+    # 5s statt 10s: die Server werden gleichzeitig abgefragt (siehe log_poll),
+    # ein Zyklus dauert deshalb nur noch so lange wie der langsamste Kunde.
+    # Damit steht eine neue Log-Zeile im Schnitt nach ~2,5s im Feed.
+    "log_poll_interval_seconds": 5,
     "max_embed_fields":          25,
     "map_name":                  "ChernarusPlus",
 
@@ -1520,6 +1523,11 @@ def a2s_query(ip: str, port: int, timeout: float = 3.0) -> Optional[Dict]:
 # immer im selben Zyklus haengen zu bleiben.
 SIZE_FEHLER_GRENZE = 3
 
+# Wie oft je Server auf eine neue .RPT (= Serverneustart) geprueft wird.
+# Nicht in jedem Poll-Zyklus: die Abfrage kostet eine eigene FTP-Runde, aber
+# Neustarts kommen nur ein paar Mal am Tag vor. Siehe _pruefe_neustart.
+_RPT_PRUEF_ABSTAND = 60.0
+
 
 # ══════════════════════════════════════════════════════════════
 #  FTP-Manager  (sync, läuft in ThreadPoolExecutor)
@@ -1567,6 +1575,23 @@ class FTPManager:
         ftp.connect(self.host, self.port, timeout=30)
         ftp.login(self.user, self.password)
         ftp.encoding = "utf-8"
+        # Binaermodus SOFORT erzwingen, nicht erst beim ersten retrbinary()
+        # (das setzt TYPE I selbst, aber eben erst dann): direkt nach dem
+        # Login steht die Verbindung im FTP-Standard ASCII (TYPE A). Ein
+        # SIZE-Aufruf VOR dem ersten Lesen (siehe file_size_or_none, laeuft
+        # in jedem Zyklus VOR read_from_offset) laeuft dann noch im
+        # ASCII-Modus, waehrend der gespeicherte offset aus binaeren
+        # read_from_offset()-Aufrufen stammt. Uebersetzt der Server dabei
+        # \r\n -> \n (ASCII-Modus-Definition), meldet SIZE weniger Bytes als
+        # tatsaechlich gelesen wurden -> offset > current_size wird faelschlich
+        # als "Datei geschrumpft" (Neustart) gedeutet, die ganze ADM-Datei
+        # nochmal von vorne gelesen und JEDES Ereignis erneut gepostet. Tritt
+        # nach jedem Reconnect auf (Verbindung schlaeft ein, NOOP schlaegt
+        # fehl) - nicht nur beim eigentlichen Bot-Start.
+        try:
+            ftp.voidcmd("TYPE I")
+        except Exception as e:
+            log.warning(f"[FTP] TYPE I fehlgeschlagen ({self.host}): {e}")
         return ftp
 
     def _drop_conn(self):
@@ -2933,6 +2958,10 @@ class ServerConnection:
         self.online_since: Optional[float] = None
         # Zeitpunkt des letzten Discovery-Versuchs (Wiederholsperre je Server)
         self.discover_retry_ts: float = 0.0
+        # Wann zuletzt auf eine neue .RPT (Serverneustart) geprueft wurde.
+        # Die Abfrage kostet eine eigene FTP-Runde und muss deshalb nicht in
+        # jedem 10s-Zyklus laufen – siehe _pruefe_neustart.
+        self.rpt_geprueft_ts: float = 0.0
         # Grund, aus dem der Poll-Zyklus diesen Server gerade uebergeht
         # (None = laeuft normal). Nur bei einer AENDERUNG geloggt (siehe
         # _poll_zustand_melden) – sonst waere das Terminal bei einem
@@ -3680,7 +3709,11 @@ class DayZBot(discord.Client):
         if interval > 10:
             log.info(f"[POLL] log_poll_interval_seconds={interval} wird auf 10s begrenzt (Echtzeit-Feeds)")
             interval = 10
-        interval = max(5, interval)
+        # Untergrenze 3s statt 5s: seit die Server gleichzeitig abgefragt
+        # werden (siehe log_poll), dauert ein Zyklus nur noch so lange wie der
+        # LANGSAMSTE Kunde – ein schnellerer Takt ist damit bezahlbar und die
+        # Zeile steht entsprechend frueher im Feed.
+        interval = max(3, interval)
         self.log_poll.change_interval(seconds=interval)
         if not self.log_poll.is_running():
             self.log_poll.start()
@@ -3802,12 +3835,27 @@ class DayZBot(discord.Client):
 
     @tasks.loop(seconds=10)
     async def log_poll(self):
-        """Jeden verbundenen Server einzeln abfragen.
+        """Alle verbundenen Server abfragen – **gleichzeitig, nicht nacheinander**.
 
         Jede Verbindung hat eigene FTP-Sitzung, eigenen Log-Zustand und einen
         eigenen Parser – die Ereignisse eines Servers erreichen dadurch nur
         noch dessen Discord-Guild.
+
+        Warum parallel: nacheinander war die Dauer eines Zyklus die SUMME aller
+        Kunden. Bei ~1s FTP-Antwortzeit und drei Kunden waren das ueber 12s –
+        mehr als der 10s-Takt. Der Bot kam damit dauerhaft nicht mehr
+        hinterher, der Rueckstand wuchs immer weiter, und Ereignisse landeten
+        erst Stunden spaeter (oder wurden als "Rueckstand" ganz uebersprungen)
+        im Feed. Gleichzeitig ist die Dauer nur noch die des LANGSAMSTEN
+        Kunden, und das traege FTP eines Kunden bremst die anderen nicht mehr.
+
+        Nebenwirkung, die hier ausdruecklich erwuenscht ist: ``asyncio`` gibt
+        jeder Aufgabe eine eigene Kopie des Kontexts. Das ``_AKTUELLER_SERVER``
+        aus ``_setze_aktuellen_server`` kann dadurch nicht mehr von einem
+        Kunden zum naechsten durchschlagen – parallel ist hier also auch die
+        sauberere Mandanten-Trennung.
         """
+        aufgaben = []
         for conn in connections.all():
             if conn.ftp is None:
                 await _poll_zustand_melden(conn, "kein FTP aufgebaut (Zugangsdaten "
@@ -3821,11 +3869,20 @@ class DayZBot(discord.Client):
                 await _poll_zustand_melden(conn, "keinem Discord-Server zugeordnet "
                                            "(Zuordnung fehlt im Dashboard unter „Serverliste“)")
                 continue
-            try:
-                await self._poll_connection(conn)
-            except Exception as e:  # noqa: BLE001 – ein Server darf die anderen nicht stoppen
-                log.error(f"[POLL] {conn.name}: {e}")
-                await self._check_ftp_health(conn)
+            aufgaben.append(self._poll_connection_sicher(conn))
+        if aufgaben:
+            await asyncio.gather(*aufgaben)
+
+    async def _poll_connection_sicher(self, conn: ServerConnection):
+        """Ein Server – ein Fehler darf die anderen nie mitreissen. Frueher
+        stand dieses try/except in der Schleife; mit ``gather`` braucht es
+        eine eigene Ebene, sonst wuerde eine Ausnahme die ganze Sammlung
+        abbrechen."""
+        try:
+            await self._poll_connection(conn)
+        except Exception as e:  # noqa: BLE001 – ein Server darf die anderen nicht stoppen
+            log.error(f"[POLL] {conn.name}: {e}")
+            await self._check_ftp_health(conn)
 
     async def _poll_connection(self, conn: ServerConnection):
         # Waehrung/Anzeige gehoeren zu DIESEM Server (siehe _cur_symbol)
@@ -4454,7 +4511,18 @@ class DayZBot(discord.Client):
 
         Das ergaenzt den eigenen Neustart-Zeitplan um die Faelle, die er nicht
         kennt: Abstuerze und Neustarts von Nitrado-Seite.
+
+        Laeuft bewusst NICHT in jedem 10s-Zyklus: Serverneustarts kommen ein
+        paar Mal am Tag vor, die Abfrage kostete aber jedes Mal eine eigene
+        FTP-Runde – ein Viertel der Zeit eines Zyklus fuer eine Information,
+        die sich stundenlang nicht aendert. Die neue ADM-Datei faellt ohnehin
+        im selben Zyklus auf (``state["file"] != latest``), das hier ist nur
+        die zusaetzliche Meldung.
         """
+        jetzt = time.time()
+        if jetzt - conn.rpt_geprueft_ts < _RPT_PRUEF_ABSTAND:
+            return
+        conn.rpt_geprueft_ts = jetzt
         try:
             rpt = await loop.run_in_executor(None, conn.ftp.list_rpt_files, log_dir)
         except Exception as e:  # noqa: BLE001 – Zugabe, darf den Poll nie kippen
@@ -5325,10 +5393,36 @@ async def cmd_status(interaction: discord.Interaction,
 
 # ══════════════════════════════════════════════════════════════
 #  /betreiber – Einstellungen, die nur den Bot-BETREIBER angehen, nicht
-#  irgendeinen Kunden. Gesperrt per bot.is_owner() (Discords Konzept fuer
-#  "wem gehoert diese Bot-Anwendung"), NICHT per Guild-Admin-Rolle – eine
-#  Admin-Rolle in Kunde XYs Discord soll hier keinen Zugriff geben.
+#  irgendeinen Kunden. Gesperrt auf den Eigentuemer der Bot-ANWENDUNG,
+#  NICHT auf eine Guild-Admin-Rolle – eine Admin-Rolle in Kunde XYs Discord
+#  soll hier keinen Zugriff geben.
 # ══════════════════════════════════════════════════════════════
+_EIGENTUEMER_IDS: set = set()
+
+
+async def _ist_bot_eigentuemer(user: discord.abc.User) -> bool:
+    """Gehoert die Bot-Anwendung diesem Discord-Konto?
+
+    ``discord.Client`` hat – anders als ``commands.Bot`` – **kein**
+    ``is_owner()``; der Aufruf lief hier in einen AttributeError und der
+    Befehl antwortete nie ("Die Anwendung reagiert nicht"). Die Auskunft
+    kommt deshalb direkt aus den Anwendungsdaten und wird gemerkt, damit
+    nicht jeder Aufruf eine HTTP-Runde zu Discord kostet.
+
+    Beruecksichtigt auch Team-Anwendungen: gehoert der Bot einem Discord-Team,
+    zaehlt jedes Team-Mitglied als Eigentuemer.
+    """
+    if not _EIGENTUEMER_IDS:
+        info = bot.application or await bot.application_info()
+        if info is None:
+            return False
+        if getattr(info, "team", None):
+            _EIGENTUEMER_IDS.update(int(m.id) for m in info.team.members)
+        elif getattr(info, "owner", None):
+            _EIGENTUEMER_IDS.add(int(info.owner.id))
+    return int(user.id) in _EIGENTUEMER_IDS
+
+
 betreiber_group = app_commands.Group(
     name="betreiber", description="🛠️ Einstellungen für den Bot-Betreiber")
 
@@ -5339,12 +5433,24 @@ betreiber_group = app_commands.Group(
 @app_commands.describe(channel="Channel in DEINEM eigenen Discord für Betriebsmeldungen")
 async def betreiber_alarm_channel(interaction: discord.Interaction,
                                   channel: discord.TextChannel):
-    if not await bot.is_owner(interaction.user):
-        return await interaction.response.send_message(
+    # ZUERST bestaetigen, dann erst pruefen: die Eigentuemer-Abfrage holt beim
+    # ersten Aufruf die Anwendungsdaten von Discord. Dauert das (oder etwas
+    # danach) laenger als 3s, verfaellt die Interaktion und Discord zeigt nur
+    # noch "Die Anwendung reagiert nicht" – ohne dass man je erfaehrt, woran
+    # es lag.
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ist_eigentuemer = await _ist_bot_eigentuemer(interaction.user)
+    except Exception as e:  # noqa: BLE001
+        log.error(f"[BETREIBER] Eigentümer-Prüfung fehlgeschlagen: {e}")
+        return await interaction.followup.send(
+            f"❌ Eigentümer-Prüfung bei Discord fehlgeschlagen: `{e}`", ephemeral=True)
+    if not ist_eigentuemer:
+        return await interaction.followup.send(
             "❌ Nur der Bot-Eigentümer darf das einstellen.", ephemeral=True)
     cfg.config["betreiber_alarm_channel_id"] = str(channel.id)
     cfg.save_config()
-    await interaction.response.send_message(
+    await interaction.followup.send(
         f"✅ Betriebsmeldungen (Ausfälle, Erholung, neue Premium-Anfragen) gehen "
         f"jetzt an {channel.mention}.", ephemeral=True)
 
