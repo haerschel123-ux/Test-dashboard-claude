@@ -3459,6 +3459,43 @@ async def _premium_check(interaction: discord.Interaction) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════
+#  Befehlsnamen auf Englisch – fuer Mitglieder, deren EIGENE Discord-App
+#  auf Englisch steht (Discords eingebaute Befehls-Lokalisierung, siehe
+#  https://discord.com/developers/docs/interactions/application-commands#localization).
+#  Hat nichts mit dem Sprache-Schalter im Web-Dashboard zu tun – der ist
+#  eine reine Browser-Einstellung ohne Bezug zu Discords Befehlsliste, die
+#  fuer den ganzen Server gleich ist. Nur echte deutsche Namen stehen hier;
+#  ohnehin englische (z. B. "ban", "hackban", "stats") bleiben unveraendert.
+# ══════════════════════════════════════════════════════════════
+_BEFEHL_NAMEN_EN = {
+    "neustart": "restart",
+    "stoppen": "stop",
+    "ban_entfernen": "ban_remove",
+    "spieler_suche": "player_search",
+    "hilfe": "help",
+    "erstellen": "create",
+    "liste": "list",
+    "löschen": "delete",
+    "ankuendigung": "announcement",
+}
+
+
+class _BefehlsUebersetzer(app_commands.Translator):
+    """Uebersetzt nur die neun deutschen Befehlsnamen oben ins Englische,
+    wenn Discord fuer einen Nutzer eine englische Anzeige anfragt (dessen
+    eigene App-Sprache, nicht unser Dashboard). Alles andere (Beschreibungen,
+    Parameter, bereits englische Namen) bekommt keinen locale_str und laeuft
+    deshalb nie durch diese Funktion – so kann hier nichts aus Versehen
+    uebersetzt werden, das gar nicht dafuer vorgesehen ist."""
+
+    async def translate(self, string: app_commands.locale_str, locale: discord.Locale,
+                        context: app_commands.TranslationContextTypes) -> Optional[str]:
+        if locale not in (discord.Locale.american_english, discord.Locale.british_english):
+            return None
+        return _BEFEHL_NAMEN_EN.get(string.message)
+
+
+# ══════════════════════════════════════════════════════════════
 #  Bot-Klasse
 # ══════════════════════════════════════════════════════════════
 class DayZBot(discord.Client):
@@ -3487,6 +3524,10 @@ class DayZBot(discord.Client):
         # (ServerConnection.discover_retry_ts), nicht mehr am Bot.
 
     async def setup_hook(self):
+        # Vor dem Registrieren setzen, damit die uebersetzten Namen gleich
+        # mit hochgeladen werden (siehe _BefehlsUebersetzer oben).
+        await self.tree.set_translator(_BefehlsUebersetzer())
+
         # Web-Dashboard im selben Prozess/Loop starten (aiohttp). Fehler hier
         # dürfen den Bot-Start nicht verhindern.
         try:
@@ -5083,7 +5124,8 @@ cmd_show_feeds.autocomplete("server")(_server_autocomplete)
 # ══════════════════════════════════════════════════════════════
 #  /neustart – Server Neustart
 # ══════════════════════════════════════════════════════════════
-@bot.tree.command(name="neustart", description="🔄 Startet den DayZ Server neu")
+@bot.tree.command(name=app_commands.locale_str("neustart"),
+                  description="🔄 Startet den DayZ Server neu")
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_neustart(interaction: discord.Interaction,
                        server: Optional[str] = None):
@@ -5106,7 +5148,8 @@ async def cmd_neustart(interaction: discord.Interaction,
 # ══════════════════════════════════════════════════════════════
 #  /stoppen – Server stoppen
 # ══════════════════════════════════════════════════════════════
-@bot.tree.command(name="stoppen", description="⏹️ Stoppt den DayZ Server")
+@bot.tree.command(name=app_commands.locale_str("stoppen"),
+                  description="⏹️ Stoppt den DayZ Server")
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_stoppen(interaction: discord.Interaction,
                       server: Optional[str] = None):
@@ -5855,7 +5898,7 @@ async def cmd_ban(interaction: discord.Interaction, spieler: str,
 # ══════════════════════════════════════════════════════════════
 #  /ban_entfernen – Ban aufheben
 # ══════════════════════════════════════════════════════════════
-@bot.tree.command(name="ban_entfernen",
+@bot.tree.command(name=app_commands.locale_str("ban_entfernen"),
                   description="✅ Entfernt Spieler von der Banliste in den Nitrado-Servereinstellungen")
 @app_commands.describe(spieler="Name(n) – mehrere per Komma getrennt",
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
@@ -6511,7 +6554,8 @@ async def cmd_positions(interaction: discord.Interaction, server: Optional[str] 
 # ══════════════════════════════════════════════════════════════
 #  /spieler_suche – Spieler in Logs suchen
 # ══════════════════════════════════════════════════════════════
-@bot.tree.command(name="spieler_suche", description="🔍 Sucht einen Spieler in den aktuellen Logs")
+@bot.tree.command(name=app_commands.locale_str("spieler_suche"),
+                  description="🔍 Sucht einen Spieler in den aktuellen Logs")
 @app_commands.describe(name="Ingame-Name oder Steam64-ID",
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_search(interaction: discord.Interaction, name: str,
@@ -6947,7 +6991,8 @@ cmd_log_status.autocomplete("server")(_server_autocomplete)
 # ══════════════════════════════════════════════════════════════
 #  /hilfe – Alle Befehle
 # ══════════════════════════════════════════════════════════════
-@bot.tree.command(name="hilfe", description="❓ Zeigt alle verfügbaren Bot-Befehle")
+@bot.tree.command(name=app_commands.locale_str("hilfe"),
+                  description="❓ Zeigt alle verfügbaren Bot-Befehle")
 async def cmd_hilfe(interaction: discord.Interaction):
     # Spam-Schutz: pro Nutzer, guild-übergreifend per gid=0-Fallback (DMs)
     gid = interaction.guild_id or 0
@@ -7562,7 +7607,8 @@ class EditAnnouncementModal(discord.ui.Modal):
         )
 
 
-@bot.tree.command(name="erstellen", description="📢 Neue wiederkehrende Ankündigung anlegen")
+@bot.tree.command(name=app_commands.locale_str("erstellen"),
+                  description="📢 Neue wiederkehrende Ankündigung anlegen")
 async def cmd_ann_erstellen(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
@@ -7574,7 +7620,8 @@ async def cmd_ann_erstellen(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="liste", description="📋 Zeigt alle geplanten Ankündigungen")
+@bot.tree.command(name=app_commands.locale_str("liste"),
+                  description="📋 Zeigt alle geplanten Ankündigungen")
 async def cmd_ann_liste(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
@@ -7640,7 +7687,8 @@ async def cmd_ann_liste(interaction: discord.Interaction):
     )
 
 
-@bot.tree.command(name="löschen", description="🗑️ Löscht eine Ankündigung")
+@bot.tree.command(name=app_commands.locale_str("löschen"),
+                  description="🗑️ Löscht eine Ankündigung")
 @app_commands.describe(index="Nummer der Ankündigung (siehe /liste)")
 async def cmd_ann_loeschen(
     interaction: discord.Interaction,
@@ -10442,7 +10490,7 @@ bot.tree.add_command(shop_group)
 # ══════════════════════════════════════════════════════════════
 edit_group = app_commands.Group(name="edit", description="✏️ Edit entries of the shop catalog")
 
-@edit_group.command(name="ankuendigung",
+@edit_group.command(name=app_commands.locale_str("ankuendigung"),
                     description="✏️ Bearbeitet eine geplante Ankündigung (Nachricht/Bild)")
 @app_commands.describe(index="Nummer der Ankündigung (siehe /liste)")
 async def edit_ankuendigung(interaction: discord.Interaction, index: int):
