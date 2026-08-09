@@ -603,15 +603,22 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
                            "emoji": "♻️", "farbe": 0x2ECC71},
 }
 
-# Die Feed-Typen, die aus Log-Ereignissen entstehen. Genau diese werden bei der
-# Umstellung aus den alten Sammelkategorien geraeumt – die Bot-Feeds oben
-# bleiben unberuehrt, sie bilden 1:1 ab.
-_FEED_EREIGNIS_TYPEN = tuple(k for k, v in FEED_TYPES.items() if v["gruppe"] != "Bot")
-
 # Die alten Sammelkategorien, die durch FEED_TYPES ersetzt wurden.
 _ALTE_EREIGNIS_FEEDS = ("killfeed", "damagefeed", "joinleave", "suicide", "chat",
                         "adminlog", "envdeath", "vehiclecrash", "basebuild",
                         "loot", "connecting")
+
+# Alter Schlüssel → heutiger Feed-Typ. Betriebsmeldungen im Code posten teils
+# noch auf die entfernten Sammelkategorien; ohne diese Übersetzung landen sie
+# nirgends, weil der Schlüssel in FEED_TYPES nicht mehr existiert und im
+# Dashboard nicht anlegbar ist.
+_FEED_ALIASSE = {
+    "adminlog": "admin_action",
+    "killfeed": "kill",
+    "joinleave": "connect",
+    "chat": "chat",
+    "restart": "server_restart",
+}
 
 # Stichwort → Feed-Typ. Zuerst passender Treffer gewinnt, deshalb stehen die
 # spezielleren Begriffe vorn (z. B. "barbed" vor "wire").
@@ -735,9 +742,17 @@ def _feed_key(ev: Dict[str, Any]) -> Optional[str]:
 
 
 def _long_range_grenze() -> float:
-    """Ab welcher Distanz ein Kill als Long Range Kill gilt (Meter)."""
+    """Ab welcher Distanz ein Kill als Long Range Kill gilt (Meter).
+
+    Wie ``_cur_symbol`` am gerade behandelten Server: sonst entschiede der
+    Betreiberwert fuer alle Kunden, ob ein Kill im normalen oder im
+    Long-Range-Feed landet, obwohl die Grenze pro Server einstellbar ist.
+    """
+    conn = _AKTUELLER_SERVER.get()
+    quelle = conn.get("long_range_kill_meter", 300) if conn is not None \
+        else cfg.config.get("long_range_kill_meter", 300)
     try:
-        return float(cfg.config.get("long_range_kill_meter", 300))
+        return float(quelle)
     except (TypeError, ValueError, AttributeError):
         return 300.0
 
@@ -799,23 +814,21 @@ ERSTE SCHRITTE
 1. Öffne config.json und trage NUR diese 2 Angaben ein:
    bot_token und guild_ids.
 2. Starte den Bot: python dayz_bot.py
-3. Führe im Discord /setup token <dein-nitrado-token> aus:
-   Es öffnet sich ein Dropdown mit deinen Nitrado-Servern –
-   Server auswählen und bestätigen. FTP-Zugang, die aktive Karte
-   und die Log-Verzeichnisse erkennt der Bot dann automatisch.
-4. Benutze /setup feeds im Discord um Channels zuzuweisen.
+3. Öffne das Web-Dashboard (Adresse steht beim Start im Log) und
+   trage unter „Optionen“ deinen Nitrado-Token ein. Server im
+   Dropdown auswählen – FTP-Zugang, die aktive Karte und die
+   Log-Verzeichnisse erkennt der Bot dann automatisch.
+4. Feeds, Zonen, Shop und Ankündigungen werden ebenfalls im
+   Dashboard eingerichtet. Die früheren Befehle /setup token,
+   /setup feeds, /setup uebersicht, /edit_feeds und
+   /zone create|edit|remove gibt es nicht mehr.
 
 BEFEHLE (alle nur für Admins mit der konfigurierten Rolle)
 ──────────────────────────────────────────────────────────
-/setup token <token>            → Nitrado-Token setzen; danach Server im
-                                   Dropdown auswählen & bestätigen (erkennt
-                                   FTP-Zugang und aktive Karte automatisch)
-/setup feeds <feed> #channel    → Feed-Channel setzen (Dropdown-Auswahl:
-                                   killfeed, damagefeed, joinleave, suicide,
-                                   chat, adminlog, envdeath, vehiclecrash,
-                                   basebuild, loot, connecting, shop_log,
-                                   economy_log, status, restart, zone)
-/setup uebersicht               → Alle Einstellungen anzeigen
+/show_feeds                     → Zeigt, welche Feeds für diesen Server
+                                   eingerichtet sind (Dashboard: Seite „Feeds“)
+/test [zeilen]                  → Liest die letzten Log-Zeilen und schickt je
+                                   Feed-Typ ein Beispiel-Event zur Kontrolle
 
 /neustart                       → Server neu starten
 /stoppen                        → Server stoppen
@@ -1058,30 +1071,68 @@ class ConfigManager:
 
     SEEN_PLAYERS_MAX = 1000
 
-    def seen_players(self, guild_id: int) -> List[str]:
-        """Ingame-Namen, die auf den Servern dieser Guild schon gesehen
-        wurden – Grundlage für die Allowlist-Autofill bei Zonen."""
+    def seen_players(self, guild_id: int,
+                     service_id: Optional[str] = None) -> List[str]:
+        """Ingame-Namen, die auf DIESEM Server schon gesehen wurden – Grundlage
+        für die Allowlist-Autofill bei Zonen.
+
+        Mit ``service_id`` genau die Namen dieses Servers; ohne (Altbestand,
+        Guild-Ebene) die gemeinsam gemerkten. Vorher lagen alle Server einer
+        Guild in einem Topf: das Zonenformular von Server B schlug Namen vor,
+        die nur auf A gesehen wurden, und eine Auswahl konnte auf B einen
+        gleichnamigen Spieler unbeabsichtigt von den Alarmen ausnehmen.
+        """
         eintrag = self.guilds.get(str(guild_id)) or {}
+        if service_id:
+            je_server = eintrag.get("seen_players_je_server")
+            if isinstance(je_server, dict):
+                werte = je_server.get(str(service_id))
+                if isinstance(werte, list):
+                    return werte
+            # Noch nichts server-eigenes gemerkt: der gemeinsame Altbestand
+            # ist besser als eine leere Liste.
         werte = eintrag.get("seen_players")
         return werte if isinstance(werte, list) else []
 
-    def record_seen_player(self, guild_id: int, name: str) -> None:
-        """Merkt sich einen Ingame-Namen dieser Guild (case-insensitiv
-        dedupliziert, auf die letzten SEEN_PLAYERS_MAX gedeckelt)."""
+    def record_seen_player(self, guild_id: int, name: str,
+                           service_id: Optional[str] = None) -> None:
+        """Merkt sich einen Ingame-Namen (case-insensitiv dedupliziert, auf die
+        letzten SEEN_PLAYERS_MAX gedeckelt) – je Server UND auf Guild-Ebene.
+
+        Die Guild-Ebene bleibt fuer den Altbestand und fuer Guilds mit genau
+        einem Server erhalten; die Aufteilung je Server verhindert, dass sich
+        die Spielerlisten mehrerer Server vermischen.
+        """
         name = (name or "").strip()
         if not name:
             return
         eintrag = self.guilds.setdefault(str(guild_id), {})
-        seen = eintrag.get("seen_players")
-        if not isinstance(seen, list):
-            seen = []
-        if name.lower() in {str(n).lower() for n in seen}:
-            return
-        seen.append(name)
-        if len(seen) > self.SEEN_PLAYERS_MAX:
-            seen = seen[-self.SEEN_PLAYERS_MAX:]
-        eintrag["seen_players"] = seen
-        self.save_guilds()
+        geaendert = False
+
+        def _merken(liste: Optional[list]) -> Optional[list]:
+            seen = liste if isinstance(liste, list) else []
+            if name.lower() in {str(n).lower() for n in seen}:
+                return None
+            seen = seen + [name]
+            if len(seen) > self.SEEN_PLAYERS_MAX:
+                seen = seen[-self.SEEN_PLAYERS_MAX:]
+            return seen
+
+        neu = _merken(eintrag.get("seen_players"))
+        if neu is not None:
+            eintrag["seen_players"] = neu
+            geaendert = True
+        if service_id:
+            je_server = eintrag.get("seen_players_je_server")
+            if not isinstance(je_server, dict):
+                je_server = {}
+            neu_srv = _merken(je_server.get(str(service_id)))
+            if neu_srv is not None:
+                je_server[str(service_id)] = neu_srv
+                eintrag["seen_players_je_server"] = je_server
+                geaendert = True
+        if geaendert:
+            self.save_guilds()
 
     def get_channel(self, guild_id: int, log_type: str,
                     service_id: Optional[str] = None) -> Optional[int]:
@@ -1926,7 +1977,7 @@ def _location_field_value(pos_str: Optional[str]) -> Optional[str]:
         z = float(parts[2])
     except ValueError:
         return None
-    map_name = cfg.config.get("map_name", "ChernarusPlus")
+    map_name = _aktuelle_karte()
     url  = _izurvive_url(x, y, map_name)
     loc  = _nearest_location(x, y, map_name)
     near = f"\n*(Near {loc})*" if loc else ""
@@ -2926,6 +2977,11 @@ class ServerConnection:
         # geerbt wuerde sonst der Zeitplan des Betreibers auf fremden Servern
         # Neustarts ausloesen.
         "map_name", "auto_restart_schedule", "auto_restart_after_purchase",
+        # Ban-/Whitelist-Feld auf dem Nitrado-Server: erbt ein Kunde hier die
+        # Kategorie oder den Settings-Key eines anderen, liest und beschreibt
+        # der Bot auf SEINEM Server das falsche Einstellungsfeld.
+        "nitrado_ban_category", "nitrado_ban_key",
+        "nitrado_whitelist_category", "nitrado_whitelist_key",
     })
 
     # Einstellungen, die jeder Kunde selbst festlegt. Rueckfallebene ist hier
@@ -3311,6 +3367,19 @@ def _setze_aktuellen_server(conn: Optional[ServerConnection]) -> None:
         pass
 
 
+def _aktuelle_karte(conn: Optional[ServerConnection] = None) -> str:
+    """Die Karte des gerade behandelten Servers – wie ``_cur_symbol`` bei der
+    Waehrung. Vorher stand hier immer ``cfg.config["map_name"]``: ein
+    Livonia- oder Sakhal-Kunde bekam dadurch Chernarus-iZurvive-Links und
+    Ortsnamen, die auf seiner Karte gar nicht existieren."""
+    conn = conn if conn is not None else _AKTUELLER_SERVER.get()
+    if conn is not None:
+        name = str(conn.get("map_name") or "").strip()
+        if name:
+            return name
+    return cfg.config.get("map_name", "ChernarusPlus")
+
+
 def _poll_zustand_melden(conn: ServerConnection, grund: Optional[str]) -> None:
     """Loggt, WARUM der Poll-Zyklus diesen Server gerade uebergeht oder wieder
     normal laeuft – aber nur bei einer AENDERUNG des Grundes, nicht bei jedem
@@ -3327,6 +3396,29 @@ def _poll_zustand_melden(conn: ServerConnection, grund: Optional[str]) -> None:
         log.info(f"[POLL] {conn.name}: läuft wieder normal "
                  f"(vorheriger Grund war: {conn.poll_zustand}).")
     conn.poll_zustand = grund
+
+
+def _historisch_parsen(conn: ServerConnection, text: str) -> Tuple[List[Dict],
+                                                                  "DayZLogParser"]:
+    """Alte Log-Zeilen parsen, **ohne** den Live-Parser zu verändern.
+
+    ``/test`` und die Diagnose-Seite lesen bereits verarbeitete Zeilen ein
+    zweites Mal. Mit ``conn.parser`` schrieben sie dabei historische
+    Positionen ueber die aktuellen und setzten ``last_seen`` auf jetzt – der
+    naechste Zonenlauf hielt eine laengst verlassene Position fuer frisch und
+    konnte einen Fehlalarm ausloesen. Deshalb eine eigene Instanz.
+
+    Die unerkannten Zeilen werden anschliessend bewusst in den Live-Parser
+    uebernommen: genau die will der Betreiber auf der Diagnose-Seite sehen,
+    und sie veraendern keinen Zustand, an dem etwas haengt.
+    """
+    eigen = DayZLogParser()
+    events = eigen.parse_lines(text)
+    if conn is not None and conn.parser is not None:
+        for zeile in eigen.unerkannte_zeilen:
+            if zeile not in conn.parser.unerkannte_zeilen:
+                conn.parser.unerkannte_zeilen.append(zeile)
+    return events, eigen
 
 
 async def _premium_check(interaction: discord.Interaction) -> bool:
@@ -3486,7 +3578,18 @@ class DayZBot(discord.Client):
         # Nahezu-Echtzeit: höchstens 10s zwischen den Polls, mindestens 5s
         # (schont den FTP-Server). Größere Werte aus alten Configs werden
         # automatisch begrenzt, damit Feeds sofort nach Erscheinen posten.
-        interval = int(cfg.config.get("log_poll_interval_seconds", 10))
+        # Eine gemeinsame Schleife bedient alle Kunden. Damit niemand langsamer
+        # abgefragt wird, als er eingestellt hat, gilt der KLEINSTE gewuenschte
+        # Wert – vorher zaehlte ausschliesslich der Betreiberwert, und die je
+        # Server gespeicherte Einstellung (die /log_status auch anzeigt) war
+        # wirkungslos.
+        wuensche = [int(cfg.config.get("log_poll_interval_seconds", 10) or 10)]
+        for _c in connections.all():
+            try:
+                wuensche.append(int(_c.get("log_poll_interval_seconds", 10) or 10))
+            except (TypeError, ValueError):
+                pass
+        interval = min(wuensche)
         if interval > 10:
             log.info(f"[POLL] log_poll_interval_seconds={interval} wird auf 10s begrenzt (Echtzeit-Feeds)")
             interval = 10
@@ -3833,14 +3936,15 @@ class DayZBot(discord.Client):
 
     UNPARSED_MAX_JE_ZYKLUS = 5
 
-    async def _post_unparsed_zeilen(self, conn: ServerConnection) -> None:
+    async def _post_unparsed_zeilen(self, conn: ServerConnection,
+                                    parser: Optional["DayZLogParser"] = None) -> None:
         """Postet neue unerkannte Log-Zeilen in den "unparsed"-Feed – NUR,
         wenn der Betreiber ihm einen Channel gegeben hat, sonst bleiben sie
         rein auf der Diagnose-Seite sichtbar. Entdoppelt und auf
         UNPARSED_MAX_JE_ZYKLUS gedeckelt, sonst würde eine rauschige ADM-Datei
         (z. B. ein Mod, der pro Tick eine Zeile schreibt) die Feeds fluten.
         """
-        parser = conn.parser if conn is not None else self.parser
+        parser = parser or (conn.parser if conn is not None else self.parser)
         if parser is None or not parser.frisch_unerkannt:
             return
         zeilen = parser.frisch_unerkannt
@@ -4048,6 +4152,9 @@ class DayZBot(discord.Client):
 
     async def _post_zone_ping(self, zone: Dict, player: str, info: Dict,
                               conn: Optional[ServerConnection] = None):
+        # Damit der iZurvive-Link die Karte DIESES Servers benutzt und nicht
+        # die global eingestellte (siehe _aktuelle_karte).
+        _setze_aktuellen_server(conn)
         e = discord.Embed(
             title="🛡️ • Ping On Detection",
             description=f"**{player}** was located within the zone **{zone['name']}**.",
@@ -4069,6 +4176,16 @@ class DayZBot(discord.Client):
             # Ohne Guild ginge der Alarm samt Spielername und Koordinaten an
             # ALLE konfigurierten Discord-Server.
             log.warning(f"[ZONE] {zone.get('name')}: keine guild_id – Ping unterdrueckt.")
+            return
+        # Die Zone traegt ihre Guild seit dem Anlegen. Wird der Server spaeter
+        # einem anderen Kunden zugeordnet, zeigt sie weiter auf den alten
+        # Discord – Spielernamen und exakte Koordinaten des NEUEN Betreibers
+        # gingen dann an den frueheren. Passt die gespeicherte Guild nicht mehr
+        # zur Verbindung, wird nicht gepostet.
+        if conn is not None and conn.guild_id is not None and gid != int(conn.guild_id):
+            log.warning(f"[ZONE] {zone.get('name')}: gespeicherte Guild {gid} gehört "
+                        f"nicht mehr zu {conn.name} (jetzt {conn.guild_id}) – Ping "
+                        f"unterdrückt. Zone im Dashboard neu speichern.")
             return
         sid = conn.service_id if conn is not None else None
         zone_ch = zone.get("channel_id")
@@ -4340,11 +4457,21 @@ class DayZBot(discord.Client):
         eintrag.update(extra)
         conn.dispatch_verlauf.append(eintrag)
 
-    async def _dispatch(self, ev: Dict, conn: Optional[ServerConnection] = None):
+    async def _dispatch(self, ev: Dict, conn: Optional[ServerConnection] = None,
+                        nebenwirkungen: bool = True):
         """Ein Log-Ereignis in die Feeds posten.
 
         Mit Verbindung geht es nur in deren Guild – die Ereignisse eines
         Servers haben in fremden Discord-Servern nichts zu suchen.
+
+        ``nebenwirkungen=False`` postet **nur** das Embed und ueberspringt
+        alles Buchende: Kill-Statistik, Kill-Belohnung, Kopfgelder,
+        Spielzeit-Sitzungen, die Dashboard-Ereignisliste und das Merken
+        gesehener Spieler. Das braucht die Diagnose-Seite, die bereits
+        gelesene Log-Zeilen ein zweites Mal durchschickt: ohne diesen
+        Schalter zaehlte jeder Klick denselben alten Kill erneut und zahlte
+        das Kopfgeld erneut aus. Der normale Poll-Zyklus laesst den Schalter
+        auf True – dort kommt jede Zeile genau einmal vorbei.
         """
         _setze_aktuellen_server(conn)
         if conn is not None and conn.guild_id is None:
@@ -4356,9 +4483,10 @@ class DayZBot(discord.Client):
         # Fuer die Allowlist-Autofill der Zonen: unabhaengig davon, ob fuer
         # "connect" ueberhaupt ein Feed eingerichtet ist, sonst wuerden nur
         # Namen von Servern mit aktivem Connect-Feed gemerkt.
-        if ev.get("type") == "connect" and ev.get("player"):
+        if nebenwirkungen and ev.get("type") == "connect" and ev.get("player"):
             for gid_str in ([str(conn.guild_id)] if conn is not None else list(cfg.guilds)):
-                cfg.record_seen_player(int(gid_str), ev["player"])
+                cfg.record_seen_player(int(gid_str), ev["player"],
+                                       conn.service_id if conn is not None else None)
         # Rückfallkette statt einem einzelnen Schlüssel: erst die feine
         # Zuordnung (Zombie Death statt "Umwelttod"), dann die grobe
         # Sammelkategorie (macht EVENT_TO_LOG wieder nutzbar – vorher toter
@@ -4380,13 +4508,15 @@ class DayZBot(discord.Client):
         # Für die Dashboard-Karte/Event-Liste festhalten (mit Koordinaten aus
         # dem Event bzw. der letzten bekannten Spielerposition). Fehler hier
         # dürfen den Log-Dispatch niemals stören.
-        try:
-            _ev_record(ev, (conn.parser if conn is not None else self.parser).player_positions,
-                       service_id=(conn.service_id if conn is not None else None))
-        except Exception:
-            pass
-        # Kill-Statistik, Sessions, Kill-Belohnung & Bounties verarbeiten
-        rewards = await self._process_event_rewards(ev, conn)
+        rewards: Dict[int, str] = {}
+        if nebenwirkungen:
+            try:
+                _ev_record(ev, (conn.parser if conn is not None else self.parser).player_positions,
+                           service_id=(conn.service_id if conn is not None else None))
+            except Exception:
+                pass
+            # Kill-Statistik, Sessions, Kill-Belohnung & Bounties verarbeiten
+            rewards = await self._process_event_rewards(ev, conn)
         _p = conn.parser if conn is not None else self.parser
         embed = EmbedBuilder.build(ev, _p.player_positions if _p else None)
         if not embed:
@@ -4899,7 +5029,10 @@ async def cmd_show_feeds(interaction: discord.Interaction, server: Optional[str]
     # beiden Schluesselmengen ueberschneiden sich kaum.
     active = {}
     for ft in FEED_TYPES:
-        feed = cfg.feed_settings(interaction.guild_id, ft, _sid_show)
+        # Im Owner-DM-Pfad ist interaction.guild_id None – dann die Guild des
+        # Servers nehmen, sonst meldet der Befehl dort faelschlich "0 Feeds".
+        feed = cfg.feed_settings(interaction.guild_id or _conn_show.guild_id,
+                                 ft, _sid_show)
         if feed:
             active[ft] = feed["channel_id"]
     inactive = [ft for ft in FEED_TYPES if ft not in active]
@@ -5137,6 +5270,18 @@ class AutoRestartView(discord.ui.View):
                 else _conn_of(itx))
         if conn is None:
             return await itx.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+        # Zwischen Aufruf und Bestaetigen liegen bis zu 180 Sekunden. In der
+        # Zeit kann der Server einem anderen Discord-Server zugeordnet worden
+        # sein oder die Person ihre Adminrolle verloren haben – sonst liesse
+        # sich hier noch ein Neustartplan fuer einen fremden Server setzen.
+        if conn.guild_id is not None and itx.guild_id \
+                and int(conn.guild_id) != int(itx.guild_id):
+            return await itx.response.send_message(
+                "❌ Dieser Server gehört inzwischen zu einem anderen Discord-Server. "
+                "Bitte `/auto restart` neu aufrufen.", ephemeral=True)
+        if not _is_admin(itx):
+            return await itx.response.send_message(
+                "❌ Dir fehlt inzwischen die nötige Rolle.", ephemeral=True)
         first = f"{self.hour:02d}:{self.minute:02d}"
         _conn_store(conn, "auto_restart_schedule", {
             "enabled": True, "first_time": first, "interval_hours": self.interval_hours})
@@ -5286,6 +5431,34 @@ def _zone_allowlist(zone: Dict) -> List[str]:
         zone["allowlist"] = al
     return al
 
+def _allowlist_aus_anfrage(data: Dict) -> Optional[List[str]]:
+    """Die im Zonen-Formular gewählten Spielernamen säubern.
+
+    ``None`` heisst "nicht mitgeschickt, vorhandene Liste behalten". Ohne
+    diese Auswertung nahmen ``create_zone``/``update_zone`` das Feld
+    stillschweigend nicht an: das Dashboard meldete Erfolg, die Namen waren
+    aber nie gespeichert und loesten weiter Zonenalarme aus.
+    """
+    roh = data.get("allowlist")
+    if roh is None:
+        return None
+    if not isinstance(roh, list):
+        return []
+    namen: List[str] = []
+    gesehen: set = set()
+    for n in roh:
+        name = str(n).strip()[:64]
+        if not name:
+            continue
+        if name.lower() in gesehen:
+            continue
+        gesehen.add(name.lower())
+        namen.append(name)
+        if len(namen) >= 200:
+            break
+    return namen
+
+
 def _player_in_allowlist(zone: Dict, pname: str) -> bool:
     """True, wenn der Spieler in dieser Zone ignoriert werden soll (case-insensitiv)."""
     key = (pname or "").strip().lower()
@@ -5329,6 +5502,7 @@ def _zone_payload(z: Dict) -> Dict:
     out["ping_role_ids"] = _zone_ping_role_ids(z)
     manage = z.get("manage_role_ids")
     out["manage_role_ids"] = manage if isinstance(manage, list) else []
+    out["allowlist"] = _zone_allowlist(z)
     if out["type"] == "polygon":
         pts = z.get("points")
         out["points"] = pts if isinstance(pts, list) else []
@@ -6102,7 +6276,17 @@ def _whitelist_conn(req: Dict[str, Any],
     """
     sid = str((req or {}).get("service_id") or "")
     if sid:
-        return connections.for_service(sid)
+        conn = connections.for_service(sid)
+        # Panels und offene Anfragen ueberdauern eine Neuzuordnung. Gehoert der
+        # Server inzwischen einem anderen Discord-Server, darf ein Admin aus
+        # dem alten hier nicht weiter dessen Nitrado-Whitelist aendern.
+        if conn is not None and conn.guild_id is not None and interaction.guild_id \
+                and int(conn.guild_id) != int(interaction.guild_id):
+            log.warning(f"[WHITELIST] Panel in Guild {interaction.guild_id} zeigt auf "
+                        f"{conn.name}, der inzwischen zu Guild {conn.guild_id} gehört – "
+                        f"abgelehnt.")
+            return None
+        return conn
     eigene = connections.all_for_guild((req or {}).get("guild_id")
                                        or interaction.guild_id)
     return eigene[0] if len(eigene) == 1 else None
@@ -6502,7 +6686,10 @@ async def cmd_test(interaction: discord.Interaction, zeilen: int = 500,
     # ── 2. Letzten N Zeilen parsen ────────────────────────────
     zeilen = max(50, min(zeilen, 2000))
     recent_lines = "\n".join(content.splitlines()[-zeilen:])
-    events = (conn.parser or bot.parser).parse_lines(recent_lines)
+    # Eigener Parser: mit conn.parser schrieb /test historische Positionen
+    # ueber die aktuellen und liess den naechsten Zonenlauf eine laengst
+    # verlassene Position fuer frisch halten.
+    events, _eigen = _historisch_parsen(conn, recent_lines)
 
     # ── 3. Pro Feed-Typ das neueste Event merken ───────────────
     # FEED_TYPES (fein: kill, connect, zombie_death, …) statt LOG_TYPES (grob:
@@ -6513,9 +6700,15 @@ async def cmd_test(interaction: discord.Interaction, zeilen: int = 500,
     # Events kommen in Lesereihenfolge → letztes überschreibt → neuestes bleibt
     latest_by_logtype: Dict[str, Dict] = {}
     for ev in events:
-        lt = _feed_key(ev) or DayZLogParser.EVENT_TO_LOG.get(ev["type"])
-        if lt:
-            latest_by_logtype[lt] = ev
+        # Dieselbe Rueckfallkette wie _dispatch: fein → grob → catch_all.
+        # Ohne den groben und den catch_all-Schluessel meldete /test bei einem
+        # Kunden, der NUR "Alles Übrige" gesetzt hat, faelschlich "kein
+        # Ereignis" bzw. "kein Channel" – obwohl der Poller genau dorthin
+        # postet.
+        for lt in (_feed_key(ev), DayZLogParser.EVENT_TO_LOG.get(ev["type"]),
+                   "catch_all"):
+            if lt:
+                latest_by_logtype[lt] = ev
 
     # ── 4. Pro Feed-Typ in konfigurierten Channel posten ──────
     sent:     List[Tuple[str, str]] = []  # (feed_type, channel_mention)
@@ -6525,7 +6718,8 @@ async def cmd_test(interaction: discord.Interaction, zeilen: int = 500,
 
     for lt in FEED_TYPES:
         ev   = latest_by_logtype.get(lt)
-        feed = cfg.feed_settings(interaction.guild_id, lt, conn.service_id)
+        feed = cfg.feed_settings(interaction.guild_id or conn.guild_id,
+                                 lt, conn.service_id)
         ch_id = feed["channel_id"] if feed else None
 
         if not ev:
@@ -6787,28 +6981,25 @@ async def cmd_hilfe(interaction: discord.Interaction):
         "`/spieler_suche <name>` — Spieler in Logs suchen"
     ), inline=False)
     embed.add_field(name="📡 Feed-Verwaltung", value=(
-        "`/show_feeds` — Alle Feeds & Channels anzeigen\n"
-        "`/edit_feeds <feed> [#channel]` — Feed ändern oder deaktivieren"
+        "`/show_feeds` — Zeigt, welche Feeds für diesen Server eingerichtet sind\n"
+        "`/test [zeilen]` — Beispiel-Event je Feed-Typ aus den letzten Log-Zeilen\n"
+        "*Einrichten, ändern und löschen im Dashboard unter „Feeds“ – "
+        "dort mit Farbe, Position und Zeitstempel je Feed.*"
     ), inline=False)
     embed.add_field(name="🛡️ Zonen-Pings", value=(
-        "`/zone create <x> <z> <name> <radius> [channel] [rolle]` — Zone anlegen "
-        "(pingt beim Betreten; Channel & Rolle optional)\n"
-        "`/zone remove <name>` — Zone entfernen\n"
-        "`/zone list` — Alle aktiven Zonen (Name, x/z, Radius, Channel)\n"
-        "`/zone edit <name> […]` — Zone bearbeiten (auch Channel)\n"
+        "`/zone list` — Alle aktiven Zonen dieses Servers\n"
         "`/zone allowlist add|remove|show <zone> <spieler>` — Spieler in einer Zone "
-        "ignorieren / wieder melden / anzeigen"
+        "ignorieren / wieder melden / anzeigen\n"
+        "*Anlegen und Bearbeiten im Dashboard unter „Zones“ – dort auch "
+        "Polygon-Zonen und mehrere Ping-Rollen.*"
     ), inline=False)
-    embed.add_field(name="📢 Setup", value=(
-        "`/setup token <token>` — Nitrado-Token setzen; Server im Dropdown "
-        "auswählen & bestätigen (FTP-Zugang und aktive Karte werden "
-        "automatisch erkannt)\n"
-        "`/setup feeds <feed> #channel` — Feed-Channel per Dropdown setzen "
-        "(killfeed, damagefeed, joinleave, suicide, chat, adminlog, envdeath, "
-        "vehiclecrash, basebuild, loot, connecting, shop_log, economy_log, "
-        "status, restart, zone)\n"
-        "`/setup uebersicht` — Alle konfigurierten Channels anzeigen\n"
-        "`/edit_feeds <feed> [#channel]` — Feed ändern oder deaktivieren"
+    embed.add_field(name="📢 Einrichtung", value=(
+        "Nitrado-Token, Server-Auswahl, Feeds, Zonen, Shop, Ankündigungen und "
+        "Auto-Neustarts werden im **Web-Dashboard** eingerichtet (Adresse steht "
+        "beim Start im Log).\n"
+        "Die früheren Befehle `/setup token`, `/setup feeds`, "
+        "`/setup uebersicht`, `/edit_feeds` und `/zone create|edit|remove` "
+        "gibt es nicht mehr."
     ), inline=False)
     embed.add_field(name="📊 Kill-Stats & Belohnungen", value=(
         "`/stats <spieler>` — Kills, Tode, K/D, Lieblingswaffe, weitester Kill\n"
@@ -6846,7 +7037,7 @@ async def cmd_hilfe(interaction: discord.Interaction):
         "`/edit shopitem <item> […]` — Classnames/Preis/Name/Kategorie ändern *(Admin)*\n"
         "`/shop pending` `/shop check` `/shop cleanup` `/shop setprice` "
         "`/shop enable` `/shop removeitem` *(Admin)*\n"
-        "`/setup feeds shop_log|economy_log #channel` — Feed-Channels"
+        "*Shop-Log und Economy-Log als Feed einrichten: Dashboard → „Feeds“.*"
     ), inline=False)
     embed.add_field(name="📢 Ankündigungen", value=(
         "`/erstellen` — Neue wiederkehrende Ankündigung anlegen (Tag/Uhrzeit/Wiederholung per Dropdown)\n"
@@ -6859,10 +7050,13 @@ async def cmd_hilfe(interaction: discord.Interaction):
     admin_ids = _c_hilfe.get("admin_role_ids", []) if _c_hilfe is not None else []
     admin_name = (_c_hilfe.get("admin_role_name", "DayZ Admin") if _c_hilfe is not None
                   else "DayZ Admin")
+    # Kein Verweis mehr auf die Dashboard-Optionen: admin_role_ids wird dort
+    # nicht angeboten (siehe api_options) – der Tipp schickte Betreiber auf
+    # die Suche nach einer Einstellung, die es an der Stelle nicht gibt.
     footer = (f"Admin-Rollen-IDs: {', '.join(str(i) for i in admin_ids)}"
               if admin_ids else
               f"Admin-Rolle: {admin_name} "
-              f"(Tipp: admin_role_ids im Dashboard unter Optionen setzen)")
+              f"(admin_role_ids stehen in der connections.json des Servers)")
     embed.set_footer(text=footer)
     await interaction.response.send_message(embed=embed)
 
@@ -7027,7 +7221,12 @@ async def check_announcements():
 
         if ann["day"] == day and ann["time"] == time_str:
 
-            key = f"{today.isoformat()}-{day}-{time_str}-{ann['channel_id']}"
+            # Die service_id gehoert in den Schluessel: zwei Server derselben
+            # Guild koennen zur selben Minute unterschiedliche Ankuendigungen
+            # in denselben Channel planen. Ohne sie galt die zweite nach dem
+            # ersten Versand als "schon gesendet" und fiel stillschweigend aus.
+            key = (f"{today.isoformat()}-{day}-{time_str}-{ann['channel_id']}"
+                   f"-{ann.get('service_id') or ''}-{ann.get('message', '')[:40]}")
 
             if key in ann_already_sent:
                 continue
@@ -7256,7 +7455,7 @@ class AnnouncementModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
 
         try:
-            channel = bot.get_channel(int(self.channel.value))
+            kanal_id = int(self.channel.value)
 
         except Exception:
 
@@ -7265,10 +7464,16 @@ class AnnouncementModal(discord.ui.Modal):
                 ephemeral=True
             )
 
+        # Bewusst NICHT bot.get_channel(): das findet jeden Channel, den der Bot
+        # sieht – auch die anderer Kunden. Der Zielchannel muss in DIESER Guild
+        # liegen, sonst liesse sich hier eine wiederkehrende Ankuendigung im
+        # Discord eines fremden Kunden einplanen.
+        channel = interaction.guild.get_channel(kanal_id) if interaction.guild else None
+
         if not channel:
 
             return await interaction.response.send_message(
-                "❌ Channel nicht gefunden",
+                "❌ Channel nicht gefunden – er muss in diesem Discord-Server liegen.",
                 ephemeral=True
             )
 
@@ -7302,6 +7507,12 @@ class EditAnnouncementModal(discord.ui.Modal):
         self.index = index
 
         ann = ann_data["announcements"][index]
+        # Der Index ist eine Position in EINER globalen Liste. Wird waehrend
+        # das Modal offen ist ein frueherer Eintrag geloescht, rutscht ein
+        # fremder Datensatz auf diese Position – ohne Merkmal wuerde dann beim
+        # Absenden die Ankuendigung eines anderen Kunden ueberschrieben.
+        self.gehoert_zu = str(ann.get("service_id") or "")
+        self.war_text = str(ann.get("message") or "")
 
         self.message_input = discord.ui.TextInput(
             label="Neue Nachricht",
@@ -7321,9 +7532,23 @@ class EditAnnouncementModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
 
-        ann_data["announcements"][self.index]["message"] = self.message_input.value
+        eintraege = ann_data["announcements"]
+        # Steht an der gemerkten Stelle noch derselbe Eintrag? Sonst hat sich
+        # die Liste zwischenzeitlich verschoben und wir wuerden den falschen
+        # (moeglicherweise fremden) Datensatz ueberschreiben.
+        ziel = eintraege[self.index] if 0 <= self.index < len(eintraege) else None
+        if (ziel is None
+                or str(ziel.get("service_id") or "") != self.gehoert_zu
+                or str(ziel.get("message") or "") != self.war_text):
+            return await interaction.response.send_message(
+                "❌ Die Liste hat sich inzwischen geändert – bitte `/liste` erneut "
+                "aufrufen und die Ankündigung neu auswählen.",
+                ephemeral=True
+            )
 
-        ann_data["announcements"][self.index]["image"] = (
+        ziel["message"] = self.message_input.value
+
+        ziel["image"] = (
             self.image_input.value.strip()
             if self.image_input.value
             else None
@@ -8248,12 +8473,28 @@ async def _post_feed(guild_id: Optional[int], log_type: str, embed: discord.Embe
     if channel_id:
         await _send(channel_id, f"{log_type} → Channel {channel_id}")
         return
+    # Rückfallkette wie in _dispatch: der erste Schlüssel mit gesetztem Channel
+    # gewinnt. Ohne sie liefen die Betriebswarnungen ins Leere – sie posten
+    # historisch auf "adminlog", das es in FEED_TYPES nicht mehr gibt und das
+    # die Migration entfernt. FTP-Ausfall, übersprungener Rückstand,
+    # Zonen-Rückfall und Link-Meldungen blieben damit stumm, obwohl der
+    # Betreiber den sichtbaren Feed „Admin Action" eingerichtet hatte.
+    kandidaten = [log_type]
+    for ersatz in (_FEED_ALIASSE.get(log_type), "catch_all"):
+        if ersatz and ersatz not in kandidaten:
+            kandidaten.append(ersatz)
     gids = [str(guild_id)] if guild_id else list(cfg.guilds.keys())
     for gid in gids:
-        ch_id = cfg.get_channel(int(gid), log_type, service_id)
+        ch_id = None
+        treffer = log_type
+        for kand in kandidaten:
+            ch_id = cfg.get_channel(int(gid), kand, service_id)
+            if ch_id:
+                treffer = kand
+                break
         if not ch_id:
             continue
-        await _send(ch_id, f"{log_type} → Guild {gid}")
+        await _send(ch_id, f"{treffer} → Guild {gid}")
 
 
 async def _notify_link_change(guild_id: Optional[int], embed: discord.Embed):
@@ -8265,7 +8506,8 @@ async def _notify_link_change(guild_id: Optional[int], embed: discord.Embed):
     """
     _leit = connections.for_guild(guild_id) if guild_id else None
     sid = _leit.service_id if _leit is not None else None
-    if guild_id and cfg.get_channel(int(guild_id), "adminlog", sid):
+    if guild_id and (cfg.get_channel(int(guild_id), "admin_action", sid)
+                     or cfg.get_channel(int(guild_id), "adminlog", sid)):
         return await _post_feed(guild_id, "adminlog", embed, service_id=sid)
     await _post_feed(guild_id, "economy_log", embed, service_id=sid)
 
@@ -11298,9 +11540,29 @@ def _sess_destroy(request: web.Request) -> None:
         _SESS_STORE.pop(sid, None)
 
 
-def _sess_cookie(response: web.Response, sid: str) -> None:
+def _ist_https(request: Optional[web.Request]) -> bool:
+    """Kam die Anfrage verschluesselt an? Beruecksichtigt den Tunnel/Proxy.
+
+    Hinter einem Cloudflare-Tunnel spricht der Bot selbst nur HTTP; ob der
+    Nutzer HTTPS benutzt hat, steht dann in ``X-Forwarded-Proto``.
+    """
+    if request is None:
+        return False
+    proto = (request.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+    if proto:
+        return proto == "https"
+    return request.scheme == "https"
+
+
+def _sess_cookie(response: web.Response, sid: str,
+                 request: Optional[web.Request] = None) -> None:
+    # ``Secure`` nur bei einer HTTPS-Anfrage: derselbe Port bedient bewusst
+    # auch HTTP (siehe _DualProtocolSite). Wuerde das Flag immer gesetzt,
+    # schickt der Browser das Cookie ueber HTTP nie mit und die Anmeldung
+    # waere dort tot. Kommt der Nutzer ueber HTTPS – der Normalfall hinter dem
+    # Tunnel –, verlaesst das Cookie den Browser ab jetzt nur noch verschluesselt.
     response.set_cookie(_SESS_COOKIE, sid, httponly=True, samesite="Lax",
-                        max_age=_SESS_TTL, path="/")
+                        max_age=_SESS_TTL, path="/", secure=_ist_https(request))
 
 
 def _sess_is_public(path: str) -> bool:
@@ -11715,7 +11977,7 @@ async def api_discord_callback(request: web.Request) -> web.Response:
         _SESS_STORE[sid]["map_name"] = conn.get("map_name")
 
     resp = web.HTTPFound("/")
-    _sess_cookie(resp, sid)
+    _sess_cookie(resp, sid, request)
     if conn is not None:
         detail = f"Server „{conn.name}“ ohne erneute Token-Eingabe verbunden"
     elif token_invalid:
@@ -11877,18 +12139,87 @@ def _audit_actor(sess: Optional[Dict[str, Any]]) -> str:
     return "Dashboard (ohne Discord-Anmeldung)"
 
 
-def _require_admin(request: web.Request) -> Optional[web.Response]:
-    """None = darf. Sonst die fertige Fehlerantwort."""
+# Wie lange eine einmal geprueft Adminrolle als bestaetigt gilt, bevor sie
+# erneut bei Discord nachgeschlagen wird. Kurz genug, dass ein Rollenentzug
+# schnell greift, lang genug, dass nicht jeder Klick einen REST-Aufruf ausloest.
+_ADMIN_NACHPRUEF_SEKUNDEN = 60
+
+
+async def _discord_admin_status(user_id: int) -> Optional[bool]:
+    """Dreiwertige Auskunft zur Dashboard-Adminrolle.
+
+    ``True``  – Mitglied gefunden, Rolle vorhanden.
+    ``False`` – Mitglied gefunden, Rolle NICHT vorhanden (echter Entzug).
+    ``None``  – nicht feststellbar: keine Rolle konfiguriert, Bot nicht
+                angemeldet, oder die Person war in keiner verbundenen Guild
+                auffindbar.
+
+    Die Unterscheidung ist der ganze Punkt: ``_discord_user_is_admin`` liefert
+    fuer "kein Admin" und "kann ich gerade nicht sagen" dasselbe ``False``.
+    Wuerde man darauf einen Entzug stuetzen, sperrte ein Discord-Ausfall oder
+    ein kurzzeitig nicht abrufbares Mitglied jeden Betreiber aus.
+    """
+    try:
+        role_id = int(str(cfg.config.get("dashboard_admin_role_id") or "0") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not role_id or bot is None or getattr(bot, "user", None) is None:
+        return None
+    gesehen = False
+    for gid in _configured_guild_ids():
+        guild = bot.get_guild(gid)
+        if guild is None:
+            continue
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except Exception:  # noqa: BLE001 – nicht Mitglied / nicht abrufbar
+                continue
+        gesehen = True
+        if any(int(r.id) == role_id for r in getattr(member, "roles", [])):
+            return True
+    return False if gesehen else None
+
+
+async def _require_admin(request: web.Request) -> Optional[web.Response]:
+    """None = darf. Sonst die fertige Fehlerantwort.
+
+    Die Adminrolle wird nicht nur beim Anmelden geprueft, sondern regelmaessig
+    neu: die Session laeuft bei Benutzung immer weiter, sodass ein entzogener
+    Betreiber-Zugang sonst beliebig lange gueltig blieb – samt Zugriff auf
+    fremde Kundenserver, Guild-Zuordnung, Loeschen und Token-Anzeige.
+    """
     sess = _sess_get(request)
     if not sess:
         return err("Session abgelaufen – bitte neu anmelden.", 401)
     if not sess.get("is_admin"):
         return err("Dafür fehlt dir die nötige Discord-Rolle.", 403)
+    uid = str(((sess.get("discord") or {}).get("id")) or "")
+    if uid:
+        jetzt = time.time()
+        if jetzt - float(sess.get("admin_geprueft_ts") or 0) > _ADMIN_NACHPRUEF_SEKUNDEN:
+            try:
+                stand = await _discord_admin_status(int(uid))
+            except Exception as e:  # noqa: BLE001
+                dash_log.warning(f"[ADMIN] Rolle nicht nachprüfbar: {e}")
+                stand = None
+            # Nur ein EINDEUTIGES "Rolle weg" entzieht die Rechte. Bei None
+            # (nicht feststellbar) bleibt alles wie es war und es wird auch
+            # kein Prueffzeitpunkt gesetzt, damit es gleich nochmal versucht wird.
+            if stand is not None:
+                sess["admin_geprueft_ts"] = jetzt
+                if stand is False:
+                    sess["is_admin"] = False
+                    _audit_add("dashboard", _audit_actor(sess),
+                               "Adminrechte entzogen",
+                               "Discord-Rolle nicht mehr vorhanden")
+                    return err("Dafür fehlt dir die nötige Discord-Rolle.", 403)
     return None
 
 
 async def api_audit(request: web.Request) -> web.Response:
-    denied = _require_admin(request)
+    denied = await _require_admin(request)
     if denied is not None:
         return denied
     entries = list(_audit_log)
@@ -11896,9 +12227,25 @@ async def api_audit(request: web.Request) -> web.Response:
     return ok({"entries": entries, "max": _AUDIT_MAX})
 
 
+def _feeds_zaehlen(guild_id: int) -> int:
+    """Wie viele Feeds sind in dieser Guild wirklich eingerichtet?
+
+    Zaehlt beides: die aktuellen, je Server abgelegten Feeds
+    (``guilds[gid]["servers"][sid]``) und die alten flachen Schluessel auf
+    Guild-Ebene. Vorher wurden nur die flachen ``LOG_TYPES`` gezaehlt – eine
+    vollstaendig eingerichtete Guild erschien dadurch mit ``0``.
+    """
+    eintrag = cfg.guilds.get(str(guild_id)) or {}
+    schluessel = {k for k in eintrag if k in FEED_TYPES or k in LOG_TYPES}
+    for feeds in (eintrag.get("servers") or {}).values():
+        if isinstance(feeds, dict):
+            schluessel |= {k for k in feeds if k in FEED_TYPES or k in LOG_TYPES}
+    return len(schluessel)
+
+
 async def api_admin_guilds(request: web.Request) -> web.Response:
     """Alle verbundenen Discord-Server mit Namen – für die Kategorie Guild IDs."""
-    denied = _require_admin(request)
+    denied = await _require_admin(request)
     if denied is not None:
         return denied
     out = []
@@ -11909,8 +12256,10 @@ async def api_admin_guilds(request: web.Request) -> web.Response:
             "name": (guild.name if guild is not None else None),
             "available": guild is not None,
             "members": (guild.member_count if guild is not None else None),
-            "feeds": sum(1 for k in (cfg.guilds.get(str(gid), {}) or {})
-                         if k in LOG_TYPES),
+            # Aktuelle Feeds liegen je Server unter "servers"; nur die flachen
+            # LOG_TYPES zu zaehlen liess jede korrekt eingerichtete Guild mit
+            # "0 Feeds" erscheinen.
+            "feeds": _feeds_zaehlen(gid),
         })
     return ok({"guilds": out, "bot_online": bool(
         bot is not None and getattr(bot, "user", None) is not None)})
@@ -11975,6 +12324,16 @@ def _session_conn(request: web.Request) -> Tuple[Optional[ServerConnection],
     conn = _conn_for_session(sess)
     if conn is None:
         return None, err("Für diese Anmeldung ist kein Nitrado-Server ausgewählt.", 409)
+    # Die Anmeldung haengt bisher nur an der gemerkten service_id. Wechselt der
+    # Eigentuemer des Servers, blieb eine alte Sitzung des frueheren Besitzers
+    # voll bedienbar – inklusive Token-Anzeige. Deshalb bei jedem Zugriff
+    # gegenpruefen, wem der Server JETZT gehoert.
+    besitzer = str(conn.data.get("owner_discord_id") or "").strip()
+    meine = str(((sess.get("discord") or {}).get("id")) or "").strip()
+    if besitzer and meine and besitzer != meine and not sess.get("is_admin"):
+        sess["service_id"] = None
+        return None, err("Dieser Nitrado-Server gehört inzwischen einem anderen "
+                         "Discord-Konto. Bitte neu anmelden.", 403)
     if not _sitzung_hat_premium(sess, conn) and request.path not in _PREMIUM_FREIE_PFADE:
         return None, err(DASHBOARD_PREMIUM_TEXT, 403)
     return conn, None
@@ -12021,7 +12380,7 @@ async def _refresh_server_name(conn: ServerConnection) -> None:
 
 async def api_admin_servers(request: web.Request) -> web.Response:
     """Alle verbundenen Nitrado-Server mit ihrer Guild-Zuordnung."""
-    denied = _require_admin(request)
+    denied = await _require_admin(request)
     if denied is not None:
         return denied
     out = []
@@ -12050,7 +12409,7 @@ async def api_admin_servers(request: web.Request) -> web.Response:
 
 async def post_admin_server_guild(request: web.Request) -> web.Response:
     """Guild-ID einem Nitrado-Server zuordnen (der Premium-Schalter)."""
-    denied = _require_admin(request)
+    denied = await _require_admin(request)
     if denied is not None:
         return denied
     service_id = request.match_info["service_id"]
@@ -12182,7 +12541,7 @@ async def delete_admin_server(request: web.Request) -> web.Response:
     Banliste bleiben gespeichert. Wird derselbe Server später erneut verbunden,
     findet er alles wieder vor.
     """
-    denied = _require_admin(request)
+    denied = await _require_admin(request)
     if denied is not None:
         return denied
     service_id = str(request.match_info["service_id"])
@@ -12323,6 +12682,18 @@ async def post_options_token(request: web.Request) -> web.Response:
         cfg.save_config()
 
     sess["token"] = token
+    # Alle ANDEREN Sitzungen, die auf diesen Server zeigen, verlieren ihre
+    # Gueltigkeit. Sonst bliebe ein alter oder entwendeter Cookie nach der
+    # Token-Rotation weiter bedienbar und koennte ueber die Options-Seite sogar
+    # den neuen Klartext-Token auslesen – die Rotation waere wirkungslos.
+    _mich = request.cookies.get(_SESS_COOKIE)
+    fremde = [s for s, v in _SESS_STORE.items()
+              if s != _mich and str(v.get("service_id") or "") == conn.service_id]
+    for s in fremde:
+        _SESS_STORE.pop(s, None)
+    if fremde:
+        dash_log.info(f"[LOGIN] Token für {conn.name} geändert – "
+                      f"{len(fremde)} andere Sitzung(en) abgemeldet.")
     try:
         # Nur den eigenen Server neu aufsetzen, nicht die aller Kunden
         await bot.init_nitrado(force=True, only=conn)
@@ -12364,7 +12735,7 @@ async def post_token(request: web.Request) -> web.Response:
         pre["token"] = token
         pre["gameservers"] = gameservers
     else:
-        _sess_cookie(resp, _sess_create(token, gameservers))
+        _sess_cookie(resp, _sess_create(token, gameservers), request)
     return resp
 
 
@@ -13012,6 +13383,32 @@ async def get_feeds(request: web.Request) -> web.Response:
     })
 
 
+def _kanal_gehoert_guild(gid: int, kanal_id: int,
+                         feld: str = "Channel") -> Optional[web.Response]:
+    """Prueft, ob ein Channel wirklich in DIESER Guild liegt.
+
+    Ohne diese Pruefung reicht es, die Channel-ID eines anderen Kunden zu
+    kennen: die Route bindet zwar Guild und Verbindung an die Anmeldung,
+    speichert die fremde ID danach aber ungeprueft, und der Versand stellt
+    spaeter botweit zu. Kills, Chat und Adminmeldungen des einen Kunden
+    landeten so im Discord des anderen.
+
+    Gibt ``None`` zurueck, wenn alles stimmt, sonst die fertige Fehlerantwort.
+    """
+    g = bot.get_guild(int(gid)) if bot else None
+    if g is None:
+        if bot is None or not getattr(bot, "is_ready", lambda: False)():
+            return err(f"Der Bot ist gerade nicht bei Discord angemeldet – die "
+                       f"{feld}-ID lässt sich erst prüfen, wenn er wieder "
+                       f"verbunden ist.", 409)
+        return err(f"Der Bot erreicht diesen Discord-Server nicht – die {feld}-ID "
+                   f"kann deshalb nicht geprüft werden. Ist der Bot dort "
+                   f"eingeladen?", 409)
+    if g.get_channel(int(kanal_id)) is None:
+        return err(f"Diese {feld}-ID gibt es in dem gewählten Discord-Server nicht.")
+    return None
+
+
 async def set_feed(request: web.Request) -> web.Response:
     gid = request.match_info["guild_id"]
     log_type = request.match_info["log_type"]
@@ -13047,6 +13444,9 @@ async def set_feed(request: web.Request) -> web.Response:
         kanal = int(channel_id)
     except (TypeError, ValueError):
         return err("Ungültige Channel-ID.")
+    fehler = _kanal_gehoert_guild(int(gid), kanal)
+    if fehler is not None:
+        return fehler
 
     # Farbe kommt als "#rrggbb" aus dem Farbwaehler oder als Zahl.
     meta = FEED_TYPES.get(log_type) or {}
@@ -13202,13 +13602,17 @@ async def api_diagnose_nachlesen(request: web.Request) -> web.Response:
     if start > 0 and zeilen:
         zeilen = zeilen[1:]  # erste Zeile kann mittendrin abgeschnitten sein
     zeilen = zeilen[-DIAGNOSE_NACHLESEN_ZEILEN:]
-    events = conn.parser.parse_lines("\n".join(zeilen))
+    # Eigener Parser und _dispatch OHNE Nebenwirkungen: diese Zeilen hat der
+    # Poll-Zyklus in aller Regel laengst verarbeitet. Wuerden sie erneut
+    # gebucht, zaehlte jeder Klick denselben Kill nochmal und zahlte das
+    # Kopfgeld erneut aus – die Diagnose soll zeigen, nicht verrechnen.
+    events, eigen = _historisch_parsen(conn, "\n".join(zeilen))
     cap = max(1, int(conn.get("max_events_per_cycle", 30)))
     if len(events) > cap:
         events = events[-cap:]
     for ev in events:
-        await bot._dispatch(ev, conn)
-    await bot._post_unparsed_zeilen(conn)
+        await bot._dispatch(ev, conn, nebenwirkungen=False)
+    await bot._post_unparsed_zeilen(conn, parser=eigen)
     verlauf = list(conn.dispatch_verlauf)[-len(events):] if events else []
     gepostet = sum(1 for e in verlauf if e.get("ergebnis") == "gepostet")
     return ok({
@@ -13401,6 +13805,7 @@ async def create_zone(request: web.Request) -> web.Response:
     zone["ping_role_ids"] = ziel.get("ping_role_ids", [])
     zone["manage_role_ids"] = ziel.get("manage_role_ids", [])
     zone["guild_id"] = ziel["guild_id"]
+    zone["allowlist"] = _allowlist_aus_anfrage(data) or []
 
     zones = _zones(_c)
     zones.append(zone)
@@ -13466,6 +13871,9 @@ async def update_zone(request: web.Request) -> web.Response:
         zone.pop("role_id", None)
     if "manage_role_ids" in ziel:
         zone["manage_role_ids"] = ziel["manage_role_ids"]
+    neue_allowlist = _allowlist_aus_anfrage(data)
+    if neue_allowlist is not None:
+        zone["allowlist"] = neue_allowlist
     _zones_save(_c)
     # Name/Geometrie/Typ koennen sich geaendert haben – die naechste frische
     # Position bewertet die Zone dann komplett neu, kein Nachzieh-Ping aus
@@ -13579,7 +13987,11 @@ async def guild_seen_players(request: web.Request) -> web.Response:
         return err("Keine gültige Discord-Server-ID.", 400)
     if gid not in _session_guilds(request):
         return err("Dieser Discord-Server gehört nicht zu deinem Nitrado-Server.", 403)
-    return ok({"players": sorted(cfg.seen_players(gid), key=str.lower)})
+    # Nur die Namen des gerade gewaehlten Servers – sonst schlaegt das
+    # Zonenformular von Server B Spieler vor, die es nur auf A gibt.
+    _c = _conn_for_session(_sess_get(request))
+    sid = _c.service_id if _c is not None else None
+    return ok({"players": sorted(cfg.seen_players(gid, sid), key=str.lower)})
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -14580,9 +14992,22 @@ async def create_announcement(request: web.Request) -> web.Response:
         return err("repeat muss weekly, biweekly, triweekly oder monthly sein.")
     if not channel_id:
         return err("channel_id fehlt.")
+    try:
+        kanal = int(channel_id)
+    except (TypeError, ValueError):
+        return err("Ungültige Channel-ID.")
+    # Der Zielchannel muss in der Guild DIESES Servers liegen. Ohne die
+    # Pruefung liess sich mit einer fremden Channel-ID eine wiederkehrende
+    # Ankuendigung im Discord eines anderen Kunden einplanen.
+    if conn.guild_id is None:
+        return err("Für diesen Server ist noch kein Discord-Server zugeordnet – "
+                   "der Bot-Betreiber schaltet ihn frei.", 409)
+    fehler = _kanal_gehoert_guild(int(conn.guild_id), kanal)
+    if fehler is not None:
+        return fehler
 
     ann = {"day": day, "time": time_, "message": message,
-           "channel_id": int(channel_id), "repeat": repeat, "last_sent": None,
+           "channel_id": kanal, "repeat": repeat, "last_sent": None,
            "service_id": conn.service_id}
     d["announcements"].append(ann)
     save = save_announcements
@@ -16674,8 +17099,14 @@ def run_dashboard_only():
         # klickbaren Link http://127.0.0.1:<port>.
         await start_dashboard(bot)
         print("  (ohne Discord-Verbindung · Strg+C zum Beenden)\n")
-        while True:
-            await asyncio.sleep(3600)
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        finally:
+            # Sonst bleiben Runner, Listener und ein eventuell gestarteter
+            # Cloudflare-Tunnel beim Beenden haengen – stop_dashboard() wurde
+            # bisher an keiner Stelle aufgerufen.
+            await stop_dashboard()
 
     try:
         asyncio.run(_serve())
