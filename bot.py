@@ -3578,20 +3578,111 @@ _BEFEHL_NAMEN_EN = {
     "ankuendigung": "announcement",
 }
 
+# Beschreibungstexte (stehen unter dem Befehlsnamen in Discords Befehlsliste,
+# siehe Screenshot). Nur Beschreibungen mit app_commands.locale_str(...) an
+# der jeweiligen Befehls-Definition laufen ueberhaupt durch translate() -
+# ein paar neuere Bereiche (Economy/Shop) sind ohnehin schon englisch und
+# brauchen deshalb keinen Eintrag hier.
+_BEFEHL_BESCHREIBUNG_EN = {
+    "📡 Zeigt alle Feed-Channels und ihren Status": "📡 Shows all feed channels and their status",
+    "🔄 Startet den DayZ Server neu": "🔄 Restarts the DayZ server",
+    "⏹️ Stoppt den DayZ Server": "⏹️ Stops the DayZ server",
+    "📊 Zeigt den aktuellen Server-Status": "📊 Shows the current server status",
+    "🛠️ Einstellungen für den Bot-Betreiber": "🛠️ Settings for the bot operator",
+    "🛠️ (Nur Bot-Eigentümer) Legt fest, wohin Ausfall-/Anfrage-Meldungen gehen":
+        "🛠️ (Bot owner only) Sets where outage/request alerts are sent",
+    "⏰ Automatische Server-Neustarts planen": "⏰ Schedule automatic server restarts",
+    "⏰ Plant automatische Neustarts (Startzeit per Dropdown + Intervall)":
+        "⏰ Schedules automatic restarts (start time via dropdown + interval)",
+    "⏹️ Deaktiviert die geplanten Neustarts": "⏹️ Disables the scheduled restarts",
+    "📋 Zeigt den aktuellen Restart-Zeitplan": "📋 Shows the current restart schedule",
+    "🛡️ Zonen-Pings verwalten (Admin)": "🛡️ Manage zone pings (admin)",
+    "📋 Alle aktiven Zonen anzeigen (Admin)": "📋 Show all active zones (admin)",
+    "🙈 Spieler in einer Zone ignorieren (Admin)": "🙈 Ignore a player in a zone (admin)",
+    "🙈 Spieler zur Ignorier-Liste einer Zone hinzufügen (Admin)":
+        "🙈 Add a player to a zone's ignore list (admin)",
+    "🔔 Spieler wieder melden – von der Ignorier-Liste entfernen (Admin)":
+        "🔔 Report a player again – remove from the ignore list (admin)",
+    "📋 Ignorierte Spieler einer Zone anzeigen (Admin)": "📋 Show a zone's ignored players (admin)",
+    "🔨 Fügt Spieler zur Banliste in den Nitrado-Servereinstellungen hinzu":
+        "🔨 Adds a player to the ban list in the Nitrado server settings",
+    "✅ Entfernt Spieler von der Banliste in den Nitrado-Servereinstellungen":
+        "✅ Removes a player from the ban list in the Nitrado server settings",
+    "📋 Zeigt die Banliste aus den Nitrado-Servereinstellungen":
+        "📋 Shows the ban list from the Nitrado server settings",
+    "✅ Whitelist in den Nitrado-Servereinstellungen verwalten (Admin)":
+        "✅ Manage the whitelist in the Nitrado server settings (admin)",
+    "✅ Spieler zur Whitelist hinzufügen (mehrere per Komma/Zeile)":
+        "✅ Add players to the whitelist (multiple via comma/line)",
+    "🗑️ Spieler von der Whitelist entfernen (mehrere per Komma/Zeile)":
+        "🗑️ Remove players from the whitelist (multiple via comma/line)",
+    "📋 Zeigt die aktuellen Spieler auf der Whitelist (Admin)":
+        "📋 Shows the current players on the whitelist (admin)",
+    "📨 Panels/Embeds senden (Admin)": "📨 Send panels/embeds (admin)",
+    "✅ Whitelist-Panel senden": "✅ Send whitelist panel",
+    "📩 Whitelist-Anfrage-Panel in einen Channel senden (Admin)":
+        "📩 Send whitelist request panel to a channel (admin)",
+    "📍 Letzte bekannte Positionen aller Spieler aus den Logs":
+        "📍 Last known positions of all players from the logs",
+    "🔍 Sucht einen Spieler in den aktuellen Logs": "🔍 Searches for a player in the current logs",
+    "🔎 Scannt FTP-Server erneut nach Log-Verzeichnissen":
+        "🔎 Re-scans the FTP server for log directories",
+    "🔍 Zeigt die letzten Zeilen des ADM-Logs (Debug)": "🔍 Shows the last lines of the ADM log (debug)",
+    "🧪 Postet das letzte Log-Event jedes Typs in die jeweiligen Channels":
+        "🧪 Posts the latest log event of each type into its channel",
+    "🔌 Testet die FTP-Verbindung zum Nitrado-Server": "🔌 Tests the FTP connection to the Nitrado server",
+    "📄 Zeigt den aktuellen Log-Polling Status": "📄 Shows the current log polling status",
+    "❓ Zeigt alle verfügbaren Bot-Befehle": "❓ Shows all available bot commands",
+    "📢 Neue wiederkehrende Ankündigung anlegen": "📢 Create a new recurring announcement",
+    "📋 Zeigt alle geplanten Ankündigungen": "📋 Shows all scheduled announcements",
+    "🗑️ Löscht eine Ankündigung": "🗑️ Deletes an announcement",
+    "🔨 Bannt einen Discord-Benutzer per ID.": "🔨 Bans a Discord user by ID.",
+    "📊 Kill-Statistiken eines Spielers (Kills, Tode, K/D, Waffe)":
+        "📊 Kill stats for a player (kills, deaths, K/D, weapon)",
+    "🏆 Top 10 PvP-Killer des Servers": "🏆 Top 10 PvP killers on the server",
+    "🔗 Verknüpft deinen Discord-Account mit deinem PlayStation-Namen":
+        "🔗 Links your Discord account to your PlayStation name",
+    "🔓 Entfernt deine eigene Ingame-Verknüpfung": "🔓 Removes your own in-game link",
+    "🔗 (Admin) Verknüpft einen Spieler mit einem Discord-Account":
+        "🔗 (Admin) Links a player to a Discord account",
+    "🔓 (Admin) Entfernt die Verknüpfung eines Discord-Accounts":
+        "🔓 (Admin) Removes a Discord account's link",
+    "🔗 Verknüpfte PSN-Namen verwalten": "🔗 Manage linked PSN names",
+    "📋 Zeigt deine verknüpften PSN-Namen (Admins: alle)": "📋 Shows your linked PSN names (admins: all)",
+    "🎯 Setzt ein Kopfgeld auf einen Spieler aus (sofort abgebucht)":
+        "🎯 Places a bounty on a player (charged immediately)",
+    "🎯 Zeigt alle aktiven Kopfgelder": "🎯 Shows all active bounties",
+    "💸 Überweist Geld aus deinem Wallet an ein anderes Mitglied":
+        "💸 Transfers money from your wallet to another member",
+    "🩺 Delivery-Diagnose: prüft cfgEffectArea.json & repariert fehlende Einträge (admin)":
+        "🩺 Delivery diagnostics: checks cfgEffectArea.json & repairs missing entries (admin)",
+    "✏️ Bearbeitet eine geplante Ankündigung (Nachricht/Bild)":
+        "✏️ Edits a scheduled announcement (message/image)",
+}
+
 
 class _BefehlsUebersetzer(app_commands.Translator):
-    """Uebersetzt nur die neun deutschen Befehlsnamen oben ins Englische,
-    wenn Discord fuer einen Nutzer eine englische Anzeige anfragt (dessen
-    eigene App-Sprache, nicht unser Dashboard). Alles andere (Beschreibungen,
-    Parameter, bereits englische Namen) bekommt keinen locale_str und laeuft
-    deshalb nie durch diese Funktion – so kann hier nichts aus Versehen
-    uebersetzt werden, das gar nicht dafuer vorgesehen ist."""
+    """Uebersetzt Befehlsnamen UND -beschreibungen ins Englische, wenn
+    Discord fuer einen Nutzer eine englische Anzeige anfragt (dessen eigene
+    App-Sprache, nicht unser Dashboard). Antworttexte einzelner Befehle
+    (Embeds etc.) laufen NICHT hierueber - Discords Uebersetzungs-API deckt
+    nur Namen/Beschreibungen/Parameter/Auswahl-Optionen ab, keine Inhalte,
+    die ein Befehl beim Ausfuehren zurueckschickt.
+    Nur Strings mit app_commands.locale_str(...) an der jeweiligen
+    Befehls-Definition laufen ueberhaupt durch diese Funktion - so kann hier
+    nichts aus Versehen uebersetzt werden, das gar nicht dafuer vorgesehen ist."""
 
     async def translate(self, string: app_commands.locale_str, locale: discord.Locale,
                         context: app_commands.TranslationContextTypes) -> Optional[str]:
         if locale not in (discord.Locale.american_english, discord.Locale.british_english):
             return None
-        return _BEFEHL_NAMEN_EN.get(string.message)
+        if context.location in (app_commands.TranslationContextLocation.command_name,
+                                app_commands.TranslationContextLocation.group_name):
+            return _BEFEHL_NAMEN_EN.get(string.message)
+        if context.location in (app_commands.TranslationContextLocation.command_description,
+                                app_commands.TranslationContextLocation.group_description):
+            return _BEFEHL_BESCHREIBUNG_EN.get(string.message)
+        return None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -5267,7 +5358,7 @@ def _panel_view_registrieren(conn: "ServerConnection") -> None:
 # ══════════════════════════════════════════════════════════════
 #  /show_feeds – Alle Feed-Channels auf einen Blick
 # ══════════════════════════════════════════════════════════════
-@bot.tree.command(name="show_feeds", description="📡 Zeigt alle Feed-Channels und ihren Status")
+@bot.tree.command(name="show_feeds", description=app_commands.locale_str("📡 Zeigt alle Feed-Channels und ihren Status"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_show_feeds(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
@@ -5339,7 +5430,7 @@ cmd_show_feeds.autocomplete("server")(_server_autocomplete)
 #  /neustart – Server Neustart
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name=app_commands.locale_str("neustart"),
-                  description="🔄 Startet den DayZ Server neu")
+                  description=app_commands.locale_str("🔄 Startet den DayZ Server neu"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_neustart(interaction: discord.Interaction,
                        server: Optional[str] = None):
@@ -5363,7 +5454,7 @@ async def cmd_neustart(interaction: discord.Interaction,
 #  /stoppen – Server stoppen
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name=app_commands.locale_str("stoppen"),
-                  description="⏹️ Stoppt den DayZ Server")
+                  description=app_commands.locale_str("⏹️ Stoppt den DayZ Server"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_stoppen(interaction: discord.Interaction,
                       server: Optional[str] = None):
@@ -5386,7 +5477,7 @@ async def cmd_stoppen(interaction: discord.Interaction,
 # ══════════════════════════════════════════════════════════════
 #  /serverstatus – Status abrufen (Nitrado API + direkter A2S-Ping)
 # ══════════════════════════════════════════════════════════════
-@bot.tree.command(name="serverstatus", description="📊 Zeigt den aktuellen Server-Status")
+@bot.tree.command(name="serverstatus", description=app_commands.locale_str("📊 Zeigt den aktuellen Server-Status"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_status(interaction: discord.Interaction,
                      server: Optional[str] = None):
@@ -5509,12 +5600,12 @@ async def _ist_bot_eigentuemer(user: discord.abc.User) -> bool:
 
 
 betreiber_group = app_commands.Group(
-    name="betreiber", description="🛠️ Einstellungen für den Bot-Betreiber")
+    name="betreiber", description=app_commands.locale_str("🛠️ Einstellungen für den Bot-Betreiber"))
 
 
 @betreiber_group.command(
     name="alarm_channel",
-    description="🛠️ (Nur Bot-Eigentümer) Legt fest, wohin Ausfall-/Anfrage-Meldungen gehen")
+    description=app_commands.locale_str("🛠️ (Nur Bot-Eigentümer) Legt fest, wohin Ausfall-/Anfrage-Meldungen gehen"))
 @app_commands.describe(channel="Channel in DEINEM eigenen Discord für Betriebsmeldungen")
 async def betreiber_alarm_channel(interaction: discord.Interaction,
                                   channel: discord.TextChannel):
@@ -5546,7 +5637,7 @@ bot.tree.add_command(betreiber_group)
 # ══════════════════════════════════════════════════════════════
 #  /auto – Geplante automatische Server-Neustarts
 # ══════════════════════════════════════════════════════════════
-auto_group = app_commands.Group(name="auto", description="⏰ Automatische Server-Neustarts planen")
+auto_group = app_commands.Group(name="auto", description=app_commands.locale_str("⏰ Automatische Server-Neustarts planen"))
 
 
 class AutoRestartView(discord.ui.View):
@@ -5627,7 +5718,7 @@ class AutoRestartView(discord.ui.View):
 
 
 @auto_group.command(name="restart",
-                    description="⏰ Plant automatische Neustarts (Startzeit per Dropdown + Intervall)")
+                    description=app_commands.locale_str("⏰ Plant automatische Neustarts (Startzeit per Dropdown + Intervall)"))
 @app_commands.describe(intervall="Abstand in Stunden, z.B. 2 = alle 2 Stunden (1–24)",
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def auto_restart(interaction: discord.Interaction,
@@ -5649,7 +5740,7 @@ async def auto_restart(interaction: discord.Interaction,
     await interaction.response.send_message(embed=e, view=view, ephemeral=True)
 
 
-@auto_group.command(name="off", description="⏹️ Deaktiviert die geplanten Neustarts")
+@auto_group.command(name="off", description=app_commands.locale_str("⏹️ Deaktiviert die geplanten Neustarts"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def auto_off(interaction: discord.Interaction,
                    server: Optional[str] = None):
@@ -5670,7 +5761,7 @@ async def auto_off(interaction: discord.Interaction,
         else "ℹ️ Es waren keine geplanten Neustarts aktiv.", ephemeral=True)
 
 
-@auto_group.command(name="status", description="📋 Zeigt den aktuellen Restart-Zeitplan")
+@auto_group.command(name="status", description=app_commands.locale_str("📋 Zeigt den aktuellen Restart-Zeitplan"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def auto_status(interaction: discord.Interaction,
                       server: Optional[str] = None):
@@ -5763,7 +5854,7 @@ def _scheduled_task_vorwaerts(next_execution: float, interval_seconds: int,
 #  (Positionen kommen aus den ADM-Logs, Prüfung in _check_zones)
 # ══════════════════════════════════════════════════════════════
 zone_group = app_commands.Group(name="zone",
-                                description="🛡️ Zonen-Pings verwalten (Admin)")
+                                description=app_commands.locale_str("🛡️ Zonen-Pings verwalten (Admin)"))
 
 def _zones(conn: Optional[ServerConnection] = None) -> List[Dict]:
     """Die Zonen eines Servers. Ohne Angabe die des Hauptservers."""
@@ -5971,7 +6062,7 @@ def _validate_zone_geometry(x: float, z: float, radius: float) -> Optional[str]:
     return None
 
 
-@zone_group.command(name="list", description="📋 Alle aktiven Zonen anzeigen (Admin)")
+@zone_group.command(name="list", description=app_commands.locale_str("📋 Alle aktiven Zonen anzeigen (Admin)"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def zone_list(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
@@ -5995,13 +6086,13 @@ async def zone_list(interaction: discord.Interaction, server: Optional[str] = No
 # ── /zone allowlist – Spieler in einer Zone ignorieren (Admin) ──
 allowlist_group = app_commands.Group(
     name="allowlist",
-    description="🙈 Spieler in einer Zone ignorieren (Admin)",
+    description=app_commands.locale_str("🙈 Spieler in einer Zone ignorieren (Admin)"),
     parent=zone_group)
 
 
 @allowlist_group.command(
     name="add",
-    description="🙈 Spieler zur Ignorier-Liste einer Zone hinzufügen (Admin)")
+    description=app_commands.locale_str("🙈 Spieler zur Ignorier-Liste einer Zone hinzufügen (Admin)"))
 @app_commands.describe(
     zone="Name der Zone (Autocomplete)",
     spieler="PlayStation-/Ingame-Name, der nicht mehr gemeldet werden soll",
@@ -6037,7 +6128,7 @@ zone_allowlist_add.autocomplete("zone")(_zone_name_autocomplete)
 
 @allowlist_group.command(
     name="remove",
-    description="🔔 Spieler wieder melden – von der Ignorier-Liste entfernen (Admin)")
+    description=app_commands.locale_str("🔔 Spieler wieder melden – von der Ignorier-Liste entfernen (Admin)"))
 @app_commands.describe(
     zone="Name der Zone (Autocomplete)",
     spieler="Name, der wieder gemeldet werden soll",
@@ -6072,7 +6163,7 @@ zone_allowlist_remove.autocomplete("zone")(_zone_name_autocomplete)
 
 @allowlist_group.command(
     name="show",
-    description="📋 Ignorierte Spieler einer Zone anzeigen (Admin)")
+    description=app_commands.locale_str("📋 Ignorierte Spieler einer Zone anzeigen (Admin)"))
 @app_commands.describe(zone="Name der Zone (Autocomplete)",
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def zone_allowlist_show(interaction: discord.Interaction, zone: str,
@@ -6167,7 +6258,7 @@ def _split_names(raw: str) -> List[str]:
 #  /ban – Spieler bannen
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="ban",
-                  description="🔨 Fügt Spieler zur Banliste in den Nitrado-Servereinstellungen hinzu")
+                  description=app_commands.locale_str("🔨 Fügt Spieler zur Banliste in den Nitrado-Servereinstellungen hinzu"))
 @app_commands.describe(
     spieler="Name(n) – mehrere per Komma getrennt",
     grund="Grund für den Ban (optional)",
@@ -6232,7 +6323,7 @@ async def cmd_ban(interaction: discord.Interaction, spieler: str,
 #  /ban_entfernen – Ban aufheben
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name=app_commands.locale_str("ban_entfernen"),
-                  description="✅ Entfernt Spieler von der Banliste in den Nitrado-Servereinstellungen")
+                  description=app_commands.locale_str("✅ Entfernt Spieler von der Banliste in den Nitrado-Servereinstellungen"))
 @app_commands.describe(spieler="Name(n) – mehrere per Komma getrennt",
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_unban(interaction: discord.Interaction, spieler: str,
@@ -6287,7 +6378,7 @@ async def cmd_unban(interaction: discord.Interaction, spieler: str,
 #  /banlist – Alle gesperrten Spieler
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="banlist",
-                  description="📋 Zeigt die Banliste aus den Nitrado-Servereinstellungen")
+                  description=app_commands.locale_str("📋 Zeigt die Banliste aus den Nitrado-Servereinstellungen"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_banlist(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
@@ -6387,12 +6478,12 @@ async def _write_whitelist(conn: ServerConnection, names: List[str],
 # ══════════════════════════════════════════════════════════════
 whitelist_group = app_commands.Group(
     name="whitelist",
-    description="✅ Whitelist in den Nitrado-Servereinstellungen verwalten (Admin)")
+    description=app_commands.locale_str("✅ Whitelist in den Nitrado-Servereinstellungen verwalten (Admin)"))
 
 
 @whitelist_group.command(
     name="add",
-    description="✅ Spieler zur Whitelist hinzufügen (mehrere per Komma/Zeile)")
+    description=app_commands.locale_str("✅ Spieler zur Whitelist hinzufügen (mehrere per Komma/Zeile)"))
 @app_commands.describe(spieler="PlayStation-Name(n) – mehrere per Komma getrennt",
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def whitelist_add(interaction: discord.Interaction, spieler: str,
@@ -6440,7 +6531,7 @@ async def whitelist_add(interaction: discord.Interaction, spieler: str,
 
 @whitelist_group.command(
     name="remove",
-    description="🗑️ Spieler von der Whitelist entfernen (mehrere per Komma/Zeile)")
+    description=app_commands.locale_str("🗑️ Spieler von der Whitelist entfernen (mehrere per Komma/Zeile)"))
 @app_commands.describe(spieler="PlayStation-Name(n) – mehrere per Komma getrennt",
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def whitelist_remove(interaction: discord.Interaction, spieler: str,
@@ -6488,7 +6579,7 @@ async def whitelist_remove(interaction: discord.Interaction, spieler: str,
 
 @whitelist_group.command(
     name="show",
-    description="📋 Zeigt die aktuellen Spieler auf der Whitelist (Admin)")
+    description=app_commands.locale_str("📋 Zeigt die aktuellen Spieler auf der Whitelist (Admin)"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def whitelist_show(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
@@ -6784,14 +6875,14 @@ class WhitelistApprovalView(discord.ui.View):
 
 
 # ── /send whitelist panel – Panel in einen Channel senden (Admin) ──
-send_group = app_commands.Group(name="send", description="📨 Panels/Embeds senden (Admin)")
+send_group = app_commands.Group(name="send", description=app_commands.locale_str("📨 Panels/Embeds senden (Admin)"))
 send_whitelist_group = app_commands.Group(
-    name="whitelist", description="✅ Whitelist-Panel senden", parent=send_group)
+    name="whitelist", description=app_commands.locale_str("✅ Whitelist-Panel senden"), parent=send_group)
 
 
 @send_whitelist_group.command(
     name="panel",
-    description="📩 Whitelist-Anfrage-Panel in einen Channel senden (Admin)")
+    description=app_commands.locale_str("📩 Whitelist-Anfrage-Panel in einen Channel senden (Admin)"))
 @app_commands.describe(
     panel_channel="Channel, in dem das Panel für die Spieler erscheint",
     admin_channel="Staff-Channel, in dem die Anfragen zur Freigabe landen",
@@ -6836,7 +6927,7 @@ bot.tree.add_command(send_group)
 #  /admin_position – Letzte bekannte Spieler-Positionen
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name="admin_position",
-                  description="📍 Letzte bekannte Positionen aller Spieler aus den Logs")
+                  description=app_commands.locale_str("📍 Letzte bekannte Positionen aller Spieler aus den Logs"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_positions(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
@@ -6888,7 +6979,7 @@ async def cmd_positions(interaction: discord.Interaction, server: Optional[str] 
 #  /spieler_suche – Spieler in Logs suchen
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name=app_commands.locale_str("spieler_suche"),
-                  description="🔍 Sucht einen Spieler in den aktuellen Logs")
+                  description=app_commands.locale_str("🔍 Sucht einen Spieler in den aktuellen Logs"))
 @app_commands.describe(name="Ingame-Name oder Steam64-ID",
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_search(interaction: discord.Interaction, name: str,
@@ -6943,7 +7034,7 @@ cmd_search.autocomplete("server")(_server_autocomplete)
 # ══════════════════════════════════════════════════════════════
 #  /ftp_scan – FTP-Verzeichnisse neu scannen
 # ══════════════════════════════════════════════════════════════
-@bot.tree.command(name="ftp_scan", description="🔎 Scannt FTP-Server erneut nach Log-Verzeichnissen")
+@bot.tree.command(name="ftp_scan", description=app_commands.locale_str("🔎 Scannt FTP-Server erneut nach Log-Verzeichnissen"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_ftp_scan(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
@@ -6983,7 +7074,7 @@ async def cmd_ftp_scan(interaction: discord.Interaction, server: Optional[str] =
 #  Hilft herauszufinden warum manche Events (damage, loot)
 #  nicht gepostet werden – zeigt das exakte Log-Format.
 # ══════════════════════════════════════════════════════════════
-@bot.tree.command(name="raw_log", description="🔍 Zeigt die letzten Zeilen des ADM-Logs (Debug)")
+@bot.tree.command(name="raw_log", description=app_commands.locale_str("🔍 Zeigt die letzten Zeilen des ADM-Logs (Debug)"))
 @app_commands.describe(zeilen="Anzahl der Zeilen (Standard: 20, max. 40)",
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_raw_log(interaction: discord.Interaction, zeilen: int = 20,
@@ -7031,7 +7122,7 @@ async def cmd_raw_log(interaction: discord.Interaction, zeilen: int = 20,
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(
     name="test",
-    description="🧪 Postet das letzte Log-Event jedes Typs in die jeweiligen Channels"
+    description=app_commands.locale_str("🧪 Postet das letzte Log-Event jedes Typs in die jeweiligen Channels")
 )
 @app_commands.describe(zeilen="Zu durchsuchende Log-Zeilen (Standard: 500, max: 2000)",
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
@@ -7190,7 +7281,7 @@ async def cmd_test(interaction: discord.Interaction, zeilen: int = 500,
     await interaction.followup.send(embed=summary, ephemeral=True)
 
 
-@bot.tree.command(name="ftp_status", description="🔌 Testet die FTP-Verbindung zum Nitrado-Server")
+@bot.tree.command(name="ftp_status", description=app_commands.locale_str("🔌 Testet die FTP-Verbindung zum Nitrado-Server"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_ftp_status(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
@@ -7279,7 +7370,7 @@ async def cmd_ftp_status(interaction: discord.Interaction, server: Optional[str]
 # ══════════════════════════════════════════════════════════════
 #  /log_status – Polling-Status anzeigen
 # ══════════════════════════════════════════════════════════════
-@bot.tree.command(name="log_status", description="📄 Zeigt den aktuellen Log-Polling Status")
+@bot.tree.command(name="log_status", description=app_commands.locale_str("📄 Zeigt den aktuellen Log-Polling Status"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_log_status(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
@@ -7325,7 +7416,7 @@ cmd_log_status.autocomplete("server")(_server_autocomplete)
 #  /hilfe – Alle Befehle
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(name=app_commands.locale_str("hilfe"),
-                  description="❓ Zeigt alle verfügbaren Bot-Befehle")
+                  description=app_commands.locale_str("❓ Zeigt alle verfügbaren Bot-Befehle"))
 async def cmd_hilfe(interaction: discord.Interaction):
     # Spam-Schutz: pro Nutzer, guild-übergreifend per gid=0-Fallback (DMs)
     gid = interaction.guild_id or 0
@@ -7941,7 +8032,7 @@ class EditAnnouncementModal(discord.ui.Modal):
 
 
 @bot.tree.command(name=app_commands.locale_str("erstellen"),
-                  description="📢 Neue wiederkehrende Ankündigung anlegen")
+                  description=app_commands.locale_str("📢 Neue wiederkehrende Ankündigung anlegen"))
 async def cmd_ann_erstellen(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
@@ -7954,7 +8045,7 @@ async def cmd_ann_erstellen(interaction: discord.Interaction):
 
 
 @bot.tree.command(name=app_commands.locale_str("liste"),
-                  description="📋 Zeigt alle geplanten Ankündigungen")
+                  description=app_commands.locale_str("📋 Zeigt alle geplanten Ankündigungen"))
 async def cmd_ann_liste(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
@@ -8021,7 +8112,7 @@ async def cmd_ann_liste(interaction: discord.Interaction):
 
 
 @bot.tree.command(name=app_commands.locale_str("löschen"),
-                  description="🗑️ Löscht eine Ankündigung")
+                  description=app_commands.locale_str("🗑️ Löscht eine Ankündigung"))
 @app_commands.describe(index="Nummer der Ankündigung (siehe /liste)")
 async def cmd_ann_loeschen(
     interaction: discord.Interaction,
@@ -8044,7 +8135,7 @@ async def cmd_ann_loeschen(
     )
 
 
-@bot.tree.command(name="hackban", description="🔨 Bannt einen Discord-Benutzer per ID.")
+@bot.tree.command(name="hackban", description=app_commands.locale_str("🔨 Bannt einen Discord-Benutzer per ID."))
 @app_commands.describe(
     user_id="Discord User-ID",
     grund="Grund für den Bann"
@@ -9609,7 +9700,7 @@ async def _player_name_ac(interaction: discord.Interaction,
     return out
 
 
-@bot.tree.command(name="stats", description="📊 Kill-Statistiken eines Spielers (Kills, Tode, K/D, Waffe)")
+@bot.tree.command(name="stats", description=app_commands.locale_str("📊 Kill-Statistiken eines Spielers (Kills, Tode, K/D, Waffe)"))
 @app_commands.describe(spieler="Ingame-/PlayStation-Name")
 @app_commands.autocomplete(spieler=_player_name_ac)
 async def cmd_stats(interaction: discord.Interaction, spieler: str):
@@ -9638,7 +9729,7 @@ async def cmd_stats(interaction: discord.Interaction, spieler: str):
     await interaction.response.send_message(embed=e)
 
 
-@bot.tree.command(name="leaderboard", description="🏆 Top 10 PvP-Killer des Servers")
+@bot.tree.command(name="leaderboard", description=app_commands.locale_str("🏆 Top 10 PvP-Killer des Servers"))
 async def cmd_leaderboard(interaction: discord.Interaction):
     conn = _conn_of(interaction)
     if conn is None:
@@ -9678,7 +9769,7 @@ def _seen_in_logs(name: str, max_age_seconds: int = 900,
     return None
 
 
-@bot.tree.command(name="link", description="🔗 Verknüpft deinen Discord-Account mit deinem PlayStation-Namen")
+@bot.tree.command(name="link", description=app_commands.locale_str("🔗 Verknüpft deinen Discord-Account mit deinem PlayStation-Namen"))
 @app_commands.describe(playstation_name="Dein Ingame-Name, exakt wie im Spiel")
 @app_commands.autocomplete(playstation_name=_player_name_ac)
 async def cmd_link(interaction: discord.Interaction, playstation_name: str):
@@ -9737,7 +9828,7 @@ async def cmd_link(interaction: discord.Interaction, playstation_name: str):
     await _notify_link_change(interaction.guild_id, note)
 
 
-@bot.tree.command(name="unlink", description="🔓 Entfernt deine eigene Ingame-Verknüpfung")
+@bot.tree.command(name="unlink", description=app_commands.locale_str("🔓 Entfernt deine eigene Ingame-Verknüpfung"))
 async def cmd_unlink(interaction: discord.Interaction):
     if not await _require_guild(interaction):
         return
@@ -9754,7 +9845,7 @@ async def cmd_unlink(interaction: discord.Interaction):
     await _notify_link_change(interaction.guild_id, note)
 
 
-@bot.tree.command(name="forcelink", description="🔗 (Admin) Verknüpft einen Spieler mit einem Discord-Account")
+@bot.tree.command(name="forcelink", description=app_commands.locale_str("🔗 (Admin) Verknüpft einen Spieler mit einem Discord-Account"))
 @app_commands.describe(playstation_name="Ingame-Name des Spielers",
                        user="Discord-Mitglied")
 @app_commands.autocomplete(playstation_name=_player_name_ac)
@@ -9780,7 +9871,7 @@ async def cmd_forcelink(interaction: discord.Interaction,
     await _notify_link_change(interaction.guild_id, note)
 
 
-@bot.tree.command(name="forceunlink", description="🔓 (Admin) Entfernt die Verknüpfung eines Discord-Accounts")
+@bot.tree.command(name="forceunlink", description=app_commands.locale_str("🔓 (Admin) Entfernt die Verknüpfung eines Discord-Accounts"))
 @app_commands.describe(user="Discord-Mitglied")
 async def cmd_forceunlink(interaction: discord.Interaction, user: discord.Member):
     if not _is_admin(interaction):
@@ -9802,10 +9893,10 @@ async def cmd_forceunlink(interaction: discord.Interaction, user: discord.Member
 
 
 username_group = app_commands.Group(name="username",
-                                    description="🔗 Verknüpfte PSN-Namen verwalten")
+                                    description=app_commands.locale_str("🔗 Verknüpfte PSN-Namen verwalten"))
 
 
-@username_group.command(name="list", description="📋 Zeigt deine verknüpften PSN-Namen (Admins: alle)")
+@username_group.command(name="list", description=app_commands.locale_str("📋 Zeigt deine verknüpften PSN-Namen (Admins: alle)"))
 async def username_list(interaction: discord.Interaction):
     if not await _require_guild(interaction):
         return
@@ -9849,7 +9940,7 @@ async def username_list(interaction: discord.Interaction):
 bot.tree.add_command(username_group)
 
 
-@bot.tree.command(name="bounty", description="🎯 Setzt ein Kopfgeld auf einen Spieler aus (sofort abgebucht)")
+@bot.tree.command(name="bounty", description=app_commands.locale_str("🎯 Setzt ein Kopfgeld auf einen Spieler aus (sofort abgebucht)"))
 @app_commands.describe(spieler="Ingame-Name des Ziels", betrag="Kopfgeld aus deinem Wallet")
 @app_commands.autocomplete(spieler=_player_name_ac)
 async def cmd_bounty(interaction: discord.Interaction,
@@ -9889,7 +9980,7 @@ async def cmd_bounty(interaction: discord.Interaction,
     await interaction.response.send_message(embed=e)
 
 
-@bot.tree.command(name="bounties", description="🎯 Zeigt alle aktiven Kopfgelder")
+@bot.tree.command(name="bounties", description=app_commands.locale_str("🎯 Zeigt alle aktiven Kopfgelder"))
 async def cmd_bounties(interaction: discord.Interaction):
     if not await _require_guild(interaction):
         return
@@ -9905,7 +9996,7 @@ async def cmd_bounties(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e)
 
 
-@bot.tree.command(name="pay", description="💸 Überweist Geld aus deinem Wallet an ein anderes Mitglied")
+@bot.tree.command(name="pay", description=app_commands.locale_str("💸 Überweist Geld aus deinem Wallet an ein anderes Mitglied"))
 @app_commands.describe(user="Empfänger", betrag="Betrag aus deinem Wallet")
 async def cmd_pay(interaction: discord.Interaction,
                   user: discord.Member, betrag: app_commands.Range[int, 1]):
@@ -10721,7 +10812,7 @@ async def shop_cleanup(interaction: discord.Interaction, server: Optional[str] =
 
 
 @shop_group.command(name="check",
-                    description="🩺 Delivery-Diagnose: prüft cfgEffectArea.json & repariert fehlende Einträge (admin)")
+                    description=app_commands.locale_str("🩺 Delivery-Diagnose: prüft cfgEffectArea.json & repariert fehlende Einträge (admin)"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def shop_check(interaction: discord.Interaction, server: Optional[str] = None):
     if not _is_admin(interaction):
@@ -10824,7 +10915,7 @@ bot.tree.add_command(shop_group)
 edit_group = app_commands.Group(name="edit", description="✏️ Edit entries of the shop catalog")
 
 @edit_group.command(name=app_commands.locale_str("ankuendigung"),
-                    description="✏️ Bearbeitet eine geplante Ankündigung (Nachricht/Bild)")
+                    description=app_commands.locale_str("✏️ Bearbeitet eine geplante Ankündigung (Nachricht/Bild)"))
 @app_commands.describe(index="Nummer der Ankündigung (siehe /liste)")
 async def edit_ankuendigung(interaction: discord.Interaction, index: int):
     if not _is_admin(interaction):
