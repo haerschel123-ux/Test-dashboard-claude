@@ -3409,11 +3409,15 @@ connections = ConnectionRegistry()
 # aus der Premium-Sperre nicht mehr heraus bzw. bekäme keine Hilfe mehr.
 _PREMIUM_FREE_COMMANDS = ("setup", "hilfe")
 
-PREMIUM_MISSING_TEXT = (
-    "❌ **Du hast kein Premium**\n"
-    "Dieser Discord-Server ist noch keinem Nitrado-Server zugeordnet. "
-    "Der Bot-Betreiber schaltet ihn im Dashboard unter **Serverliste** frei."
-)
+def _premium_missing_text(interaction: discord.Interaction) -> str:
+    return _t(
+        interaction,
+        "❌ **Du hast kein Premium**\n"
+        "Dieser Discord-Server ist noch keinem Nitrado-Server zugeordnet. "
+        "Der Bot-Betreiber schaltet ihn im Dashboard unter **Serverliste** frei.",
+        "❌ **You don't have Premium**\n"
+        "This Discord server is not yet linked to a Nitrado server. "
+        "The bot operator unlocks it in the dashboard under **Server List**.")
 
 
 # Der Server, um den es im gerade laufenden Befehl bzw. Poll-Zyklus geht.
@@ -3550,9 +3554,9 @@ async def _premium_check(interaction: discord.Interaction) -> bool:
 
     try:
         if interaction.response.is_done():
-            await interaction.followup.send(PREMIUM_MISSING_TEXT, ephemeral=True)
+            await interaction.followup.send(_premium_missing_text(interaction), ephemeral=True)
         else:
-            await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+            await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
     except Exception:  # noqa: BLE001
         pass
     return False
@@ -5144,7 +5148,7 @@ def _conn_waehlen(interaction: discord.Interaction, server: Optional[str] = None
     """
     verfuegbar = _conns_of(interaction)
     if not verfuegbar:
-        return None, PREMIUM_MISSING_TEXT
+        return None, _premium_missing_text(interaction)
 
     wahl = (server or "").strip()
     if wahl:
@@ -5156,8 +5160,11 @@ def _conn_waehlen(interaction: discord.Interaction, server: Optional[str] = None
             passend = [c for c in verfuegbar if gesucht in c.name.lower()]
             treffer = passend[0] if len(passend) == 1 else None
         if treffer is None:
-            return None, (f"❌ Kein Server namens `{wahl}` an diesem Discord-Server.\n"
-                          + _server_liste(verfuegbar))
+            return None, (_t(
+                interaction,
+                f"❌ Kein Server namens `{wahl}` an diesem Discord-Server.\n",
+                f"❌ No server named `{wahl}` on this Discord server.\n")
+                + _server_liste(verfuegbar))
         _setze_aktuellen_server(treffer)
         return treffer, None
 
@@ -5165,9 +5172,13 @@ def _conn_waehlen(interaction: discord.Interaction, server: Optional[str] = None
         _setze_aktuellen_server(verfuegbar[0])
         return verfuegbar[0], None
 
-    return None, ("❌ Dieser Discord-Server verwaltet mehrere Nitrado-Server – "
-                  "gib mit `server:` an, welchen du meinst.\n"
-                  + _server_liste(verfuegbar))
+    return None, (_t(
+        interaction,
+        "❌ Dieser Discord-Server verwaltet mehrere Nitrado-Server – "
+        "gib mit `server:` an, welchen du meinst.\n",
+        "❌ This Discord server manages multiple Nitrado servers – "
+        "use `server:` to specify which one you mean.\n")
+        + _server_liste(verfuegbar))
 
 
 def _server_liste(conns: List[ServerConnection]) -> str:
@@ -5364,15 +5375,25 @@ async def _require_conn(interaction: discord.Interaction,
         return conn
 
     if conn is None:
-        msg = auswahlfehler or PREMIUM_MISSING_TEXT
+        msg = auswahlfehler or _premium_missing_text(interaction)
     elif conn.api is None:
-        msg = ("❌ Nitrado ist für diesen Server noch nicht eingerichtet.\n"
-               "Führe `/setup token <dein-nitrado-token>` aus und wähle "
-               "deinen Server im Dropdown aus.")
+        msg = _t(
+            interaction,
+            "❌ Nitrado ist für diesen Server noch nicht eingerichtet.\n"
+            "Führe `/setup token <dein-nitrado-token>` aus und wähle "
+            "deinen Server im Dropdown aus.",
+            "❌ Nitrado is not yet set up for this server.\n"
+            "Run `/setup token <your-nitrado-token>` and select "
+            "your server in the dropdown.")
     else:
-        msg = ("❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn sind "
-               "Logs und Spielerpositionen nicht lesbar.\n"
-               "Bitte wende dich an den Bot-Betreiber, damit er die Pfade neu erkennen lässt.")
+        msg = _t(
+            interaction,
+            "❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn sind "
+            "Logs und Spielerpositionen nicht lesbar.\n"
+            "Bitte wende dich an den Bot-Betreiber, damit er die Pfade neu erkennen lässt.",
+            "❌ FTP access is missing for this server – without it, logs "
+            "and player positions can't be read.\n"
+            "Please contact the bot operator so they can re-detect the paths.")
     if interaction.response.is_done():
         await interaction.followup.send(msg, ephemeral=True)
     else:
@@ -5409,7 +5430,7 @@ async def cmd_show_feeds(interaction: discord.Interaction, server: Optional[str]
     _conn_show, _fehler = _conn_waehlen(interaction, server)
     if _conn_show is None:
         return await interaction.response.send_message(
-            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
     _sid_show = _conn_show.service_id
     # FEED_TYPES statt LOG_TYPES: die feinen Feeds (kill, connect, zombie_death
     # …) sind es, was das Dashboard tatsaechlich schreibt. Mit LOG_TYPES
@@ -5743,7 +5764,7 @@ class AutoRestartView(discord.ui.View):
         conn = (connections.for_service(self.service_id) if self.service_id
                 else _conn_of(itx))
         if conn is None:
-            return await itx.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+            return await itx.response.send_message(_premium_missing_text(itx), ephemeral=True)
         # Zwischen Aufruf und Bestaetigen liegen bis zu 180 Sekunden. In der
         # Zeit kann der Server einem anderen Discord-Server zugeordnet worden
         # sein oder die Person ihre Adminrolle verloren haben – sonst liesse
@@ -5799,7 +5820,7 @@ async def auto_restart(interaction: discord.Interaction,
     _conn_ar, _fehler = _conn_waehlen(interaction, server)
     if _conn_ar is None:
         return await interaction.response.send_message(
-            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
     view = AutoRestartView(interaction, int(intervall), _conn_ar.service_id)
     e = discord.Embed(
         title=_t(interaction, "⏰ Auto-Restart einrichten", "⏰ Set Up Auto-Restart"),
@@ -5824,7 +5845,7 @@ async def auto_off(interaction: discord.Interaction,
     conn, _fehler = _conn_waehlen(interaction, server)
     if conn is None:
         return await interaction.response.send_message(
-            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
     sched = dict(conn.get("auto_restart_schedule") or {})
     was_on = bool(sched.get("enabled"))
     sched["enabled"] = False
@@ -5846,7 +5867,7 @@ async def auto_status(interaction: discord.Interaction,
     conn, _fehler = _conn_waehlen(interaction, server)
     if conn is None:
         return await interaction.response.send_message(
-            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
     sched = conn.get("auto_restart_schedule") or {}
     if not sched.get("enabled"):
         return await interaction.response.send_message(_t(
@@ -5899,9 +5920,13 @@ SCHEDULED_TASK_TYPES: Dict[str, Dict[str, Any]] = {
     "online_list": {"label": "Online-Liste posten", "channel_pflicht": True},
 }
 
-# Mehr Namen sprengen die 4096 Zeichen einer Embed-Beschreibung nicht, machen
-# den Post aber unlesbar – der Rest wird zusammengefasst.
+# Zwei unabhaengige Grenzen: zu VIELE Namen machen den Post nur unlesbar
+# (_ONLINE_LISTE_MAX), zu LANGE Namen (Klammer-/Stern-Dekoration in
+# Clan-Tags, die escape_markdown zusaetzlich verdoppelt) koennen dagegen
+# Discords 4096-Zeichen-Grenze der Embed-Beschreibung sprengen – dann lehnt
+# Discord den GANZEN Post ab. Deshalb wird zusaetzlich nach Zeichen gekappt.
 _ONLINE_LISTE_MAX = 100
+_ONLINE_LISTE_ZEICHEN_MAX = 3900
 
 
 def _online_spieler_namen(positions: Dict[str, Dict],
@@ -5940,10 +5965,22 @@ def _online_liste_embed(conn: ServerConnection, namen: List[str],
     ``escape_markdown`` wuerde aus ``ICH_MAG_HUNDE_xD`` kursiver Text.
     """
     gezeigt = namen[:_ONLINE_LISTE_MAX]
-    zeilen = [f"• **{discord.utils.escape_markdown(n)}**" for n in gezeigt]
+    zeilen: List[str] = []
+    laenge = 0
+    abgeschnitten = False
+    for i, n in enumerate(gezeigt):
+        zeile = f"• **{discord.utils.escape_markdown(n)}**"
+        # +40 Puffer fuer die spaeter angehaengte "… und N weitere"-Zeile
+        if laenge + len(zeile) + 1 > _ONLINE_LISTE_ZEICHEN_MAX - 40:
+            abgeschnitten = True
+            gezeigt = gezeigt[:i]
+            break
+        zeilen.append(zeile)
+        laenge += len(zeile) + 1
     rest = len(namen) - len(gezeigt)
     if rest > 0:
-        zeilen.append(f"… und {rest} weitere")
+        zeilen.append(f"… und {rest} weitere"
+                      + (" (Namen zu lang für einen Post)" if abgeschnitten else ""))
     e = discord.Embed(
         title=f"📡 • Online-Liste • {len(namen)} Spieler",
         description="\n".join(zeilen) or "Gerade ist niemand online.",
@@ -7152,7 +7189,7 @@ async def send_whitelist_panel(interaction: discord.Interaction,
     _conn, _fehler = _conn_waehlen(interaction, server)
     if _conn is None:
         return await interaction.response.send_message(
-            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
     # Anfrage-Channel je Server merken (das Modal liest ihn beim Absenden aus)
     cfg.set_channel(interaction.guild_id, "whitelist_request", admin_channel.id,
                     service_id=_conn.service_id)
@@ -7437,6 +7474,18 @@ _SCHADEN_SCHLUESSEL = {
     "container": "disableContainerDamage",
 }
 
+# Ein Lock pro Server: ohne das wuerden zwei gleichzeitige Aufrufe (z. B. Base-
+# und Container-Damage in zwei Discord-Nachrichten kurz hintereinander) beide
+# dieselbe alte Fassung lesen – wer zuletzt schreibt, wirft dann die Aenderung
+# des anderen komplett weg (Lost-Update). Ein einfaches Dict statt eines
+# festen Locks pro ServerConnection, weil cfggameplay.json keinen eigenen
+# Manager wie der Shop (ShopManager.lock) hat.
+_SCHADEN_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def _schaden_lock(service_id: str) -> asyncio.Lock:
+    return _SCHADEN_LOCKS.setdefault(service_id, asyncio.Lock())
+
 
 def _cfggameplay_pfad(conn: ServerConnection) -> Optional[str]:
     """Pfad der cfggameplay.json – sie liegt im selben Mission-Ordner wie die
@@ -7524,77 +7573,81 @@ async def cmd_change_damage_settings(interaction: discord.Interaction,
             "Please contact the bot operator."), ephemeral=True)
 
     loop = asyncio.get_running_loop()
-    roh, status = await loop.run_in_executor(None, conn.ftp.read_file_ex, pfad)
-    if status == "error":
-        # Inhalt UNBEKANNT – niemals blind ueberschreiben, sonst ist die
-        # komplette Gameplay-Konfiguration des Kunden weg.
-        return await interaction.followup.send(_t(
-            interaction,
-            f"❌ `cfggameplay.json` konnte nicht gelesen werden (FTP-Fehler). "
-            f"Es wurde **nichts** geändert. Bitte gleich nochmal versuchen.\n"
-            f"Pfad: `{pfad}`",
-            f"❌ Could not read `cfggameplay.json` (FTP error). **Nothing** was "
-            f"changed. Please try again in a moment.\nPath: `{pfad}`"), ephemeral=True)
-    if status == "missing":
-        return await interaction.followup.send(_t(
-            interaction,
-            f"❌ Es gibt keine `cfggameplay.json` in diesem Mission-Ordner.\n"
-            f"Pfad: `{pfad}`\n\nLege sie im Nitrado-Dateimanager an und setze in "
-            f"der `serverDZ.cfg` zusätzlich `enableCfgGameplayFile = 1;` – sonst "
-            f"liest DayZ die Datei gar nicht ein.",
-            f"❌ There is no `cfggameplay.json` in this mission folder.\n"
-            f"Path: `{pfad}`\n\nCreate it via the Nitrado file manager and also set "
-            f"`enableCfgGameplayFile = 1;` in `serverDZ.cfg` – otherwise DayZ will "
-            f"not read the file at all."), ephemeral=True)
-
-    try:
-        daten = json.loads(roh or "")
-        if not isinstance(daten, dict):
-            raise ValueError("Wurzel-Element ist kein JSON-Objekt")
-    except Exception as e:  # noqa: BLE001
-        return await interaction.followup.send(_t(
-            interaction,
-            f"❌ `cfggameplay.json` ist kein gültiges JSON: `{e}`\n"
-            f"Es wurde nichts geändert.",
-            f"❌ `cfggameplay.json` is not valid JSON: `{e}`\n"
-            f"Nothing was changed."), ephemeral=True)
-
-    fundort = _json_schluessel_finden(daten, schluessel)
-    if fundort is None:
-        # Nicht vorhanden: nur dort ergaenzen, wo DayZ ihn erwartet.
-        if isinstance(daten.get("GeneralData"), dict):
-            fundort = "GeneralData"
-        else:
+    # Lesen+Schreiben als Einheit sperren – sonst liest ein zweiter,
+    # gleichzeitiger Aufruf (anderer Bereich oder anderer Admin) noch die
+    # alte Fassung und wirft beim Zurueckschreiben die erste Aenderung weg.
+    async with _schaden_lock(conn.service_id):
+        roh, status = await loop.run_in_executor(None, conn.ftp.read_file_ex, pfad)
+        if status == "error":
+            # Inhalt UNBEKANNT – niemals blind ueberschreiben, sonst ist die
+            # komplette Gameplay-Konfiguration des Kunden weg.
             return await interaction.followup.send(_t(
                 interaction,
-                f"❌ `{schluessel}` steht nicht in dieser `cfggameplay.json`, und es "
-                f"gibt auch keinen Abschnitt `GeneralData`, in den er gehören würde. "
-                f"Es wurde nichts geändert – bitte schick mir den Inhalt der Datei.",
-                f"❌ `{schluessel}` is not in this `cfggameplay.json`, and there is no "
-                f"`GeneralData` section it would belong to. Nothing was changed – "
-                f"please send me the contents of the file."), ephemeral=True)
+                f"❌ `cfggameplay.json` konnte nicht gelesen werden (FTP-Fehler). "
+                f"Es wurde **nichts** geändert. Bitte gleich nochmal versuchen.\n"
+                f"Pfad: `{pfad}`",
+                f"❌ Could not read `cfggameplay.json` (FTP error). **Nothing** was "
+                f"changed. Please try again in a moment.\nPath: `{pfad}`"), ephemeral=True)
+        if status == "missing":
+            return await interaction.followup.send(_t(
+                interaction,
+                f"❌ Es gibt keine `cfggameplay.json` in diesem Mission-Ordner.\n"
+                f"Pfad: `{pfad}`\n\nLege sie im Nitrado-Dateimanager an und setze in "
+                f"der `serverDZ.cfg` zusätzlich `enableCfgGameplayFile = 1;` – sonst "
+                f"liest DayZ die Datei gar nicht ein.",
+                f"❌ There is no `cfggameplay.json` in this mission folder.\n"
+                f"Path: `{pfad}`\n\nCreate it via the Nitrado file manager and also set "
+                f"`enableCfgGameplayFile = 1;` in `serverDZ.cfg` – otherwise DayZ will "
+                f"not read the file at all."), ephemeral=True)
 
-    ziel = _json_unterobjekt(daten, fundort)
-    alter_wert = ziel.get(schluessel)
-    an_aus = _t(interaction, "AN", "ON") if not neuer_wert else _t(interaction, "AUS", "OFF")
-    if alter_wert is neuer_wert:
-        return await interaction.followup.send(_t(
-            interaction,
-            f"ℹ️ **{bereich.name}** steht auf **{an_aus}** – das ist bereits so "
-            f"eingestellt (`{schluessel}: {str(neuer_wert).lower()}`). "
-            f"Die Datei wurde nicht angefasst.",
-            f"ℹ️ **{bereich.name}** is **{an_aus}** – it is already set that way "
-            f"(`{schluessel}: {str(neuer_wert).lower()}`). The file was left "
-            f"untouched."), ephemeral=True)
+        try:
+            daten = json.loads(roh or "")
+            if not isinstance(daten, dict):
+                raise ValueError("Wurzel-Element ist kein JSON-Objekt")
+        except Exception as e:  # noqa: BLE001
+            return await interaction.followup.send(_t(
+                interaction,
+                f"❌ `cfggameplay.json` ist kein gültiges JSON: `{e}`\n"
+                f"Es wurde nichts geändert.",
+                f"❌ `cfggameplay.json` is not valid JSON: `{e}`\n"
+                f"Nothing was changed."), ephemeral=True)
 
-    ziel[schluessel] = neuer_wert
-    inhalt = json.dumps(daten, ensure_ascii=False, indent=4)
-    ok = await loop.run_in_executor(None, conn.ftp.write_file, pfad, inhalt)
-    if not ok:
-        return await interaction.followup.send(_t(
-            interaction,
-            "❌ Schreiben per FTP fehlgeschlagen – die Datei ist unverändert.",
-            "❌ FTP write failed – the file is unchanged."), ephemeral=True)
+        fundort = _json_schluessel_finden(daten, schluessel)
+        if fundort is None:
+            # Nicht vorhanden: nur dort ergaenzen, wo DayZ ihn erwartet.
+            if isinstance(daten.get("GeneralData"), dict):
+                fundort = "GeneralData"
+            else:
+                return await interaction.followup.send(_t(
+                    interaction,
+                    f"❌ `{schluessel}` steht nicht in dieser `cfggameplay.json`, und es "
+                    f"gibt auch keinen Abschnitt `GeneralData`, in den er gehören würde. "
+                    f"Es wurde nichts geändert – bitte schick mir den Inhalt der Datei.",
+                    f"❌ `{schluessel}` is not in this `cfggameplay.json`, and there is no "
+                    f"`GeneralData` section it would belong to. Nothing was changed – "
+                    f"please send me the contents of the file."), ephemeral=True)
+
+        ziel = _json_unterobjekt(daten, fundort)
+        alter_wert = ziel.get(schluessel)
+        an_aus = _t(interaction, "AN", "ON") if not neuer_wert else _t(interaction, "AUS", "OFF")
+        if alter_wert is neuer_wert:
+            return await interaction.followup.send(_t(
+                interaction,
+                f"ℹ️ **{bereich.name}** steht auf **{an_aus}** – das ist bereits so "
+                f"eingestellt (`{schluessel}: {str(neuer_wert).lower()}`). "
+                f"Die Datei wurde nicht angefasst.",
+                f"ℹ️ **{bereich.name}** is **{an_aus}** – it is already set that way "
+                f"(`{schluessel}: {str(neuer_wert).lower()}`). The file was left "
+                f"untouched."), ephemeral=True)
+
+        ziel[schluessel] = neuer_wert
+        inhalt = json.dumps(daten, ensure_ascii=False, indent=4)
+        ok = await loop.run_in_executor(None, conn.ftp.write_file, pfad, inhalt)
+        if not ok:
+            return await interaction.followup.send(_t(
+                interaction,
+                "❌ Schreiben per FTP fehlgeschlagen – die Datei ist unverändert.",
+                "❌ FTP write failed – the file is unchanged."), ephemeral=True)
 
     log.info(f"[GAMEPLAY] {conn.name}: {schluessel} = {str(neuer_wert).lower()} "
              f"(durch {interaction.user})")
@@ -8144,7 +8197,7 @@ async def _ann_position(interaction: discord.Interaction,
     """
     conn = _conn_of(interaction)
     if conn is None:
-        await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+        await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
         return None
     eigene = _ann_eigene(conn)
     if index < 0 or index >= len(eigene):
@@ -8643,7 +8696,7 @@ async def cmd_ann_liste(interaction: discord.Interaction):
 
     conn = _conn_of(interaction)
     if conn is None:
-        return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
     eigene = _ann_eigene(conn)
 
     sprache = _sprache(interaction)
@@ -10363,7 +10416,7 @@ async def _player_name_ac(interaction: discord.Interaction,
 async def cmd_stats(interaction: discord.Interaction, spieler: str):
     conn = _conn_of(interaction)
     if conn is None:
-        return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
     st = db.player_stats(conn.service_id, spieler.strip())
     if not st:
         return await interaction.response.send_message(_t(
@@ -10395,7 +10448,7 @@ async def cmd_stats(interaction: discord.Interaction, spieler: str):
 async def cmd_leaderboard(interaction: discord.Interaction):
     conn = _conn_of(interaction)
     if conn is None:
-        return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
     rows = db.leaderboard(conn.service_id, 10)
     if not rows:
         return await interaction.response.send_message(_t(
@@ -11300,7 +11353,7 @@ async def _require_catalog(interaction: discord.Interaction,
     conn, fehler = _conn_waehlen(interaction, server)
     if conn is not None:
         return conn.catalog
-    msg = fehler or PREMIUM_MISSING_TEXT
+    msg = fehler or _premium_missing_text(interaction)
     if interaction.response.is_done():
         await interaction.followup.send(msg, ephemeral=True)
     else:
@@ -11515,7 +11568,7 @@ async def shop_pending(interaction: discord.Interaction, server: Optional[str] =
     _conn, _fehler = _conn_waehlen(interaction, server)
     if _conn is None:
         return await interaction.response.send_message(
-            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
     rows = db.pending_purchases(guild_id=interaction.guild_id,
                                 service_id=_conn.service_id)
     if not rows:
@@ -11786,12 +11839,12 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
     _conn, _fehler = _conn_waehlen(interaction, server)
     if _conn is None:
         return await interaction.response.send_message(
-            _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
     katalog_conn = _conn
     katalog = _conn.catalog
     if katalog is None:
         return await interaction.response.send_message(
-            PREMIUM_MISSING_TEXT, ephemeral=True)
+            _premium_missing_text(interaction), ephemeral=True)
     it = katalog.find(item)
     if not it or not it.get("enabled", True):
         return await interaction.response.send_message(_t(
