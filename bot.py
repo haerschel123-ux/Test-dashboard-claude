@@ -4653,12 +4653,8 @@ class DayZBot(discord.Client):
             except Exception as e:  # noqa: BLE001
                 return False, str(e), None
         if art == "online_list":
-            try:
-                loop = asyncio.get_running_loop()
-                namen = await loop.run_in_executor(
-                    None, db.open_session_names, conn.service_id)
-            except Exception as e:  # noqa: BLE001
-                return False, str(e), None
+            positions = dict((conn.parser or self.parser).player_positions)
+            namen = _online_spieler_namen(positions)
             return (True, f"{len(namen)} Spieler online",
                     _online_liste_embed(conn, namen, str(task.get("note") or "")))
         return False, f"Unbekannter Aufgaben-Typ: {art}", None
@@ -5904,6 +5900,34 @@ SCHEDULED_TASK_TYPES: Dict[str, Dict[str, Any]] = {
 # Mehr Namen sprengen die 4096 Zeichen einer Embed-Beschreibung nicht, machen
 # den Post aber unlesbar – der Rest wird zusammengefasst.
 _ONLINE_LISTE_MAX = 100
+
+
+def _online_spieler_namen(positions: Dict[str, Dict],
+                          max_age_seconds: int = 900) -> List[str]:
+    """Wer ist laut Log gerade auf dem Server – unabhaengig von Verknuepfung
+    oder einem gesehenen Connect-Event.
+
+    Die sessions-Tabelle (fuer Spielzeit-Belohnung gedacht) faengt nur echte
+    "is connected"-Zeilen ab und holt sonst nur VERLINKTE Namen nach
+    (sync_sessions_from_positions) – ein Spieler, der schon verbunden war,
+    BEVOR Bot oder FTP zuletzt gestartet sind, taucht dort nie auf, obwohl
+    er laufend in den Positions-Zeilen des Logs steht (fast jede Aktion
+    schreibt "Player "Name" (id=... pos=<...>)"). Deshalb liest die
+    Online-Liste direkt aus dem Positions-Tracking – demselben, das auch
+    _seen_in_logs fuer die "bist du gerade online"-Pruefung bei /link nutzt,
+    daher derselbe Standard-Zeitraum von 900s.
+    """
+    now = datetime.now(timezone.utc)
+    namen = []
+    for name, info in positions.items():
+        try:
+            seen = datetime.fromisoformat(str(info.get("last_seen", "")))
+        except ValueError:
+            continue
+        if (now - seen).total_seconds() <= max_age_seconds:
+            namen.append(name)
+    namen.sort(key=str.lower)
+    return namen
 
 
 def _online_liste_embed(conn: ServerConnection, namen: List[str],
@@ -9112,20 +9136,6 @@ class EconomyDB:
                 "SELECT 1 FROM sessions WHERE service_id=? AND ingame_name=? COLLATE NOCASE",
                 (str(service_id or ""), ingame_name)).fetchone()
         return row is not None
-
-    def open_session_names(self, service_id: str) -> List[str]:
-        """Namen aller Spieler mit offener Sitzung auf DIESEM Server.
-
-        Quelle sind die connect/disconnect-Zeilen der .ADM – A2S liefert bei
-        DayZ keine Spielernamen. Ein Server-Neustart leert die Sitzungen
-        (close_all_sessions), danach fuellen sie sich aus den Logs wieder auf.
-        """
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT ingame_name FROM sessions WHERE service_id=? "
-                "ORDER BY ingame_name COLLATE NOCASE",
-                (str(service_id or ""),)).fetchall()
-        return [str(r["ingame_name"]) for r in rows]
 
     def sync_sessions_from_positions(self, service_id: str, positions: Dict,
                                      max_age_seconds: int = 300,
