@@ -304,7 +304,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "  sie, hat sie Vorrang vor shop_items. Preise pro Kategorie: shop_category_prices",
         "  (Datei löschen + Neustart = neu generieren) oder einzeln per /shop setprice",
         "  bzw. /edit shopitem. Items hinzufügen/ändern: /add shopitem, /edit shopitem.",
-        "Nach Änderungen an dieser Datei: /economy_reload im Discord (kein Neustart nötig)."
+        "Nach Änderungen an dieser Datei: /economy_reload im Discord (kein Neustart nötig, "
+        "nur Bot-Eigentümer)."
     ],
 
     "admin_role_ids":              [],
@@ -863,8 +864,7 @@ BEFEHLE (alle nur für Admins mit der konfigurierten Rolle)
 
 /admin_position                 → Letzte bekannte Positionen aller Spieler
 /spieler_suche <name>           → Spieler in den Logs suchen
-/log_status                     → Log-Polling Status anzeigen
-/ftp_scan                       → FTP-Verzeichnisse neu scannen
+/ftp_scan                       → FTP-Verzeichnisse neu scannen (nur Bot-Eigentümer)
 /hilfe                          → Diese Hilfe
 
 SHOP & ECONOMY & CASINO
@@ -901,7 +901,8 @@ Economy-Admin-Befehle (admin_role_ids / economy_admin_role_ids):
 /edit shopitem <item> [...]     → Classnames, Preis, Name, Kategorie oder
    Max-Menge eines vorhandenen Items/Bundles ändern
 /shop removeitem <item>         → Item/Bundle aus dem Katalog löschen
-/economy_reload                 → config.json + Katalog neu laden (ohne Bot-Neustart)
+/economy_reload                 → config.json + Katalog neu laden (ohne Bot-Neustart,
+                                   nur Bot-Eigentümer)
 
 ITEM-KATALOG (shop_items.json)
 ──────────────────────────────
@@ -3591,6 +3592,8 @@ _BEFEHL_BESCHREIBUNG_EN = {
     "🛠️ Einstellungen für den Bot-Betreiber": "🛠️ Settings for the bot operator",
     "🛠️ (Nur Bot-Eigentümer) Legt fest, wohin Ausfall-/Anfrage-Meldungen gehen":
         "🛠️ (Bot owner only) Sets where outage/request alerts are sent",
+    "🔄 (Nur Bot-Eigentümer) Lädt config.json (shop/economy/casino) neu, ohne den Bot neu zu starten":
+        "🔄 (Bot owner only) Reloads config.json (shop/economy/casino) without restarting the bot",
     "⏰ Automatische Server-Neustarts planen": "⏰ Schedule automatic server restarts",
     "⏰ Plant automatische Neustarts (Startzeit per Dropdown + Intervall)":
         "⏰ Schedules automatic restarts (start time via dropdown + interval)",
@@ -3625,13 +3628,12 @@ _BEFEHL_BESCHREIBUNG_EN = {
     "📍 Letzte bekannte Positionen aller Spieler aus den Logs":
         "📍 Last known positions of all players from the logs",
     "🔍 Sucht einen Spieler in den aktuellen Logs": "🔍 Searches for a player in the current logs",
-    "🔎 Scannt FTP-Server erneut nach Log-Verzeichnissen":
-        "🔎 Re-scans the FTP server for log directories",
+    "🔎 (Nur Bot-Eigentümer) Scannt FTP-Server erneut nach Log-Verzeichnissen":
+        "🔎 (Bot owner only) Re-scans the FTP server for log directories",
     "🔍 Zeigt die letzten Zeilen des ADM-Logs (Debug)": "🔍 Shows the last lines of the ADM log (debug)",
     "🧪 Postet das letzte Log-Event jedes Typs in die jeweiligen Channels":
         "🧪 Posts the latest log event of each type into its channel",
     "🔌 Testet die FTP-Verbindung zum Nitrado-Server": "🔌 Tests the FTP connection to the Nitrado server",
-    "📄 Zeigt den aktuellen Log-Polling Status": "📄 Shows the current log polling status",
     "❓ Zeigt alle verfügbaren Bot-Befehle": "❓ Shows all available bot commands",
     "📢 Neue wiederkehrende Ankündigung anlegen": "📢 Create a new recurring announcement",
     "📋 Zeigt alle geplanten Ankündigungen": "📋 Shows all scheduled announcements",
@@ -3834,7 +3836,7 @@ class DayZBot(discord.Client):
         # Eine gemeinsame Schleife bedient alle Kunden. Damit niemand langsamer
         # abgefragt wird, als er eingestellt hat, gilt der KLEINSTE gewuenschte
         # Wert – vorher zaehlte ausschliesslich der Betreiberwert, und die je
-        # Server gespeicherte Einstellung (die /log_status auch anzeigt) war
+        # Server gespeicherte Einstellung (in der Diagnose-Seite sichtbar) war
         # wirkungslos.
         wuensche = [int(cfg.config.get("log_poll_interval_seconds", 10) or 10)]
         for _c in connections.all():
@@ -7236,15 +7238,27 @@ cmd_search.autocomplete("server")(_server_autocomplete)
 # ══════════════════════════════════════════════════════════════
 #  /ftp_scan – FTP-Verzeichnisse neu scannen
 # ══════════════════════════════════════════════════════════════
-@bot.tree.command(name="ftp_scan", description=app_commands.locale_str("🔎 Scannt FTP-Server erneut nach Log-Verzeichnissen"))
+@bot.tree.command(name="ftp_scan", description=app_commands.locale_str(
+    "🔎 (Nur Bot-Eigentümer) Scannt FTP-Server erneut nach Log-Verzeichnissen"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_ftp_scan(interaction: discord.Interaction, server: Optional[str] = None):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
+    # ZUERST bestaetigen, dann erst pruefen: siehe betreiber_alarm_channel -
+    # application_info() beim ersten Aufruf kann laenger als 3s dauern.
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ist_eigentuemer = await _ist_bot_eigentuemer(interaction.user)
+    except Exception as e:  # noqa: BLE001
+        log.error(f"[FTP_SCAN] Eigentümer-Prüfung fehlgeschlagen: {e}")
+        return await interaction.followup.send(_t(
+            interaction, f"❌ Eigentümer-Prüfung bei Discord fehlgeschlagen: `{e}`",
+            f"❌ Owner check with Discord failed: `{e}`"), ephemeral=True)
+    if not ist_eigentuemer:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Nur der Bot-Eigentümer darf das ausführen.",
+            "❌ Only the bot owner can run this."), ephemeral=True)
     conn = await _require_conn(interaction, need_ftp=True, server=server)
     if conn is None:
         return
-    await interaction.response.defer(ephemeral=True)
 
     # Pfade zurücksetzen damit discover_paths nicht überspringt
     for key in ("ftp_log_dir", "ftp_ban_file", "ftp_mission_dir",
@@ -7608,52 +7622,10 @@ async def cmd_ftp_status(interaction: discord.Interaction, server: Optional[str]
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-# ══════════════════════════════════════════════════════════════
-#  /log_status – Polling-Status anzeigen
-# ══════════════════════════════════════════════════════════════
-@bot.tree.command(name="log_status", description=app_commands.locale_str("📄 Zeigt den aktuellen Log-Polling Status"))
-@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
-async def cmd_log_status(interaction: discord.Interaction, server: Optional[str] = None):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
-
-    _conn, _fehler = _conn_waehlen(interaction, server)
-    if _conn is None:
-        return await interaction.response.send_message(_fehler, ephemeral=True)
-    # Alles aus DIESER Verbindung – sonst zeigte der Befehl den Log-Pfad und
-    # FTP-Host des Betreibers, egal aus welchem Discord er kam.
-    state = _conn.log_state.get("current", {})
-    keine_wort = _t(interaction, "Keine", "None")
-    embed = discord.Embed(title=_t(interaction, "📄 Log-Polling Status", "📄 Log Polling Status"),
-                          color=0x5865F2)
-    embed.add_field(name="Server", value=_conn.name, inline=False)
-    embed.add_field(name=_t(interaction, "Aktuelle Log-Datei", "Current Log File"),
-                    value=f"`{state.get('file', keine_wort)}`",         inline=False)
-    embed.add_field(name=_t(interaction, "Gelesene Bytes", "Bytes Read"),
-                    value=f"{state.get('offset', 0):,}",             inline=True)
-    embed.add_field(name=_t(interaction, "Poll-Intervall", "Poll Interval"),
-                    value=f"{_conn.get('log_poll_interval_seconds', 10)}s",inline=True)
-    embed.add_field(name=_t(interaction, "Log-Verzeichnis", "Log Directory"),
-                    value=f"`{_conn.get('ftp_log_dir') or '–'}`", inline=False)
-    embed.add_field(name=_t(interaction, "Banliste", "Ban List"),
-                    value=_t(interaction, "Nitrado-Servereinstellungen (via API)",
-                            "Nitrado server settings (via API)"),     inline=False)
-    embed.add_field(name="FTP-Host",
-                    value=f"`{_conn.get('ftp_host') or '–'}`",    inline=False)
-    embed.add_field(name=_t(interaction, "Bekannte Spieler-Positionen", "Known Player Positions"),
-                    value=str(len(_conn.parser.player_positions
-                                  if _conn.parser else {})),
-                    inline=True)
-    embed.add_field(name=_t(interaction, "Lokale Bans", "Local Bans"),
-                    value=str(len(_bans_of(_conn))),                  inline=True)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
 cmd_ftp_scan.autocomplete("server")(_server_autocomplete)
 cmd_raw_log.autocomplete("server")(_server_autocomplete)
 cmd_test.autocomplete("server")(_server_autocomplete)
 cmd_ftp_status.autocomplete("server")(_server_autocomplete)
-cmd_log_status.autocomplete("server")(_server_autocomplete)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -7766,13 +7738,11 @@ async def cmd_hilfe(interaction: discord.Interaction):
     ), inline=False)
     embed.add_field(name=_t(interaction, "🔧 Diagnose", "🔧 Diagnostics"), value=_t(
         interaction,
-        "`/log_status` — Polling-Status\n"
-        "`/ftp_scan` — FTP neu scannen\n"
+        "`/ftp_scan` — FTP neu scannen *(Bot-Eigentümer)*\n"
         "`/ftp_status` — FTP-Verbindung testen\n"
         "`/raw_log [zeilen]` — Rohe Log-Zeilen anzeigen (Debug)\n"
         "`/test [zeilen]` — Letztes Event pro Typ in Channels posten",
-        "`/log_status` — Polling status\n"
-        "`/ftp_scan` — Re-scan FTP\n"
+        "`/ftp_scan` — Re-scan FTP *(bot owner)*\n"
         "`/ftp_status` — Test the FTP connection\n"
         "`/raw_log [lines]` — Show raw log lines (debug)\n"
         "`/test [lines]` — Post the latest event per type into the channels"
@@ -7784,13 +7754,13 @@ async def cmd_hilfe(interaction: discord.Interaction):
         "`/pay <@user> <betrag>` — Geld an Mitspieler überweisen\n"
         "`/work` `/daily` `/beg` — Geld verdienen\n"
         "`/addmoney` `/removemoney` `/setbalance` *(Admin)*\n"
-        "`/economy_reload` — config.json neu laden *(Admin)*",
+        "`/economy_reload` — config.json neu laden *(Bot-Eigentümer)*",
         "`/balance [@user]` — Wallet & bank\n"
         "`/deposit [amount]` / `/withdraw [amount]`\n"
         "`/pay <@user> <amount>` — Transfer money to another member\n"
         "`/work` `/daily` `/beg` — Earn money\n"
         "`/addmoney` `/removemoney` `/setbalance` *(admin)*\n"
-        "`/economy_reload` — Reload config.json *(admin)*"
+        "`/economy_reload` — Reload config.json *(bot owner)*"
     ), inline=False)
     embed.add_field(name="🎰 Casino", value=_t(
         interaction,
@@ -10032,11 +10002,23 @@ async def cmd_setbalance(interaction: discord.Interaction,
                                   user, _fmt_money(wallet), wallet, 0x5865F2)
 
 
-@bot.tree.command(name="economy_reload",
-                  description="🔄 Reload config.json (shop/economy/casino) without restarting the bot")
+@bot.tree.command(name="economy_reload", description=app_commands.locale_str(
+    "🔄 (Nur Bot-Eigentümer) Lädt config.json (shop/economy/casino) neu, ohne den Bot neu zu starten"))
 async def cmd_economy_reload(interaction: discord.Interaction):
-    if not _is_admin(interaction):
-        return await _deny(interaction)
+    # ZUERST bestaetigen, dann erst pruefen: siehe betreiber_alarm_channel -
+    # application_info() beim ersten Aufruf kann laenger als 3s dauern.
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ist_eigentuemer = await _ist_bot_eigentuemer(interaction.user)
+    except Exception as e:  # noqa: BLE001
+        log.error(f"[ECONOMY_RELOAD] Eigentümer-Prüfung fehlgeschlagen: {e}")
+        return await interaction.followup.send(_t(
+            interaction, f"❌ Eigentümer-Prüfung bei Discord fehlgeschlagen: `{e}`",
+            f"❌ Owner check with Discord failed: `{e}`"), ephemeral=True)
+    if not ist_eigentuemer:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Nur der Bot-Eigentümer darf das ausführen.",
+            "❌ Only the bot owner can run this."), ephemeral=True)
     ok = cfg.reload_config()
     if ok:
         _conn_c = _conn_of(interaction)
@@ -10069,7 +10051,7 @@ async def cmd_economy_reload(interaction: discord.Interaction):
                 "`config.json` konnte nicht gelesen werden – Bot-Log / JSON-Syntax prüfen.",
                 "Could not parse `config.json` – check the bot log / JSON syntax."),
             color=0xE74C3C)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ══════════════════════════════════════════════════════════════
