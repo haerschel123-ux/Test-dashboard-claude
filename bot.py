@@ -3586,6 +3586,8 @@ _BEFEHL_NAMEN_EN = {
 # brauchen deshalb keinen Eintrag hier.
 _BEFEHL_BESCHREIBUNG_EN = {
     "📡 Zeigt alle Feed-Channels und ihren Status": "📡 Shows all feed channels and their status",
+    "🧱 Schaltet Base- oder Container-Schaden an/aus (cfggameplay.json)":
+        "🧱 Turns base or container damage on/off (cfggameplay.json)",
     "🔄 Startet den DayZ Server neu": "🔄 Restarts the DayZ server",
     "⏹️ Stoppt den DayZ Server": "⏹️ Stops the DayZ server",
     "📊 Zeigt den aktuellen Server-Status": "📊 Shows the current server status",
@@ -7423,6 +7425,199 @@ async def cmd_raw_log(interaction: discord.Interaction, zeilen: int = 20,
 
 
 # ══════════════════════════════════════════════════════════════
+#  /change_damage_settings – Base-/Container-Schaden umschalten
+#
+#  Geaendert wird die cfggameplay.json im Mission-Ordner des jeweiligen
+#  Kunden-Servers (mpmissions/dayzOffline.<karte>/cfggameplay.json).
+#  ACHTUNG Umkehrung: die Datei speichert das VERBOT, nicht die Erlaubnis –
+#  Schaden AN heisst disableXxxDamage = false.
+# ══════════════════════════════════════════════════════════════
+_SCHADEN_SCHLUESSEL = {
+    "base":      "disableBaseDamage",
+    "container": "disableContainerDamage",
+}
+
+
+def _cfggameplay_pfad(conn: ServerConnection) -> Optional[str]:
+    """Pfad der cfggameplay.json – sie liegt im selben Mission-Ordner wie die
+    cfgEffectArea.json, die /ftp_scan bereits findet."""
+    mission = str(conn.get("ftp_mission_dir") or "")
+    if mission:
+        return f"{mission.rstrip('/')}/cfggameplay.json"
+    # Rueckfall: aus dem cfgEffectArea-Pfad ableiten (gleicher Ordner)
+    effect = str(conn.get("cfg_effect_area_path") or "")
+    if effect and "/" in effect:
+        return effect.rsplit("/", 1)[0] + "/cfggameplay.json"
+    return None
+
+
+def _json_schluessel_finden(daten: Any, schluessel: str,
+                            pfad: str = "") -> Optional[str]:
+    """Sucht ``schluessel`` rekursiv in verschachtelten Dicts und gibt den
+    Fundort als Punktpfad zurueck ("GeneralData" bzw. "" fuer die Wurzel),
+    sonst ``None``.
+
+    Bewusst gesucht statt "GeneralData" fest verdrahtet: Bohemia hat die
+    Abschnitte der cfggameplay.json schon mehrfach umsortiert – wird der
+    Schluessel nicht gefunden, meldet der Befehl das, statt an falscher
+    Stelle einen wirkungslosen neuen Eintrag anzulegen.
+    """
+    if not isinstance(daten, dict):
+        return None
+    if schluessel in daten and not isinstance(daten[schluessel], (dict, list)):
+        return pfad
+    for k, v in daten.items():
+        if isinstance(v, dict):
+            treffer = _json_schluessel_finden(v, schluessel, f"{pfad}.{k}" if pfad else k)
+            if treffer is not None:
+                return treffer
+    return None
+
+
+def _json_unterobjekt(daten: Dict, pfad: str) -> Dict:
+    """Folgt einem Punktpfad aus _json_schluessel_finden ("" = Wurzel)."""
+    ziel = daten
+    for teil in [t for t in pfad.split(".") if t]:
+        ziel = ziel[teil]
+    return ziel
+
+
+@bot.tree.command(
+    name="change_damage_settings",
+    description=app_commands.locale_str(
+        "🧱 Schaltet Base- oder Container-Schaden an/aus (cfggameplay.json)")
+)
+@app_commands.describe(
+    bereich="Was soll umgestellt werden?",
+    zustand="Schaden erlauben (an) oder verbieten (aus)?",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+@app_commands.choices(
+    bereich=[
+        app_commands.Choice(name="Base Damage", value="base"),
+        app_commands.Choice(name="Container Damage", value="container"),
+    ],
+    zustand=[
+        app_commands.Choice(name="enable (Schaden an)", value="enable"),
+        app_commands.Choice(name="disable (Schaden aus)", value="disable"),
+    ])
+async def cmd_change_damage_settings(interaction: discord.Interaction,
+                                     bereich: app_commands.Choice[str],
+                                     zustand: app_commands.Choice[str],
+                                     server: Optional[str] = None):
+    if not _is_admin(interaction):
+        return await _deny(interaction)
+    conn = await _require_conn(interaction, need_ftp=True, server=server)
+    if conn is None:
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    schluessel = _SCHADEN_SCHLUESSEL[bereich.value]
+    # Umkehrung: "enable" (Schaden an) = disableXxxDamage FALSE
+    neuer_wert = (zustand.value == "disable")
+    pfad = _cfggameplay_pfad(conn)
+    if not pfad:
+        return await interaction.followup.send(_t(
+            interaction,
+            "❌ Der Mission-Ordner dieses Servers ist nicht bekannt. "
+            "Wende dich an den Bot-Betreiber.",
+            "❌ The mission folder of this server is unknown. "
+            "Please contact the bot operator."), ephemeral=True)
+
+    loop = asyncio.get_running_loop()
+    roh, status = await loop.run_in_executor(None, conn.ftp.read_file_ex, pfad)
+    if status == "error":
+        # Inhalt UNBEKANNT – niemals blind ueberschreiben, sonst ist die
+        # komplette Gameplay-Konfiguration des Kunden weg.
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ `cfggameplay.json` konnte nicht gelesen werden (FTP-Fehler). "
+            f"Es wurde **nichts** geändert. Bitte gleich nochmal versuchen.\n"
+            f"Pfad: `{pfad}`",
+            f"❌ Could not read `cfggameplay.json` (FTP error). **Nothing** was "
+            f"changed. Please try again in a moment.\nPath: `{pfad}`"), ephemeral=True)
+    if status == "missing":
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ Es gibt keine `cfggameplay.json` in diesem Mission-Ordner.\n"
+            f"Pfad: `{pfad}`\n\nLege sie im Nitrado-Dateimanager an und setze in "
+            f"der `serverDZ.cfg` zusätzlich `enableCfgGameplayFile = 1;` – sonst "
+            f"liest DayZ die Datei gar nicht ein.",
+            f"❌ There is no `cfggameplay.json` in this mission folder.\n"
+            f"Path: `{pfad}`\n\nCreate it via the Nitrado file manager and also set "
+            f"`enableCfgGameplayFile = 1;` in `serverDZ.cfg` – otherwise DayZ will "
+            f"not read the file at all."), ephemeral=True)
+
+    try:
+        daten = json.loads(roh or "")
+        if not isinstance(daten, dict):
+            raise ValueError("Wurzel-Element ist kein JSON-Objekt")
+    except Exception as e:  # noqa: BLE001
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ `cfggameplay.json` ist kein gültiges JSON: `{e}`\n"
+            f"Es wurde nichts geändert.",
+            f"❌ `cfggameplay.json` is not valid JSON: `{e}`\n"
+            f"Nothing was changed."), ephemeral=True)
+
+    fundort = _json_schluessel_finden(daten, schluessel)
+    if fundort is None:
+        # Nicht vorhanden: nur dort ergaenzen, wo DayZ ihn erwartet.
+        if isinstance(daten.get("GeneralData"), dict):
+            fundort = "GeneralData"
+        else:
+            return await interaction.followup.send(_t(
+                interaction,
+                f"❌ `{schluessel}` steht nicht in dieser `cfggameplay.json`, und es "
+                f"gibt auch keinen Abschnitt `GeneralData`, in den er gehören würde. "
+                f"Es wurde nichts geändert – bitte schick mir den Inhalt der Datei.",
+                f"❌ `{schluessel}` is not in this `cfggameplay.json`, and there is no "
+                f"`GeneralData` section it would belong to. Nothing was changed – "
+                f"please send me the contents of the file."), ephemeral=True)
+
+    ziel = _json_unterobjekt(daten, fundort)
+    alter_wert = ziel.get(schluessel)
+    an_aus = _t(interaction, "AN", "ON") if not neuer_wert else _t(interaction, "AUS", "OFF")
+    if alter_wert is neuer_wert:
+        return await interaction.followup.send(_t(
+            interaction,
+            f"ℹ️ **{bereich.name}** steht auf **{an_aus}** – das ist bereits so "
+            f"eingestellt (`{schluessel}: {str(neuer_wert).lower()}`). "
+            f"Die Datei wurde nicht angefasst.",
+            f"ℹ️ **{bereich.name}** is **{an_aus}** – it is already set that way "
+            f"(`{schluessel}: {str(neuer_wert).lower()}`). The file was left "
+            f"untouched."), ephemeral=True)
+
+    ziel[schluessel] = neuer_wert
+    inhalt = json.dumps(daten, ensure_ascii=False, indent=4)
+    ok = await loop.run_in_executor(None, conn.ftp.write_file, pfad, inhalt)
+    if not ok:
+        return await interaction.followup.send(_t(
+            interaction,
+            "❌ Schreiben per FTP fehlgeschlagen – die Datei ist unverändert.",
+            "❌ FTP write failed – the file is unchanged."), ephemeral=True)
+
+    log.info(f"[GAMEPLAY] {conn.name}: {schluessel} = {str(neuer_wert).lower()} "
+             f"(durch {interaction.user})")
+    embed = discord.Embed(
+        title=_t(interaction, f"🧱 {bereich.name} ist jetzt {an_aus}",
+                 f"🧱 {bereich.name} is now {an_aus}"),
+        color=0x2ECC71 if not neuer_wert else 0xE67E22)
+    embed.add_field(name=_t(interaction, "Geändert", "Changed"),
+                    value=f"`{schluessel}: {str(alter_wert).lower()} → "
+                          f"{str(neuer_wert).lower()}`", inline=False)
+    embed.add_field(name=_t(interaction, "Datei", "File"),
+                    value=f"`{pfad}`", inline=False)
+    embed.set_footer(text=_t(
+        interaction,
+        "⚠️ Wirkt erst nach einem Server-Neustart (/neustart).",
+        "⚠️ Takes effect only after a server restart (/neustart)."))
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+cmd_change_damage_settings.autocomplete("server")(_server_autocomplete)
+
+
+# ══════════════════════════════════════════════════════════════
 #  /test – Letztes Log-Event pro Typ in die jeweiligen Channels
 # ══════════════════════════════════════════════════════════════
 @bot.tree.command(
@@ -7729,12 +7924,16 @@ async def cmd_hilfe(interaction: discord.Interaction):
         "`/stoppen` — Server stoppen\n"
         "`/serverstatus` — Server-Status anzeigen\n"
         "`/auto restart <intervall>` — Geplante Neustarts (Uhrzeit per Dropdown)\n"
-        "`/auto status` / `/auto off` — Zeitplan anzeigen / deaktivieren",
+        "`/auto status` / `/auto off` — Zeitplan anzeigen / deaktivieren\n"
+        "`/change_damage_settings <bereich> <zustand>` — Base-/Container-Schaden "
+        "an/aus *(wirkt nach Neustart)*",
         "`/restart` — Restart the server\n"
         "`/stop` — Stop the server\n"
         "`/serverstatus` — Show server status\n"
         "`/auto restart <interval>` — Scheduled restarts (start time via dropdown)\n"
-        "`/auto status` / `/auto off` — Show / disable the schedule"
+        "`/auto status` / `/auto off` — Show / disable the schedule\n"
+        "`/change_damage_settings <area> <state>` — Base/container damage "
+        "on/off *(takes effect after a restart)*"
     ), inline=False)
     embed.add_field(name=_t(interaction, "🔨 Spieler-Verwaltung", "🔨 Player Management"), value=_t(
         interaction,
