@@ -5353,7 +5353,7 @@ async def _require_conn(interaction: discord.Interaction,
     else:
         msg = ("❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn sind "
                "Logs und Spielerpositionen nicht lesbar.\n"
-               "`/ftp_scan` versucht die Erkennung erneut.")
+               "Bitte wende dich an den Bot-Betreiber, damit er die Pfade neu erkennen lässt.")
     if interaction.response.is_done():
         await interaction.followup.send(msg, ephemeral=True)
     else:
@@ -7190,8 +7190,8 @@ async def cmd_search(interaction: discord.Interaction, name: str,
     if not log_dir:
         return await interaction.followup.send(_t(
             interaction,
-            "❌ Log-Verzeichnis nicht konfiguriert. Starte den Bot neu oder nutze `/ftp_scan`.",
-            "❌ Log directory not configured. Restart the bot or use `/ftp_scan`."),
+            "❌ Log-Verzeichnis nicht konfiguriert. Wende dich an den Bot-Betreiber.",
+            "❌ Log directory not configured. Please contact the bot operator."),
             ephemeral=True
         )
 
@@ -7310,8 +7310,8 @@ async def cmd_raw_log(interaction: discord.Interaction, zeilen: int = 20,
     log_dir = conn.get("ftp_log_dir")
     if not log_dir:
         return await interaction.followup.send(_t(
-            interaction, "❌ Log-Verzeichnis nicht konfiguriert. Nutze `/ftp_scan`.",
-            "❌ Log directory not configured. Use `/ftp_scan`."), ephemeral=True
+            interaction, "❌ Log-Verzeichnis nicht konfiguriert. Wende dich an den Bot-Betreiber.",
+            "❌ Log directory not configured. Please contact the bot operator."), ephemeral=True
         )
 
     loop = asyncio.get_running_loop()
@@ -7369,8 +7369,8 @@ async def cmd_test(interaction: discord.Interaction, zeilen: int = 500,
     log_dir = conn.get("ftp_log_dir")
     if not log_dir:
         return await interaction.followup.send(_t(
-            interaction, "❌ Log-Verzeichnis nicht konfiguriert. Nutze `/ftp_scan`.",
-            "❌ Log directory not configured. Use `/ftp_scan`."), ephemeral=True
+            interaction, "❌ Log-Verzeichnis nicht konfiguriert. Wende dich an den Bot-Betreiber.",
+            "❌ Log directory not configured. Please contact the bot operator."), ephemeral=True
         )
 
     loop = asyncio.get_running_loop()
@@ -7616,8 +7616,8 @@ async def cmd_ftp_status(interaction: discord.Interaction, server: Optional[str]
 
     if not connect_ok:
         embed.set_footer(text=_t(
-            interaction, "Tipp: `/ftp_scan` holt die Zugangsdaten neu über den Nitrado-Token",
-            "Tip: `/ftp_scan` fetches the credentials again via the Nitrado token"))
+            interaction, "Tipp: Wende dich an den Bot-Betreiber, damit er die Zugangsdaten neu holt",
+            "Tip: Please contact the bot operator to fetch the credentials again"))
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -9425,7 +9425,7 @@ class ShopManager:
         if not path:
             return (False,
                     "cfgEffectArea.json path is not configured. "
-                    "Run `/ftp_scan` or set `cfg_effect_area_path` in config.json.", [])
+                    "Please contact the bot operator.", [])
         async with self.lock:
             loop = asyncio.get_running_loop()
             raw, status = await loop.run_in_executor(None, self.conn.ftp.read_file_ex, path)
@@ -11350,10 +11350,8 @@ async def shop_check(interaction: discord.Interaction, server: Optional[str] = N
     path = rep.get("path")
     embed.add_field(name=_t(interaction, "Pfad", "Path"), value=f"`{path}`" if path else _t(
         interaction,
-        "❌ Nicht konfiguriert – `/ftp_scan` ausführen oder "
-        "`cfg_effect_area_path` in config.json setzen.",
-        "❌ Not configured – run `/ftp_scan` or "
-        "set `cfg_effect_area_path` in config.json."), inline=False)
+        "❌ Nicht konfiguriert – wende dich an den Bot-Betreiber.",
+        "❌ Not configured – please contact the bot operator."), inline=False)
     status = rep.get("status")
     if status == "no_path":
         embed.colour = 0xE74C3C
@@ -11587,9 +11585,9 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
         return await interaction.followup.send(_t(
             interaction,
             "❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn kann nichts "
-            "ausgeliefert werden.\n`/ftp_scan` versucht die Erkennung erneut.",
+            "ausgeliefert werden.\nBitte wende dich an den Bot-Betreiber.",
             "❌ This server is missing FTP access – without it nothing "
-            "can be delivered.\n`/ftp_scan` tries detection again."),
+            "can be delivered.\nPlease contact the bot operator."),
             ephemeral=True)
     if not _conn.shop:
         return await interaction.followup.send(_t(
@@ -11880,7 +11878,7 @@ async def katalog_von_server_holen(conn: "ServerConnection") -> Tuple[Optional[i
     kandidaten = _types_xml_kandidaten(conn)
     if not kandidaten:
         return None, ("Das Mission-Verzeichnis ist noch unbekannt. "
-                      "`/ftp_scan` sucht es erneut.")
+                      "Bitte wende dich an den Bot-Betreiber.")
 
     loop = asyncio.get_running_loop()
     roh, gefunden = None, ""
