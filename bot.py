@@ -3686,6 +3686,28 @@ class _BefehlsUebersetzer(app_commands.Translator):
 
 
 # ══════════════════════════════════════════════════════════════
+#  Antworttexte von Befehlen: Sprache des ausfuehrenden Nutzers
+#  (interaction.locale) - anders als bei Namen/Beschreibungen oben gibt es
+#  dafuer KEINE Discord-API, das entscheidet der Bot beim Antworten selbst.
+#  Deckt bewusst NUR interaktive Befehls-Antworten ab - proaktive
+#  Nachrichten (Feeds, Neustart-Meldungen, Auto-Aufgaben-Bestaetigungen)
+#  haben keine ausloesende Interaktion und damit keine Nutzersprache.
+# ══════════════════════════════════════════════════════════════
+def _sprache(interaction: discord.Interaction) -> str:
+    """'en' bei englischer Discord-App-Sprache des Nutzers, sonst 'de'."""
+    if interaction.locale in (discord.Locale.american_english, discord.Locale.british_english):
+        return "en"
+    return "de"
+
+
+def _t(interaction: discord.Interaction, de: str, en: str) -> str:
+    """Waehlt den zur Nutzersprache passenden Text - kein globales
+    Woerterbuch wie bei den Beschreibungen, weil Antworttexte fast immer nur
+    an genau einer Stelle vorkommen und oft dynamische Werte enthalten."""
+    return en if _sprache(interaction) == "en" else de
+
+
+# ══════════════════════════════════════════════════════════════
 #  Bot-Klasse
 # ══════════════════════════════════════════════════════════════
 class DayZBot(discord.Client):
@@ -5384,11 +5406,14 @@ async def cmd_show_feeds(interaction: discord.Interaction, server: Optional[str]
     inactive = [ft for ft in FEED_TYPES if ft not in active]
 
     embed = discord.Embed(
-        title=f"📡 Feed-Channel Übersicht – {_conn_show.name}",
-        description=(
+        title=_t(interaction, f"📡 Feed-Channel Übersicht – {_conn_show.name}",
+                 f"📡 Feed Channel Overview – {_conn_show.name}"),
+        description=_t(
+            interaction,
             f"**{len(active)}** Feed{'s' if len(active) != 1 else ''} aktiv  •  "
-            f"**{len(inactive)}** nicht konfiguriert"
-        ),
+            f"**{len(inactive)}** nicht konfiguriert",
+            f"**{len(active)}** feed{'s' if len(active) != 1 else ''} active  •  "
+            f"**{len(inactive)}** not configured"),
         color=0x2ECC71 if active else 0x95A5A6,
     )
 
@@ -5399,7 +5424,7 @@ async def cmd_show_feeds(interaction: discord.Interaction, server: Optional[str]
         text = "\n".join(lines)
         rest = len(schluessel) - 20
         if rest > 0:
-            text += f"\n… und {rest} weitere"
+            text += _t(interaction, f"\n… und {rest} weitere", f"\n… and {rest} more")
         return text[:1024]
 
     # ── Aktive Feeds ──────────────────────────────────────────
@@ -5407,19 +5432,21 @@ async def cmd_show_feeds(interaction: discord.Interaction, server: Optional[str]
         def _aktiv_zeile(ft):
             ch_id = active[ft]
             ch = interaction.guild.get_channel(int(ch_id)) if interaction.guild else None
-            ch_mention = ch.mention if ch else f"<#{ch_id}> *(Channel nicht gefunden)*"
+            ch_mention = (ch.mention if ch else
+                         f"<#{ch_id}> *({_t(interaction, 'Channel nicht gefunden', 'channel not found')})*")
             return f"{FEED_TYPES[ft]['emoji']} {FEED_TYPES[ft]['label']} → {ch_mention}"
-        embed.add_field(name="✅ Aktive Feeds",
+        embed.add_field(name=_t(interaction, "✅ Aktive Feeds", "✅ Active Feeds"),
                         value=_feld_text(list(active), _aktiv_zeile), inline=False)
 
     # ── Inaktive Feeds ────────────────────────────────────────
     if inactive:
         embed.add_field(
-            name="⚪ Nicht konfiguriert",
+            name=_t(interaction, "⚪ Nicht konfiguriert", "⚪ Not Configured"),
             value=_feld_text(inactive, lambda ft: f"❌ {FEED_TYPES[ft]['label']}"),
             inline=False)
 
-    embed.set_footer(text="Feeds werden im Dashboard unter „Feeds“ geändert")
+    embed.set_footer(text=_t(interaction, "Feeds werden im Dashboard unter „Feeds“ geändert",
+                             "Feeds are changed in the dashboard under „Feeds“"))
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -5442,11 +5469,12 @@ async def cmd_neustart(interaction: discord.Interaction,
     await interaction.response.defer()
     ok, msg = await conn.api.restart()
     embed = discord.Embed(
-        title="🔄 Server Neustart",
+        title=_t(interaction, "🔄 Server Neustart", "🔄 Server Restart"),
         description=msg,
         color=0x2ECC71 if ok else 0xE74C3C
     )
-    embed.set_footer(text=f"Ausgeführt von {interaction.user.display_name}")
+    embed.set_footer(text=_t(interaction, "Ausgeführt von ", "Executed by ")
+                     + interaction.user.display_name)
     await interaction.followup.send(embed=embed)
 
 
@@ -5466,11 +5494,12 @@ async def cmd_stoppen(interaction: discord.Interaction,
     await interaction.response.defer()
     ok, msg = await conn.api.stop()
     embed = discord.Embed(
-        title="⏹️ Server gestoppt",
+        title=_t(interaction, "⏹️ Server gestoppt", "⏹️ Server Stopped"),
         description=msg,
         color=0xF39C12 if ok else 0xE74C3C
     )
-    embed.set_footer(text=f"Ausgeführt von {interaction.user.display_name}")
+    embed.set_footer(text=_t(interaction, "Ausgeführt von ", "Executed by ")
+                     + interaction.user.display_name)
     await interaction.followup.send(embed=embed)
 
 
@@ -5501,10 +5530,9 @@ async def cmd_status(interaction: discord.Interaction,
     a2s: Optional[Dict] = None
     a2s_ping_ms = -1
     if srv_ip:
-        import time as _t
-        t0 = _t.monotonic()
+        t0 = time.monotonic()
         a2s = await loop.run_in_executor(None, a2s_query, srv_ip, qport)
-        a2s_ping_ms = int((_t.monotonic() - t0) * 1000)
+        a2s_ping_ms = int((time.monotonic() - t0) * 1000)
 
     # ── 3. Status aus den Quellen zusammenbauen ───────────────
     # Nitrado-Daten
@@ -5530,7 +5558,8 @@ async def cmd_status(interaction: discord.Interaction,
     else:
         players_str = f"{n_players}/{n_max}"
         is_up       = "started" in n_status.lower() or "running" in n_status.lower()
-        ping_str    = "Timeout (offline?)" if srv_ip else "Keine IP konfiguriert"
+        ping_str    = (_t(interaction, "Timeout (offline?)", "Timeout (offline?)") if srv_ip
+                      else _t(interaction, "Keine IP konfiguriert", "No IP configured"))
         mapname     = "–"
         srv_name    = "–"
 
@@ -5542,12 +5571,12 @@ async def cmd_status(interaction: discord.Interaction,
 
     # Zeile 1: Status, Spieler, Ping
     embed.add_field(name="Status",    value=f"{st_icon} {n_st}",  inline=True)
-    embed.add_field(name="Spieler",   value=players_str,           inline=True)
+    embed.add_field(name=_t(interaction, "Spieler", "Players"), value=players_str, inline=True)
     embed.add_field(name="Ping",      value=ping_str,              inline=True)
 
     # Zeile 2: IP/Port, Query-Port, RCON-Port
     display_ip = n_ip if n_ip not in ("–", "") else (srv_ip or "–")
-    embed.add_field(name="Server-IP", value=f"`{display_ip}`",           inline=True)
+    embed.add_field(name=_t(interaction, "Server-IP", "Server IP"), value=f"`{display_ip}`", inline=True)
     embed.add_field(name="Game-Port / Query",
                     value=f"`{n_port}` / `{qport}`",                     inline=True)
     embed.add_field(name="RCON-Port", value=f"`{rcon_port}`",            inline=True)
@@ -5555,15 +5584,17 @@ async def cmd_status(interaction: discord.Interaction,
     # Zeile 3: Map + Servername (nur wenn A2S geantwortet hat)
     if a2s:
         embed.add_field(name="Map",          value=mapname,  inline=True)
-        embed.add_field(name="Servername",   value=srv_name[:50], inline=True)
-        lock = "🔒 Passwort" if a2s.get("password") else "🔓 Offen"
-        embed.add_field(name="Zugang",       value=lock,     inline=True)
+        embed.add_field(name=_t(interaction, "Servername", "Server Name"),
+                        value=srv_name[:50], inline=True)
+        lock = (_t(interaction, "🔒 Passwort", "🔒 Password") if a2s.get("password")
+               else _t(interaction, "🔓 Offen", "🔓 Open"))
+        embed.add_field(name=_t(interaction, "Zugang", "Access"), value=lock, inline=True)
 
     src = []
-    if info:   src.append("Nitrado API")
-    if a2s:    src.append("Direkter Ping (A2S)")
-    embed.set_footer(text=f"Quellen: {', '.join(src) or '–'} | "
-                          f"Service ID: {conn.service_id or '–'}")
+    if info:   src.append(_t(interaction, "Nitrado API", "Nitrado API"))
+    if a2s:    src.append(_t(interaction, "Direkter Ping (A2S)", "Direct Ping (A2S)"))
+    embed.set_footer(text=_t(interaction, "Quellen: ", "Sources: ")
+                          + f"{', '.join(src) or '–'} | Service ID: {conn.service_id or '–'}")
     await interaction.followup.send(embed=embed)
 
 
@@ -5619,16 +5650,21 @@ async def betreiber_alarm_channel(interaction: discord.Interaction,
         ist_eigentuemer = await _ist_bot_eigentuemer(interaction.user)
     except Exception as e:  # noqa: BLE001
         log.error(f"[BETREIBER] Eigentümer-Prüfung fehlgeschlagen: {e}")
-        return await interaction.followup.send(
-            f"❌ Eigentümer-Prüfung bei Discord fehlgeschlagen: `{e}`", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, f"❌ Eigentümer-Prüfung bei Discord fehlgeschlagen: `{e}`",
+            f"❌ Owner check with Discord failed: `{e}`"), ephemeral=True)
     if not ist_eigentuemer:
-        return await interaction.followup.send(
-            "❌ Nur der Bot-Eigentümer darf das einstellen.", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, "❌ Nur der Bot-Eigentümer darf das einstellen.",
+            "❌ Only the bot owner can set this."), ephemeral=True)
     cfg.config["betreiber_alarm_channel_id"] = str(channel.id)
     cfg.save_config()
-    await interaction.followup.send(
+    await interaction.followup.send(_t(
+        interaction,
         f"✅ Betriebsmeldungen (Ausfälle, Erholung, neue Premium-Anfragen) gehen "
-        f"jetzt an {channel.mention}.", ephemeral=True)
+        f"jetzt an {channel.mention}.",
+        f"✅ Operational alerts (outages, recovery, new premium requests) now go "
+        f"to {channel.mention}."), ephemeral=True)
 
 
 bot.tree.add_command(betreiber_group)
@@ -5657,8 +5693,9 @@ class AutoRestartView(discord.ui.View):
 
     async def interaction_check(self, itx: discord.Interaction) -> bool:
         if itx.user.id != self.author_id:
-            await itx.response.send_message(
-                "❌ Nur wer den Befehl aufgerufen hat, kann hier auswählen.", ephemeral=True)
+            await itx.response.send_message(_t(
+                itx, "❌ Nur wer den Befehl aufgerufen hat, kann hier auswählen.",
+                "❌ Only the person who invoked this command can select here."), ephemeral=True)
             return False
         return True
 
@@ -5679,8 +5716,9 @@ class AutoRestartView(discord.ui.View):
     @discord.ui.button(label="✅ Aktivieren", style=discord.ButtonStyle.success)
     async def confirm(self, itx: discord.Interaction, button: discord.ui.Button):
         if self.hour is None or self.minute is None:
-            return await itx.response.send_message(
-                "❌ Bitte zuerst Stunde und Minute auswählen.", ephemeral=True)
+            return await itx.response.send_message(_t(
+                itx, "❌ Bitte zuerst Stunde und Minute auswählen.",
+                "❌ Please select an hour and minute first."), ephemeral=True)
         conn = (connections.for_service(self.service_id) if self.service_id
                 else _conn_of(itx))
         if conn is None:
@@ -5691,12 +5729,16 @@ class AutoRestartView(discord.ui.View):
         # sich hier noch ein Neustartplan fuer einen fremden Server setzen.
         if conn.guild_id is not None and itx.guild_id \
                 and int(conn.guild_id) != int(itx.guild_id):
-            return await itx.response.send_message(
+            return await itx.response.send_message(_t(
+                itx,
                 "❌ Dieser Server gehört inzwischen zu einem anderen Discord-Server. "
-                "Bitte `/auto restart` neu aufrufen.", ephemeral=True)
+                "Bitte `/auto restart` neu aufrufen.",
+                "❌ This server now belongs to a different Discord server. "
+                "Please run `/auto restart` again."), ephemeral=True)
         if not _is_admin(itx):
-            return await itx.response.send_message(
-                "❌ Dir fehlt inzwischen die nötige Rolle.", ephemeral=True)
+            return await itx.response.send_message(_t(
+                itx, "❌ Dir fehlt inzwischen die nötige Rolle.",
+                "❌ You no longer have the required role."), ephemeral=True)
         first = f"{self.hour:02d}:{self.minute:02d}"
         _conn_store(conn, "auto_restart_schedule", {
             "enabled": True, "first_time": first, "interval_hours": self.interval_hours})
@@ -5706,12 +5748,19 @@ class AutoRestartView(discord.ui.View):
         for child in self.children:
             child.disabled = True
         e = discord.Embed(
-            title="⏰ Auto-Restart aktiviert",
-            description=(f"Erste Ausführung: **{first} Uhr** · "
-                         f"Intervall: **alle {self.interval_hours} Stunde(n)**\n"
-                         f"Nächster Neustart: <t:{int(nxt)}:F> (<t:{int(nxt)}:R>)\n"
-                         f"Ankündigungen **15/5/1 Min** vorher im `restart`-Feed-Channel "
-                         f"(`/setup feeds restart`, Fallback: Adminlog)."),
+            title=_t(itx, "⏰ Auto-Restart aktiviert", "⏰ Auto-Restart Enabled"),
+            description=_t(
+                itx,
+                f"Erste Ausführung: **{first} Uhr** · "
+                f"Intervall: **alle {self.interval_hours} Stunde(n)**\n"
+                f"Nächster Neustart: <t:{int(nxt)}:F> (<t:{int(nxt)}:R>)\n"
+                f"Ankündigungen **15/5/1 Min** vorher im `restart`-Feed-Channel "
+                f"(`/setup feeds restart`, Fallback: Adminlog).",
+                f"First execution: **{first}** · "
+                f"Interval: **every {self.interval_hours} hour(s)**\n"
+                f"Next restart: <t:{int(nxt)}:F> (<t:{int(nxt)}:R>)\n"
+                f"Announcements **15/5/1 min** before in the `restart` feed channel "
+                f"(`/setup feeds restart`, fallback: adminlog)."),
             color=0x2ECC71)
         await itx.response.edit_message(embed=e, view=self)
         self.stop()
@@ -5732,10 +5781,15 @@ async def auto_restart(interaction: discord.Interaction,
             _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
     view = AutoRestartView(interaction, int(intervall), _conn_ar.service_id)
     e = discord.Embed(
-        title="⏰ Auto-Restart einrichten",
-        description=(f"Intervall: **alle {int(intervall)} Stunde(n)**\n\n"
-                     f"Wähle unten die Uhrzeit der **ersten Ausführung** "
-                     f"(danach immer im gewählten Intervall) und bestätige."),
+        title=_t(interaction, "⏰ Auto-Restart einrichten", "⏰ Set Up Auto-Restart"),
+        description=_t(
+            interaction,
+            f"Intervall: **alle {int(intervall)} Stunde(n)**\n\n"
+            f"Wähle unten die Uhrzeit der **ersten Ausführung** "
+            f"(danach immer im gewählten Intervall) und bestätige.",
+            f"Interval: **every {int(intervall)} hour(s)**\n\n"
+            f"Select the time of the **first execution** below "
+            f"(then always at the chosen interval) and confirm."),
         color=0x5865F2)
     await interaction.response.send_message(embed=e, view=view, ephemeral=True)
 
@@ -5756,9 +5810,12 @@ async def auto_off(interaction: discord.Interaction,
     _conn_store(conn, "auto_restart_schedule", sched)
     bot._restart_announced = {k for k in bot._restart_announced
                               if k[0] != conn.service_id}
-    await interaction.response.send_message(
+    await interaction.response.send_message(_t(
+        interaction,
         "⏹️ Geplante Neustarts deaktiviert." if was_on
-        else "ℹ️ Es waren keine geplanten Neustarts aktiv.", ephemeral=True)
+        else "ℹ️ Es waren keine geplanten Neustarts aktiv.",
+        "⏹️ Scheduled restarts disabled." if was_on
+        else "ℹ️ No scheduled restarts were active."), ephemeral=True)
 
 
 @auto_group.command(name="status", description=app_commands.locale_str("📋 Zeigt den aktuellen Restart-Zeitplan"))
@@ -5771,14 +5828,21 @@ async def auto_status(interaction: discord.Interaction,
             _fehler or PREMIUM_MISSING_TEXT, ephemeral=True)
     sched = conn.get("auto_restart_schedule") or {}
     if not sched.get("enabled"):
-        return await interaction.response.send_message(
-            "ℹ️ Keine geplanten Neustarts aktiv. Einrichten: `/auto restart`.", ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction,
+            "ℹ️ Keine geplanten Neustarts aktiv. Einrichten: `/auto restart`.",
+            "ℹ️ No scheduled restarts active. Set up with: `/auto restart`."), ephemeral=True)
     nxt = bot._next_scheduled_restart(conn)
     e = discord.Embed(
-        title="⏰ Auto-Restart Zeitplan",
-        description=(f"Startzeit: **{sched.get('first_time', '?')} Uhr** · "
-                     f"Intervall: **alle {sched.get('interval_hours', '?')} Stunde(n)**\n"
-                     f"Nächster Neustart: <t:{int(nxt)}:F> (<t:{int(nxt)}:R>)"),
+        title=_t(interaction, "⏰ Auto-Restart Zeitplan", "⏰ Auto-Restart Schedule"),
+        description=_t(
+            interaction,
+            f"Startzeit: **{sched.get('first_time', '?')} Uhr** · "
+            f"Intervall: **alle {sched.get('interval_hours', '?')} Stunde(n)**\n"
+            f"Nächster Neustart: <t:{int(nxt)}:F> (<t:{int(nxt)}:R>)",
+            f"Start time: **{sched.get('first_time', '?')}** · "
+            f"Interval: **every {sched.get('interval_hours', '?')} hour(s)**\n"
+            f"Next restart: <t:{int(nxt)}:F> (<t:{int(nxt)}:R>)"),
         color=0x5865F2)
     await interaction.response.send_message(embed=e, ephemeral=True)
 
@@ -6072,14 +6136,18 @@ async def zone_list(interaction: discord.Interaction, server: Optional[str] = No
         return await interaction.response.send_message(_fehler, ephemeral=True)
     zones = [z for z in _zones(_c) if isinstance(z, dict) and z.get("name")]
     if not zones:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             "ℹ️ Keine Zonen angelegt. Im Dashboard unter „Zonen“ eine Zone einrichten.",
+            "ℹ️ No zones set up. Create one in the dashboard under „Zones“."),
             ephemeral=True)
-    e = discord.Embed(title=f"🛡️ Aktive Zonen ({len(zones)})", color=0x3498DB)
+    e = discord.Embed(title=_t(interaction, f"🛡️ Aktive Zonen ({len(zones)})",
+                               f"🛡️ Active Zones ({len(zones)})"), color=0x3498DB)
     for z in zones[:25]:
         e.add_field(name=f"📍 {z['name']}", value=_zone_summary(z), inline=False)
     if len(zones) > 25:
-        e.set_footer(text=f"… und {len(zones) - 25} weitere (Embed-Limit)")
+        e.set_footer(text=_t(interaction, f"… und {len(zones) - 25} weitere (Embed-Limit)",
+                             f"… and {len(zones) - 25} more (embed limit)"))
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
@@ -6106,21 +6174,28 @@ async def zone_allowlist_add(interaction: discord.Interaction, zone: str, spiele
         return await interaction.response.send_message(_fehler, ephemeral=True)
     z = _find_zone(zone, _c)
     if not z:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             f"❌ Keine Zone namens **{zone.strip()}** gefunden – `/zone list` zeigt alle.",
+            f"❌ No zone named **{zone.strip()}** found – `/zone list` shows all of them."),
             ephemeral=True)
     spieler = spieler.strip()
     if not spieler:
-        return await interaction.response.send_message(
-            "❌ Kein Spielername angegeben.", ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Kein Spielername angegeben.",
+            "❌ No player name given."), ephemeral=True)
     if _player_in_allowlist(z, spieler):
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             f"ℹ️ **{spieler}** steht bereits auf der Ignorier-Liste von **{z['name']}**.",
+            f"ℹ️ **{spieler}** is already on the ignore list of **{z['name']}**."),
             ephemeral=True)
     _zone_allowlist(z).append(spieler)
     _zones_save(_c)
-    await interaction.response.send_message(
+    await interaction.response.send_message(_t(
+        interaction,
         f"🙈 **{spieler}** wird in Zone **{z['name']}** ab sofort **nicht** mehr gemeldet.",
+        f"🙈 **{spieler}** will **no longer** be reported in zone **{z['name']}**."),
         ephemeral=True)
 
 zone_allowlist_add.autocomplete("zone")(_zone_name_autocomplete)
@@ -6142,20 +6217,26 @@ async def zone_allowlist_remove(interaction: discord.Interaction, zone: str, spi
         return await interaction.response.send_message(_fehler, ephemeral=True)
     z = _find_zone(zone, _c)
     if not z:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             f"❌ Keine Zone namens **{zone.strip()}** gefunden – `/zone list` zeigt alle.",
+            f"❌ No zone named **{zone.strip()}** found – `/zone list` shows all of them."),
             ephemeral=True)
     key = spieler.strip().lower()
     al = _zone_allowlist(z)
     matches = [n for n in al if str(n).strip().lower() == key]
     if not matches:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             f"ℹ️ **{spieler.strip()}** steht nicht auf der Ignorier-Liste von **{z['name']}**.",
+            f"ℹ️ **{spieler.strip()}** is not on the ignore list of **{z['name']}**."),
             ephemeral=True)
     z["allowlist"] = [n for n in al if str(n).strip().lower() != key]
     _zones_save(_c)
-    await interaction.response.send_message(
+    await interaction.response.send_message(_t(
+        interaction,
         f"🔔 **{matches[0]}** wird in Zone **{z['name']}** wieder gemeldet.",
+        f"🔔 **{matches[0]}** will be reported again in zone **{z['name']}**."),
         ephemeral=True)
 
 zone_allowlist_remove.autocomplete("zone")(_zone_name_autocomplete)
@@ -6175,19 +6256,25 @@ async def zone_allowlist_show(interaction: discord.Interaction, zone: str,
         return await interaction.response.send_message(_fehler, ephemeral=True)
     z = _find_zone(zone, _c)
     if not z:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             f"❌ Keine Zone namens **{zone.strip()}** gefunden – `/zone list` zeigt alle.",
+            f"❌ No zone named **{zone.strip()}** found – `/zone list` shows all of them."),
             ephemeral=True)
     al = _zone_allowlist(z)
     if not al:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             f"ℹ️ Für Zone **{z['name']}** werden aktuell keine Spieler ignoriert.",
+            f"ℹ️ No players are currently ignored for zone **{z['name']}**."),
             ephemeral=True)
     listing = "\n".join(f"• {n}" for n in al[:50])
     if len(al) > 50:
-        listing += f"\n… und {len(al) - 50} weitere"
+        listing += _t(interaction, f"\n… und {len(al) - 50} weitere",
+                     f"\n… and {len(al) - 50} more")
     e = discord.Embed(
-        title=f"🙈 Ignorierte Spieler – {z['name']} ({len(al)})",
+        title=_t(interaction, f"🙈 Ignorierte Spieler – {z['name']} ({len(al)})",
+                 f"🙈 Ignored Players – {z['name']} ({len(al)})"),
         description=listing,
         color=0x95A5A6)
     await interaction.response.send_message(embed=e, ephemeral=True)
@@ -6275,27 +6362,36 @@ async def cmd_ban(interaction: discord.Interaction, spieler: str,
 
     names = _split_names(spieler)
     if not names:
-        return await interaction.followup.send("❌ Keinen gültigen Namen angegeben.")
+        return await interaction.followup.send(_t(
+            interaction, "❌ Keinen gültigen Namen angegeben.", "❌ No valid name given."))
+    if grund == "Kein Grund angegeben":
+        grund = _t(interaction, grund, "No reason given")
 
     # Erst lesen – bei API-Fehler NICHT schreiben, sonst würde die
     # bestehende Nitrado-Banliste überschrieben/geleert
     try:
         current, category, key = await _read_banlist(conn)
     except Exception as e:
-        return await interaction.followup.send(
-            f"❌ Nitrado-Banliste konnte nicht gelesen werden – nichts geändert.\n`{e}`")
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ Nitrado-Banliste konnte nicht gelesen werden – nichts geändert.\n`{e}`",
+            f"❌ Could not read the Nitrado ban list – nothing changed.\n`{e}`"))
 
     existing_lower = {n.lower() for n in current}
     added   = [n for n in names if n.lower() not in existing_lower]
     already = [n for n in names if n.lower() in existing_lower]
 
-    sv = "ℹ️ Alle Namen standen bereits auf der Banliste"
+    sv = _t(interaction, "ℹ️ Alle Namen standen bereits auf der Banliste",
+           "ℹ️ All names were already on the ban list")
     if added:
         ok, msg = await _write_banlist(conn, current + added, category, key)
         if not ok:
-            return await interaction.followup.send(
-                f"❌ Nitrado-Banliste konnte nicht gespeichert werden – nichts geändert.\n`{msg}`")
-        sv = "✅ In der Nitrado-Banliste gespeichert"
+            return await interaction.followup.send(_t(
+                interaction,
+                f"❌ Nitrado-Banliste konnte nicht gespeichert werden – nichts geändert.\n`{msg}`",
+                f"❌ Could not save the Nitrado ban list – nothing changed.\n`{msg}`"))
+        sv = _t(interaction, "✅ In der Nitrado-Banliste gespeichert",
+               "✅ Saved in the Nitrado ban list")
 
     # Lokale Metadaten (nur für die Anzeige in /banlist)
     now = datetime.now(timezone.utc).isoformat()
@@ -6306,16 +6402,19 @@ async def cmd_ban(interaction: discord.Interaction, spieler: str,
     if added:
         cfg.save_bans()
 
-    embed = discord.Embed(title="🔨 Spieler gebannt", color=0xE74C3C)
-    embed.add_field(name="Hinzugefügt",
+    embed = discord.Embed(title=_t(interaction, "🔨 Spieler gebannt", "🔨 Player(s) Banned"),
+                          color=0xE74C3C)
+    embed.add_field(name=_t(interaction, "Hinzugefügt", "Added"),
                     value="\n".join(f"`{n}`" for n in added) or "–", inline=True)
     if already:
-        embed.add_field(name="Bereits gebannt",
+        embed.add_field(name=_t(interaction, "Bereits gebannt", "Already banned"),
                         value="\n".join(f"`{n}`" for n in already), inline=True)
-    embed.add_field(name="Grund",       value=grund,                 inline=True)
-    embed.add_field(name="Gebannt von", value=str(interaction.user), inline=True)
-    embed.add_field(name="Nitrado",     value=sv,                    inline=False)
-    embed.set_footer(text="Änderung greift ggf. erst nach einem Server-Neustart.")
+    embed.add_field(name=_t(interaction, "Grund", "Reason"), value=grund, inline=True)
+    embed.add_field(name=_t(interaction, "Gebannt von", "Banned by"),
+                    value=str(interaction.user), inline=True)
+    embed.add_field(name="Nitrado", value=sv, inline=False)
+    embed.set_footer(text=_t(interaction, "Änderung greift ggf. erst nach einem Server-Neustart.",
+                             "The change may only take effect after a server restart."))
     await interaction.followup.send(embed=embed)
 
 
@@ -6337,40 +6436,48 @@ async def cmd_unban(interaction: discord.Interaction, spieler: str,
 
     names = _split_names(spieler)
     if not names:
-        return await interaction.followup.send("❌ Keinen gültigen Namen angegeben.")
+        return await interaction.followup.send(_t(
+            interaction, "❌ Keinen gültigen Namen angegeben.", "❌ No valid name given."))
 
     try:
         current, category, key = await _read_banlist(conn)
     except Exception as e:
-        return await interaction.followup.send(
-            f"❌ Nitrado-Banliste konnte nicht gelesen werden – nichts geändert.\n`{e}`")
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ Nitrado-Banliste konnte nicht gelesen werden – nichts geändert.\n`{e}`",
+            f"❌ Could not read the Nitrado ban list – nothing changed.\n`{e}`"))
 
     wanted_lower = {n.lower() for n in names}
     new_list  = [n for n in current if n.lower() not in wanted_lower]
     removed   = [n for n in current if n.lower() in wanted_lower]
     not_found = [n for n in names if n.lower() not in {r.lower() for r in removed}]
 
-    sv = "ℹ️ Keiner der Namen stand auf der Banliste"
+    sv = _t(interaction, "ℹ️ Keiner der Namen stand auf der Banliste",
+           "ℹ️ None of the names were on the ban list")
     if removed:
         ok, msg = await _write_banlist(conn, new_list, category, key)
         if not ok:
-            return await interaction.followup.send(
-                f"❌ Nitrado-Banliste konnte nicht gespeichert werden – nichts geändert.\n`{msg}`")
-        sv = "✅ Von der Nitrado-Banliste entfernt"
+            return await interaction.followup.send(_t(
+                interaction,
+                f"❌ Nitrado-Banliste konnte nicht gespeichert werden – nichts geändert.\n`{msg}`",
+                f"❌ Could not save the Nitrado ban list – nothing changed.\n`{msg}`"))
+        sv = _t(interaction, "✅ Von der Nitrado-Banliste entfernt",
+               "✅ Removed from the Nitrado ban list")
         # Lokale Metadaten aufräumen (case-insensitive)
         _eimer = _bans_of(conn)
         for local_key in [k for k in _eimer if k.lower() in wanted_lower]:
             _eimer.pop(local_key, None)
         cfg.save_bans()
 
-    embed = discord.Embed(title="✅ Ban aufgehoben", color=0x2ECC71)
-    embed.add_field(name="Entfernt",
+    embed = discord.Embed(title=_t(interaction, "✅ Ban aufgehoben", "✅ Ban Removed"), color=0x2ECC71)
+    embed.add_field(name=_t(interaction, "Entfernt", "Removed"),
                     value="\n".join(f"`{n}`" for n in removed) or "–", inline=True)
     if not_found:
-        embed.add_field(name="Nicht auf der Liste",
+        embed.add_field(name=_t(interaction, "Nicht auf der Liste", "Not on the list"),
                         value="\n".join(f"`{n}`" for n in not_found), inline=True)
     embed.add_field(name="Nitrado", value=sv, inline=False)
-    embed.set_footer(text="Änderung greift ggf. erst nach einem Server-Neustart.")
+    embed.set_footer(text=_t(interaction, "Änderung greift ggf. erst nach einem Server-Neustart.",
+                             "The change may only take effect after a server restart."))
     await interaction.followup.send(embed=embed)
 
 
@@ -6391,20 +6498,24 @@ async def cmd_banlist(interaction: discord.Interaction, server: Optional[str] = 
     try:
         all_bans, _category, _key = await _read_banlist(conn)
     except Exception as e:
-        return await interaction.followup.send(
-            f"❌ Nitrado-Banliste konnte nicht gelesen werden.\n`{e}`", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, f"❌ Nitrado-Banliste konnte nicht gelesen werden.\n`{e}`",
+            f"❌ Could not read the Nitrado ban list.\n`{e}`"), ephemeral=True)
 
     if not all_bans:
-        return await interaction.followup.send("✅ Keine gesperrten Spieler.", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, "✅ Keine gesperrten Spieler.", "✅ No banned players."), ephemeral=True)
 
     embed = discord.Embed(
-        title=f"🚫 Banliste – {len(all_bans)} Spieler gesperrt",
+        title=_t(interaction, f"🚫 Banliste – {len(all_bans)} Spieler gesperrt",
+                 f"🚫 Ban List – {len(all_bans)} player(s) banned"),
         color=0xE74C3C
     )
     # Metadaten (Grund/Datum/von) kommen aus der lokalen banlist.json, falls
     # der Ban über /ban gesetzt wurde – Einträge direkt aus dem Nitrado-
     # Webinterface haben keine Metadaten (case-insensitives Matching)
     local = {k.lower(): v for k, v in _bans_of(conn).items()}
+    von_wort = _t(interaction, "von", "by")
     lines = []
     for entry in sorted(all_bans, key=str.lower):
         info = local.get(entry.lower())
@@ -6412,7 +6523,7 @@ async def cmd_banlist(interaction: discord.Interaction, server: Optional[str] = 
             grund = info.get("reason", "–")
             datum = (info.get("banned_at", "")[:10]) if info.get("banned_at") else "–"
             von   = info.get("banned_by", "–")
-            lines.append(f"• `{entry}` — {grund} | {datum} | von {von}")
+            lines.append(f"• `{entry}` — {grund} | {datum} | {von_wort} {von}")
         else:
             lines.append(f"• `{entry}`")
 
@@ -6427,8 +6538,9 @@ async def cmd_banlist(interaction: discord.Interaction, server: Optional[str] = 
     if chunk:
         chunks.append("\n".join(chunk))
 
+    spieler_wort = _t(interaction, "Spieler", "Players")
     for i, c in enumerate(chunks[:25]):
-        embed.add_field(name=f"Spieler {i+1}" if len(chunks) > 1 else "Spieler",
+        embed.add_field(name=f"{spieler_wort} {i+1}" if len(chunks) > 1 else spieler_wort,
                         value=c, inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -6497,35 +6609,45 @@ async def whitelist_add(interaction: discord.Interaction, spieler: str,
 
     names = _split_names(spieler.replace("\n", ","))
     if not names:
-        return await interaction.followup.send("❌ Keinen gültigen Namen angegeben.")
+        return await interaction.followup.send(_t(
+            interaction, "❌ Keinen gültigen Namen angegeben.", "❌ No valid name given."))
 
     try:
         current, category, key = await _read_whitelist(conn)
     except Exception as e:
-        return await interaction.followup.send(
-            f"❌ Nitrado-Whitelist konnte nicht gelesen werden – nichts geändert.\n`{e}`")
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ Nitrado-Whitelist konnte nicht gelesen werden – nichts geändert.\n`{e}`",
+            f"❌ Could not read the Nitrado whitelist – nothing changed.\n`{e}`"))
 
     existing_lower = {n.lower() for n in current}
     added   = [n for n in names if n.lower() not in existing_lower]
     already = [n for n in names if n.lower() in existing_lower]
 
-    sv = "ℹ️ Alle Namen standen bereits auf der Whitelist"
+    sv = _t(interaction, "ℹ️ Alle Namen standen bereits auf der Whitelist",
+           "ℹ️ All names were already on the whitelist")
     if added:
         ok, msg = await _write_whitelist(conn, current + added, category, key)
         if not ok:
-            return await interaction.followup.send(
-                f"❌ Nitrado-Whitelist konnte nicht gespeichert werden – nichts geändert.\n`{msg}`")
-        sv = "✅ In der Nitrado-Whitelist gespeichert"
+            return await interaction.followup.send(_t(
+                interaction,
+                f"❌ Nitrado-Whitelist konnte nicht gespeichert werden – nichts geändert.\n`{msg}`",
+                f"❌ Could not save the Nitrado whitelist – nothing changed.\n`{msg}`"))
+        sv = _t(interaction, "✅ In der Nitrado-Whitelist gespeichert",
+               "✅ Saved in the Nitrado whitelist")
 
-    embed = discord.Embed(title="✅ Whitelist aktualisiert", color=0x2ECC71)
-    embed.add_field(name="Hinzugefügt",
+    embed = discord.Embed(title=_t(interaction, "✅ Whitelist aktualisiert", "✅ Whitelist Updated"),
+                          color=0x2ECC71)
+    embed.add_field(name=_t(interaction, "Hinzugefügt", "Added"),
                     value="\n".join(f"`{n}`" for n in added) or "–", inline=True)
     if already:
-        embed.add_field(name="Bereits auf der Whitelist",
+        embed.add_field(name=_t(interaction, "Bereits auf der Whitelist", "Already on the whitelist"),
                         value="\n".join(f"`{n}`" for n in already), inline=True)
-    embed.add_field(name="Hinzugefügt von", value=str(interaction.user), inline=True)
-    embed.add_field(name="Nitrado",         value=sv,                    inline=False)
-    embed.set_footer(text="Änderung greift ggf. erst nach einem Server-Neustart.")
+    embed.add_field(name=_t(interaction, "Hinzugefügt von", "Added by"),
+                    value=str(interaction.user), inline=True)
+    embed.add_field(name="Nitrado", value=sv, inline=False)
+    embed.set_footer(text=_t(interaction, "Änderung greift ggf. erst nach einem Server-Neustart.",
+                             "The change may only take effect after a server restart."))
     await interaction.followup.send(embed=embed)
 
 
@@ -6545,35 +6667,44 @@ async def whitelist_remove(interaction: discord.Interaction, spieler: str,
 
     names = _split_names(spieler.replace("\n", ","))
     if not names:
-        return await interaction.followup.send("❌ Keinen gültigen Namen angegeben.")
+        return await interaction.followup.send(_t(
+            interaction, "❌ Keinen gültigen Namen angegeben.", "❌ No valid name given."))
 
     try:
         current, category, key = await _read_whitelist(conn)
     except Exception as e:
-        return await interaction.followup.send(
-            f"❌ Nitrado-Whitelist konnte nicht gelesen werden – nichts geändert.\n`{e}`")
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ Nitrado-Whitelist konnte nicht gelesen werden – nichts geändert.\n`{e}`",
+            f"❌ Could not read the Nitrado whitelist – nothing changed.\n`{e}`"))
 
     wanted_lower = {n.lower() for n in names}
     new_list  = [n for n in current if n.lower() not in wanted_lower]
     removed   = [n for n in current if n.lower() in wanted_lower]
     not_found = [n for n in names if n.lower() not in {r.lower() for r in removed}]
 
-    sv = "ℹ️ Keiner der Namen stand auf der Whitelist"
+    sv = _t(interaction, "ℹ️ Keiner der Namen stand auf der Whitelist",
+           "ℹ️ None of the names were on the whitelist")
     if removed:
         ok, msg = await _write_whitelist(conn, new_list, category, key)
         if not ok:
-            return await interaction.followup.send(
-                f"❌ Nitrado-Whitelist konnte nicht gespeichert werden – nichts geändert.\n`{msg}`")
-        sv = "✅ Von der Nitrado-Whitelist entfernt"
+            return await interaction.followup.send(_t(
+                interaction,
+                f"❌ Nitrado-Whitelist konnte nicht gespeichert werden – nichts geändert.\n`{msg}`",
+                f"❌ Could not save the Nitrado whitelist – nothing changed.\n`{msg}`"))
+        sv = _t(interaction, "✅ Von der Nitrado-Whitelist entfernt",
+               "✅ Removed from the Nitrado whitelist")
 
-    embed = discord.Embed(title="🗑️ Whitelist aktualisiert", color=0xE67E22)
-    embed.add_field(name="Entfernt",
+    embed = discord.Embed(title=_t(interaction, "🗑️ Whitelist aktualisiert", "🗑️ Whitelist Updated"),
+                          color=0xE67E22)
+    embed.add_field(name=_t(interaction, "Entfernt", "Removed"),
                     value="\n".join(f"`{n}`" for n in removed) or "–", inline=True)
     if not_found:
-        embed.add_field(name="Nicht auf der Liste",
+        embed.add_field(name=_t(interaction, "Nicht auf der Liste", "Not on the list"),
                         value="\n".join(f"`{n}`" for n in not_found), inline=True)
     embed.add_field(name="Nitrado", value=sv, inline=False)
-    embed.set_footer(text="Änderung greift ggf. erst nach einem Server-Neustart.")
+    embed.set_footer(text=_t(interaction, "Änderung greift ggf. erst nach einem Server-Neustart.",
+                             "The change may only take effect after a server restart."))
     await interaction.followup.send(embed=embed)
 
 
@@ -6592,15 +6723,18 @@ async def whitelist_show(interaction: discord.Interaction, server: Optional[str]
     try:
         names, _category, _key = await _read_whitelist(conn)
     except Exception as e:
-        return await interaction.followup.send(
-            f"❌ Nitrado-Whitelist konnte nicht gelesen werden.\n`{e}`", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, f"❌ Nitrado-Whitelist konnte nicht gelesen werden.\n`{e}`",
+            f"❌ Could not read the Nitrado whitelist.\n`{e}`"), ephemeral=True)
 
     if not names:
-        return await interaction.followup.send(
-            "ℹ️ Es stehen keine Spieler auf der Whitelist.", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, "ℹ️ Es stehen keine Spieler auf der Whitelist.",
+            "ℹ️ No players are on the whitelist."), ephemeral=True)
 
     embed = discord.Embed(
-        title=f"✅ Whitelist – {len(names)} Spieler",
+        title=_t(interaction, f"✅ Whitelist – {len(names)} Spieler",
+                 f"✅ Whitelist – {len(names)} player(s)"),
         color=0x2ECC71)
     lines = [f"• `{n}`" for n in sorted(names, key=str.lower)]
     chunks, chunk = [], []
@@ -6612,8 +6746,9 @@ async def whitelist_show(interaction: discord.Interaction, server: Optional[str]
             chunk.append(line)
     if chunk:
         chunks.append("\n".join(chunk))
+    spieler_wort = _t(interaction, "Spieler", "Players")
     for i, c in enumerate(chunks[:25]):
-        embed.add_field(name=f"Spieler {i+1}" if len(chunks) > 1 else "Spieler",
+        embed.add_field(name=f"{spieler_wort} {i+1}" if len(chunks) > 1 else spieler_wort,
                         value=c, inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -6644,12 +6779,14 @@ def _whitelist_request_embed(requester_id: int, psn: str) -> discord.Embed:
 class WhitelistRequestModal(discord.ui.Modal, title="🎮 PSN Name eintragen"):
     """Formular, in das der Spieler seinen PlayStation-Namen einträgt."""
 
-    def __init__(self, service_id: Optional[str] = None):
+    def __init__(self, service_id: Optional[str] = None, sprache: str = "de"):
         super().__init__()
         self.service_id = str(service_id or "")
+        if sprache == "en":
+            self.title = "🎮 Enter PSN Name"
         self.psn_in = discord.ui.TextInput(
-            label="Dein PlayStation Name",
-            placeholder="z.B. DeinPSNName",
+            label="Your PlayStation Name" if sprache == "en" else "Dein PlayStation Name",
+            placeholder="e.g. YourPSNName" if sprache == "en" else "z.B. DeinPSNName",
             required=True, max_length=32)
         self.add_item(self.psn_in)
 
@@ -6657,11 +6794,12 @@ class WhitelistRequestModal(discord.ui.Modal, title="🎮 PSN Name eintragen"):
         raw = str(self.psn_in.value or "")
         psn = (raw.splitlines()[0].strip() if raw.strip() else "")
         if not psn:
-            return await interaction.response.send_message(
-                "❌ Kein Name eingegeben.", ephemeral=True)
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Kein Name eingegeben.", "❌ No name entered."), ephemeral=True)
         if "," in psn:
-            return await interaction.response.send_message(
-                "❌ Bitte nur **einen** Namen eintragen (ohne Komma).", ephemeral=True)
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Bitte nur **einen** Namen eintragen (ohne Komma).",
+                "❌ Please enter only **one** name (no comma)."), ephemeral=True)
 
         gid = interaction.guild_id
         # Der Server steckt im Panel-Knopf; fehlt er (Alt-Panel), gilt der
@@ -6672,29 +6810,42 @@ class WhitelistRequestModal(discord.ui.Modal, title="🎮 PSN Name eintragen"):
             if len(eigene) == 1:
                 sid = eigene[0].service_id
             elif len(eigene) > 1:
-                return await interaction.response.send_message(
+                return await interaction.response.send_message(_t(
+                    interaction,
                     "❌ Dieser Discord-Server verwaltet mehrere Nitrado-Server. "
                     "Ein Admin muss das Whitelist-Panel mit `/send whitelist panel` "
                     "neu senden, damit klar ist, für welchen Server es gilt.",
+                    "❌ This Discord server manages multiple Nitrado servers. "
+                    "An admin must re-send the whitelist panel with `/send whitelist panel` "
+                    "so it's clear which server it applies to."),
                     ephemeral=True)
         admin_ch_id = cfg.get_channel(gid, "whitelist_request", sid or None)
         if not admin_ch_id:
-            return await interaction.response.send_message(
+            return await interaction.response.send_message(_t(
+                interaction,
                 "❌ Das Whitelist-System ist noch nicht eingerichtet. "
-                "Bitte wende dich an einen Admin.", ephemeral=True)
+                "Bitte wende dich an einen Admin.",
+                "❌ The whitelist system is not set up yet. "
+                "Please contact an admin."), ephemeral=True)
         admin_ch = bot.get_channel(int(admin_ch_id))
         if admin_ch is None:
-            return await interaction.response.send_message(
+            return await interaction.response.send_message(_t(
+                interaction,
                 "❌ Der Anfrage-Channel wurde nicht gefunden. "
-                "Bitte wende dich an einen Admin.", ephemeral=True)
+                "Bitte wende dich an einen Admin.",
+                "❌ The request channel was not found. "
+                "Please contact an admin."), ephemeral=True)
 
         # Doppelte Anfrage für denselben PSN-Namen abwehren
         for r in cfg.whitelist_reqs.values():
             if (str(r.get("guild_id")) == str(gid)
                     and str(r.get("psn", "")).lower() == psn.lower()):
-                return await interaction.response.send_message(
+                return await interaction.response.send_message(_t(
+                    interaction,
                     f"ℹ️ Für **{psn}** läuft bereits eine Anfrage. "
-                    "Bitte warte auf die Freigabe.", ephemeral=True)
+                    "Bitte warte auf die Freigabe.",
+                    f"ℹ️ A request for **{psn}** is already pending. "
+                    "Please wait for approval."), ephemeral=True)
 
         reqid = uuid.uuid4().hex[:12]
         req = {
@@ -6712,20 +6863,27 @@ class WhitelistRequestModal(discord.ui.Modal, title="🎮 PSN Name eintragen"):
                 embed=_whitelist_request_embed(interaction.user.id, psn),
                 view=WhitelistApprovalView(reqid))
         except discord.Forbidden:
-            return await interaction.response.send_message(
+            return await interaction.response.send_message(_t(
+                interaction,
                 "❌ Der Bot darf im Anfrage-Channel nicht schreiben. "
-                "Bitte informiere einen Admin.", ephemeral=True)
+                "Bitte informiere einen Admin.",
+                "❌ The bot is not allowed to post in the request channel. "
+                "Please inform an admin."), ephemeral=True)
         req["message_id"] = msg.id
         cfg.whitelist_reqs[reqid] = req
         cfg.save_whitelist_reqs()
 
-        await interaction.response.send_message(
+        await interaction.response.send_message(_t(
+            interaction,
             f"✅ Deine Anfrage für den PSN-Namen **{psn}** wurde eingereicht. "
-            "Ein Admin prüft sie in Kürze.", ephemeral=True)
+            "Ein Admin prüft sie in Kürze.",
+            f"✅ Your request for the PSN name **{psn}** has been submitted. "
+            "An admin will review it shortly."), ephemeral=True)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         log.error(f"[WHITELIST] Anfrage-Modal-Fehler: {error}")
-        msg = "❌ Etwas ist schiefgelaufen. Bitte versuche es erneut."
+        msg = _t(interaction, "❌ Etwas ist schiefgelaufen. Bitte versuche es erneut.",
+                 "❌ Something went wrong. Please try again.")
         if interaction.response.is_done():
             await interaction.followup.send(msg, ephemeral=True)
         else:
@@ -6778,7 +6936,7 @@ class WhitelistPanelView(discord.ui.View):
 
     async def _open_modal(self, interaction: discord.Interaction):
         await interaction.response.send_modal(
-            WhitelistRequestModal(self.service_id or None))
+            WhitelistRequestModal(self.service_id or None, _sprache(interaction)))
 
 
 class WhitelistApprovalView(discord.ui.View):
@@ -6805,8 +6963,9 @@ class WhitelistApprovalView(discord.ui.View):
         req = cfg.whitelist_reqs.pop(self.reqid, None)
         cfg.save_whitelist_reqs()
         if not req:
-            return await interaction.response.send_message(
-                "ℹ️ Diese Anfrage wurde bereits bearbeitet.", ephemeral=True)
+            return await interaction.response.send_message(_t(
+                interaction, "ℹ️ Diese Anfrage wurde bereits bearbeitet.",
+                "ℹ️ This request has already been handled."), ephemeral=True)
 
         # Der Server steht in der Anfrage – die Buttons ueberleben Neustarts,
         # und bei mehreren Servern derselben Guild waere _conn_of geraten.
@@ -6814,10 +6973,14 @@ class WhitelistApprovalView(discord.ui.View):
         if conn is None or conn.api is None:
             cfg.whitelist_reqs[self.reqid] = req
             cfg.save_whitelist_reqs()
-            return await interaction.response.send_message(
+            return await interaction.response.send_message(_t(
+                interaction,
                 "❌ Für diese Anfrage ist kein Nitrado-Server eingerichtet – "
                 "sie bleibt offen. Ein Admin kann das Whitelist-Panel mit "
-                "`/send whitelist panel` neu senden.", ephemeral=True)
+                "`/send whitelist panel` neu senden.",
+                "❌ No Nitrado server is set up for this request – "
+                "it stays open. An admin can re-send the whitelist panel with "
+                "`/send whitelist panel`."), ephemeral=True)
 
         await interaction.response.defer()
         try:
@@ -6825,9 +6988,12 @@ class WhitelistApprovalView(discord.ui.View):
         except Exception as e:
             cfg.whitelist_reqs[self.reqid] = req
             cfg.save_whitelist_reqs()
-            return await interaction.followup.send(
+            return await interaction.followup.send(_t(
+                interaction,
                 f"❌ Whitelist konnte nicht gelesen werden – nichts geändert. "
-                f"Anfrage bleibt offen.\n`{e}`", ephemeral=True)
+                f"Anfrage bleibt offen.\n`{e}`",
+                f"❌ Could not read the whitelist – nothing changed. "
+                f"Request stays open.\n`{e}`"), ephemeral=True)
 
         psn = req["psn"]
         if psn.lower() not in {n.lower() for n in current}:
@@ -6835,22 +7001,29 @@ class WhitelistApprovalView(discord.ui.View):
             if not ok:
                 cfg.whitelist_reqs[self.reqid] = req
                 cfg.save_whitelist_reqs()
-                return await interaction.followup.send(
+                return await interaction.followup.send(_t(
+                    interaction,
                     f"❌ Whitelist konnte nicht gespeichert werden – nichts geändert. "
-                    f"Anfrage bleibt offen.\n`{msg}`", ephemeral=True)
-            nitrado_note = "✅ Zur Nitrado-Whitelist hinzugefügt"
+                    f"Anfrage bleibt offen.\n`{msg}`",
+                    f"❌ Could not save the whitelist – nothing changed. "
+                    f"Request stays open.\n`{msg}`"), ephemeral=True)
+            nitrado_note = _t(interaction, "✅ Zur Nitrado-Whitelist hinzugefügt",
+                             "✅ Added to the Nitrado whitelist")
         else:
-            nitrado_note = "ℹ️ Stand bereits auf der Whitelist"
+            nitrado_note = _t(interaction, "ℹ️ Stand bereits auf der Whitelist",
+                             "ℹ️ Was already on the whitelist")
 
         embed = discord.Embed(
-            title="✅ Whitelist-Anfrage angenommen",
+            title=_t(interaction, "✅ Whitelist-Anfrage angenommen", "✅ Whitelist Request Approved"),
             color=0x2ECC71, timestamp=datetime.now(timezone.utc))
-        embed.add_field(name="Spieler", value=f"<@{req['requester_id']}>", inline=True)
+        embed.add_field(name=_t(interaction, "Spieler", "Player"),
+                        value=f"<@{req['requester_id']}>", inline=True)
         embed.add_field(name="PlayStation-Name", value=f"`{psn}`", inline=True)
         embed.add_field(name="Status", value=nitrado_note, inline=False)
-        embed.add_field(name="Bearbeitet von",
+        embed.add_field(name=_t(interaction, "Bearbeitet von", "Handled by"),
                         value=interaction.user.mention, inline=False)
-        embed.set_footer(text="Änderung greift ggf. erst nach einem Server-Neustart.")
+        embed.set_footer(text=_t(interaction, "Änderung greift ggf. erst nach einem Server-Neustart.",
+                                 "The change may only take effect after a server restart."))
         await interaction.edit_original_response(embed=embed, view=None)
 
     async def _reject(self, interaction: discord.Interaction):
@@ -6859,17 +7032,20 @@ class WhitelistApprovalView(discord.ui.View):
         req = cfg.whitelist_reqs.pop(self.reqid, None)
         cfg.save_whitelist_reqs()
         if not req:
-            return await interaction.response.send_message(
-                "ℹ️ Diese Anfrage wurde bereits bearbeitet.", ephemeral=True)
+            return await interaction.response.send_message(_t(
+                interaction, "ℹ️ Diese Anfrage wurde bereits bearbeitet.",
+                "ℹ️ This request has already been handled."), ephemeral=True)
 
         embed = discord.Embed(
-            title="❌ Whitelist-Anfrage abgelehnt",
+            title=_t(interaction, "❌ Whitelist-Anfrage abgelehnt", "❌ Whitelist Request Rejected"),
             color=0xE74C3C, timestamp=datetime.now(timezone.utc))
-        embed.add_field(name="Spieler", value=f"<@{req['requester_id']}>", inline=True)
+        embed.add_field(name=_t(interaction, "Spieler", "Player"),
+                        value=f"<@{req['requester_id']}>", inline=True)
         embed.add_field(name="PlayStation-Name", value=f"`{req['psn']}`", inline=True)
-        embed.add_field(name="Status",
-                        value="❌ Nicht zur Whitelist hinzugefügt", inline=False)
-        embed.add_field(name="Bearbeitet von",
+        embed.add_field(name=_t(interaction, "Status", "Status"),
+                        value=_t(interaction, "❌ Nicht zur Whitelist hinzugefügt",
+                                "❌ Not added to the whitelist"), inline=False)
+        embed.add_field(name=_t(interaction, "Bearbeitet von", "Handled by"),
                         value=interaction.user.mention, inline=False)
         await interaction.response.edit_message(embed=embed, view=None)
 
@@ -6910,13 +7086,19 @@ async def send_whitelist_panel(interaction: discord.Interaction,
         await panel_channel.send(embed=panel_embed,
                                  view=WhitelistPanelView(_conn.service_id))
     except discord.Forbidden:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             f"❌ Ich darf in {panel_channel.mention} nicht schreiben. "
-            "Bitte Kanal-Rechte prüfen.", ephemeral=True)
+            "Bitte Kanal-Rechte prüfen.",
+            f"❌ I'm not allowed to post in {panel_channel.mention}. "
+            "Please check the channel permissions."), ephemeral=True)
 
-    await interaction.response.send_message(
+    await interaction.response.send_message(_t(
+        interaction,
         f"✅ Whitelist-Panel in {panel_channel.mention} gesendet.\n"
         f"Anfragen zur Freigabe erscheinen in {admin_channel.mention}.",
+        f"✅ Whitelist panel sent to {panel_channel.mention}.\n"
+        f"Requests for approval will appear in {admin_channel.mention}."),
         ephemeral=True)
 
 
@@ -6938,40 +7120,51 @@ async def cmd_positions(interaction: discord.Interaction, server: Optional[str] 
         return
     positions = (_conn.parser.player_positions if _conn.parser else {})
     if not positions:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             "⚠️ Noch keine Positions-Daten verfügbar.\n"
             "Positionen werden aus Kill/Death-Events automatisch gesammelt. "
             "Warte bis der erste Log-Zyklus gelaufen ist.",
+            "⚠️ No position data available yet.\n"
+            "Positions are collected automatically from kill/death events. "
+            "Wait until the first log cycle has run."),
             ephemeral=True
         )
 
     embed = discord.Embed(
-        title=f"📍 Spieler-Positionen ({len(positions)} bekannt)",
-        description="Letzte bekannte Koordinaten aus Server-Logs (nicht live)",
+        title=_t(interaction, f"📍 Spieler-Positionen ({len(positions)} bekannt)",
+                 f"📍 Player Positions ({len(positions)} known)"),
+        description=_t(interaction, "Letzte bekannte Koordinaten aus Server-Logs (nicht live)",
+                       "Last known coordinates from server logs (not live)"),
         color=0x3498DB
     )
 
+    zuletzt_wort = _t(interaction, "zuletzt", "last seen")
     lines = []
     for name, data in sorted(positions.items()):
         ts = data.get("last_seen", "")
         ts_fmt = ts[:16].replace("T", " ") if ts else "?"
-        lines.append(f"**{name}** → `{data['position']}` *(zuletzt: {ts_fmt} UTC)*")
+        lines.append(f"**{name}** → `{data['position']}` *({zuletzt_wort}: {ts_fmt} UTC)*")
 
+    spieler_wort = _t(interaction, "Spieler", "Players")
     chunk, fc = [], 0
     for line in lines:
         if len("\n".join(chunk + [line])) > 1000:
-            embed.add_field(name="Spieler", value="\n".join(chunk), inline=False)
+            embed.add_field(name=spieler_wort, value="\n".join(chunk), inline=False)
             chunk = [line]
             fc += 1
             if fc >= 24:
-                chunk.append(f"... und {len(lines)-fc*10} weitere")
+                chunk.append(_t(interaction, f"... und {len(lines)-fc*10} weitere",
+                               f"... and {len(lines)-fc*10} more"))
                 break
         else:
             chunk.append(line)
     if chunk:
-        embed.add_field(name="Spieler", value="\n".join(chunk), inline=False)
+        embed.add_field(name=spieler_wort, value="\n".join(chunk), inline=False)
 
-    embed.set_footer(text="⚠️ Positionen stammen aus Log-Events – nicht live in Echtzeit")
+    embed.set_footer(text=_t(
+        interaction, "⚠️ Positionen stammen aus Log-Events – nicht live in Echtzeit",
+        "⚠️ Positions come from log events – not real-time"))
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -6993,30 +7186,39 @@ async def cmd_search(interaction: discord.Interaction, name: str,
 
     log_dir = conn.get("ftp_log_dir")
     if not log_dir:
-        return await interaction.followup.send(
+        return await interaction.followup.send(_t(
+            interaction,
             "❌ Log-Verzeichnis nicht konfiguriert. Starte den Bot neu oder nutze `/ftp_scan`.",
+            "❌ Log directory not configured. Restart the bot or use `/ftp_scan`."),
             ephemeral=True
         )
 
     loop = asyncio.get_running_loop()
     adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
     if not adm_files:
-        return await interaction.followup.send("❌ Keine Log-Dateien gefunden.", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, "❌ Keine Log-Dateien gefunden.", "❌ No log files found."), ephemeral=True)
 
     content = await loop.run_in_executor(None, conn.ftp.read_file, adm_files[-1])
     if not content:
-        return await interaction.followup.send("❌ Log-Datei konnte nicht gelesen werden.", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, "❌ Log-Datei konnte nicht gelesen werden.",
+            "❌ Could not read the log file."), ephemeral=True)
 
     hits = [l.strip() for l in content.splitlines() if name.lower() in l.lower()][:25]
     if not hits:
-        return await interaction.followup.send(f"❌ Keine Einträge für **{name}** gefunden.", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, f"❌ Keine Einträge für **{name}** gefunden.",
+            f"❌ No entries found for **{name}**."), ephemeral=True)
 
     result = "\n".join(f"`{h[:120]}`" for h in hits)
     if len(result) > 3900:
         result = result[:3900] + "\n..."
 
-    embed = discord.Embed(title=f"🔍 Suche: {name}", description=result, color=0x5865F2)
-    embed.set_footer(text=f"Datei: {adm_files[-1]} | {len(hits)} Treffer (max. 25)")
+    embed = discord.Embed(title=_t(interaction, f"🔍 Suche: {name}", f"🔍 Search: {name}"),
+                          description=result, color=0x5865F2)
+    embed.set_footer(text=_t(interaction, f"Datei: {adm_files[-1]} | {len(hits)} Treffer (max. 25)",
+                             f"File: {adm_files[-1]} | {len(hits)} hit(s) (max. 25)"))
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -7056,15 +7258,20 @@ async def cmd_ftp_scan(interaction: discord.Interaction, server: Optional[str] =
 
     await bot._auto_discover(conn)
 
-    log_dir  = conn.get("ftp_log_dir")          or "Nicht gefunden"
-    ban_file = conn.get("ftp_ban_file")         or "Nicht gefunden"
-    mission  = conn.get("ftp_mission_dir")      or "Nicht gefunden"
-    effect   = conn.get("cfg_effect_area_path") or "Nicht gefunden"
+    nicht_gefunden = _t(interaction, "Nicht gefunden", "Not found")
+    log_dir  = conn.get("ftp_log_dir")          or nicht_gefunden
+    ban_file = conn.get("ftp_ban_file")         or nicht_gefunden
+    mission  = conn.get("ftp_mission_dir")      or nicht_gefunden
+    effect   = conn.get("cfg_effect_area_path") or nicht_gefunden
 
-    embed = discord.Embed(title="🔎 FTP-Scan abgeschlossen", color=0x2ECC71)
-    embed.add_field(name="Log-Verzeichnis", value=f"`{log_dir}`",  inline=False)
-    embed.add_field(name="Ban-Datei",       value=f"`{ban_file}`", inline=False)
-    embed.add_field(name="Mission-Ordner",  value=f"`{mission}`",  inline=False)
+    embed = discord.Embed(title=_t(interaction, "🔎 FTP-Scan abgeschlossen", "🔎 FTP Scan Completed"),
+                          color=0x2ECC71)
+    embed.add_field(name=_t(interaction, "Log-Verzeichnis", "Log Directory"),
+                    value=f"`{log_dir}`",  inline=False)
+    embed.add_field(name=_t(interaction, "Ban-Datei", "Ban File"),
+                    value=f"`{ban_file}`", inline=False)
+    embed.add_field(name=_t(interaction, "Mission-Ordner", "Mission Folder"),
+                    value=f"`{mission}`",  inline=False)
     embed.add_field(name="cfgEffectArea",   value=f"`{effect}`",   inline=False)
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -7088,18 +7295,22 @@ async def cmd_raw_log(interaction: discord.Interaction, zeilen: int = 20,
 
     log_dir = conn.get("ftp_log_dir")
     if not log_dir:
-        return await interaction.followup.send(
-            "❌ Log-Verzeichnis nicht konfiguriert. Nutze `/ftp_scan`.", ephemeral=True
+        return await interaction.followup.send(_t(
+            interaction, "❌ Log-Verzeichnis nicht konfiguriert. Nutze `/ftp_scan`.",
+            "❌ Log directory not configured. Use `/ftp_scan`."), ephemeral=True
         )
 
     loop = asyncio.get_running_loop()
     adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
     if not adm_files:
-        return await interaction.followup.send("❌ Keine ADM-Dateien gefunden.", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, "❌ Keine ADM-Dateien gefunden.", "❌ No ADM files found."), ephemeral=True)
 
     content = await loop.run_in_executor(None, conn.ftp.read_file, adm_files[-1])
     if not content:
-        return await interaction.followup.send("❌ Log-Datei konnte nicht gelesen werden.", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, "❌ Log-Datei konnte nicht gelesen werden.",
+            "❌ Could not read the log file."), ephemeral=True)
 
     zeilen = max(5, min(zeilen, 40))
     lines  = [l for l in content.splitlines() if l.strip()][-zeilen:]
@@ -7108,12 +7319,17 @@ async def cmd_raw_log(interaction: discord.Interaction, zeilen: int = 20,
         result = result[:3900] + "\n..."
 
     embed = discord.Embed(
-        title=f"🔍 Raw Log – letzte {len(lines)} Zeilen",
+        title=_t(interaction, f"🔍 Raw Log – letzte {len(lines)} Zeilen",
+                 f"🔍 Raw Log – last {len(lines)} lines"),
         description=result,
         color=0x7F8C8D
     )
-    embed.set_footer(text=f"Datei: {adm_files[-1].split('/')[-1]}  •  "
-                         f"Tipp: Damage/Loot erscheinen nur wenn der Server diese Events loggt")
+    embed.set_footer(text=_t(
+        interaction,
+        f"Datei: {adm_files[-1].split('/')[-1]}  •  "
+        f"Tipp: Damage/Loot erscheinen nur wenn der Server diese Events loggt",
+        f"File: {adm_files[-1].split('/')[-1]}  •  "
+        f"Tip: Damage/loot only appear if the server logs these events"))
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -7138,18 +7354,22 @@ async def cmd_test(interaction: discord.Interaction, zeilen: int = 500,
     # ── 1. Log-Datei lesen ────────────────────────────────────
     log_dir = conn.get("ftp_log_dir")
     if not log_dir:
-        return await interaction.followup.send(
-            "❌ Log-Verzeichnis nicht konfiguriert. Nutze `/ftp_scan`.", ephemeral=True
+        return await interaction.followup.send(_t(
+            interaction, "❌ Log-Verzeichnis nicht konfiguriert. Nutze `/ftp_scan`.",
+            "❌ Log directory not configured. Use `/ftp_scan`."), ephemeral=True
         )
 
     loop = asyncio.get_running_loop()
     adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
     if not adm_files:
-        return await interaction.followup.send("❌ Keine ADM-Dateien gefunden.", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, "❌ Keine ADM-Dateien gefunden.", "❌ No ADM files found."), ephemeral=True)
 
     content = await loop.run_in_executor(None, conn.ftp.read_file, adm_files[-1])
     if not content:
-        return await interaction.followup.send("❌ Log-Datei konnte nicht gelesen werden.", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, "❌ Log-Datei konnte nicht gelesen werden.",
+            "❌ Could not read the log file."), ephemeral=True)
 
     # ── 2. Letzten N Zeilen parsen ────────────────────────────
     zeilen = max(50, min(zeilen, 2000))
@@ -7199,18 +7419,21 @@ async def cmd_test(interaction: discord.Interaction, zeilen: int = 500,
 
         ch = bot.get_channel(int(ch_id))
         if not ch:
-            errors.append((lt, "Channel nicht gefunden (ID veraltet?)"))
+            errors.append((lt, _t(interaction, "Channel nicht gefunden (ID veraltet?)",
+                                  "Channel not found (outdated ID?)")))
             continue
 
         embed = EmbedBuilder.build(ev)
         if not embed:
-            errors.append((lt, "Embed konnte nicht erstellt werden"))
+            errors.append((lt, _t(interaction, "Embed konnte nicht erstellt werden",
+                                  "Could not build the embed")))
             continue
 
         # Test-Kennung in den Embed-Titel & Author einbauen
         embed.title = f"🧪 [TEST] {embed.title or lt}"
         embed.set_author(
-            name=f"Testpost via /test · {interaction.user.display_name}",
+            name=_t(interaction, f"Testpost via /test · {interaction.user.display_name}",
+                   f"Test post via /test · {interaction.user.display_name}"),
             icon_url=interaction.user.display_avatar.url if interaction.user.display_avatar else None
         )
 
@@ -7218,7 +7441,8 @@ async def cmd_test(interaction: discord.Interaction, zeilen: int = 500,
             await ch.send(embed=embed)
             sent.append((lt, ch.mention))
         except discord.Forbidden:
-            errors.append((lt, f"Keine Schreibrechte in {ch.mention}"))
+            errors.append((lt, _t(interaction, f"Keine Schreibrechte in {ch.mention}",
+                                  f"No write permission in {ch.mention}")))
         except Exception as ex:
             errors.append((lt, str(ex)[:80]))
 
@@ -7227,11 +7451,13 @@ async def cmd_test(interaction: discord.Interaction, zeilen: int = 500,
     color = 0x2ECC71 if ok_count > 0 else 0xE74C3C
 
     summary = discord.Embed(
-        title="🧪 Test-Ergebnis",
-        description=(
+        title=_t(interaction, "🧪 Test-Ergebnis", "🧪 Test Result"),
+        description=_t(
+            interaction,
             f"Gescannt: letzte **{zeilen}** Zeilen aus `{adm_files[-1].split('/')[-1]}`\n"
-            f"Events gefunden: **{len(events)}** · Gepostet: **{ok_count}**"
-        ),
+            f"Events gefunden: **{len(events)}** · Gepostet: **{ok_count}**",
+            f"Scanned: last **{zeilen}** lines from `{adm_files[-1].split('/')[-1]}`\n"
+            f"Events found: **{len(events)}** · Posted: **{ok_count}**"),
         color=color,
     )
 
@@ -7241,43 +7467,51 @@ async def cmd_test(interaction: discord.Interaction, zeilen: int = 500,
         text = trenner.join(zeilen_liste[:20])
         rest = len(zeilen_liste) - 20
         if rest > 0:
-            text += f"{trenner}… und {rest} weitere"
+            text += _t(interaction, f"{trenner}… und {rest} weitere",
+                      f"{trenner}… and {rest} more")
         return text[:1024]
 
     if sent:
         lines = [f"✅ `{lt}` → {ch}" for lt, ch in sent]
         summary.add_field(
-            name=f"✅ Erfolgreich gepostet ({len(sent)})",
+            name=_t(interaction, f"✅ Erfolgreich gepostet ({len(sent)})",
+                   f"✅ Successfully Posted ({len(sent)})"),
             value=_gekuerzt(lines),
             inline=False
         )
     if no_ch:
         lines = [f"⚪ `{lt}`" for lt in no_ch]
         summary.add_field(
-            name=f"⚪ Kein Channel konfiguriert ({len(no_ch)})",
+            name=_t(interaction, f"⚪ Kein Channel konfiguriert ({len(no_ch)})",
+                   f"⚪ No Channel Configured ({len(no_ch)})"),
             value=_gekuerzt(lines, "  "),
             inline=False
         )
     if no_event:
         lines = [f"🔍 `{lt}`" for lt in no_event]
         summary.add_field(
-            name=f"🔍 Kein Event in den letzten {zeilen} Zeilen ({len(no_event)})",
+            name=_t(interaction, f"🔍 Kein Event in den letzten {zeilen} Zeilen ({len(no_event)})",
+                   f"🔍 No Event in the Last {zeilen} Lines ({len(no_event)})"),
             value=_gekuerzt(lines, "  "),
             inline=False
         )
     if errors:
         lines = [f"❌ `{lt}` — {msg}" for lt, msg in errors]
         summary.add_field(
-            name=f"❌ Fehler ({len(errors)})",
+            name=_t(interaction, f"❌ Fehler ({len(errors)})", f"❌ Error(s) ({len(errors)})"),
             value=_gekuerzt(lines),
             inline=False
         )
 
-    summary.set_footer(
-        text="🔍-Typen = diese Events kommen in deinen Logs nicht vor "
-             "(z.B. Damage/Loot brauchen Server-Mods). "
-             "⚪-Typen → im Dashboard unter „Feeds“ einrichten"
-    )
+    summary.set_footer(text=_t(
+        interaction,
+        "🔍-Typen = diese Events kommen in deinen Logs nicht vor "
+        "(z.B. Damage/Loot brauchen Server-Mods). "
+        "⚪-Typen → im Dashboard unter „Feeds“ einrichten",
+        "🔍 types = these events don't occur in your logs "
+        "(e.g. damage/loot need server mods). "
+        "⚪ types → set up in the dashboard under „Feeds“"
+    ))
     await interaction.followup.send(embed=summary, ephemeral=True)
 
 
@@ -7294,7 +7528,8 @@ async def cmd_ftp_status(interaction: discord.Interaction, server: Optional[str]
     host     = conn.get("ftp_host", "–")
     port     = conn.get("ftp_port", 21)
     user     = conn.get("ftp_user", "–")
-    log_dir  = conn.get("ftp_log_dir",  "Noch nicht gesetzt")
+    noch_nicht_gesetzt = _t(interaction, "Noch nicht gesetzt", "Not set yet")
+    log_dir  = conn.get("ftp_log_dir",  noch_nicht_gesetzt)
 
     loop = asyncio.get_running_loop()
 
@@ -7314,55 +7549,61 @@ async def cmd_ftp_status(interaction: discord.Interaction, server: Optional[str]
             return _time.monotonic() - t0, welcome
         t_connect, welcome = await loop.run_in_executor(None, _test_login)
         connect_ok  = True
-        connect_msg = welcome[:80] if welcome else "Verbindung erfolgreich"
+        connect_msg = welcome[:80] if welcome else _t(interaction, "Verbindung erfolgreich",
+                                                       "Connection successful")
     except Exception as e:
         connect_msg = str(e)[:120]
 
     # ── 2. Log-Verzeichnis lesen ──────────────────────────────
     adm_count  = 0
     adm_latest = "–"
-    if connect_ok and log_dir and log_dir != "Noch nicht gesetzt":
+    if connect_ok and log_dir and log_dir != noch_nicht_gesetzt:
         try:
             adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
             adm_count  = len(adm_files)
-            adm_latest = adm_files[-1].split("/")[-1] if adm_files else "Keine gefunden"
+            adm_latest = (adm_files[-1].split("/")[-1] if adm_files
+                         else _t(interaction, "Keine gefunden", "None found"))
         except Exception as e:
-            adm_latest = f"Fehler: {e}"
+            adm_latest = _t(interaction, f"Fehler: {e}", f"Error: {e}")
 
     # ── 3. Nitrado-Banliste prüfen (Servereinstellungen, nicht FTP) ──
     try:
         ban_names, _bcat, _bkey = await _read_banlist(conn)
-        ban_msg = f"✅ {len(ban_names)} Einträge"
+        ban_msg = _t(interaction, f"✅ {len(ban_names)} Einträge", f"✅ {len(ban_names)} entries")
     except Exception as e:
         ban_msg = f"⚠️ {e}"
 
     # ── Embed zusammenbauen ───────────────────────────────────
     if connect_ok:
         color = 0x2ECC71
-        title = "🟢 FTP-Verbindung erfolgreich"
+        title = _t(interaction, "🟢 FTP-Verbindung erfolgreich", "🟢 FTP Connection Successful")
     else:
         color = 0xE74C3C
-        title = "🔴 FTP-Verbindung fehlgeschlagen"
+        title = _t(interaction, "🔴 FTP-Verbindung fehlgeschlagen", "🔴 FTP Connection Failed")
 
     embed = discord.Embed(title=title, color=color)
     embed.add_field(name="Host",
                     value=f"`{host}:{port}`",                              inline=True)
-    embed.add_field(name="Benutzer",
+    embed.add_field(name=_t(interaction, "Benutzer", "User"),
                     value=f"`{user}`",                                     inline=True)
-    embed.add_field(name="Ping / Antwortzeit",
+    embed.add_field(name=_t(interaction, "Ping / Antwortzeit", "Ping / Response Time"),
                     value=f"`{t_connect*1000:.0f} ms`" if connect_ok else "–", inline=True)
-    embed.add_field(name="Server-Antwort",
+    embed.add_field(name=_t(interaction, "Server-Antwort", "Server Response"),
                     value=f"`{connect_msg}`" if connect_ok else f"❌ `{connect_msg}`",
                     inline=False)
-    embed.add_field(name="Log-Verzeichnis",
+    embed.add_field(name=_t(interaction, "Log-Verzeichnis", "Log Directory"),
                     value=f"`{log_dir}`",                                  inline=False)
-    embed.add_field(name="ADM-Dateien gefunden",
-                    value=f"`{adm_count}`  •  Neueste: `{adm_latest}`",   inline=False)
-    embed.add_field(name="Nitrado-Banliste (Servereinstellungen)",
+    embed.add_field(name=_t(interaction, "ADM-Dateien gefunden", "ADM Files Found"),
+                    value=_t(interaction, f"`{adm_count}`  •  Neueste: `{adm_latest}`",
+                            f"`{adm_count}`  •  Latest: `{adm_latest}`"),   inline=False)
+    embed.add_field(name=_t(interaction, "Nitrado-Banliste (Servereinstellungen)",
+                            "Nitrado Ban List (Server Settings)"),
                     value=ban_msg,                                         inline=False)
 
     if not connect_ok:
-        embed.set_footer(text="Tipp: `/ftp_scan` holt die Zugangsdaten neu über den Nitrado-Token")
+        embed.set_footer(text=_t(
+            interaction, "Tipp: `/ftp_scan` holt die Zugangsdaten neu über den Nitrado-Token",
+            "Tip: `/ftp_scan` fetches the credentials again via the Nitrado token"))
 
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -7382,25 +7623,28 @@ async def cmd_log_status(interaction: discord.Interaction, server: Optional[str]
     # Alles aus DIESER Verbindung – sonst zeigte der Befehl den Log-Pfad und
     # FTP-Host des Betreibers, egal aus welchem Discord er kam.
     state = _conn.log_state.get("current", {})
-    embed = discord.Embed(title="📄 Log-Polling Status", color=0x5865F2)
+    keine_wort = _t(interaction, "Keine", "None")
+    embed = discord.Embed(title=_t(interaction, "📄 Log-Polling Status", "📄 Log Polling Status"),
+                          color=0x5865F2)
     embed.add_field(name="Server", value=_conn.name, inline=False)
-    embed.add_field(name="Aktuelle Log-Datei",
-                    value=f"`{state.get('file', 'Keine')}`",         inline=False)
-    embed.add_field(name="Gelesene Bytes",
+    embed.add_field(name=_t(interaction, "Aktuelle Log-Datei", "Current Log File"),
+                    value=f"`{state.get('file', keine_wort)}`",         inline=False)
+    embed.add_field(name=_t(interaction, "Gelesene Bytes", "Bytes Read"),
                     value=f"{state.get('offset', 0):,}",             inline=True)
-    embed.add_field(name="Poll-Intervall",
+    embed.add_field(name=_t(interaction, "Poll-Intervall", "Poll Interval"),
                     value=f"{_conn.get('log_poll_interval_seconds', 10)}s",inline=True)
-    embed.add_field(name="Log-Verzeichnis",
+    embed.add_field(name=_t(interaction, "Log-Verzeichnis", "Log Directory"),
                     value=f"`{_conn.get('ftp_log_dir') or '–'}`", inline=False)
-    embed.add_field(name="Banliste",
-                    value="Nitrado-Servereinstellungen (via API)",     inline=False)
+    embed.add_field(name=_t(interaction, "Banliste", "Ban List"),
+                    value=_t(interaction, "Nitrado-Servereinstellungen (via API)",
+                            "Nitrado server settings (via API)"),     inline=False)
     embed.add_field(name="FTP-Host",
                     value=f"`{_conn.get('ftp_host') or '–'}`",    inline=False)
-    embed.add_field(name="Bekannte Spieler-Positionen",
+    embed.add_field(name=_t(interaction, "Bekannte Spieler-Positionen", "Known Player Positions"),
                     value=str(len(_conn.parser.player_positions
                                   if _conn.parser else {})),
                     inline=True)
-    embed.add_field(name="Lokale Bans",
+    embed.add_field(name=_t(interaction, "Lokale Bans", "Local Bans"),
                     value=str(len(_bans_of(_conn))),                  inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -7427,18 +7671,26 @@ async def cmd_hilfe(interaction: discord.Interaction):
     db.set_cooldown(gid, interaction.user.id, "hilfe",
                     int(cfg.config.get("hilfe_cooldown_seconds", 30)))
     embed = discord.Embed(
-        title="🎮 DayZ Bot – Befehlsübersicht",
-        description="Alle Befehle (Admin-Rolle erforderlich, außer /hilfe)",
+        title=_t(interaction, "🎮 DayZ Bot – Befehlsübersicht", "🎮 DayZ Bot – Command Overview"),
+        description=_t(interaction, "Alle Befehle (Admin-Rolle erforderlich, außer /hilfe)",
+                       "All commands (admin role required, except /help)"),
         color=0x5865F2
     )
-    embed.add_field(name="⚙️ Server-Verwaltung", value=(
+    embed.add_field(name=_t(interaction, "⚙️ Server-Verwaltung", "⚙️ Server Management"), value=_t(
+        interaction,
         "`/neustart` — Server neu starten\n"
         "`/stoppen` — Server stoppen\n"
         "`/serverstatus` — Server-Status anzeigen\n"
         "`/auto restart <intervall>` — Geplante Neustarts (Uhrzeit per Dropdown)\n"
-        "`/auto status` / `/auto off` — Zeitplan anzeigen / deaktivieren"
+        "`/auto status` / `/auto off` — Zeitplan anzeigen / deaktivieren",
+        "`/restart` — Restart the server\n"
+        "`/stop` — Stop the server\n"
+        "`/serverstatus` — Show server status\n"
+        "`/auto restart <interval>` — Scheduled restarts (start time via dropdown)\n"
+        "`/auto status` / `/auto off` — Show / disable the schedule"
     ), inline=False)
-    embed.add_field(name="🔨 Spieler-Verwaltung", value=(
+    embed.add_field(name=_t(interaction, "🔨 Spieler-Verwaltung", "🔨 Player Management"), value=_t(
+        interaction,
         "`/ban <spieler> [grund]` — Auf die Nitrado-Banliste setzen (Komma = mehrere)\n"
         "`/ban_entfernen <spieler>` — Von der Nitrado-Banliste entfernen\n"
         "`/banlist` — Nitrado-Banliste anzeigen\n"
@@ -7447,58 +7699,110 @@ async def cmd_hilfe(interaction: discord.Interaction):
         "`/whitelist show` — Nitrado-Whitelist anzeigen\n"
         "`/send whitelist panel <panel> <admin>` — Whitelist-Anmelde-Panel senden\n"
         "`/admin_position` — Letzte Positionen\n"
-        "`/spieler_suche <name>` — Spieler in Logs suchen"
+        "`/spieler_suche <name>` — Spieler in Logs suchen",
+        "`/ban <player> [reason]` — Add to the Nitrado ban list (comma = multiple)\n"
+        "`/ban_remove <player>` — Remove from the Nitrado ban list\n"
+        "`/banlist` — Show the Nitrado ban list\n"
+        "`/whitelist add <player>` — Add to the Nitrado whitelist (comma = multiple)\n"
+        "`/whitelist remove <player>` — Remove from the Nitrado whitelist\n"
+        "`/whitelist show` — Show the Nitrado whitelist\n"
+        "`/send whitelist panel <panel> <admin>` — Send the whitelist signup panel\n"
+        "`/admin_position` — Last known positions\n"
+        "`/player_search <name>` — Search for a player in the logs"
     ), inline=False)
-    embed.add_field(name="📡 Feed-Verwaltung", value=(
+    embed.add_field(name=_t(interaction, "📡 Feed-Verwaltung", "📡 Feed Management"), value=_t(
+        interaction,
         "`/show_feeds` — Zeigt, welche Feeds für diesen Server eingerichtet sind\n"
         "`/test [zeilen]` — Beispiel-Event je Feed-Typ aus den letzten Log-Zeilen\n"
         "*Einrichten, ändern und löschen im Dashboard unter „Feeds“ – "
-        "dort mit Farbe, Position und Zeitstempel je Feed.*"
+        "dort mit Farbe, Position und Zeitstempel je Feed.*",
+        "`/show_feeds` — Shows which feeds are set up for this server\n"
+        "`/test [lines]` — Sample event per feed type from the latest log lines\n"
+        "*Set up, change and delete feeds in the dashboard under „Feeds“ – "
+        "with color, position and timestamp per feed.*"
     ), inline=False)
-    embed.add_field(name="🛡️ Zonen-Pings", value=(
+    embed.add_field(name=_t(interaction, "🛡️ Zonen-Pings", "🛡️ Zone Pings"), value=_t(
+        interaction,
         "`/zone list` — Alle aktiven Zonen dieses Servers\n"
         "`/zone allowlist add|remove|show <zone> <spieler>` — Spieler in einer Zone "
         "ignorieren / wieder melden / anzeigen\n"
         "*Anlegen und Bearbeiten im Dashboard unter „Zones“ – dort auch "
-        "Polygon-Zonen und mehrere Ping-Rollen.*"
+        "Polygon-Zonen und mehrere Ping-Rollen.*",
+        "`/zone list` — All active zones of this server\n"
+        "`/zone allowlist add|remove|show <zone> <player>` — Ignore a player in a zone "
+        "/ report them again / show the list\n"
+        "*Create and edit in the dashboard under „Zones“ – also "
+        "polygon zones and multiple ping roles.*"
     ), inline=False)
-    embed.add_field(name="📢 Einrichtung", value=(
+    embed.add_field(name=_t(interaction, "📢 Einrichtung", "📢 Setup"), value=_t(
+        interaction,
         "Nitrado-Token, Server-Auswahl, Feeds, Zonen, Shop, Ankündigungen und "
         "Auto-Neustarts werden im **Web-Dashboard** eingerichtet (Adresse steht "
         "beim Start im Log).\n"
         "Die früheren Befehle `/setup token`, `/setup feeds`, "
         "`/setup uebersicht`, `/edit_feeds` und `/zone create|edit|remove` "
-        "gibt es nicht mehr."
+        "gibt es nicht mehr.",
+        "Nitrado token, server selection, feeds, zones, shop, announcements and "
+        "auto-restarts are set up in the **web dashboard** (the address is "
+        "in the log at startup).\n"
+        "The former commands `/setup token`, `/setup feeds`, "
+        "`/setup uebersicht`, `/edit_feeds` and `/zone create|edit|remove` "
+        "no longer exist."
     ), inline=False)
-    embed.add_field(name="📊 Kill-Stats & Belohnungen", value=(
+    embed.add_field(name=_t(interaction, "📊 Kill-Stats & Belohnungen", "📊 Kill Stats & Rewards"), value=_t(
+        interaction,
         "`/stats <spieler>` — Kills, Tode, K/D, Lieblingswaffe, weitester Kill\n"
         "`/leaderboard` — Top 10 PvP-Killer\n"
         "`/link <playstation-name>` / `/unlink` — Account verknüpfen (Kill- & Spielzeit-Geld)\n"
         "`/username list` — Eigene Verknüpfung anzeigen (Admins: alle, 🟢 = online)\n"
         "`/forcelink <name> <@user>` / `/forceunlink <@user>` *(Admin)*\n"
-        "`/bounty <spieler> <betrag>` — Kopfgeld aussetzen · `/bounties` — aktive Kopfgelder"
+        "`/bounty <spieler> <betrag>` — Kopfgeld aussetzen · `/bounties` — aktive Kopfgelder",
+        "`/stats <player>` — Kills, deaths, K/D, favorite weapon, longest kill\n"
+        "`/leaderboard` — Top 10 PvP killers\n"
+        "`/link <playstation-name>` / `/unlink` — Link your account (kill & playtime money)\n"
+        "`/username list` — Show your own link (admins: all, 🟢 = online)\n"
+        "`/forcelink <name> <@user>` / `/forceunlink <@user>` *(admin)*\n"
+        "`/bounty <player> <amount>` — Place a bounty · `/bounties` — active bounties"
     ), inline=False)
-    embed.add_field(name="🔧 Diagnose", value=(
+    embed.add_field(name=_t(interaction, "🔧 Diagnose", "🔧 Diagnostics"), value=_t(
+        interaction,
         "`/log_status` — Polling-Status\n"
         "`/ftp_scan` — FTP neu scannen\n"
         "`/ftp_status` — FTP-Verbindung testen\n"
         "`/raw_log [zeilen]` — Rohe Log-Zeilen anzeigen (Debug)\n"
-        "`/test [zeilen]` — Letztes Event pro Typ in Channels posten"
+        "`/test [zeilen]` — Letztes Event pro Typ in Channels posten",
+        "`/log_status` — Polling status\n"
+        "`/ftp_scan` — Re-scan FTP\n"
+        "`/ftp_status` — Test the FTP connection\n"
+        "`/raw_log [lines]` — Show raw log lines (debug)\n"
+        "`/test [lines]` — Post the latest event per type into the channels"
     ), inline=False)
-    embed.add_field(name="💰 Economy", value=(
+    embed.add_field(name="💰 Economy", value=_t(
+        interaction,
         "`/balance [@user]` — Wallet & Bank\n"
         "`/deposit [amount]` / `/withdraw [amount]`\n"
         "`/pay <@user> <betrag>` — Geld an Mitspieler überweisen\n"
         "`/work` `/daily` `/beg` — Geld verdienen\n"
         "`/addmoney` `/removemoney` `/setbalance` *(Admin)*\n"
-        "`/economy_reload` — config.json neu laden *(Admin)*"
+        "`/economy_reload` — config.json neu laden *(Admin)*",
+        "`/balance [@user]` — Wallet & bank\n"
+        "`/deposit [amount]` / `/withdraw [amount]`\n"
+        "`/pay <@user> <amount>` — Transfer money to another member\n"
+        "`/work` `/daily` `/beg` — Earn money\n"
+        "`/addmoney` `/removemoney` `/setbalance` *(admin)*\n"
+        "`/economy_reload` — Reload config.json *(admin)*"
     ), inline=False)
-    embed.add_field(name="🎰 Casino", value=(
+    embed.add_field(name="🎰 Casino", value=_t(
+        interaction,
         "`/blackjack <bet>` — Blackjack mit Hit/Stand-Buttons\n"
         "`/roulette <bet> <wager>` — red/black/even/odd/low/high/0-36\n"
-        "`/slots <bet>` — Slot-Maschine"
+        "`/slots <bet>` — Slot-Maschine",
+        "`/blackjack <bet>` — Blackjack with Hit/Stand buttons\n"
+        "`/roulette <bet> <wager>` — red/black/even/odd/low/high/0-36\n"
+        "`/slots <bet>` — Slot machine"
     ), inline=False)
-    embed.add_field(name="🛒 Shop", value=(
+    embed.add_field(name="🛒 Shop", value=_t(
+        interaction,
         "`/shop list [category]` — Item-Katalog (leer = Kategorie-Übersicht)\n"
         "`/buy <item> <amount> <x> <z> [y]` — Item kaufen (spawnt nach Neustart)\n"
         "`/add shopitem <classnames> <price>` — Item/Bundle hinzufügen *(Admin)*\n"
@@ -7506,14 +7810,28 @@ async def cmd_hilfe(interaction: discord.Interaction):
         "`/edit shopitem <item> […]` — Classnames/Preis/Name/Kategorie ändern *(Admin)*\n"
         "`/shop pending` `/shop check` `/shop cleanup` `/shop setprice` "
         "`/shop enable` `/shop removeitem` *(Admin)*\n"
-        "*Shop-Log und Economy-Log als Feed einrichten: Dashboard → „Feeds“.*"
+        "*Shop-Log und Economy-Log als Feed einrichten: Dashboard → „Feeds“.*",
+        "`/shop list [category]` — Item catalog (empty = category overview)\n"
+        "`/buy <item> <amount> <x> <z> [y]` — Buy an item (spawns after the next restart)\n"
+        "`/add shopitem <classnames> <price>` — Add an item/bundle *(admin)*\n"
+        "`/bundle add` — Create a bundle via form (amount per item, dropdown category) *(admin)*\n"
+        "`/edit shopitem <item> […]` — Change classnames/price/name/category *(admin)*\n"
+        "`/shop pending` `/shop check` `/shop cleanup` `/shop setprice` "
+        "`/shop enable` `/shop removeitem` *(admin)*\n"
+        "*Set up shop log and economy log as a feed: dashboard → „Feeds“.*"
     ), inline=False)
-    embed.add_field(name="📢 Ankündigungen", value=(
+    embed.add_field(name=_t(interaction, "📢 Ankündigungen", "📢 Announcements"), value=_t(
+        interaction,
         "`/erstellen` — Neue wiederkehrende Ankündigung anlegen (Tag/Uhrzeit/Wiederholung per Dropdown)\n"
         "`/liste` — Alle Ankündigungen mit nächstem Sendetermin & Countdown\n"
         "`/löschen <index>` — Ankündigung löschen\n"
         "`/edit ankuendigung <index>` — Nachricht/Bild einer Ankündigung ändern\n"
-        "`/hackban <user_id> [grund]` — Discord-Nutzer per ID bannen"
+        "`/hackban <user_id> [grund]` — Discord-Nutzer per ID bannen",
+        "`/create` — Create a new recurring announcement (day/time/repeat via dropdown)\n"
+        "`/list` — All announcements with next send time & countdown\n"
+        "`/delete <index>` — Delete an announcement\n"
+        "`/edit announcement <index>` — Change an announcement's message/image\n"
+        "`/hackban <user_id> [reason]` — Ban a Discord user by ID"
     ), inline=False)
     _c_hilfe = _conn_of(interaction)
     admin_ids = _c_hilfe.get("admin_role_ids", []) if _c_hilfe is not None else []
@@ -7522,10 +7840,14 @@ async def cmd_hilfe(interaction: discord.Interaction):
     # Kein Verweis mehr auf die Dashboard-Optionen: admin_role_ids wird dort
     # nicht angeboten (siehe api_options) – der Tipp schickte Betreiber auf
     # die Suche nach einer Einstellung, die es an der Stelle nicht gibt.
-    footer = (f"Admin-Rollen-IDs: {', '.join(str(i) for i in admin_ids)}"
-              if admin_ids else
-              f"Admin-Rolle: {admin_name} "
-              f"(admin_role_ids stehen in der connections.json des Servers)")
+    if admin_ids:
+        footer = (_t(interaction, "Admin-Rollen-IDs: ", "Admin role IDs: ")
+                  + ', '.join(str(i) for i in admin_ids))
+    else:
+        footer = _t(
+            interaction,
+            f"Admin-Rolle: {admin_name} (admin_role_ids stehen in der connections.json des Servers)",
+            f"Admin role: {admin_name} (admin_role_ids is set in the server's connections.json)")
     embed.set_footer(text=footer)
     await interaction.response.send_message(embed=embed)
 
@@ -7582,8 +7904,10 @@ async def _ann_position(interaction: discord.Interaction,
         return None
     eigene = _ann_eigene(conn)
     if index < 0 or index >= len(eigene):
-        await interaction.response.send_message(
+        await interaction.response.send_message(_t(
+            interaction,
             "❌ Ungültige Nummer – `/liste` zeigt die Ankündigungen dieses Servers.",
+            "❌ Invalid number – `/list` shows this server's announcements."),
             ephemeral=True)
         return None
     return eigene[index][0]
@@ -7735,22 +8059,25 @@ async def announcement_scheduler():
 
 # ─── Ankündigungs-UI: Tag / Uhrzeit / Wiederholung ───
 
+_WOCHENTAGE_EN = {
+    "Montag": "Monday", "Dienstag": "Tuesday", "Mittwoch": "Wednesday",
+    "Donnerstag": "Thursday", "Freitag": "Friday", "Samstag": "Saturday", "Sonntag": "Sunday",
+}
+
+
 class TagSelect(discord.ui.Select):
 
-    def __init__(self):
+    def __init__(self, sprache: str = "de"):
 
+        tage = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+        werte = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
         options = [
-            discord.SelectOption(label="Montag", value="monday"),
-            discord.SelectOption(label="Dienstag", value="tuesday"),
-            discord.SelectOption(label="Mittwoch", value="wednesday"),
-            discord.SelectOption(label="Donnerstag", value="thursday"),
-            discord.SelectOption(label="Freitag", value="friday"),
-            discord.SelectOption(label="Samstag", value="saturday"),
-            discord.SelectOption(label="Sonntag", value="sunday"),
+            discord.SelectOption(label=_WOCHENTAGE_EN[tag] if sprache == "en" else tag, value=wert)
+            for tag, wert in zip(tage, werte)
         ]
 
         super().__init__(
-            placeholder="Tag auswählen",
+            placeholder="Select day" if sprache == "en" else "Tag auswählen",
             options=options
         )
 
@@ -7763,7 +8090,7 @@ class TagSelect(discord.ui.Select):
 
 class TimeSelect(discord.ui.Select):
 
-    def __init__(self, page=0):
+    def __init__(self, page=0, sprache: str = "de"):
 
         all_times = []
 
@@ -7785,7 +8112,8 @@ class TimeSelect(discord.ui.Select):
         ]
 
         super().__init__(
-            placeholder=f"Uhrzeit (Seite {page+1}/3)",
+            placeholder=(f"Time (page {page+1}/3)" if sprache == "en"
+                        else f"Uhrzeit (Seite {page+1}/3)"),
             options=options
         )
 
@@ -7798,17 +8126,25 @@ class TimeSelect(discord.ui.Select):
 
 class RepeatSelect(discord.ui.Select):
 
-    def __init__(self):
+    def __init__(self, sprache: str = "de"):
 
-        options = [
-            discord.SelectOption(label="Jede Woche", value="weekly"),
-            discord.SelectOption(label="Alle 2 Wochen", value="biweekly"),
-            discord.SelectOption(label="Alle 3 Wochen", value="triweekly"),
-            discord.SelectOption(label="Jeden Monat", value="monthly"),
-        ]
+        if sprache == "en":
+            options = [
+                discord.SelectOption(label="Every week", value="weekly"),
+                discord.SelectOption(label="Every 2 weeks", value="biweekly"),
+                discord.SelectOption(label="Every 3 weeks", value="triweekly"),
+                discord.SelectOption(label="Every month", value="monthly"),
+            ]
+        else:
+            options = [
+                discord.SelectOption(label="Jede Woche", value="weekly"),
+                discord.SelectOption(label="Alle 2 Wochen", value="biweekly"),
+                discord.SelectOption(label="Alle 3 Wochen", value="triweekly"),
+                discord.SelectOption(label="Jeden Monat", value="monthly"),
+            ]
 
         super().__init__(
-            placeholder="Wiederholung auswählen",
+            placeholder="Select repeat interval" if sprache == "en" else "Wiederholung auswählen",
             options=options
         )
 
@@ -7831,7 +8167,7 @@ class PageButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction):
 
-        view = CreateAnnouncementView(page=self.page)
+        view = CreateAnnouncementView(page=self.page, sprache=self.view.sprache)
 
         view.selected_day = self.view.selected_day
         view.selected_time = self.view.selected_time
@@ -7842,10 +8178,10 @@ class PageButton(discord.ui.Button):
 
 class NextButton(discord.ui.Button):
 
-    def __init__(self):
+    def __init__(self, sprache: str = "de"):
 
         super().__init__(
-            label="Weiter",
+            label="Next" if sprache == "en" else "Weiter",
             style=discord.ButtonStyle.success
         )
 
@@ -7853,8 +8189,9 @@ class NextButton(discord.ui.Button):
 
         if not self.view.selected_day or not self.view.selected_time or not self.view.selected_repeat:
 
-            await interaction.response.send_message(
-                "Bitte Tag und Uhrzeit wählen.",
+            await interaction.response.send_message(_t(
+                interaction, "Bitte Tag und Uhrzeit wählen.",
+                "Please select a day and time."),
                 ephemeral=True
             )
 
@@ -7863,7 +8200,8 @@ class NextButton(discord.ui.Button):
         modal = AnnouncementModal(
             self.view.selected_day,
             self.view.selected_time,
-            self.view.selected_repeat
+            self.view.selected_repeat,
+            self.view.sprache
         )
 
         await interaction.response.send_modal(modal)
@@ -7871,17 +8209,18 @@ class NextButton(discord.ui.Button):
 
 class CreateAnnouncementView(discord.ui.View):
 
-    def __init__(self, page=0):
+    def __init__(self, page=0, sprache: str = "de"):
 
         super().__init__(timeout=300)
 
         self.selected_day = None
         self.selected_time = None
         self.selected_repeat = None
+        self.sprache = sprache
 
-        self.add_item(TagSelect())
-        self.add_item(TimeSelect(page))
-        self.add_item(RepeatSelect())
+        self.add_item(TagSelect(sprache))
+        self.add_item(TimeSelect(page, sprache))
+        self.add_item(RepeatSelect(sprache))
 
         if page > 0:
             self.add_item(PageButton("⬅", page - 1))
@@ -7889,31 +8228,32 @@ class CreateAnnouncementView(discord.ui.View):
         if page < 2:
             self.add_item(PageButton("➡", page + 1))
 
-        self.add_item(NextButton())
+        self.add_item(NextButton(sprache))
 
 
 class AnnouncementModal(discord.ui.Modal):
 
-    def __init__(self, day, time, repeat_type):
+    def __init__(self, day, time, repeat_type, sprache: str = "de"):
 
-        super().__init__(title="Ankündigung")
+        super().__init__(title="Announcement" if sprache == "en" else "Ankündigung")
 
         self.day = day
         self.time = time
         self.repeat_type = repeat_type
+        self.sprache = sprache
 
         self.msg = discord.ui.TextInput(
-            label="Nachricht",
+            label="Message" if sprache == "en" else "Nachricht",
             style=discord.TextStyle.paragraph,
             max_length=2000
         )
 
         self.channel = discord.ui.TextInput(
-            label="Channel-ID"
+            label="Channel ID" if sprache == "en" else "Channel-ID"
         )
 
         self.image = discord.ui.TextInput(
-            label="Bild URL",
+            label="Image URL" if sprache == "en" else "Bild URL",
             required=False
         )
 
@@ -7928,8 +8268,8 @@ class AnnouncementModal(discord.ui.Modal):
 
         except Exception:
 
-            return await interaction.response.send_message(
-                "❌ Fehlerhafte Channel-ID",
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Fehlerhafte Channel-ID", "❌ Invalid channel ID"),
                 ephemeral=True
             )
 
@@ -7941,8 +8281,10 @@ class AnnouncementModal(discord.ui.Modal):
 
         if not channel:
 
-            return await interaction.response.send_message(
+            return await interaction.response.send_message(_t(
+                interaction,
                 "❌ Channel nicht gefunden – er muss in diesem Discord-Server liegen.",
+                "❌ Channel not found – it must be in this Discord server."),
                 ephemeral=True
             )
 
@@ -7961,19 +8303,20 @@ class AnnouncementModal(discord.ui.Modal):
 
         save_announcements()
 
-        await interaction.response.send_message(
-            "✅ Ankündigung gespeichert",
+        await interaction.response.send_message(_t(
+            interaction, "✅ Ankündigung gespeichert", "✅ Announcement saved"),
             ephemeral=True
         )
 
 
 class EditAnnouncementModal(discord.ui.Modal):
 
-    def __init__(self, index):
+    def __init__(self, index, sprache: str = "de"):
 
-        super().__init__(title="Ankündigung bearbeiten")
+        super().__init__(title="Edit Announcement" if sprache == "en" else "Ankündigung bearbeiten")
 
         self.index = index
+        self.sprache = sprache
 
         ann = ann_data["announcements"][index]
         # Der Index ist eine Position in EINER globalen Liste. Wird waehrend
@@ -7984,14 +8327,14 @@ class EditAnnouncementModal(discord.ui.Modal):
         self.war_text = str(ann.get("message") or "")
 
         self.message_input = discord.ui.TextInput(
-            label="Neue Nachricht",
+            label="New message" if sprache == "en" else "Neue Nachricht",
             style=discord.TextStyle.paragraph,
             default=ann["message"],
             max_length=2000
         )
 
         self.image_input = discord.ui.TextInput(
-            label="Neue Bild URL",
+            label="New image URL" if sprache == "en" else "Neue Bild URL",
             default=ann.get("image") or "",
             required=False
         )
@@ -8009,9 +8352,12 @@ class EditAnnouncementModal(discord.ui.Modal):
         if (ziel is None
                 or str(ziel.get("service_id") or "") != self.gehoert_zu
                 or str(ziel.get("message") or "") != self.war_text):
-            return await interaction.response.send_message(
+            return await interaction.response.send_message(_t(
+                interaction,
                 "❌ Die Liste hat sich inzwischen geändert – bitte `/liste` erneut "
                 "aufrufen und die Ankündigung neu auswählen.",
+                "❌ The list has changed in the meantime – please run `/list` again "
+                "and re-select the announcement."),
                 ephemeral=True
             )
 
@@ -8025,8 +8371,8 @@ class EditAnnouncementModal(discord.ui.Modal):
 
         save_announcements()
 
-        await interaction.response.send_message(
-            "✅ Ankündigung bearbeitet",
+        await interaction.response.send_message(_t(
+            interaction, "✅ Ankündigung bearbeitet", "✅ Announcement edited"),
             ephemeral=True
         )
 
@@ -8037,9 +8383,10 @@ async def cmd_ann_erstellen(interaction: discord.Interaction):
     if not _is_admin(interaction):
         return await _deny(interaction)
 
+    sprache = _sprache(interaction)
     await interaction.response.send_message(
-        "Setup starten:",
-        view=CreateAnnouncementView(),
+        "Start setup:" if sprache == "en" else "Setup starten:",
+        view=CreateAnnouncementView(sprache=sprache),
         ephemeral=True
     )
 
@@ -8055,47 +8402,74 @@ async def cmd_ann_liste(interaction: discord.Interaction):
         return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
     eigene = _ann_eigene(conn)
 
+    sprache = _sprache(interaction)
     embed = discord.Embed(
-        title="📋 Ankündigungen",
+        title="📋 Announcements" if sprache == "en" else "📋 Ankündigungen",
         color=discord.Color.blue()
     )
 
     if not eigene:
 
-        embed.description = "Keine Ankündigungen gespeichert."
+        embed.description = ("No announcements saved." if sprache == "en"
+                             else "Keine Ankündigungen gespeichert.")
 
     else:
 
-        repeat_label = {
-            "weekly":    "Jede Woche",
-            "biweekly":  "Alle 2 Wochen",
-            "triweekly": "Alle 3 Wochen",
-            "monthly":   "Jeden Monat",
-        }
+        if sprache == "en":
+            repeat_label = {
+                "weekly": "Every week", "biweekly": "Every 2 weeks",
+                "triweekly": "Every 3 weeks", "monthly": "Every month",
+            }
+            day_label = {
+                "monday": "Monday", "tuesday": "Tuesday", "wednesday": "Wednesday",
+                "thursday": "Thursday", "friday": "Friday",
+                "saturday": "Saturday", "sunday": "Sunday"
+            }
+        else:
+            repeat_label = {
+                "weekly":    "Jede Woche",
+                "biweekly":  "Alle 2 Wochen",
+                "triweekly": "Alle 3 Wochen",
+                "monthly":   "Jeden Monat",
+            }
 
-        day_label = {
-            "monday": "Montag", "tuesday": "Dienstag", "wednesday": "Mittwoch",
-            "thursday": "Donnerstag", "friday": "Freitag",
-            "saturday": "Samstag", "sunday": "Sonntag"
-        }
+            day_label = {
+                "monday": "Montag", "tuesday": "Dienstag", "wednesday": "Mittwoch",
+                "thursday": "Donnerstag", "friday": "Freitag",
+                "saturday": "Samstag", "sunday": "Sonntag"
+            }
 
         for i, (_pos, ann) in enumerate(eigene):
 
             last_sent_str = ann.get("last_sent")
-            last_sent_display = (
-                f"📅 Zuletzt gesendet: **{last_sent_str}** um **{ann['time']} Uhr**"
-                if last_sent_str
-                else "📅 Zuletzt gesendet: **Noch nie**"
-            )
+            if sprache == "en":
+                last_sent_display = (
+                    f"📅 Last sent: **{last_sent_str}** at **{ann['time']}**"
+                    if last_sent_str else "📅 Last sent: **Never**"
+                )
+            else:
+                last_sent_display = (
+                    f"📅 Zuletzt gesendet: **{last_sent_str}** um **{ann['time']} Uhr**"
+                    if last_sent_str
+                    else "📅 Zuletzt gesendet: **Noch nie**"
+                )
 
             next_dt = get_next_send_datetime(ann)
-            next_display = (
-                f"⏭️ Nächster Post: **{next_dt.strftime('%d.%m.%Y')}** um **{next_dt.strftime('%H:%M')} Uhr**\n"
-                f"⏱️ In: **{format_countdown(next_dt)}**"
-            )
+            if sprache == "en":
+                next_display = (
+                    f"⏭️ Next post: **{next_dt.strftime('%d.%m.%Y')}** at **{next_dt.strftime('%H:%M')}**\n"
+                    f"⏱️ In: **{format_countdown(next_dt)}**"
+                )
+            else:
+                next_display = (
+                    f"⏭️ Nächster Post: **{next_dt.strftime('%d.%m.%Y')}** um **{next_dt.strftime('%H:%M')} Uhr**\n"
+                    f"⏱️ In: **{format_countdown(next_dt)}**"
+                )
 
+            zeiteinheit = "" if sprache == "en" else " Uhr"
             embed.add_field(
-                name=f"#{i} • {day_label.get(ann['day'], ann['day'])} • {ann['time']} Uhr • {repeat_label.get(ann.get('repeat', 'weekly'), ann.get('repeat', ''))}",
+                name=f"#{i} • {day_label.get(ann['day'], ann['day'])} • {ann['time']}{zeiteinheit} • "
+                     f"{repeat_label.get(ann.get('repeat', 'weekly'), ann.get('repeat', ''))}",
                 value=(
                     f"💬 {ann['message']}\n"
                     f"📢 Channel: <#{ann['channel_id']}>\n"
@@ -8130,7 +8504,7 @@ async def cmd_ann_loeschen(
     save_announcements()
 
     await interaction.response.send_message(
-        "✅ Gelöscht",
+        _t(interaction, "✅ Gelöscht", "✅ Deleted"),
         ephemeral=True
     )
 
@@ -8148,6 +8522,9 @@ async def cmd_hackban(
     if not _is_admin(interaction):
         return await _deny(interaction)
 
+    if grund == "Kein Grund angegeben":
+        grund = _t(interaction, grund, "No reason given")
+
     try:
 
         user = await bot.fetch_user(int(user_id))
@@ -8158,35 +8535,36 @@ async def cmd_hackban(
             delete_message_days=0
         )
 
-        await interaction.response.send_message(
-            f"✅ Benutzer {user} wurde gebannt.\nGrund: {grund}"
+        await interaction.response.send_message(_t(
+            interaction, f"✅ Benutzer {user} wurde gebannt.\nGrund: {grund}",
+            f"✅ User {user} has been banned.\nReason: {grund}")
         )
 
     except discord.NotFound:
 
-        await interaction.response.send_message(
-            "❌ Benutzer nicht gefunden.",
+        await interaction.response.send_message(_t(
+            interaction, "❌ Benutzer nicht gefunden.", "❌ User not found."),
             ephemeral=True
         )
 
     except discord.Forbidden:
 
-        await interaction.response.send_message(
-            "❌ Keine Rechte.",
+        await interaction.response.send_message(_t(
+            interaction, "❌ Keine Rechte.", "❌ No permission."),
             ephemeral=True
         )
 
     except ValueError:
 
-        await interaction.response.send_message(
-            "❌ Ungültige User-ID.",
+        await interaction.response.send_message(_t(
+            interaction, "❌ Ungültige User-ID.", "❌ Invalid user ID."),
             ephemeral=True
         )
 
     except Exception as e:
 
         await interaction.response.send_message(
-            f"❌ Fehler: {e}",
+            f"❌ {_t(interaction, 'Fehler', 'Error')}: {e}",
             ephemeral=True
         )
 
@@ -9418,8 +9796,9 @@ async def _require_guild(interaction: discord.Interaction) -> bool:
     """Economy/Shop funktionieren nur in einer Guild (Salden sind pro Guild)."""
     if interaction.guild_id:
         return True
-    await interaction.response.send_message(
-        "❌ This command only works inside a server.", ephemeral=True)
+    await interaction.response.send_message(_t(
+        interaction, "❌ Dieser Befehl funktioniert nur auf einem Server.",
+        "❌ This command only works inside a server."), ephemeral=True)
     return False
 
 
@@ -9441,10 +9820,11 @@ async def cmd_work(interaction: discord.Interaction):
     db.set_cooldown(gid, uid, "work", int(conf.get("cooldown_seconds", 3600)))
 
     embed = discord.Embed(
-        title="💼 Work complete",
+        title=_t(interaction, "💼 Arbeit erledigt", "💼 Work complete"),
         description=random.choice(WORK_FLAVOR).format(amount=f"**{_fmt_money(amount)}**"),
         color=0x2ECC71)
-    embed.set_footer(text=f"Wallet: {_fmt_money(wallet)}")
+    embed.set_footer(text=_t(interaction, f"Wallet: {_fmt_money(wallet)}",
+                             f"Wallet: {_fmt_money(wallet)}"))
     await interaction.response.send_message(embed=embed)
 
 
@@ -9470,8 +9850,9 @@ async def cmd_daily(interaction: discord.Interaction):
     db.set_cooldown(gid, uid, "daily", int(conf.get("cooldown_seconds", 86400)))
 
     embed = discord.Embed(
-        title="📅 Daily bonus",
-        description=f"You claimed your daily bonus of **{_fmt_money(amount)}**!",
+        title=_t(interaction, "📅 Tagesbonus", "📅 Daily bonus"),
+        description=_t(interaction, f"Du hast deinen Tagesbonus von **{_fmt_money(amount)}** abgeholt!",
+                       f"You claimed your daily bonus of **{_fmt_money(amount)}**!"),
         color=0x2ECC71)
     embed.set_footer(text=f"Wallet: {_fmt_money(wallet)}")
     await interaction.response.send_message(embed=embed)
@@ -9493,7 +9874,7 @@ async def cmd_beg(interaction: discord.Interaction):
 
     if random.random() < float(conf.get("fail_chance", 0.35)):
         embed = discord.Embed(
-            title="🥺 Begging failed",
+            title=_t(interaction, "🥺 Betteln fehlgeschlagen", "🥺 Begging failed"),
             description=random.choice(BEG_FAIL),
             color=0xE74C3C)
         return await interaction.response.send_message(embed=embed)
@@ -9503,7 +9884,7 @@ async def cmd_beg(interaction: discord.Interaction):
     wallet, _bank = db.add_wallet(gid, uid, amount)
 
     embed = discord.Embed(
-        title="🥺 Begging paid off",
+        title=_t(interaction, "🥺 Betteln hat sich gelohnt", "🥺 Begging paid off"),
         description=random.choice(BEG_SUCCESS).format(amount=f"**{_fmt_money(amount)}**"),
         color=0x2ECC71)
     embed.set_footer(text=f"Wallet: {_fmt_money(wallet)}")
@@ -9523,7 +9904,8 @@ async def cmd_balance(interaction: discord.Interaction,
     wallet, bank = db.get_balance(interaction.guild_id, target.id)
 
     embed = discord.Embed(
-        title=f"💳 Balance – {target.display_name}",
+        title=_t(interaction, f"💳 Kontostand – {target.display_name}",
+                 f"💳 Balance – {target.display_name}"),
         color=0x5865F2)
     embed.add_field(name="👛 Wallet", value=_fmt_money(wallet),        inline=True)
     embed.add_field(name="🏦 Bank",   value=_fmt_money(bank),          inline=True)
@@ -9541,11 +9923,13 @@ async def cmd_deposit(interaction: discord.Interaction,
         return
     moved, wallet, bank = db.deposit(interaction.guild_id, interaction.user.id, amount)
     if moved <= 0:
-        return await interaction.response.send_message(
-            "❌ Nothing to deposit – your wallet is empty.", ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Nichts einzuzahlen – dein Wallet ist leer.",
+            "❌ Nothing to deposit – your wallet is empty."), ephemeral=True)
     embed = discord.Embed(
-        title="🏦 Deposit successful",
-        description=f"Moved **{_fmt_money(moved)}** into your bank.",
+        title=_t(interaction, "🏦 Einzahlung erfolgreich", "🏦 Deposit successful"),
+        description=_t(interaction, f"**{_fmt_money(moved)}** in deine Bank verschoben.",
+                       f"Moved **{_fmt_money(moved)}** into your bank."),
         color=0x2ECC71)
     embed.add_field(name="👛 Wallet", value=_fmt_money(wallet), inline=True)
     embed.add_field(name="🏦 Bank",   value=_fmt_money(bank),   inline=True)
@@ -9560,11 +9944,13 @@ async def cmd_withdraw(interaction: discord.Interaction,
         return
     moved, wallet, bank = db.withdraw(interaction.guild_id, interaction.user.id, amount)
     if moved <= 0:
-        return await interaction.response.send_message(
-            "❌ Nothing to withdraw – your bank is empty.", ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Nichts abzuheben – deine Bank ist leer.",
+            "❌ Nothing to withdraw – your bank is empty."), ephemeral=True)
     embed = discord.Embed(
-        title="👛 Withdraw successful",
-        description=f"Moved **{_fmt_money(moved)}** into your wallet.",
+        title=_t(interaction, "👛 Abhebung erfolgreich", "👛 Withdraw successful"),
+        description=_t(interaction, f"**{_fmt_money(moved)}** in dein Wallet verschoben.",
+                       f"Moved **{_fmt_money(moved)}** into your wallet."),
         color=0x2ECC71)
     embed.add_field(name="👛 Wallet", value=_fmt_money(wallet), inline=True)
     embed.add_field(name="🏦 Bank",   value=_fmt_money(bank),   inline=True)
@@ -9597,10 +9983,12 @@ async def cmd_addmoney(interaction: discord.Interaction,
         return await _deny(interaction)
     wallet, _bank = db.add_wallet(interaction.guild_id, user.id, int(amount))
     embed = discord.Embed(
-        title="💰 Money added",
-        description=f"Added **{_fmt_money(amount)}** to {user.mention}'s wallet.",
+        title=_t(interaction, "💰 Geld hinzugefügt", "💰 Money added"),
+        description=_t(interaction, f"**{_fmt_money(amount)}** zu {user.mention}s Wallet hinzugefügt.",
+                       f"Added **{_fmt_money(amount)}** to {user.mention}'s wallet."),
         color=0x2ECC71)
-    embed.set_footer(text=f"New wallet: {_fmt_money(wallet)}")
+    embed.set_footer(text=_t(interaction, f"Neues Wallet: {_fmt_money(wallet)}",
+                             f"New wallet: {_fmt_money(wallet)}"))
     await interaction.response.send_message(embed=embed)
     await _post_economy_admin_log(interaction, "💰 ADMIN: ADD MONEY",
                                   user, f"+{_fmt_money(amount)}", wallet, 0x2ECC71)
@@ -9616,10 +10004,12 @@ async def cmd_removemoney(interaction: discord.Interaction,
     wallet, _bank = db.add_wallet(interaction.guild_id, user.id, -int(amount))
     removed = old_wallet - wallet   # nie unter 0 → tatsächlich abgezogener Betrag
     embed = discord.Embed(
-        title="💸 Money removed",
-        description=f"Removed **{_fmt_money(removed)}** from {user.mention}'s wallet.",
+        title=_t(interaction, "💸 Geld entfernt", "💸 Money removed"),
+        description=_t(interaction, f"**{_fmt_money(removed)}** von {user.mention}s Wallet entfernt.",
+                       f"Removed **{_fmt_money(removed)}** from {user.mention}'s wallet."),
         color=0xE67E22)
-    embed.set_footer(text=f"New wallet: {_fmt_money(wallet)}")
+    embed.set_footer(text=_t(interaction, f"Neues Wallet: {_fmt_money(wallet)}",
+                             f"New wallet: {_fmt_money(wallet)}"))
     await interaction.response.send_message(embed=embed)
     await _post_economy_admin_log(interaction, "💸 ADMIN: REMOVE MONEY",
                                   user, f"-{_fmt_money(removed)}", wallet, 0xE67E22)
@@ -9633,8 +10023,9 @@ async def cmd_setbalance(interaction: discord.Interaction,
         return await _deny(interaction)
     wallet, _bank = db.set_wallet(interaction.guild_id, user.id, int(amount))
     embed = discord.Embed(
-        title="🎯 Balance set",
-        description=f"{user.mention}'s wallet is now **{_fmt_money(wallet)}**.",
+        title=_t(interaction, "🎯 Kontostand gesetzt", "🎯 Balance set"),
+        description=_t(interaction, f"{user.mention}s Wallet ist jetzt **{_fmt_money(wallet)}**.",
+                       f"{user.mention}'s wallet is now **{_fmt_money(wallet)}**."),
         color=0x5865F2)
     await interaction.response.send_message(embed=embed)
     await _post_economy_admin_log(interaction, "🎯 ADMIN: SET BALANCE",
@@ -9653,20 +10044,30 @@ async def cmd_economy_reload(interaction: discord.Interaction):
         if katalog is not None:
             katalog.load()
             items = [i for i in katalog.items if i.get("enabled", True)]
-            katalog_txt = f"**{len(items)}** active items from `{katalog.source}`"
+            katalog_txt = _t(interaction, f"**{len(items)}** aktive Items aus `{katalog.source}`",
+                             f"**{len(items)}** active items from `{katalog.source}`")
         else:
-            katalog_txt = "kein Server zugeordnet"
+            katalog_txt = _t(interaction, "kein Server zugeordnet", "no server assigned")
         embed = discord.Embed(
-            title="🔄 Config reloaded",
-            description=(f"`config.json` was reloaded successfully.\n"
-                         f"Catalog: {katalog_txt} · "
-                         f"Currency: **{_conn_c.get('currency_name', '?') if _conn_c else '?'} "
-                         f"({_cur_symbol(_conn_c)})**"),
+            title=_t(interaction, "🔄 Config neu geladen", "🔄 Config reloaded"),
+            description=_t(
+                interaction,
+                f"`config.json` wurde erfolgreich neu geladen.\n"
+                f"Katalog: {katalog_txt} · "
+                f"Währung: **{_conn_c.get('currency_name', '?') if _conn_c else '?'} "
+                f"({_cur_symbol(_conn_c)})**",
+                f"`config.json` was reloaded successfully.\n"
+                f"Catalog: {katalog_txt} · "
+                f"Currency: **{_conn_c.get('currency_name', '?') if _conn_c else '?'} "
+                f"({_cur_symbol(_conn_c)})**"),
             color=0x2ECC71)
     else:
         embed = discord.Embed(
-            title="❌ Reload failed",
-            description="Could not parse `config.json` – check the bot log / JSON syntax.",
+            title=_t(interaction, "❌ Neuladen fehlgeschlagen", "❌ Reload failed"),
+            description=_t(
+                interaction,
+                "`config.json` konnte nicht gelesen werden – Bot-Log / JSON-Syntax prüfen.",
+                "Could not parse `config.json` – check the bot log / JSON syntax."),
             color=0xE74C3C)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -9709,22 +10110,27 @@ async def cmd_stats(interaction: discord.Interaction, spieler: str):
         return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
     st = db.player_stats(conn.service_id, spieler.strip())
     if not st:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             f"❌ Keine PvP-Daten für **{spieler}** gefunden. Statistiken werden "
-            f"ab jetzt automatisch aus dem Killfeed aufgezeichnet.", ephemeral=True)
-    e = discord.Embed(title=f"📊 Statistiken – {spieler}", color=0x5865F2)
+            f"ab jetzt automatisch aus dem Killfeed aufgezeichnet.",
+            f"❌ No PvP data found for **{spieler}**. Stats are recorded "
+            f"automatically from the kill feed from now on."), ephemeral=True)
+    e = discord.Embed(title=_t(interaction, f"📊 Statistiken – {spieler}", f"📊 Stats – {spieler}"),
+                      color=0x5865F2)
     e.add_field(name="☠️ Kills", value=str(st["kills"]), inline=True)
-    e.add_field(name="💀 Tode",  value=str(st["deaths"]), inline=True)
+    e.add_field(name=_t(interaction, "💀 Tode", "💀 Deaths"), value=str(st["deaths"]), inline=True)
     e.add_field(name="⚖️ K/D",   value=f"{st['kd']:.2f}", inline=True)
-    e.add_field(name="🔫 Lieblingswaffe",
-                value=(f"{st['fav_weapon']} ({st['fav_weapon_kills']} Kills)"
-                       if st["fav_weapon"] else "–"), inline=True)
-    e.add_field(name="🎯 Weitester Kill",
+    e.add_field(name=_t(interaction, "🔫 Lieblingswaffe", "🔫 Favorite Weapon"),
+                value=(f"{st['fav_weapon']} ({st['fav_weapon_kills']} "
+                      f"{_t(interaction, 'Kills', 'kills')})"
+                      if st["fav_weapon"] else "–"), inline=True)
+    e.add_field(name=_t(interaction, "🎯 Weitester Kill", "🎯 Longest Kill"),
                 value=(f"{st['longest']:.0f} m" if st["longest"] else "–"), inline=True)
     if interaction.guild_id:
         links = db.links_for_name(spieler.strip(), interaction.guild_id)
         if links:
-            e.add_field(name="🔗 Verknüpft mit",
+            e.add_field(name=_t(interaction, "🔗 Verknüpft mit", "🔗 Linked To"),
                         value=f"<@{int(links[0]['user_id'])}>", inline=True)
     await interaction.response.send_message(embed=e)
 
@@ -9736,19 +10142,24 @@ async def cmd_leaderboard(interaction: discord.Interaction):
         return await interaction.response.send_message(PREMIUM_MISSING_TEXT, ephemeral=True)
     rows = db.leaderboard(conn.service_id, 10)
     if not rows:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             "❌ Noch keine PvP-Kills aufgezeichnet – das Leaderboard füllt sich "
-            "automatisch aus dem Killfeed.", ephemeral=True)
+            "automatisch aus dem Killfeed.",
+            "❌ No PvP kills recorded yet – the leaderboard fills "
+            "automatically from the kill feed."), ephemeral=True)
     medals = ["🥇", "🥈", "🥉"]
+    tode_wort = _t(interaction, "Tode", "deaths")
     lines = []
     for i, r in enumerate(rows):
         rank = medals[i] if i < 3 else f"`#{i + 1}`"
         best = f" · 🎯 {r['best']:.0f} m" if r["best"] else ""
         lines.append(f"{rank} **{r['name']}** – {r['kills']} Kills · "
-                     f"{r['deaths']} Tode · K/D {r['kd']:.2f}{best}")
-    e = discord.Embed(title="🏆 Kill-Leaderboard", description="\n".join(lines),
-                      color=0xF1C40F)
-    e.set_footer(text="Automatisch aus dem Killfeed · /stats <spieler> für Details")
+                     f"{r['deaths']} {tode_wort} · K/D {r['kd']:.2f}{best}")
+    e = discord.Embed(title=_t(interaction, "🏆 Kill-Leaderboard", "🏆 Kill Leaderboard"),
+                      description="\n".join(lines), color=0xF1C40F)
+    e.set_footer(text=_t(interaction, "Automatisch aus dem Killfeed · /stats <spieler> für Details",
+                         "Automatic from the kill feed · /stats <player> for details"))
     await interaction.response.send_message(embed=e)
 
 
@@ -9777,22 +10188,29 @@ async def cmd_link(interaction: discord.Interaction, playstation_name: str):
         return
     name = playstation_name.strip()
     if not name or len(name) > 64:
-        return await interaction.response.send_message(
-            "❌ Ungültiger Name.", ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Ungültiger Name.", "❌ Invalid name."), ephemeral=True)
     existing = db.get_link_by_user(interaction.guild_id, interaction.user.id)
     if existing:
         old_name = str(existing["ingame_name"])
         if old_name.lower() == name.lower():
-            return await interaction.response.send_message(
-                f"✅ Du bist bereits mit **{old_name}** verbunden.", ephemeral=True)
-        return await interaction.response.send_message(
+            return await interaction.response.send_message(_t(
+                interaction, f"✅ Du bist bereits mit **{old_name}** verbunden.",
+                f"✅ You are already linked to **{old_name}**."), ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction,
             f"❌ Du bist bereits mit **{old_name}** verbunden – nutze zuerst `/unlink`, "
-            f"um den Namen zu wechseln.", ephemeral=True)
+            f"um den Namen zu wechseln.",
+            f"❌ You are already linked to **{old_name}** – use `/unlink` first "
+            f"to change the name."), ephemeral=True)
     ok, _why = db.link_user(interaction.guild_id, interaction.user.id, name)
     if not ok:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             f"❌ **{name}** ist bereits mit einem anderen Discord-Account verknüpft. "
-            f"Ein Admin kann das mit `/forcelink` korrigieren.", ephemeral=True)
+            f"Ein Admin kann das mit `/forcelink` korrigieren.",
+            f"❌ **{name}** is already linked to a different Discord account. "
+            f"An admin can fix this with `/forcelink`."), ephemeral=True)
     # Logs nach dem PSN-Namen prüfen: Ist der Spieler gerade auf dem Server,
     # startet der Spielzeit-Zähler sofort (kein neues Connect-Event nötig)
     _conn = _conn_of(interaction)
@@ -9804,21 +10222,35 @@ async def cmd_link(interaction: discord.Interaction, playstation_name: str):
             db.update_link_id(name, str(seen["id"]), interaction.guild_id)
         if not db.has_session(_sid, name):
             db.open_session(_sid, name, seen.get("id"))
-        online_line = "\n🟢 Du bist gerade auf dem Server – der Spielzeit-Zähler läuft ab jetzt!"
+        online_line = _t(
+            interaction,
+            "\n🟢 Du bist gerade auf dem Server – der Spielzeit-Zähler läuft ab jetzt!",
+            "\n🟢 You are currently on the server – the playtime counter starts now!")
     else:
-        online_line = ("\nℹ️ Aktuell nicht in den Logs gesehen – der Spielzeit-Zähler "
-                       "startet bei deinem nächsten Connect.")
+        online_line = _t(
+            interaction,
+            "\nℹ️ Aktuell nicht in den Logs gesehen – der Spielzeit-Zähler "
+            "startet bei deinem nächsten Connect.",
+            "\nℹ️ Not currently seen in the logs – the playtime counter "
+            "starts on your next connect.")
     reward   = int((_conn.get("kill_reward", 0) if _conn is not None
                     else cfg.config.get("kill_reward", 0)) or 0)
     pt       = ((_conn.get("playtime_reward") if _conn is not None
                  else cfg.config.get("playtime_reward")) or {})
-    pt_line  = (f"\n⏱️ Spielzeit: **{_fmt_money(int(pt.get('amount', 0)))}** pro "
-                f"**{int(pt.get('interval_minutes', 30))} Min** auf dem Server"
+    pt_line  = (_t(interaction,
+                   f"\n⏱️ Spielzeit: **{_fmt_money(int(pt.get('amount', 0)))}** pro "
+                   f"**{int(pt.get('interval_minutes', 30))} Min** auf dem Server",
+                   f"\n⏱️ Playtime: **{_fmt_money(int(pt.get('amount', 0)))}** per "
+                   f"**{int(pt.get('interval_minutes', 30))} min** on the server")
                 if int(pt.get("amount", 0)) > 0 else "")
     e = discord.Embed(
-        title="🔗 Account verknüpft",
-        description=(f"{interaction.user.mention} ↔ **{name}**\n"
-                     f"☠️ Pro PvP-Kill: **{_fmt_money(reward)}**{pt_line}{online_line}"),
+        title=_t(interaction, "🔗 Account verknüpft", "🔗 Account linked"),
+        description=_t(
+            interaction,
+            f"{interaction.user.mention} ↔ **{name}**\n"
+            f"☠️ Pro PvP-Kill: **{_fmt_money(reward)}**{pt_line}{online_line}",
+            f"{interaction.user.mention} ↔ **{name}**\n"
+            f"☠️ Per PvP kill: **{_fmt_money(reward)}**{pt_line}{online_line}"),
         color=0x2ECC71)
     await interaction.response.send_message(embed=e)
     note = discord.Embed(
@@ -9834,10 +10266,12 @@ async def cmd_unlink(interaction: discord.Interaction):
         return
     old = db.unlink_user(interaction.guild_id, interaction.user.id)
     if not old:
-        return await interaction.response.send_message(
-            "❌ Du bist mit keinem Ingame-Namen verknüpft.", ephemeral=True)
-    await interaction.response.send_message(
-        f"🔓 Verknüpfung mit **{old}** entfernt.", ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Du bist mit keinem Ingame-Namen verknüpft.",
+            "❌ You are not linked to any in-game name."), ephemeral=True)
+    await interaction.response.send_message(_t(
+        interaction, f"🔓 Verknüpfung mit **{old}** entfernt.",
+        f"🔓 Link to **{old}** removed."), ephemeral=True)
     note = discord.Embed(
         title="🔓 /unlink verwendet",
         description=f"{interaction.user.mention} (`{interaction.user}`) hat die Verknüpfung mit **{old}** entfernt.",
@@ -9861,8 +10295,9 @@ async def cmd_forcelink(interaction: discord.Interaction,
         if int(lk["user_id"]) != user.id:
             db.unlink_user(interaction.guild_id, int(lk["user_id"]))
     db.link_user(interaction.guild_id, user.id, name)
-    await interaction.response.send_message(
-        f"🔗 **{name}** ↔ {user.mention} verknüpft (Admin).", ephemeral=True)
+    await interaction.response.send_message(_t(
+        interaction, f"🔗 **{name}** ↔ {user.mention} verknüpft (Admin).",
+        f"🔗 **{name}** ↔ {user.mention} linked (admin)."), ephemeral=True)
     note = discord.Embed(
         title="🔗 /forcelink verwendet",
         description=(f"{interaction.user.mention} hat {user.mention} "
@@ -9880,10 +10315,12 @@ async def cmd_forceunlink(interaction: discord.Interaction, user: discord.Member
         return
     old = db.unlink_user(interaction.guild_id, user.id)
     if not old:
-        return await interaction.response.send_message(
-            f"❌ {user.mention} ist mit keinem Ingame-Namen verknüpft.", ephemeral=True)
-    await interaction.response.send_message(
-        f"🔓 Verknüpfung {user.mention} ↔ **{old}** entfernt (Admin).", ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ {user.mention} ist mit keinem Ingame-Namen verknüpft.",
+            f"❌ {user.mention} is not linked to any in-game name."), ephemeral=True)
+    await interaction.response.send_message(_t(
+        interaction, f"🔓 Verknüpfung {user.mention} ↔ **{old}** entfernt (Admin).",
+        f"🔓 Link {user.mention} ↔ **{old}** removed (admin)."), ephemeral=True)
     note = discord.Embed(
         title="🔓 /forceunlink verwendet",
         description=(f"{interaction.user.mention} hat die Verknüpfung "
@@ -9904,24 +10341,28 @@ async def username_list(interaction: discord.Interaction):
         # Normale Nutzer sehen nur die eigene Verknüpfung
         own = db.get_link_by_user(interaction.guild_id, interaction.user.id)
         if not own:
-            return await interaction.response.send_message(
-                "ℹ️ Du bist mit keinem PSN-Namen verknüpft. Nutze `/link <psn-name>`.",
+            return await interaction.response.send_message(_t(
+                interaction, "ℹ️ Du bist mit keinem PSN-Namen verknüpft. Nutze `/link <psn-name>`.",
+                "ℹ️ You are not linked to any PSN name. Use `/link <psn-name>`."),
                 ephemeral=True)
         name   = str(own["ingame_name"])
         _conn  = _conn_of(interaction)
         _sid   = _conn.service_id if _conn is not None else ""
         online = "🟢 " if db.has_session(_sid, name) else "⚫ "
         e = discord.Embed(
-            title="🔗 Deine Verknüpfung",
+            title=_t(interaction, "🔗 Deine Verknüpfung", "🔗 Your Link"),
             description=f"{online}**{name}** ↔ {interaction.user.mention}",
             color=0x5865F2)
-        e.set_footer(text="🟢 = gerade auf dem Server · Admins sehen die vollständige Liste")
+        e.set_footer(text=_t(interaction, "🟢 = gerade auf dem Server · Admins sehen die vollständige Liste",
+                             "🟢 = currently on the server · Admins see the full list"))
         return await interaction.response.send_message(embed=e, ephemeral=True)
     rows = db.list_links(interaction.guild_id)
     if not rows:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             "ℹ️ Noch keine Verknüpfungen vorhanden. Spieler verbinden sich mit "
-            "`/link <psn-name>`.", ephemeral=True)
+            "`/link <psn-name>`.",
+            "ℹ️ No links yet. Players link with `/link <psn-name>`."), ephemeral=True)
     lines = []
     _conn = _conn_of(interaction)
     _sid  = _conn.service_id if _conn is not None else ""
@@ -9929,11 +10370,16 @@ async def username_list(interaction: discord.Interaction):
         online = "🟢 " if db.has_session(_sid, str(r["ingame_name"])) else "⚫ "
         lines.append(f"{online}**{r['ingame_name']}** ↔ <@{int(r['user_id'])}>")
     e = discord.Embed(
-        title=f"🔗 Verknüpfte PSN-Namen ({len(rows)})",
+        title=_t(interaction, f"🔗 Verknüpfte PSN-Namen ({len(rows)})",
+                 f"🔗 Linked PSN Names ({len(rows)})"),
         description="\n".join(lines),
         color=0x5865F2)
-    e.set_footer(text="🟢 = gerade auf dem Server (offene Spielzeit-Sitzung)"
-                      + (f" · … und {len(rows) - 50} weitere" if len(rows) > 50 else ""))
+    e.set_footer(text=_t(
+        interaction,
+        "🟢 = gerade auf dem Server (offene Spielzeit-Sitzung)"
+        + (f" · … und {len(rows) - 50} weitere" if len(rows) > 50 else ""),
+        "🟢 = currently on the server (open playtime session)"
+        + (f" · … and {len(rows) - 50} more" if len(rows) > 50 else "")))
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
@@ -9950,15 +10396,19 @@ async def cmd_bounty(interaction: discord.Interaction,
     name = spieler.strip()
     own = db.get_link_by_user(interaction.guild_id, interaction.user.id)
     if own and str(own["ingame_name"]).lower() == name.lower():
-        return await interaction.response.send_message(
-            "❌ Auf deinen eigenen Kopf kannst du kein Kopfgeld aussetzen.", ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Auf deinen eigenen Kopf kannst du kein Kopfgeld aussetzen.",
+            "❌ You can't place a bounty on your own head."), ephemeral=True)
     bconf   = _srv_conf(interaction, "bounty")
     min_amt = int(bconf.get("min_amount", 100))
     max_amt = int(bconf.get("max_amount", 10000))
     if not (min_amt <= int(betrag) <= max_amt):
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             f"❌ Kopfgeld muss zwischen **{_fmt_money(min_amt)}** und "
-            f"**{_fmt_money(max_amt)}** liegen (`bounty` in config.json).", ephemeral=True)
+            f"**{_fmt_money(max_amt)}** liegen (`bounty` in config.json).",
+            f"❌ Bounty must be between **{_fmt_money(min_amt)}** and "
+            f"**{_fmt_money(max_amt)}** (`bounty` in config.json)."), ephemeral=True)
     remaining = db.cooldown_remaining(interaction.guild_id, interaction.user.id, "bounty")
     if remaining > 0:
         return await interaction.response.send_message(
@@ -9971,12 +10421,18 @@ async def cmd_bounty(interaction: discord.Interaction,
     db.set_cooldown(interaction.guild_id, interaction.user.id, "bounty",
                     int(bconf.get("cooldown_seconds", 300)))
     e = discord.Embed(
-        title="🎯 Kopfgeld ausgesetzt",
-        description=(f"**{_fmt_money(betrag)}** auf den Kopf von **{name}**!\n"
-                     f"Gesamtes Kopfgeld: **{_fmt_money(total)}**\n"
-                     f"Auszahlung automatisch an den (per `/link` verknüpften) Killer."),
+        title=_t(interaction, "🎯 Kopfgeld ausgesetzt", "🎯 Bounty placed"),
+        description=_t(
+            interaction,
+            f"**{_fmt_money(betrag)}** auf den Kopf von **{name}**!\n"
+            f"Gesamtes Kopfgeld: **{_fmt_money(total)}**\n"
+            f"Auszahlung automatisch an den (per `/link` verknüpften) Killer.",
+            f"**{_fmt_money(betrag)}** on the head of **{name}**!\n"
+            f"Total bounty: **{_fmt_money(total)}**\n"
+            f"Paid out automatically to the killer (if linked via `/link`)."),
         color=0xE67E22)
-    e.set_footer(text=f"Ausgesetzt von {interaction.user.display_name}")
+    e.set_footer(text=_t(interaction, f"Ausgesetzt von {interaction.user.display_name}",
+                         f"Placed by {interaction.user.display_name}"))
     await interaction.response.send_message(embed=e)
 
 
@@ -9986,13 +10442,15 @@ async def cmd_bounties(interaction: discord.Interaction):
         return
     rows = db.open_bounties(interaction.guild_id)
     if not rows:
-        return await interaction.response.send_message(
-            "✅ Keine aktiven Kopfgelder.", ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction, "✅ Keine aktiven Kopfgelder.", "✅ No active bounties."), ephemeral=True)
+    kopfgeld_wort = _t(interaction, "Kopfgeld", "bounty")
+    kopfgelder_wort = _t(interaction, "Kopfgelder", "bounties")
     lines = [f"🎯 **{r['target_name']}** – {_fmt_money(int(r['total']))} "
-             f"({int(r['n'])} Kopfgeld{'er' if int(r['n']) != 1 else ''})"
+             f"({int(r['n'])} {kopfgelder_wort if int(r['n']) != 1 else kopfgeld_wort})"
              for r in rows[:20]]
-    e = discord.Embed(title="🎯 Aktive Kopfgelder", description="\n".join(lines),
-                      color=0xE67E22)
+    e = discord.Embed(title=_t(interaction, "🎯 Aktive Kopfgelder", "🎯 Active Bounties"),
+                      description="\n".join(lines), color=0xE67E22)
     await interaction.response.send_message(embed=e)
 
 
@@ -10003,18 +10461,20 @@ async def cmd_pay(interaction: discord.Interaction,
     if not await _require_guild(interaction):
         return
     if user.id == interaction.user.id:
-        return await interaction.response.send_message(
-            "❌ Du kannst dir nicht selbst Geld überweisen.", ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Du kannst dir nicht selbst Geld überweisen.",
+            "❌ You can't transfer money to yourself."), ephemeral=True)
     if user.bot:
-        return await interaction.response.send_message(
-            "❌ Bots brauchen kein Geld.", ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Bots brauchen kein Geld.", "❌ Bots don't need money."),
+            ephemeral=True)
     if not db.try_spend_wallet(interaction.guild_id, interaction.user.id, int(betrag)):
         wallet, _ = db.get_balance(interaction.guild_id, interaction.user.id)
         return await interaction.response.send_message(
             embed=_insufficient_embed(int(betrag), wallet), ephemeral=True)
     new_wallet, _ = db.add_wallet(interaction.guild_id, user.id, int(betrag))
     e = discord.Embed(
-        title="💸 Überweisung",
+        title=_t(interaction, "💸 Überweisung", "💸 Transfer"),
         description=f"{interaction.user.mention} → {user.mention}: **{_fmt_money(betrag)}**",
         color=0x2ECC71)
     await interaction.response.send_message(embed=e)
@@ -10079,17 +10539,24 @@ async def cmd_slots(interaction: discord.Interaction, bet: app_commands.Range[in
 
     net = payout - bet
     if net > 0:
-        color, headline = 0x2ECC71, f"You won **{_fmt_money(payout)}**! (net **+{net:,}**)"
+        color = 0x2ECC71
+        headline = _t(interaction, f"Du hast **{_fmt_money(payout)}** gewonnen! (netto **+{net:,}**)",
+                     f"You won **{_fmt_money(payout)}**! (net **+{net:,}**)")
     elif net == 0:
-        color, headline = 0x95A5A6, "Break-even – your bet came back."
+        color = 0x95A5A6
+        headline = _t(interaction, "Unentschieden – dein Einsatz kam zurück.",
+                     "Break-even – your bet came back.")
     else:
-        color, headline = 0xE74C3C, f"You lost **{_fmt_money(bet)}**."
+        color = 0xE74C3C
+        headline = _t(interaction, f"Du hast **{_fmt_money(bet)}** verloren.",
+                     f"You lost **{_fmt_money(bet)}**.")
 
     embed = discord.Embed(
         title="🎰 Slots",
         description=f"**| {reels[0]} | {reels[1]} | {reels[2]} |**\n\n{headline}",
         color=color)
-    embed.set_footer(text=f"Bet: {_fmt_money(bet)} · Wallet: {_fmt_money(wallet)}")
+    embed.set_footer(text=_t(interaction, f"Einsatz: {_fmt_money(bet)} · Wallet: {_fmt_money(wallet)}",
+                             f"Bet: {_fmt_money(bet)} · Wallet: {_fmt_money(wallet)}"))
     await interaction.response.send_message(embed=embed)
 
 
@@ -10119,9 +10586,12 @@ async def cmd_roulette(interaction: discord.Interaction,
     elif w.isdigit() and 0 <= int(w) <= 36:
         kind, number = "number", int(w)
     else:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Ungültige Wette. Nutze `red`, `black`, `green`, `even`, `odd`, `low`, `high` "
+            "oder eine Zahl von `0` bis `36`.",
             "❌ Invalid wager. Use `red`, `black`, `green`, `even`, `odd`, `low`, `high` "
-            "or a number from `0` to `36`.", ephemeral=True)
+            "or a number from `0` to `36`."), ephemeral=True)
 
     err = _validate_bet(bet, conf)
     if err:
@@ -10138,11 +10608,11 @@ async def cmd_roulette(interaction: discord.Interaction,
 
     spin = random.randint(0, 36)
     if spin == 0:
-        spin_disp = "🟢 **0** (green)"
+        spin_disp = _t(interaction, "🟢 **0** (grün)", "🟢 **0** (green)")
     elif spin in _ROULETTE_RED:
-        spin_disp = f"🔴 **{spin}** (red)"
+        spin_disp = _t(interaction, f"🔴 **{spin}** (rot)", f"🔴 **{spin}** (red)")
     else:
-        spin_disp = f"⚫ **{spin}** (black)"
+        spin_disp = _t(interaction, f"⚫ **{spin}** (schwarz)", f"⚫ **{spin}** (black)")
 
     # Gewinn & Auszahlungs-Multiplikator (Multiplikator = Gesamt-Rückzahlung × Einsatz)
     p_num  = float(conf.get("payout_number", 36.0))
@@ -10176,16 +10646,22 @@ async def cmd_roulette(interaction: discord.Interaction,
 
     if won:
         color = 0x2ECC71
-        headline = f"You won **{_fmt_money(payout)}**! (net **+{payout - bet:,}**)"
+        headline = _t(interaction, f"Du hast **{_fmt_money(payout)}** gewonnen! (netto **+{payout - bet:,}**)",
+                     f"You won **{_fmt_money(payout)}**! (net **+{payout - bet:,}**)")
     else:
         color = 0xE74C3C
-        headline = f"You lost **{_fmt_money(bet)}**."
+        headline = _t(interaction, f"Du hast **{_fmt_money(bet)}** verloren.",
+                     f"You lost **{_fmt_money(bet)}**.")
 
     embed = discord.Embed(
         title="🎡 Roulette",
-        description=f"The ball landed on {spin_disp}\nYour wager: **{wager_disp}**\n\n{headline}",
+        description=_t(
+            interaction,
+            f"Die Kugel landete auf {spin_disp}\nDeine Wette: **{wager_disp}**\n\n{headline}",
+            f"The ball landed on {spin_disp}\nYour wager: **{wager_disp}**\n\n{headline}"),
         color=color)
-    embed.set_footer(text=f"Bet: {_fmt_money(bet)} · Wallet: {_fmt_money(wallet)}")
+    embed.set_footer(text=_t(interaction, f"Einsatz: {_fmt_money(bet)} · Wallet: {_fmt_money(wallet)}",
+                             f"Bet: {_fmt_money(bet)} · Wallet: {_fmt_money(wallet)}"))
     await interaction.response.send_message(embed=embed)
 
 
@@ -10235,6 +10711,7 @@ class BlackjackView(discord.ui.View):
         super().__init__(timeout=120)
         self.user_id   = interaction.user.id
         self.guild_id  = interaction.guild_id
+        self.sprache   = _sprache(interaction)
         self.bet       = bet
         self.payout_bj = float(conf.get("blackjack_payout", 1.5))
         self.cooldown_s = int(conf.get("cooldown_seconds", 30))
@@ -10244,9 +10721,13 @@ class BlackjackView(discord.ui.View):
         self.finished  = False
         self.message: Optional[discord.Message] = None
 
+    def _t2(self, de: str, en: str) -> str:
+        return en if self.sprache == "en" else de
+
     async def interaction_check(self, itx: discord.Interaction) -> bool:
         if itx.user.id != self.user_id:
-            await itx.response.send_message("This is not your game.", ephemeral=True)
+            await itx.response.send_message(
+                self._t2("Das ist nicht dein Spiel.", "This is not your game."), ephemeral=True)
             return False
         return True
 
@@ -10255,12 +10736,14 @@ class BlackjackView(discord.ui.View):
         dealer_hand = " ".join(self.dealer) if reveal else f"{self.dealer[0]} 🂠"
         dealer_val  = str(_bj_value(self.dealer)) if reveal else "?"
         e = discord.Embed(title="🃏 Blackjack", color=color)
-        e.add_field(name=f"Your hand ({_bj_value(self.player)})",
+        e.add_field(name=self._t2(f"Deine Hand ({_bj_value(self.player)})",
+                                  f"Your hand ({_bj_value(self.player)})"),
                     value=" ".join(self.player), inline=False)
-        e.add_field(name=f"Dealer ({dealer_val})", value=dealer_hand, inline=False)
-        e.add_field(name="Bet", value=_fmt_money(self.bet), inline=True)
+        e.add_field(name=self._t2(f"Dealer ({dealer_val})", f"Dealer ({dealer_val})"),
+                    value=dealer_hand, inline=False)
+        e.add_field(name=self._t2("Einsatz", "Bet"), value=_fmt_money(self.bet), inline=True)
         if result_line:
-            e.add_field(name="Result", value=result_line, inline=False)
+            e.add_field(name=self._t2("Ergebnis", "Result"), value=result_line, inline=False)
         return e
 
     def _payout_and_log(self, mult: float, result: str) -> int:
@@ -10288,8 +10771,11 @@ class BlackjackView(discord.ui.View):
         db.set_cooldown(self.guild_id, self.user_id, "blackjack", self.cooldown_s)
         wallet, _bank = db.get_balance(self.guild_id, self.user_id)
         net = payout - self.bet
-        line = (f"{result}\nPayout: **{_fmt_money(payout)}** "
-                f"(net **{'+' if net >= 0 else ''}{net:,}**) · Wallet: {_fmt_money(wallet)}")
+        line = self._t2(
+            f"{result}\nAuszahlung: **{_fmt_money(payout)}** "
+            f"(netto **{'+' if net >= 0 else ''}{net:,}**) · Wallet: {_fmt_money(wallet)}",
+            f"{result}\nPayout: **{_fmt_money(payout)}** "
+            f"(net **{'+' if net >= 0 else ''}{net:,}**) · Wallet: {_fmt_money(wallet)}")
         embed = self.build_embed(reveal=True, result_line=line, color=color)
         if itx is not None:
             await itx.response.edit_message(embed=embed, view=self)
@@ -10304,13 +10790,15 @@ class BlackjackView(discord.ui.View):
         self._dealer_play()
         pv, dv = _bj_value(self.player), _bj_value(self.dealer)
         if dv > 21:
-            await self._finish(itx, "Dealer busts – you win!", 2.0, 0x2ECC71)
+            await self._finish(itx, self._t2("Dealer überkauft sich – du gewinnst!",
+                                              "Dealer busts – you win!"), 2.0, 0x2ECC71)
         elif pv > dv:
-            await self._finish(itx, "You win!", 2.0, 0x2ECC71)
+            await self._finish(itx, self._t2("Du gewinnst!", "You win!"), 2.0, 0x2ECC71)
         elif pv == dv:
-            await self._finish(itx, "Push – bet returned.", 1.0, 0x95A5A6)
+            await self._finish(itx, self._t2("Unentschieden – Einsatz zurück.",
+                                              "Push – bet returned."), 1.0, 0x95A5A6)
         else:
-            await self._finish(itx, "Dealer wins.", 0.0, 0xE74C3C)
+            await self._finish(itx, self._t2("Dealer gewinnt.", "Dealer wins."), 0.0, 0xE74C3C)
 
     @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary, emoji="🃏")
     async def hit(self, itx: discord.Interaction, button: discord.ui.Button):
@@ -10319,7 +10807,8 @@ class BlackjackView(discord.ui.View):
         self.player.append(self.deck.pop())
         value = _bj_value(self.player)
         if value > 21:
-            return await self._finish(itx, "Bust! You lose.", 0.0, 0xE74C3C)
+            return await self._finish(itx, self._t2("Überkauft! Du verlierst.", "Bust! You lose."),
+                                      0.0, 0xE74C3C)
         if value == 21:
             return await self._resolve_stand(itx)
         await itx.response.edit_message(embed=self.build_embed(), view=self)
@@ -10364,17 +10853,24 @@ async def cmd_blackjack(interaction: discord.Interaction, bet: app_commands.Rang
     # Natürlicher Blackjack → sofort auflösen, keine Buttons nötig
     if pv == 21 or dv == 21:
         if pv == 21 and dv == 21:
-            result, mult, color = "Double blackjack – push, bet returned.", 1.0, 0x95A5A6
+            result = view._t2("Doppelter Blackjack – Unentschieden, Einsatz zurück.",
+                              "Double blackjack – push, bet returned.")
+            mult, color = 1.0, 0x95A5A6
         elif pv == 21:
-            result = f"BLACKJACK! Pays {view.payout_bj}x bonus."
+            result = view._t2(f"BLACKJACK! Zahlt {view.payout_bj}x Bonus.",
+                              f"BLACKJACK! Pays {view.payout_bj}x bonus.")
             mult, color = 1.0 + view.payout_bj, 0xF1C40F
         else:
-            result, mult, color = "Dealer has blackjack. You lose.", 0.0, 0xE74C3C
+            result = view._t2("Dealer hat Blackjack. Du verlierst.", "Dealer has blackjack. You lose.")
+            mult, color = 0.0, 0xE74C3C
         payout = view._payout_and_log(mult, result)
         wallet, _bank = db.get_balance(gid, uid)
         net = payout - bet
-        line = (f"{result}\nPayout: **{_fmt_money(payout)}** "
-                f"(net **{'+' if net >= 0 else ''}{net:,}**) · Wallet: {_fmt_money(wallet)}")
+        line = view._t2(
+            f"{result}\nAuszahlung: **{_fmt_money(payout)}** "
+            f"(netto **{'+' if net >= 0 else ''}{net:,}**) · Wallet: {_fmt_money(wallet)}",
+            f"{result}\nPayout: **{_fmt_money(payout)}** "
+            f"(net **{'+' if net >= 0 else ''}{net:,}**) · Wallet: {_fmt_money(wallet)}")
         embed = view.build_embed(reveal=True, result_line=line, color=color)
         view.stop()
         return await interaction.response.send_message(embed=embed)
@@ -10637,10 +11133,16 @@ async def _shop_category_autocomplete(interaction: discord.Interaction,
 class ShopListView(discord.ui.View):
     """Einfache Seiten-Navigation für den Item-Katalog."""
 
-    def __init__(self, pages: List[discord.Embed]):
+    def __init__(self, pages: List[discord.Embed], sprache: str = "de"):
         super().__init__(timeout=180)
         self.pages = pages
         self.index = 0
+        if sprache == "en":
+            self.prev_page.label = "◀ Back"
+            self.next_page.label = "Next ▶"
+        else:
+            self.prev_page.label = "◀ Zurück"
+            self.next_page.label = "Weiter ▶"
         self._sync()
 
     def _sync(self):
@@ -10672,9 +11174,12 @@ async def shop_list(interaction: discord.Interaction, category: Optional[str] = 
         return
     enabled_items = [it for it in katalog.items if it.get("enabled", True)]
     if not enabled_items:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
+            "🛒 Der Shop ist aktuell leer. Admins: `types.xml` neben den Bot legen "
+            "und neu starten (der Katalog wird automatisch generiert), oder `/add shopitem` nutzen.",
             "🛒 The shop is currently empty. Admins: put your `types.xml` next to the bot "
-            "and restart (the catalog is generated automatically), or use `/add shopitem`.",
+            "and restart (the catalog is generated automatically), or use `/add shopitem`."),
             ephemeral=True)
 
     if category is not None:
@@ -10684,25 +11189,28 @@ async def shop_list(interaction: discord.Interaction, category: Optional[str] = 
         items = ([i for i in katalog.by_category.get(match, []) if i.get("enabled", True)]
                  if match else [])
         if not items:
-            return await interaction.response.send_message(
-                f"❌ No category `{category}` – pick one from the autocomplete list.",
+            return await interaction.response.send_message(_t(
+                interaction, f"❌ Keine Kategorie `{category}` – eine aus der Autovervollständigung wählen.",
+                f"❌ No category `{category}` – pick one from the autocomplete list."),
                 ephemeral=True)
         lines = [_shop_line(it)
                  for it in sorted(items, key=lambda i: str(i.get("name", "")))]
-        title = f"🛒 Item Shop – {match}"
+        title = _t(interaction, f"🛒 Item-Shop – {match}", f"🛒 Item Shop – {match}")
     elif len(enabled_items) > 45:
         # Groß-Katalog (generierte shop_items.json): Kategorie-Übersicht statt 1700 Zeilen
         lines = []
+        items_wort = _t(interaction, "Items", "items")
         for cat in sorted(katalog.by_category):
             items = [i for i in katalog.by_category[cat] if i.get("enabled", True)]
             if not items:
                 continue
             prices = [int(i.get("price", 0)) for i in items]
-            lines.append(f"**{cat}** — {len(items)} items · "
+            lines.append(f"**{cat}** — {len(items)} {items_wort} · "
                          f"{_fmt_money(min(prices))} – {_fmt_money(max(prices))}")
         lines.append("")
-        lines.append("Use `/shop list category:<name>` to browse the items.")
-        title = "🛒 Item Shop – Categories"
+        lines.append(_t(interaction, "Nutze `/shop list category:<name>`, um die Items zu durchsuchen.",
+                        "Use `/shop list category:<name>` to browse the items."))
+        title = _t(interaction, "🛒 Item-Shop – Kategorien", "🛒 Item Shop – Categories")
     else:
         # Kleiner Katalog: komplette Liste, nach Kategorie gruppiert
         by_cat: Dict[str, List[Dict]] = {}
@@ -10713,25 +11221,32 @@ async def shop_list(interaction: discord.Interaction, category: Optional[str] = 
             lines.append(f"__**{cat}**__")
             for it in sorted(by_cat[cat], key=lambda i: str(i.get("name", ""))):
                 lines.append(_shop_line(it))
-        title = "🛒 Item Shop"
+        title = _t(interaction, "🛒 Item-Shop", "🛒 Item Shop")
 
     # In Seiten à 15 Zeilen aufteilen
     per_page = 15
     chunks = [lines[i:i + per_page] for i in range(0, len(lines), per_page)]
     pages: List[discord.Embed] = []
+    seite_wort = _t(interaction, "Seite", "Page")
     for i, chunk in enumerate(chunks):
         e = discord.Embed(
             title=title,
             description="\n".join(chunk),
             color=0x5865F2)
-        e.set_footer(text=(f"Page {i + 1}/{len(chunks)} · "
-                           f"Buy with /buy <item> <amount> <x> <z> · "
-                           f"Items spawn after the next server restart"))
+        e.set_footer(text=_t(
+            interaction,
+            f"{seite_wort} {i + 1}/{len(chunks)} · "
+            f"Kaufen mit /buy <item> <menge> <x> <z> · "
+            f"Items spawnen nach dem nächsten Server-Neustart",
+            f"{seite_wort} {i + 1}/{len(chunks)} · "
+            f"Buy with /buy <item> <amount> <x> <z> · "
+            f"Items spawn after the next server restart"))
         pages.append(e)
 
     if len(pages) == 1:
         return await interaction.response.send_message(embed=pages[0])
-    await interaction.response.send_message(embed=pages[0], view=ShopListView(pages))
+    await interaction.response.send_message(embed=pages[0],
+                                            view=ShopListView(pages, _sprache(interaction)))
 
 shop_list.autocomplete("category")(_shop_category_autocomplete)
 
@@ -10748,17 +11263,22 @@ async def shop_pending(interaction: discord.Interaction, server: Optional[str] =
     rows = db.pending_purchases(guild_id=interaction.guild_id,
                                 service_id=_conn.service_id)
     if not rows:
-        return await interaction.response.send_message(
-            "✅ No pending deliveries.", ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction, "✅ Keine offenen Lieferungen.", "✅ No pending deliveries."),
+            ephemeral=True)
     lines = []
     for r in rows[:25]:
         lines.append(f"`#{r['id']}` <@{r['user_id']}> — **{r['amount']}× {r['item_name']}** "
                      f"({_fmt_money(int(r['total_price']))}) · <t:{int(r['created_at'])}:R>")
     embed = discord.Embed(
-        title=f"📦 Pending deliveries ({len(rows)})",
+        title=_t(interaction, f"📦 Offene Lieferungen ({len(rows)})",
+                 f"📦 Pending deliveries ({len(rows)})"),
         description="\n".join(lines),
         color=0xF39C12)
-    embed.set_footer(text="Items spawn at the next server restart · /shop cleanup to finish manually")
+    embed.set_footer(text=_t(
+        interaction,
+        "Items spawnen beim nächsten Server-Neustart · /shop cleanup zum manuellen Abschließen",
+        "Items spawn at the next server restart · /shop cleanup to finish manually"))
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -10775,7 +11295,9 @@ async def shop_cleanup(interaction: discord.Interaction, server: Optional[str] =
     if _conn is None:
         return
     if not _conn.shop:
-        return await interaction.followup.send("❌ Shop manager not ready yet.", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, "❌ Shop-Manager noch nicht bereit.", "❌ Shop manager not ready yet."),
+            ephemeral=True)
     rows = db.pending_purchases(guild_id=interaction.guild_id,
                                 service_id=_conn.service_id)
     ids, names = [], []
@@ -10788,8 +11310,11 @@ async def shop_cleanup(interaction: discord.Interaction, server: Optional[str] =
     if names:
         ok = await _conn.shop.remove_area_entries(names)
         if not ok:
-            return await interaction.followup.send(
-                "❌ Could not clean cfgEffectArea.json (FTP/parse error) – nothing was changed.",
+            return await interaction.followup.send(_t(
+                interaction,
+                "❌ cfgEffectArea.json konnte nicht bereinigt werden (FTP-/Parse-Fehler) – "
+                "nichts wurde geändert.",
+                "❌ Could not clean cfgEffectArea.json (FTP/parse error) – nothing was changed."),
                 ephemeral=True)
     if ids:
         db.mark_delivered(ids)
@@ -10798,16 +11323,27 @@ async def shop_cleanup(interaction: discord.Interaction, server: Optional[str] =
     # Selbstheilung: verwaiste SHOP_-Einträge ohne zugehörigen Kauf entfernen
     orphans = await _conn.shop.sweep_orphans()
 
+    sprache = _sprache(interaction)
     parts = []
     if ids:
-        parts.append(f"**{len(ids)}** purchase(s) marked as delivered, "
-                     f"**{len(names)}** entries removed from cfgEffectArea.json.")
+        if sprache == "en":
+            parts.append(f"**{len(ids)}** purchase(s) marked as delivered, "
+                         f"**{len(names)}** entries removed from cfgEffectArea.json.")
+        else:
+            parts.append(f"**{len(ids)}** Kauf/Käufe als geliefert markiert, "
+                         f"**{len(names)}** Einträge aus cfgEffectArea.json entfernt.")
     if orphans > 0:
-        parts.append(f"**{orphans}** orphaned `SHOP_` entr{'y' if orphans == 1 else 'ies'} removed.")
+        if sprache == "en":
+            parts.append(f"**{orphans}** orphaned `SHOP_` entr{'y' if orphans == 1 else 'ies'} removed.")
+        else:
+            parts.append(f"**{orphans}** verwaiste `SHOP_`-Einträge entfernt.")
     elif orphans < 0:
-        parts.append("⚠️ Orphan sweep failed (FTP/parse error).")
+        parts.append(_t(interaction, "⚠️ Aufräumen verwaister Einträge fehlgeschlagen (FTP-/Parse-Fehler).",
+                        "⚠️ Orphan sweep failed (FTP/parse error)."))
     if not parts:
-        parts.append("Nothing to clean – no pending deliveries and no orphaned entries.")
+        parts.append(_t(interaction,
+                        "Nichts zu bereinigen – keine offenen Lieferungen und keine verwaisten Einträge.",
+                        "Nothing to clean – no pending deliveries and no orphaned entries."))
     await interaction.followup.send("🧹 " + " ".join(parts), ephemeral=True)
 
 
@@ -10822,58 +11358,91 @@ async def shop_check(interaction: discord.Interaction, server: Optional[str] = N
     if _conn is None:
         return
     if not _conn.shop:
-        return await interaction.followup.send("❌ Shop manager not ready yet.", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, "❌ Shop-Manager noch nicht bereit.", "❌ Shop manager not ready yet."),
+            ephemeral=True)
     rep = await _conn.shop.check_and_heal()
 
-    embed = discord.Embed(title="🩺 Shop-Delivery-Diagnose", color=0x5865F2)
+    embed = discord.Embed(title=_t(interaction, "🩺 Shop-Delivery-Diagnose", "🩺 Shop Delivery Diagnostics"),
+                          color=0x5865F2)
     path = rep.get("path")
-    embed.add_field(name="Pfad", value=f"`{path}`" if path else
-                    "❌ Nicht konfiguriert – `/ftp_scan` ausführen oder "
-                    "`cfg_effect_area_path` in config.json setzen.", inline=False)
+    embed.add_field(name=_t(interaction, "Pfad", "Path"), value=f"`{path}`" if path else _t(
+        interaction,
+        "❌ Nicht konfiguriert – `/ftp_scan` ausführen oder "
+        "`cfg_effect_area_path` in config.json setzen.",
+        "❌ Not configured – run `/ftp_scan` or "
+        "set `cfg_effect_area_path` in config.json."), inline=False)
     status = rep.get("status")
     if status == "no_path":
         embed.colour = 0xE74C3C
         return await interaction.followup.send(embed=embed, ephemeral=True)
     if status == "error":
         embed.colour = 0xE74C3C
-        embed.add_field(name="Datei", value="❌ FTP-Lesefehler – Verbindung prüfen "
-                        "(`/ftp_status`), dann erneut versuchen.", inline=False)
+        embed.add_field(name=_t(interaction, "Datei", "File"), value=_t(
+            interaction,
+            "❌ FTP-Lesefehler – Verbindung prüfen (`/ftp_status`), dann erneut versuchen.",
+            "❌ FTP read error – check the connection (`/ftp_status`), then try again."),
+            inline=False)
         return await interaction.followup.send(embed=embed, ephemeral=True)
     if status == "parse_error":
         embed.colour = 0xE74C3C
-        embed.add_field(name="Datei", value=f"❌ Ungültiges JSON: `{rep.get('error')}`",
+        embed.add_field(name=_t(interaction, "Datei", "File"),
+                        value=_t(interaction, f"❌ Ungültiges JSON: `{rep.get('error')}`",
+                                f"❌ Invalid JSON: `{rep.get('error')}`"),
                         inline=False)
         return await interaction.followup.send(embed=embed, ephemeral=True)
 
-    file_line = ("✅ lesbar, gültiges JSON" if status == "ok" else
-                 "⚠️ existiert noch nicht – wird beim ersten Kauf angelegt")
-    embed.add_field(name="Datei", value=file_line, inline=False)
-    embed.add_field(name="Einträge",
-                    value=(f"{rep.get('areas_total', 0)} gesamt · "
-                           f"{rep.get('shop_entries', 0)} SHOP_ · "
-                           f"{rep.get('vanilla_entries', 0)} Vanilla"), inline=False)
+    file_line = _t(
+        interaction,
+        "✅ lesbar, gültiges JSON" if status == "ok" else
+        "⚠️ existiert noch nicht – wird beim ersten Kauf angelegt",
+        "✅ readable, valid JSON" if status == "ok" else
+        "⚠️ doesn't exist yet – will be created on the first purchase")
+    embed.add_field(name=_t(interaction, "Datei", "File"), value=file_line, inline=False)
+    embed.add_field(name=_t(interaction, "Einträge", "Entries"),
+                    value=_t(
+                        interaction,
+                        f"{rep.get('areas_total', 0)} gesamt · "
+                        f"{rep.get('shop_entries', 0)} SHOP_ · "
+                        f"{rep.get('vanilla_entries', 0)} Vanilla",
+                        f"{rep.get('areas_total', 0)} total · "
+                        f"{rep.get('shop_entries', 0)} SHOP_ · "
+                        f"{rep.get('vanilla_entries', 0)} vanilla"), inline=False)
 
     pending = rep.get("pending", 0)
     healed  = rep.get("healed_entries", 0)
     if healed:
         ok_write = rep.get("heal_written", False)
-        heal_txt = (f"🔧 **{healed}** fehlende Einträge aus "
-                    f"{len(rep.get('healed_purchases', []))} offenen Käufen wieder "
-                    f"eingetragen" + ("" if ok_write else " – ❌ FTP-Schreibfehler!"))
+        heal_txt = _t(
+            interaction,
+            f"🔧 **{healed}** fehlende Einträge aus "
+            f"{len(rep.get('healed_purchases', []))} offenen Käufen wieder "
+            f"eingetragen" + ("" if ok_write else " – ❌ FTP-Schreibfehler!"),
+            f"🔧 **{healed}** missing entries from "
+            f"{len(rep.get('healed_purchases', []))} pending purchases re-added"
+            + ("" if ok_write else " – ❌ FTP write error!"))
         embed.add_field(name="Self-Heal", value=heal_txt, inline=False)
         if not ok_write:
             embed.colour = 0xE74C3C
-    embed.add_field(name="Offene Käufe", value=str(pending), inline=True)
+    embed.add_field(name=_t(interaction, "Offene Käufe", "Pending Purchases"),
+                    value=str(pending), inline=True)
 
     if pending and not _conn.get("auto_restart_after_purchase", False):
         embed.add_field(
-            name="Hinweis",
-            value=("`auto_restart_after_purchase` ist **aus** – Items spawnen erst "
-                   "beim nächsten (manuellen/geplanten) Server-Neustart."), inline=False)
+            name=_t(interaction, "Hinweis", "Note"),
+            value=_t(
+                interaction,
+                "`auto_restart_after_purchase` ist **aus** – Items spawnen erst "
+                "beim nächsten (manuellen/geplanten) Server-Neustart.",
+                "`auto_restart_after_purchase` is **off** – items only spawn "
+                "at the next (manual/scheduled) server restart."), inline=False)
     last = rep.get("last_restart_at") or 0
-    embed.set_footer(text=("Letzter erkannter Server-Neustart: " +
-                           (f"vor {int((time.time() - last) // 60)} Min"
-                            if last else "seit Bot-Start keiner")))
+    embed.set_footer(text=_t(
+        interaction,
+        "Letzter erkannter Server-Neustart: " +
+        (f"vor {int((time.time() - last) // 60)} Min" if last else "seit Bot-Start keiner"),
+        "Last detected server restart: " +
+        (f"{int((time.time() - last) // 60)} min ago" if last else "none since bot start")))
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -10889,14 +11458,20 @@ async def shop_enable(interaction: discord.Interaction, item: str, enabled: bool
         return
     it = katalog.find(item)
     if not it:
-        return await interaction.response.send_message(
-            f"❌ Item `{item}` not found in the shop catalog.", ephemeral=True)
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Item `{item}` nicht im Shop-Katalog gefunden.",
+            f"❌ Item `{item}` not found in the shop catalog."), ephemeral=True)
     it["enabled"] = bool(enabled)
     saved = katalog.save()
-    state = "✅ **enabled**" if enabled else "🚫 **disabled**"
-    note  = "" if saved else f"\n⚠️ Could not persist to `{katalog.source}` – change is in memory only."
-    await interaction.response.send_message(
-        f"🔧 **{it['name']}** is now {state}.{note}", ephemeral=True)
+    state = _t(interaction, "✅ **aktiviert**", "✅ **enabled**") if enabled \
+        else _t(interaction, "🚫 **deaktiviert**", "🚫 **disabled**")
+    note  = "" if saved else _t(
+        interaction,
+        f"\n⚠️ Konnte nicht in `{katalog.source}` gespeichert werden – Änderung nur im Arbeitsspeicher.",
+        f"\n⚠️ Could not persist to `{katalog.source}` – change is in memory only.")
+    await interaction.response.send_message(_t(
+        interaction, f"🔧 **{it['name']}** ist jetzt {state}.{note}",
+        f"🔧 **{it['name']}** is now {state}.{note}"), ephemeral=True)
 
 shop_enable.autocomplete("item")(_shop_item_autocomplete)
 
@@ -10925,7 +11500,7 @@ async def edit_ankuendigung(interaction: discord.Interaction, index: int):
     if pos is None:
         return
 
-    modal = EditAnnouncementModal(pos)
+    modal = EditAnnouncementModal(pos, _sprache(interaction))
 
     await interaction.response.send_modal(modal)
 
@@ -10965,8 +11540,9 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
             PREMIUM_MISSING_TEXT, ephemeral=True)
     it = katalog.find(item)
     if not it or not it.get("enabled", True):
-        return await interaction.response.send_message(
-            f"❌ Item `{item}` is not available. Use `/shop list` to see the catalog.",
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Item `{item}` ist nicht verfügbar. `/shop list` zeigt den Katalog.",
+            f"❌ Item `{item}` is not available. Use `/shop list` to see the catalog."),
             ephemeral=True)
     # ── 1b. Rollen-Beschraenkung: leer heisst, alle duerfen kaufen ──
     #        Vor allen weiteren Pruefungen, damit niemand ueber die
@@ -10974,33 +11550,45 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
     noetig = _item_role_ids(it)
     if noetig and not (isinstance(interaction.user, discord.Member)
                        and _member_has_role_ids(interaction.user, noetig)):
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
             f"❌ Du hast nicht die erforderliche Rolle, um **{it['name']}** zu kaufen.\n"
             "Benötigt wird: " + ", ".join(f"<@&{r}>" for r in noetig),
+            f"❌ You don't have the required role to buy **{it['name']}**.\n"
+            "Required: " + ", ".join(f"<@&{r}>" for r in noetig)),
             ephemeral=True)
 
     max_amount = int(it.get("max_amount_per_buy", 1))
     if amount > max_amount:
-        return await interaction.response.send_message(
-            f"❌ You can buy at most **{max_amount}× {it['name']}** per purchase.",
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Du kannst höchstens **{max_amount}× {it['name']}** pro Kauf erwerben.",
+            f"❌ You can buy at most **{max_amount}× {it['name']}** per purchase."),
             ephemeral=True)
     cls_list = _item_classnames(it)
     if not cls_list:
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Item `{it.get('name', item)}` hat keine Classnames konfiguriert – "
+            f"ein Admin muss den Katalog-Eintrag korrigieren.",
             f"❌ Item `{it.get('name', item)}` has no classnames configured – "
-            f"ask an admin to fix the catalog entry.", ephemeral=True)
+            f"ask an admin to fix the catalog entry."), ephemeral=True)
 
     # ── 2. Koordinaten validieren (iZurvive: x=Ost, z=Nord) ───
     if not (0.0 <= x <= 20000.0 and 0.0 <= z <= 20000.0):
-        return await interaction.response.send_message(
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Koordinaten außerhalb der Map. Gib die beiden iZurvive-Zahlen als "
+            "`x` (Ost) und `z` (Nord) an, z. B. `x: 4640` `z: 10350`.",
             "❌ Coordinates out of range. Enter the two iZurvive numbers as "
-            "`x` (East) and `z` (North), e.g. `x: 4640` `z: 10350`.", ephemeral=True)
+            "`x` (East) and `z` (North), e.g. `x: 4640` `z: 10350`."), ephemeral=True)
     # ACHTUNG Achsen-Mapping: cfgEffectArea Pos = [X, HÖHE, NORD]
     # → iZurvive-X → Pos[0], Höhe (y-Parameter) → Pos[1], iZurvive-Y → Pos[2]
     y_val = float(katalog_conn.get("default_pos_y", 0.0) or 0.0) if y is None else float(y)
     if not (-100.0 <= y_val <= 1000.0):
-        return await interaction.response.send_message(
-            "❌ Height `y` out of range (−100 … 1000). Leave it empty for ground level.",
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Höhe `y` außerhalb des Bereichs (−100 … 1000). Leer lassen für Bodenhöhe.",
+            "❌ Height `y` out of range (−100 … 1000). Leave it empty for ground level."),
             ephemeral=True)
 
     # ── 3. Preis prüfen (Vorprüfung, Abbuchung erst nach FTP-Erfolg) ──
@@ -11014,20 +11602,25 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
     # Auslieferung auf genau dem oben gewaehlten Server – hier wird nur noch
     # geprueft, ob er einsatzbereit ist, nicht neu aufgeloest.
     if _conn.api is None or _conn.ftp is None:
-        return await interaction.followup.send(
+        return await interaction.followup.send(_t(
+            interaction,
             "❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn kann nichts "
             "ausgeliefert werden.\n`/ftp_scan` versucht die Erkennung erneut.",
+            "❌ This server is missing FTP access – without it nothing "
+            "can be delivered.\n`/ftp_scan` tries detection again."),
             ephemeral=True)
     if not _conn.shop:
-        return await interaction.followup.send(
-            "❌ Shop system is still starting up – try again in a moment.", ephemeral=True)
+        return await interaction.followup.send(_t(
+            interaction, "❌ Shop-System startet noch – bitte gleich noch einmal versuchen.",
+            "❌ Shop system is still starting up – try again in a moment."), ephemeral=True)
 
     # ── 4. Erst in cfgEffectArea.json schreiben ... ───────────
     ok, err, area_names = await _conn.shop.add_purchase_entries(
         cls_list, int(amount), x, y_val, z)
     if not ok:
         return await interaction.followup.send(
-            embed=discord.Embed(title="❌ Purchase failed", description=err, color=0xE74C3C),
+            embed=discord.Embed(title=_t(interaction, "❌ Kauf fehlgeschlagen", "❌ Purchase failed"),
+                               description=err, color=0xE74C3C),
             ephemeral=True)
 
     # ── 5. ... dann Geld abbuchen (atomar). Bei Fehlschlag: Rollback ──
@@ -11057,27 +11650,35 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
     if _conn.get("auto_restart_after_purchase", False):
         _conn.shop.schedule_auto_restart()
         cooldown = int(_conn.get("restart_cooldown_seconds", 300) or 300)
-        delivery_info = (f"🔄 A server restart has been scheduled – your items will spawn "
-                         f"in about **{max(5, cooldown)} seconds** (plus boot time).")
+        delivery_info = _t(
+            interaction,
+            f"🔄 Ein Server-Neustart wurde geplant – deine Items spawnen in "
+            f"etwa **{max(5, cooldown)} Sekunden** (plus Startzeit).",
+            f"🔄 A server restart has been scheduled – your items will spawn "
+            f"in about **{max(5, cooldown)} seconds** (plus boot time).")
     else:
-        delivery_info = "⏳ Your items will spawn at the **next scheduled server restart**."
+        delivery_info = _t(interaction,
+                           "⏳ Deine Items spawnen beim **nächsten geplanten Server-Neustart**.",
+                           "⏳ Your items will spawn at the **next scheduled server restart**.")
 
     # ── 8. Bestätigung an den Käufer (Ort + iZurvive-Link) ────
     map_name = _conn.get("map_name", "ChernarusPlus")
     loc_url  = _izurvive_url(x, z, map_name)
     near     = _nearest_location(x, z, map_name)
-    near_txt = f"\n*(Near {near})*" if near else ""
+    near_txt = _t(interaction, f"\n*(Nahe {near})*", f"\n*(Near {near})*") if near else ""
     wallet, _bank = db.get_balance(gid, uid)
 
     embed = discord.Embed(
-        title="🛒 Purchase successful",
-        description=f"You bought **{amount}× {it['name']}** for **{_fmt_money(total)}**.",
+        title=_t(interaction, "🛒 Kauf erfolgreich", "🛒 Purchase successful"),
+        description=_t(
+            interaction, f"Du hast **{amount}× {it['name']}** für **{_fmt_money(total)}** gekauft.",
+            f"You bought **{amount}× {it['name']}** for **{_fmt_money(total)}**."),
         color=0x2ECC71)
-    embed.add_field(name="📍 Spawn location",
+    embed.add_field(name=_t(interaction, "📍 Spawn-Ort", "📍 Spawn location"),
                     value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=False)
-    embed.add_field(name="🚚 Delivery", value=delivery_info, inline=False)
+    embed.add_field(name=_t(interaction, "🚚 Lieferung", "🚚 Delivery"), value=delivery_info, inline=False)
     embed.add_field(name="👛 Wallet",   value=_fmt_money(wallet), inline=True)
-    embed.set_footer(text=f"Purchase #{purchase_id}")
+    embed.set_footer(text=_t(interaction, f"Kauf #{purchase_id}", f"Purchase #{purchase_id}"))
     await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── 9. Kauf in den shop_log-Feed posten ───────────────────
