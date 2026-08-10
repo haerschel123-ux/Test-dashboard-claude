@@ -2004,8 +2004,22 @@ def _nearest_location(x: float, y: float, map_name: str = "ChernarusPlus") -> Op
     dist = ((nearest[1] - x) ** 2 + (nearest[2] - y) ** 2) ** 0.5
     return nearest[0] if dist <= 1500 else None
 
-def _izurvive_url(x: float, y: float, map_name: str = "ChernarusPlus") -> str:
-    return f"https://www.izurvive.com/?m={map_name}#l={x:.1f};{y:.1f}"
+# Kanonischer Map-Name -> Pfad-Baustein der iZurvive-Adresse.
+_IZURVIVE_MAP_SLUG = {
+    "ChernarusPlus": "chernarusplus",
+    "Livonia": "livonia",
+    "Sakhal": "sakhal",
+}
+
+
+def _izurvive_url(x: float, y: float, map_name: str = "ChernarusPlus",
+                  z: float = 0.0) -> str:
+    """Deep-Link MIT Markierung an der Stelle (https://www.izurvive.com/
+    <karte>/#location=X;Y;Z). Das alte Format (?m=<karte>#l=X;Y) zentrierte
+    iZurvive nur auf die Koordinate, setzte aber keine Markierung – man
+    musste die Stelle auf der Karte erst wieder suchen."""
+    slug = _IZURVIVE_MAP_SLUG.get(map_name, map_name.lower().replace(" ", ""))
+    return f"https://www.izurvive.com/{slug}/#location={x:.0f};{y:.0f};{z:.0f}"
 
 def _location_field_value(pos_str: Optional[str]) -> Optional[str]:
     """
@@ -2024,7 +2038,7 @@ def _location_field_value(pos_str: Optional[str]) -> Optional[str]:
     except ValueError:
         return None
     map_name = _aktuelle_karte()
-    url  = _izurvive_url(x, y, map_name)
+    url  = _izurvive_url(x, y, map_name, z)
     loc  = _nearest_location(x, y, map_name)
     near = f"\n*(Near {loc})*" if loc else ""
     return f"[{x:.1f}, {y:.1f}, {z:.1f}]({url}){near}"
