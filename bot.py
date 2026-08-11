@@ -16841,10 +16841,15 @@ Abs. 1 lit. f DSGVO (berechtigtes Interesse am Betrieb).</p>
 Adresse) zur Fehlersuche und zum Schutz vor Missbrauch für begrenzte Zeit
 gespeichert. Rechtsgrundlage: Art. 6 Abs. 1 lit. f DSGVO.</p>
 <h2>7. Spenden</h2>
-<p><em>Platzhalter – wird ergänzt, sobald ein Zahlungsdienstleister feststeht.</em>
-Sollte künftig eine Spendenfunktion über einen externen Anbieter angeboten werden, wird
-dieser Anbieter und die dabei verarbeiteten Daten an dieser Stelle ergänzt, bevor die
-Funktion freigeschaltet wird.</p>
+<p>Freiwillige Spenden können über PayPal (PayPal (Europe) S.à r.l. et Cie, S.C.A.,
+22-24 Boulevard Royal, L-2449 Luxemburg) abgewickelt werden. Entscheidest du dich für
+eine Spende, verarbeitet PayPal die dafür nötigen Zahlungsdaten (u. a. Name,
+Zahlungsbetrag, Transaktionsdaten); diese Verarbeitung erfolgt in eigener
+Verantwortung von PayPal auf Grundlage von dessen eigener Datenschutzerklärung
+(<a href="https://www.paypal.com/de/webapps/mpp/ua/privacy-full" target="_blank"
+rel="noopener noreferrer">paypal.com/de/webapps/mpp/ua/privacy-full</a>).
+Rechtsgrundlage auf unserer Seite ist Art. 6 Abs. 1 lit. b DSGVO (Abwicklung der von
+dir veranlassten Zahlung).</p>
 <h2>8. Weitergabe an Dritte</h2>
 <p>Eine Weitergabe deiner Daten erfolgt nur, soweit es für den Betrieb notwendig ist
 (z. B. an Discord und den Hosting-Anbieter), oder wenn eine gesetzliche Pflicht dazu
