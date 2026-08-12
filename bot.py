@@ -586,12 +586,13 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
     "flag_lower":         {"label": "Flag Lower",          "gruppe": "Bau",
                            "emoji": "🏳️", "farbe": 0x95A5A6},
     # ── Sonstiges ────────────────────────────────────────────
-    "chat":               {"label": "Chat",                "gruppe": "Sonstiges",
-                           "emoji": "💬", "farbe": 0x3498DB},
+    # "chat" und "loot" bewusst NICHT als waehlbare Feeds: DayZ-Server
+    # protokollieren beides in aller Regel gar nicht in der ADM-Datei, die
+    # Feeds blieben also immer leer. _feed_key() faellt fuer diese Ereignis-
+    # typen automatisch auf die grobe Rueckfallkette zurueck (siehe dort),
+    # nichts geht dadurch verloren.
     "admin_action":       {"label": "Admin Action",        "gruppe": "Sonstiges",
                            "emoji": "🛡️", "farbe": 0x9B59B6},
-    "loot":               {"label": "Loot",                "gruppe": "Sonstiges",
-                           "emoji": "🎒", "farbe": 0x27AE60},
     # Rückfall-Feeds: garantieren, dass nichts mehr unbemerkt verschwindet.
     # catch_all fängt jedes ERKANNTE Ereignis auf, für das kein eigener Feed
     # gesetzt ist (Rückfallkette in _dispatch: fein → grob → catch_all).
@@ -612,8 +613,10 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
                            "emoji": "📊", "farbe": 0x3498DB},
     "restart":            {"label": "Restart-Ankündigung", "gruppe": "Bot",
                            "emoji": "🔄", "farbe": 0xE67E22},
-    "zone":               {"label": "Zonen-Ping",          "gruppe": "Bot",
-                           "emoji": "🛡️", "farbe": 0xE74C3C},
+    # "zone" bewusst NICHT als eigener Feed: jede Zone hat ihren Channel
+    # direkt in der Zonen-Einstellung (channel_id), das ist der eigentliche
+    # Weg. Der Fallback darauf bleibt in _post_zone_ping bestehen (feed_
+    # settings), falls eine Zone noch keinen eigenen Channel hat.
     # Aus der .RPT erkannt: jeder Serverstart legt eine neue an. Meldet auch
     # Neustarts, die NICHT vom eigenen Zeitplan kommen (Absturz, Nitrado).
     "server_restart":     {"label": "Server Restart (erkannt)", "gruppe": "Bot",
