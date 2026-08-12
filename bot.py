@@ -2084,6 +2084,13 @@ class DayZLogParser:
         # eignet sich also nicht als "was ist neu" – siehe _poll_connection,
         # das dies nach jedem Zyklus wieder leert).
         self.frisch_unerkannt: List[str] = []
+        # "##### PlayerList log: N players" – manche Server-Konfigurationen
+        # schreiben periodisch eine vollstaendige Momentaufnahme, wer gerade
+        # verbunden ist. Verlaesslicher als das last_seen-Zeitfenster: wer
+        # dort NICHT auftaucht, ist nicht mehr online, selbst wenn eine
+        # aeltere Position noch "frisch genug" waere (siehe parse_line unten).
+        self._playerlist_erwartet: int = 0
+        self._playerlist_gesehen: set = set()
 
     # Spieler-Muster: Name + optionale Steam-ID.
     # Tolerant gegenüber dem echten Nitrado-Konsolen-ADM-Format:
@@ -2106,6 +2113,13 @@ class DayZLogParser:
 
     # ── Regex-Muster ──────────────────────────────────────────
     P = {
+        # Kopfzeile einer vollstaendigen Spielerliste, z. B.
+        # "##### PlayerList log: 4 players" - danach folgen N Zeilen im
+        # normalen Positions-Format (siehe "position" unten), aber OHNE
+        # weitere Aktion (kein "killed by", "connected" usw.).
+        "playerlist_start": re.compile(
+            r'#####\s*PlayerList log:\s*(\d+)\s*players?', re.IGNORECASE
+        ),
         # Konsolen-Format: pos INNERHALB der id-Klammer, pro Spieler
         "position": re.compile(
             r'Player\s*"([^"]+)"(?:\s*\(DEAD\))?\s*\(id=([^)\s]+)\s+pos\s*=\s*<([\d., \-]+)>[^)]*\)',
@@ -2428,6 +2442,14 @@ class DayZLogParser:
 
         ts = self._extract_ts(line)
 
+        # Kopfzeile einer vollstaendigen Spielerliste: die naechsten N Zeilen
+        # gehoeren dazu (siehe unten, kurz vor der "unerkannt"-Marke).
+        m_pl = self.P["playerlist_start"].search(line)
+        if m_pl:
+            self._playerlist_erwartet = int(m_pl.group(1))
+            self._playerlist_gesehen = set()
+            return None
+
         # Positionen immer tracken – Konsolen-Format zuerst (pro Spieler in
         # der eigenen id-Klammer), sonst altes Format als Fallback
         tracked = False
@@ -2729,6 +2751,24 @@ class DayZLogParser:
                     "item": m_build.group(2).strip(),
                     "raw": line,
                 }
+
+        # Teil einer laufenden Spielerliste (siehe playerlist_start oben):
+        # eine reine "Player ... pos=..."-Zeile ohne weitere Aktion, die bis
+        # hierher kein anderes Muster getroffen hat. Zaehlt als erkannt statt
+        # als unerkannte Zeile, und bei der letzten Zeile des Blocks gilt die
+        # Momentaufnahme als Wahrheit: wer hier fehlt, ist nicht mehr online,
+        # selbst wenn eine aeltere Position noch im 15-Minuten-Fenster laege.
+        if self._playerlist_erwartet > 0 and tracked:
+            pm = self.P["position"].search(line)
+            if pm:
+                self._playerlist_gesehen.add(pm.group(1))
+            self._playerlist_erwartet -= 1
+            if self._playerlist_erwartet <= 0:
+                for name in list(self.player_positions):
+                    if name not in self._playerlist_gesehen:
+                        del self.player_positions[name]
+                self._playerlist_erwartet = 0
+            return None
 
         # Nichts hat gegriffen: die Roh-Zeile fuer die Diagnose merken statt sie
         # spurlos zu verwerfen. Aus Diskretion nur, wenn ueberhaupt Buchstaben
