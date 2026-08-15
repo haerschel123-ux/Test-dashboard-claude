@@ -721,6 +721,8 @@ def _feed_stumm_wegen(feed_key: str,
 # Stichwort → Feed-Typ. Zuerst passender Treffer gewinnt, deshalb stehen die
 # spezielleren Begriffe vorn (z. B. "barbed" vor "wire").
 _URSACHE_TODE = (
+    # "tripwire" MUSS vor "wire" stehen – siehe _URSACHE_TREFFER.
+    ("tripwire", "trap_death"),
     ("barbed", "barbed_wire_death"), ("wire", "barbed_wire_death"),
     ("zmb", "zombie_death"), ("zombie", "zombie_death"), ("infected", "zombie_death"),
     # DayZ schreibt die Klassennamen, nicht die Tiernamen: Animal_CanisLupus,
@@ -745,6 +747,9 @@ _TODESVERBEN = (
     ("bled out", "bleed_out_death"),
 )
 _URSACHE_TREFFER = (
+    # "tripwire" MUSS vor "wire" stehen: eine TripwireTrap ist eine Falle,
+    # kein Stacheldraht - das Wort "wire" steckt aber zufaellig in beiden.
+    ("tripwire", "trap_hit"),
     ("barbed", "barbed_wire_hit"), ("wire", "barbed_wire_hit"),
     ("zmb", "zombie_hit"), ("zombie", "zombie_hit"), ("infected", "zombie_hit"),
     # "trap" vor den Tieren – siehe _URSACHE_TODE (BearTrap).
@@ -759,6 +764,28 @@ _URSACHE_TREFFER = (
     ("vehicle", "vehicle_hit"), ("car", "vehicle_hit"),
     ("truck", "vehicle_hit"), ("transport", "vehicle_hit"),
 )
+# Munitions-/Schadensklasse aus der Klammer am Zeilenende (siehe
+# _generic_env_damage_event, Feld "ammo") - ein fester Bezeichner aus dem
+# Spielcode, nicht lokalisiert und ohne die Mehrdeutigkeiten des
+# Anzeigenamens (der z. B. bei Baeren "Brown Bear" mit Leerzeichen lautet,
+# oder bei Fallen zufaellig "wire" enthalten kann). Wird in _feed_key VOR
+# der Stichwortsuche im Anzeigenamen/Waffenfeld geprueft. Belegt aus dem
+# DayZ-Quellcode (PluginAdminLog.c) und echten .ADM-Dateien.
+_AMMO_TREFFER = (
+    ("tripwirehit", "trap_hit"), ("beartraphit", "trap_hit"),
+    ("barbedwirehit", "barbed_wire_hit"),
+    ("meleesoldierinfected", "zombie_hit"), ("meleeinfected", "zombie_hit"),
+    ("meleezombie", "zombie_hit"),
+    ("meleewolf", "animal_hit"), ("meleebear", "animal_hit"),
+    ("meleeboar", "animal_hit"), ("meleecow", "animal_hit"),
+    ("meleedeer", "animal_hit"), ("meleegoat", "animal_hit"),
+    ("meleechicken", "animal_hit"), ("meleerabbit", "animal_hit"),
+    ("firedamage", "fire_hit"),
+    ("falldamage", "fall_damage_hit"),
+    ("transporthit", "vehicle_hit"),
+    ("explosiondamage", "explosion_hit"), ("handgrenade", "explosion_hit"),
+    ("claymore", "explosion_hit"), ("landmine", "explosion_hit"),
+)
 # Bau-Verb → Feed-Typ. Die Verben stammen aus dem basebuild-Muster.
 _BAU_VERBEN = {
     "built": "build", "constructed": "build",
@@ -766,7 +793,9 @@ _BAU_VERBEN = {
     "placed": "place", "deployed": "place", "attached": "place",
     "packed": "pack", "folded": "fold", "repaired": "repair",
     "mounted": "mount", "unmounted": "unmount",
-    "buried": "bury", "unburied": "unbury",
+    # Kein "buried"/"unburied" - DayZ schreibt "Dug in"/"Dug out" (siehe
+    # "dig_stash"-Muster), diese Verben kommen in echten Logs nie vor.
+    "dug in": "bury", "dug out": "unbury",
     "raised": "flag_raise", "lowered": "flag_lower",
 }
 
@@ -813,9 +842,13 @@ def _feed_key(ev: Dict[str, Any]) -> Optional[str]:
                 or "unknown_death")
 
     if t == "damage":
-        # Waffe und Angreifer zusammen betrachten: mal steht die Quelle im
-        # einen, mal im anderen Feld.
-        treffer = (_stichwort(ev.get("weapon"), _URSACHE_TREFFER)
+        # Munitionsklasse zuerst (siehe _AMMO_TREFFER) - ein fester, nicht
+        # lokalisierter Bezeichner aus dem Spielcode. Erst wenn die Zeile
+        # keine hat (manche Formate haben kein "(Ammo)" am Ende), Waffe und
+        # Angreifer als Stichwortsuche - mal steht die Quelle im einen, mal
+        # im anderen Feld.
+        treffer = (_stichwort(ev.get("ammo"), _AMMO_TREFFER)
+                   or _stichwort(ev.get("weapon"), _URSACHE_TREFFER)
                    or _stichwort(ev.get("attacker"), _URSACHE_TREFFER))
         return treffer or "player_hit"
 
@@ -2269,6 +2302,16 @@ class DayZLogParser:
         self._playerlist_offen: bool = False
         self._playerlist_erwartet: int = 0
         self._playerlist_gesehen: set = set()
+        # Letzter nicht-toedlicher Umwelt-Treffer je Spieler (Angreifer/Waffe
+        # + Zeitpunkt). Grund: DayZ schreibt in die Todeszeile selbst nur bei
+        # ausdruecklich benannten Ursachen "killed by X"/"due to X" - Sturz,
+        # Feuer und einige andere Umwelt-Tode schreiben NUR ein nacktes
+        # "died." OHNE jede Ursache (in der echten Spiel-Quelle bestaetigt).
+        # Ohne diese Kopplung landet z. B. jeder Sturztod unter "Unknown
+        # Death" statt "Fall Death", weil die Todeszeile allein keine Angabe
+        # dazu enthaelt, WORAN der Spieler gestorben ist - siehe
+        # _generic_env_death_event.
+        self._letzte_umwelt_treffer: Dict[str, Dict[str, str]] = {}
 
     # Spieler-Muster: Name + optionale Steam-ID.
     # Tolerant gegenüber dem echten Nitrado-Konsolen-ADM-Format:
@@ -2391,8 +2434,19 @@ class DayZLogParser:
             # Das Verb steht in einer eigenen Fanggruppe: daran haengt die
             # Aufteilung in Build/Dismantle/Place/Pack/Fold/... (_feed_key).
             PLAYER + r'\s+(placed|built|constructed|dismantled|repaired|attached|removed'
-                     r'|folded|packed|deployed|mounted|unmounted|buried|unburied'
+                     r'|folded|packed|deployed|mounted|unmounted'
                      r'|raised|lowered)\s+([^\n]+)',
+            re.IGNORECASE
+        ),
+        # Vergraben/Ausgraben eines Verstecks – VOELLIG anderes Format als
+        # die uebrigen Bau-Aktionen (belegt im DayZ-Quellcode, ActionDigIn/
+        # OutStash): kein Leerzeichen nach der Spieler-Klammer, ein zweiter,
+        # unzitierter "Player <Klasse><Zeiger>"-Block, dann "Dug in"/"Dug out"
+        # <Objekt><Zeiger> "at position" <Hex-Adresse> {<x,y,z>}. Die Verben
+        # "buried"/"unburied" kommen in echten Logs gar nicht vor.
+        "dig_stash": re.compile(
+            PLAYER + r'Player\s+\w+<[0-9a-fA-F]+>\s+Dug\s+(in|out)\s+'
+                     r'(\w+)<[0-9a-fA-F]+>\s+at\s+position\s+0x[0-9a-fA-F]+',
             re.IGNORECASE
         ),
         # Fahrzeug
@@ -2489,6 +2543,20 @@ class DayZLogParser:
     def _extract_ts(self, line: str) -> str:
         ts_m = re.match(r'^(\d{2}:\d{2}:\d{2})\s*\|?\s*', line)
         return ts_m.group(1) if ts_m else ""
+
+    @staticmethod
+    def _ts_diff_sekunden(a: str, b: str) -> float:
+        """Abstand zweier ``HH:MM:SS``-Zeitstempel in Sekunden, ueber
+        Mitternacht hinweg korrekt. Unlesbare Zeitstempel gelten als "weit
+        auseinander" (kein falsches Zusammenfuehren durch Zufall)."""
+        m1 = re.match(r'^(\d{2}):(\d{2}):(\d{2})$', a or "")
+        m2 = re.match(r'^(\d{2}):(\d{2}):(\d{2})$', b or "")
+        if not m1 or not m2:
+            return 999.0
+        s1 = int(m1.group(1)) * 3600 + int(m1.group(2)) * 60 + int(m1.group(3))
+        s2 = int(m2.group(1)) * 3600 + int(m2.group(2)) * 60 + int(m2.group(3))
+        diff = abs(s1 - s2)
+        return min(diff, 86400 - diff)
 
     def _generic_kill_event(self, line: str, ts: str) -> Optional[Dict]:
         players = self._players_found(line)
@@ -2591,6 +2659,26 @@ class DayZLogParser:
                 if kw in line.lower():
                     cause = txt
                     break
+            if cause == "Umgebung":
+                # Immer noch keine Ursache in der Todeszeile selbst: DayZ
+                # schreibt bei vielen Umwelt-Toden (Sturz, Feuer, ...) nur ein
+                # nacktes "died." ohne jede Angabe - belegt in echten .ADM-
+                # Dateien. Der letzte nicht-toedliche Treffer DESSELBEN
+                # Spielers kurz zuvor (siehe _generic_env_damage_event) traegt
+                # die Ursache stattdessen; ohne das landen z. B. alle
+                # Sturztode unter "Unknown Death". Nur innerhalb weniger
+                # Sekunden verwendet, damit ein laengst verheilter alter
+                # Treffer nicht faelschlich einem spaeteren Tod zugeschrieben
+                # wird (z. B. Verhungern Minuten nach einem ueberlebten
+                # Wolfsangriff).
+                letzter = self._letzte_umwelt_treffer.pop(p["name"], None)
+                if letzter is not None and self._ts_diff_sekunden(ts, letzter.get("ts", "")) <= 5:
+                    kombiniert = " ".join(
+                        x for x in (letzter.get("ammo"), letzter.get("attacker"),
+                                   letzter.get("weapon"))
+                        if x and x != "Unbekannt")
+                    if kombiniert:
+                        cause = kombiniert
 
         pos_m = re.search(r'pos\s*=\s*<([\d., \-]+)>', line, re.IGNORECASE)
         if pos_m:
@@ -2633,9 +2721,28 @@ class DayZLogParser:
         if m_weapon:
             weapon = m_weapon.group(1).strip()
 
+        # Munitions-/Schadensklasse in der Klammer am Zeilenende, z.B.
+        # "... for 9 damage (MeleeZombie)". Ein waehlbarer Server-Konstante
+        # aus dem Spielcode, nicht lokalisiert - verlaesslicher als der
+        # Anzeigename (der lokalisiert ist und Leerzeichen enthalten kann,
+        # z. B. "Brown Bear") oder eine Stichwortsuche darin (z. B. enthaelt
+        # "TripwireTrap" zufaellig "wire" und traefe sonst faelschlich
+        # Stacheldraht statt Falle). Siehe _AMMO_TREFFER.
+        ammo = None
+        m_ammo = re.search(r'\(([A-Za-z0-9_]+)\)\s*$', line)
+        if m_ammo:
+            ammo = m_ammo.group(1)
+
         pos_m = re.search(r'pos\s*=\s*<([\d., \-]+)>', line, re.IGNORECASE)
         if pos_m:
             self._set_position(victim["name"], victim["id"], pos_m.group(1))
+
+        # Fuer eine spaetere ursachenlose Todeszeile merken (siehe
+        # _generic_env_death_event) - nur nicht-toedliche Treffer sind hier
+        # relevant, ein Tod raeumt den Merker selbst wieder ab.
+        self._letzte_umwelt_treffer[victim["name"]] = {
+            "attacker": attacker, "weapon": weapon, "ammo": ammo or "", "ts": ts,
+        }
 
         return {
             "type": "damage",
@@ -2647,6 +2754,7 @@ class DayZLogParser:
             "hit_zone": hit_zone,
             "damage": damage,
             "weapon": weapon,
+            "ammo": ammo,
             "distance": "?",
             "raw": line,
         }
@@ -2900,7 +3008,23 @@ class DayZLogParser:
                 "raw": line,
             }
 
-        # 8) Basis-Bau
+        # 8) Vergraben/Ausgraben – eigenes Format, siehe "dig_stash" oben.
+        # Vor dem generischen Bau-Muster, weil dessen ehemalige "buried"/
+        # "unburied"-Verben in echten Logs nie vorkommen und dieses Muster
+        # sonst gar nicht zum Zug kaeme.
+        m = self.P["dig_stash"].search(line)
+        if m:
+            return {
+                "type": "basebuild",
+                "timestamp": ts,
+                "player": m.group(1),
+                "player_id": m.group(2) or "Unbekannt",
+                "aktion": "dug in" if m.group(3).lower() == "in" else "dug out",
+                "item": m.group(4),
+                "raw": line,
+            }
+
+        # 8b) Basis-Bau
         m = self.P["basebuild"].search(line)
         if m:
             return {
