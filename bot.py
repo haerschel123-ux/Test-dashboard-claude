@@ -2341,6 +2341,14 @@ class DayZLogParser:
         "playerlist_start": re.compile(
             r'#####\s*PlayerList log:\s*(\d+)\s*players?', re.IGNORECASE
         ),
+        # Nitrado-Konsole schliesst den Block mit einer eigenen Zeile, die
+        # NUR aus "#####" besteht (kein "PlayerList log" mehr davor/danach -
+        # das unterscheidet sie von playerlist_start). Ohne diese eigene
+        # Erkennung landete sie als "unerkannte Zeile" auf der Diagnose-
+        # Seite, obwohl sie zum Block gehoert und nichts Unerwartetes ist.
+        "playerlist_end": re.compile(
+            r'^\s*(?:\d{2}:\d{2}:\d{2}\s*\|?\s*)?#####\s*$'
+        ),
         # Eine EINZELNE Zeile aus so einem Block: Zeitstempel, Spieler,
         # Position – und sonst NICHTS. Bewusst als vollstaendige Zeile
         # (^...$) geprueft: nur so laesst sich "gehoert zum Block" von
@@ -2821,6 +2829,15 @@ class DayZLogParser:
         # Laeuft gerade ein Block? Dann gehoert diese Zeile entweder dazu
         # (reine Spieler+Positions-Zeile) oder der Block ist hier zu Ende.
         if self._playerlist_offen and self._playerlist_zeile(line):
+            return None
+
+        # Abschluss-Zeile der Konsole ("23:59:26 | #####", ohne "PlayerList
+        # log" davor - das unterscheidet sie von der Kopfzeile). Der Block
+        # ist zu diesem Zeitpunkt meist schon ueber die Spieleranzahl
+        # abgeschlossen (_playerlist_offen bereits False) - ohne diese
+        # eigene Erkennung landete die Zeile trotzdem als "unerkannt".
+        if self.P["playerlist_end"].match(line):
+            self._playerlist_offen = False
             return None
 
         # Positionen immer tracken – Konsolen-Format zuerst (pro Spieler in
@@ -5123,17 +5140,18 @@ class DayZBot(discord.Client):
             except Exception as e:  # noqa: BLE001
                 return False, str(e), None
         if art == "online_list":
-            # Primaer A2S_PLAYER: die echten Namen direkt vom Server, egal
-            # was der Server ins ADM-Log schreibt (siehe _a2s_online_namen).
-            namen = await _a2s_online_namen(conn)
-            gesamt = None
-            if namen is None:
-                # Keine Antwort auf A2S_PLAYER (Firewall, alter Server o.ae.)
-                # – zurueck auf die log-basierte Erkennung samt Anzahl-
-                # Gegenprobe per A2S_INFO, wie bisher.
-                positions = dict((conn.parser or self.parser).player_positions)
-                namen = _online_spieler_namen(positions)
-                gesamt = await _a2s_spielerzahl(conn)
+            # A2S_PLAYER ABSICHTLICH NICHT genutzt: DayZ liefert darueber auf
+            # echten Servern keine echten Namen, sondern fuer jeden Spieler
+            # denselben Platzhalter-Text "player" (an einem echten Nitrado-
+            # Server beobachtet und bestaetigt - vermutlich eine bewusste
+            # Anonymisierung des Spiels gegen Scraping). _a2s_online_namen
+            # bleibt im Code, wird aber bewusst NICHT mehr aufgerufen, bis
+            # geklaert ist, ob/wie sich Platzhalter zuverlaessig erkennen
+            # lassen. Primaer bleibt die log-basierte Erkennung, mit A2S_INFO
+            # nur fuer die reine Anzahl als Gegenprobe (die stimmt weiterhin).
+            positions = dict((conn.parser or self.parser).player_positions)
+            namen = _online_spieler_namen(positions)
+            gesamt = await _a2s_spielerzahl(conn)
             if not namen and not gesamt and not task.get("post_wenn_leer"):
                 # ``False`` statt ``None``: der Aufrufer soll HIER GAR NICHTS
                 # posten, auch keine allgemeine "erledigt"-Bestaetigung -
@@ -15891,21 +15909,14 @@ async def api_diagnose(request: web.Request) -> web.Response:
     state = conn.log_state.get("current") or {}
     ampel = _diagnose_ampel(conn)
     log_namen = _online_spieler_namen(parser.player_positions) if parser else []
-    # A2S_PLAYER: die echten Namen direkt vom Server. ``None`` heisst "keine
-    # Antwort" – dann bleibt nur die log-basierte Schaetzung uebrig.
-    a2s_namen = await _a2s_online_namen(conn)
-    if (ampel["status"] == "grün" and a2s_namen is not None
-            and len(a2s_namen) > len(log_namen)):
-        # Der Server meldet mehr Spieler, als das Log-Tracking kennt – die
-        # Online-Liste (Auto-Aufgabe) nutzt zwar bereits A2S_PLAYER direkt,
-        # aber die Luecke selbst sagt etwas ueber das Log-Format oder die
-        # Aktualitaet des Pollings aus, das lohnt einen Blick unten.
-        ampel = {"status": "gelb",
-                "grund": f"Läuft – aber der Server meldet {len(a2s_namen)} Spieler, "
-                         f"das Log-Tracking kennt nur {len(log_namen)}. Die Online-"
-                         f"Liste selbst ist davon nicht betroffen (sie fragt A2S_PLAYER "
-                         f"direkt ab), aber Zonen-Pings und die Ereignis-Karte nutzen "
-                         f"das Log-Tracking – siehe „Online laut Log-Tracking“ unten."}
+    # A2S_PLAYER wird HIER BEWUSST NICHT abgefragt: an einem echten Nitrado-
+    # Server bestaetigt, dass DayZ darueber fuer jeden Spieler denselben
+    # Platzhalter-Text "player" statt des echten Namens liefert (vermutlich
+    # eine Anonymisierung des Spiels gegen Scraping). _a2s_online_namen
+    # bleibt im Code, bis geklaert ist, ob/wie sich Platzhalter zuverlaessig
+    # von echten Namen unterscheiden lassen - bis dahin lieber gar nichts
+    # zeigen als falsche Namen.
+    a2s_namen = None
 
     feed_status = []
     for ft in FEED_TYPES:
