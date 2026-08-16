@@ -4471,12 +4471,28 @@ class DayZBot(discord.Client):
             state = conn.log_state.get("current")
             if state is None:
                 # Erststart ohne gespeicherten Offset: Alt-Events NICHT in die
-                # Feeds nachposten, sondern ab dem aktuellen Dateiende weiterlesen
-                size_now = await loop.run_in_executor(None, conn.ftp.file_size_or_none, latest)
-                conn.log_state["current"] = {"file": latest, "offset": int(size_now or 0)}
+                # Feeds nachposten (sonst flutet ein volles Bestandslog die
+                # Kanaele), die Datei aber trotzdem einmal komplett EINLESEN
+                # statt nur ihre Groesse abzufragen - nur so lernt der Parser,
+                # wer laut dem letzten PlayerList-Block/Connect gerade online
+                # ist. Ohne das blieb die Online-Liste nach jedem Bot-Neustart
+                # leer, bis zufaellig ein neues Ereignis geschrieben wurde
+                # (teils stundenlang), obwohl die Info im Log schon stand.
+                content, new_offset = await loop.run_in_executor(
+                    None, conn.ftp.read_from_offset, latest, 0
+                )
+                if content is None:
+                    # Lesefehler statt "leer" – Groesse als Notloesung nehmen,
+                    # der naechste Zyklus versucht das Bootstrap erneut.
+                    size_now = await loop.run_in_executor(None, conn.ftp.file_size_or_none, latest)
+                    new_offset = int(size_now or 0)
+                elif content:
+                    conn.parser.parse_lines(content)  # nur Online-Status lernen, NICHT posten
+                conn.log_state["current"] = {"file": latest, "offset": new_offset}
                 conn.log_state["last_poll_ts"] = time.time()
                 connections.save()
-                log.info(f"[POLL] Erststart – überspringe Alt-Events, Offset={int(size_now or 0)} ({latest})")
+                log.info(f"[POLL] Erststart – überspringe Alt-Events, lerne Online-Status, "
+                        f"Offset={new_offset} ({latest})")
                 await _poll_zustand_melden(conn, None)
                 return
 
@@ -4534,33 +4550,41 @@ class DayZBot(discord.Client):
                 await loop.run_in_executor(None, db.close_all_sessions, conn.service_id)
 
             if skip_backlog:
-                # Fast-Forward ans aktuelle Dateiende – nichts nachposten
-                size_now = (current_size if current_size is not None
-                           else await loop.run_in_executor(None, conn.ftp.file_size_or_none, latest))
-                if size_now is None:
-                    # Größe nicht ermittelbar (FTP-Fehler?). Ein paar Zyklen
+                # Fast-Forward ans aktuelle Dateiende – Ereignisse NICHT
+                # nachposten (sonst flutet ein langer Rueckstand die Feeds),
+                # den uebersprungenen Teil aber trotzdem EINLESEN, damit der
+                # Parser weiss, wer laut dem letzten PlayerList-Block/Connect
+                # gerade online ist (gleiche Absicht wie beim Erststart oben –
+                # sonst blieb die Online-Liste nach jeder laengeren Pause leer).
+                content, new_offset = await loop.run_in_executor(
+                    None, conn.ftp.read_from_offset, latest, state.get("offset", 0)
+                )
+                if content is None:
+                    # Datei nicht lesbar (FTP-Fehler?). Ein paar Zyklen
                     # abwarten (last_poll_ts NICHT aktualisieren, Skip greift
                     # erneut) – aber NICHT fuer immer: manche FTP-Server
-                    # beantworten SIZE dauerhaft mit einem Fehler (z.B. im
-                    # ASCII-Modus), und ohne Ausweg blieb der Bot dann fuer
-                    # alle Zeit in diesem Zweig haengen, ohne je wieder etwas
-                    # zu posten. Ab SIZE_FEHLER_GRENZE wird stattdessen ganz
+                    # antworten dauerhaft mit einem Fehler (z.B. im ASCII-
+                    # Modus), und ohne Ausweg blieb der Bot dann fuer alle
+                    # Zeit in diesem Zweig haengen, ohne je wieder etwas zu
+                    # posten. Ab SIZE_FEHLER_GRENZE wird stattdessen ganz
                     # normal ab dem zuletzt bekannten Offset weitergelesen –
                     # der aufgelaufene Rueckstand kommt dann einmalig nach,
                     # was besser ist als dauerhafte Stille.
                     conn.size_fehler += 1
                     if conn.size_fehler < SIZE_FEHLER_GRENZE:
-                        await _poll_zustand_melden(conn, "Dateigröße nicht ermittelbar "
-                                                   "(FTP-Fehler beim SIZE-Kommando?) – Zyklus wird wiederholt")
+                        await _poll_zustand_melden(conn, "Log-Datei nicht lesbar "
+                                                   "(FTP-Fehler beim Lesen) – Zyklus wird wiederholt")
                         await self._check_ftp_health(conn)
                         return
-                    log.warning(f"[POLL] {conn.name}: Dateigröße seit {conn.size_fehler} Zyklen "
-                                f"nicht ermittelbar – lese trotzdem ab Offset {state.get('offset', 0)} "
+                    log.warning(f"[POLL] {conn.name}: Log-Datei seit {conn.size_fehler} Zyklen "
+                                f"nicht lesbar – lese trotzdem ab Offset {state.get('offset', 0)} "
                                 f"weiter, statt weiter zu warten.")
                     skip_backlog = False
                 else:
+                    if content:
+                        conn.parser.parse_lines(content)  # nur Online-Status lernen, NICHT posten
                     conn.size_fehler = 0
-                    state = {"file": latest, "offset": int(size_now)}
+                    state = {"file": latest, "offset": new_offset}
                     conn.log_state["current"] = state
                     conn.log_state["last_poll_ts"] = now
                     connections.save()
