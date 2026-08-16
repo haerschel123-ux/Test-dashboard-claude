@@ -6888,21 +6888,6 @@ def _online_liste_embed(conn: ServerConnection, namen: List[str],
     if rest > 0:
         zeilen.append(f"… und {rest} weitere"
                       + (" (Namen zu lang für einen Post)" if abgeschnitten else ""))
-    # Der Server meldet mehr Spieler als der Bot Namen kennt: das im Klartext
-    # sagen, statt es zu verschweigen. Genau dieser Fall sah frueher aus wie
-    # "0 Spieler online", obwohl der Server voll war.
-    if anzahl > len(namen):
-        # BEWUSST ohne Schuldzuweisung an die Server-Konfiguration: derselbe
-        # Fall entsteht auch bei einem FTP-Lesefehler, einer stillstehenden
-        # Log-Datei oder einem gerade erst neu gestarteten Bot. Frueher stand
-        # hier "der Server schreibt keine Positions-Zeilen … adminLogPlayerList
-        # = 1 setzen" – eine Behauptung, die aus den vorliegenden Daten gar
-        # nicht ableitbar ist und Betreiber auf die falsche Faehrte schickte.
-        fehlen = anzahl - len(namen)
-        zeilen.append(
-            f"\n_Für {fehlen} weitere{'n' if fehlen == 1 else ''} Spieler ist gerade "
-            f"kein Name bekannt. Die Diagnose-Seite des Dashboards zeigt unter "
-            f"„FTP & Log-Datei“, woran es liegt._")
     e = discord.Embed(
         title=f"📡 • Online-Liste • {anzahl} Spieler",
         description="\n".join(zeilen) or "Gerade ist niemand online.",
