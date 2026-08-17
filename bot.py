@@ -590,6 +590,9 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
                            "emoji": "😵", "farbe": 0x8E44AD},
     "conscious":          {"label": "Conscious",           "gruppe": "Zustand",
                            "emoji": "🙂", "farbe": 0x9B59B6},
+    # ── Emotes ───────────────────────────────────────────────
+    "emote":              {"label": "Emote",               "gruppe": "Emotes",
+                           "emoji": "🎭", "farbe": 0x00BCD4},
     # ── Bau ──────────────────────────────────────────────────
     "build":              {"label": "Build",               "gruppe": "Bau",
                            "emoji": "🏗️", "farbe": 0xF1C40F},
@@ -2415,6 +2418,12 @@ class DayZLogParser:
                      r'|raised|lowered)\s+([^\n]+)',
             re.IGNORECASE
         ),
+        # Emote (z. B. "performed EmoteSitA with CableReel", "performed
+        # EmoteSurrender" ohne Gegenstand). "with <Gegenstand>" ist optional.
+        "emote": re.compile(
+            PLAYER + r'\s+performed\s+(\w+)(?:\s+with\s+([^\n]+))?',
+            re.IGNORECASE
+        ),
         # Vergraben/Ausgraben eines Verstecks – VOELLIG anderes Format als
         # die uebrigen Bau-Aktionen (belegt im DayZ-Quellcode, ActionDigIn/
         # OutStash): kein Leerzeichen nach der Spieler-Klammer, ein zweiter,
@@ -3068,6 +3077,19 @@ class DayZLogParser:
                 "raw": line,
             }
 
+        # 8c) Emote
+        m = self.P["emote"].search(line)
+        if m:
+            return {
+                "type": "emote",
+                "timestamp": ts,
+                "player": m.group(1),
+                "player_id": m.group(2) or "Unbekannt",
+                "emote": m.group(3),
+                "item": (m.group(4) or "").strip() or None,
+                "raw": line,
+            }
+
         # 9) Fahrzeug
         m = self.P["vehicle"].search(line)
         if m:
@@ -3220,6 +3242,19 @@ def _footer(ev: Dict) -> str:
 
 def _dist(d: str) -> str:
     return f"{d} m" if d != "?" else "Nah­kampf"
+
+_EMOTE_CAMEL_RE = re.compile(r'(?<=[a-z0-9])(?=[A-Z])')
+
+def _emote_label(roh: Optional[str]) -> str:
+    """"EmoteSitA" -> "Sit A", "EmoteSurrender" -> "Surrender".
+
+    Der lesbare Name fuer das Embed: das feste "Emote"-Praefix ab, danach vor
+    jedem Grossbuchstaben, der auf einen Klein-/Ziffern-Buchstaben folgt, ein
+    Leerzeichen einfuegen (Zusammenschreibung wie in den DayZ-Klassennamen)."""
+    name = str(roh or "").strip()
+    if name.lower().startswith("emote"):
+        name = name[len("emote"):]
+    return _EMOTE_CAMEL_RE.sub(" ", name).strip() or "Emote"
 
 def _add_location_field(e: discord.Embed, ev: Dict, player_key: str,
                         positions: Optional[Dict[str, Dict]] = None):
@@ -3397,6 +3432,19 @@ class EmbedBuilder:
                 description=(f"**{ev['player']}** ist bewusstlos" if bewusstlos
                              else f"**{ev['player']}** ist wieder bei Bewusstsein"),
                 color=0x8E44AD if bewusstlos else 0x9B59B6
+            )
+            _add_location_field(e, ev, "player", positions)
+            e.add_field(name="Steam-ID", value=f"`{ev['player_id']}`", inline=False)
+
+        elif t == "emote":
+            name = _emote_label(ev.get("emote"))
+            beschreibung = f"**{ev['player']}** hat **{name}** gespielt"
+            if ev.get("item"):
+                beschreibung += f" (mit {ev['item']})"
+            e = discord.Embed(
+                title="🎭 EMOTE",
+                description=beschreibung,
+                color=0x00BCD4
             )
             _add_location_field(e, ev, "player", positions)
             e.add_field(name="Steam-ID", value=f"`{ev['player_id']}`", inline=False)
