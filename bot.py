@@ -2236,9 +2236,9 @@ def _nearest_location(x: float, y: float, map_name: str = "ChernarusPlus") -> Op
 
 # Kanonischer Map-Name -> Pfad-Baustein der iZurvive-Adresse.
 _IZURVIVE_MAP_SLUG = {
-    "ChernarusPlus": "chernarusplus",
-    "Livonia": "livonia",
-    "Sakhal": "sakhal",
+    "ChernarusPlus": "chernarusplussatmap",
+    "Livonia": "livoniasatmap",
+    "Sakhal": "sakhalsatmap",
 }
 
 
@@ -3118,6 +3118,14 @@ class DayZLogParser:
         # 8c) Emote
         m = self.P["emote"].search(line)
         if m:
+            # pos=<...> steckt in der id-Klammer, die PLAYER bewusst ohne den
+            # pos-Anteil erfasst (siehe Kommentar bei PLAYER) - deshalb wie bei
+            # Kills/Toden/Treffern extra danach suchen. Ohne das blieb das
+            # Positions-Feld im Embed leer, sobald keine ANDERE Zeile desselben
+            # Spielers kurz zuvor den Positions-Cache aktuell gehalten hatte.
+            pos_m = re.search(r'pos\s*=\s*<([\d., \-]+)>', line, re.IGNORECASE)
+            if pos_m:
+                self._set_position(m.group(1), m.group(2) or "Unbekannt", pos_m.group(1))
             return {
                 "type": "emote",
                 "timestamp": ts,
@@ -3125,6 +3133,7 @@ class DayZLogParser:
                 "player_id": m.group(2) or "Unbekannt",
                 "emote": m.group(3),
                 "item": (m.group(4) or "").strip() or None,
+                "position": pos_m.group(1).strip() if pos_m else None,
                 "raw": line,
             }
 
