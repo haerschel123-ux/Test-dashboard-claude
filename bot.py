@@ -5198,7 +5198,9 @@ class DayZBot(discord.Client):
                         continue
                     zkey = (_sid, str(zone["name"]).strip().lower(), pname)
                     if _player_in_allowlist(zone, pname):
-                        continue     # Allowlist: nie pingen
+                        continue     # Namens-Allowlist: nie pingen
+                    if await _player_hat_allowlist_rolle(zone, pname):
+                        continue     # Rollen-Allowlist (verlinkt + Rolle): nie pingen
                     if now - self._zone_last_ping.get(zkey, 0.0) < cooldown:
                         continue     # Wiederhol-Intervall noch nicht abgelaufen
                     self._zone_last_ping[zkey] = now
@@ -5229,10 +5231,22 @@ class DayZBot(discord.Client):
         content = " ".join(f"<@&{r}>" for r in role_ids) or None
         gid = int(zone["guild_id"]) if zone.get("guild_id") else None
         if gid is None:
-            # Ohne Guild ginge der Alarm samt Spielername und Koordinaten an
-            # ALLE konfigurierten Discord-Server.
-            log.warning(f"[ZONE] {zone.get('name')}: keine guild_id – Ping unterdrueckt.")
-            return
+            # Fehlt die guild_id (aeltere Zone, angelegt bevor eine Guild
+            # zugeordnet war), auf die aktuelle Guild DIESER Verbindung
+            # zurueckfallen - sicher, weil _zones(conn) die Zone ohnehin nur
+            # zu genau dieser Verbindung gehoeren laesst. Anders als eine
+            # GESPEICHERTE, aber veraltete guild_id (Pruefung direkt danach):
+            # dort bleibt die Sperre bestehen, das ist der eigentliche
+            # Sicherheitsfall (Server-Eigentuemerwechsel).
+            if conn is not None and conn.guild_id is not None:
+                gid = int(conn.guild_id)
+            else:
+                log.warning(f"[ZONE] {zone.get('name')}: keine guild_id – Ping unterdrueckt.")
+                _audit_add("system", conn.name if conn is not None else "?",
+                          "Zonen-Ping unterdrückt",
+                          f"{zone.get('name')}: keine Discord-Guild an der Zone oder am "
+                          f"Server gespeichert.", success=False)
+                return
         # Die Zone traegt ihre Guild seit dem Anlegen. Wird der Server spaeter
         # einem anderen Kunden zugeordnet, zeigt sie weiter auf den alten
         # Discord – Spielernamen und exakte Koordinaten des NEUEN Betreibers
@@ -5242,6 +5256,10 @@ class DayZBot(discord.Client):
             log.warning(f"[ZONE] {zone.get('name')}: gespeicherte Guild {gid} gehört "
                         f"nicht mehr zu {conn.name} (jetzt {conn.guild_id}) – Ping "
                         f"unterdrückt. Zone im Dashboard neu speichern.")
+            _audit_add("system", conn.name,
+                      "Zonen-Ping unterdrückt",
+                      f"{zone.get('name')}: gespeicherte Guild passt nicht mehr zu "
+                      f"{conn.name} – Zone im Dashboard neu speichern.", success=False)
             return
         sid = conn.service_id if conn is not None else None
         zone_ch = zone.get("channel_id")
@@ -7269,6 +7287,42 @@ def _player_in_allowlist(zone: Dict, pname: str) -> bool:
     """True, wenn der Spieler in dieser Zone ignoriert werden soll (case-insensitiv)."""
     key = (pname or "").strip().lower()
     return any(str(n).strip().lower() == key for n in _zone_allowlist(zone))
+
+
+async def _player_hat_allowlist_rolle(zone: Dict, pname: str) -> bool:
+    """True, wenn der Spieler per ``/link`` mit einem Discord-Konto verbunden
+    ist, DAS eine der ``manage_role_ids`` ("Allowlist Roles" im Dashboard)
+    traegt - die zweite im Zonen-Formular vorgesehene Ignorier-Bedingung.
+
+    War bisher toter Code: ``manage_role_ids`` wurde gespeichert und im
+    Formular angezeigt, aber ``_check_zones`` fragte es nie ab - Allowlist
+    Roles hatten dadurch nie eine Wirkung, unabhaengig von der Verlinkung.
+    """
+    role_ids = zone.get("manage_role_ids")
+    if not isinstance(role_ids, list) or not role_ids:
+        return False
+    try:
+        gid = int(zone.get("guild_id") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not gid:
+        return False
+    try:
+        rows = db.links_for_name(pname, gid)
+    except Exception:  # noqa: BLE001 – Datenbankfehler soll die Zonen-Pruefung nicht abwuergen
+        return False
+    for row in rows:
+        try:
+            uid = int(row["user_id"])
+        except (TypeError, ValueError, KeyError, IndexError):
+            continue
+        for rid in role_ids:
+            try:
+                if await _user_hat_rolle(gid, uid, int(rid)):
+                    return True
+            except (TypeError, ValueError):
+                continue
+    return False
 
 def _reset_zone_state(zone_name: str, conn: Optional[ServerConnection] = None):
     """Ping-Cooldowns einer Zone verwerfen (nach remove/edit),
