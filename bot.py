@@ -5743,17 +5743,39 @@ class DayZBot(discord.Client):
                      f"(Fenster {weite} B ab Offset {start}).")
             return True
 
-        # Kein vollstaendiger Block im groessten Fenster: BEWUSST nichts
-        # uebernehmen. Aus Connect-Zeilen allein einen Roster zu bauen waere
-        # geraten – ein Spieler, dessen Disconnect ausserhalb des Fensters
-        # liegt, gaelte faelschlich als online. Der normale Poll lernt den
-        # naechsten Block ohnehin, sobald der Server ihn schreibt.
+        # Kein vollstaendiger Block im groessten Fenster: als Naeherung das
+        # ganze gelesene Fenster sequenziell auswerten (Connect-, Disconnect-
+        # und alle Positions-Ereignisse) statt "Connect-Zeilen allein" (das
+        # waere tatsaechlich geraten, siehe die urspruengliche Warnung hier:
+        # ein blosses Auflisten aller Connects OHNE Disconnects zu verrechnen
+        # liesse jeden, der zwischenzeitlich ging, faelschlich als online
+        # gelten). Ein SEQUENZIELLER Parser-Durchlauf verrechnet Disconnects
+        # aber automatisch (parse_line entfernt den Spieler sofort aus
+        # player_positions, siehe dort) - das Ergebnis ist kein autoritativer
+        # Schnappschuss wie ein vollstaendiger PlayerList-Block (wer schon VOR
+        # diesem Fenster verbunden war und es nicht verlaesst, bleibt weiter
+        # unsichtbar), aber auf einem belebten Server, der lange keinen
+        # PlayerList-Block schreibt, ist es die einzige Chance, echte, gerade
+        # verbundene Spieler ueberhaupt zu sehen - besser als eine dauerhaft
+        # leere Liste, obwohl A2S laengst Spieler zaehlt.
+        naeherung = DayZLogParser()
+        naeherung.parse_lines("\n".join(zeilen) + "\n")
         conn.parser_hydrated = True     # nicht bei jedem Poll erneut versuchen
         conn.hydrated_file = latest
-        conn.roster_datei = None        # es wurde NICHTS uebernommen
-        conn.last_read_status = "kein vollständiger PlayerList-Block im Log gefunden"
-        log.info(f"[HYDRATE] {conn.name}: kein vollständiger PlayerList-Block in {latest} – "
-                 f"Online-Namen kommen erst mit dem nächsten Block des Servers.")
+        conn.roster_datei = None        # kein vollstaendiger Block -> nicht autoritativ
+        if naeherung.player_positions:
+            conn.parser.player_positions = dict(naeherung.player_positions)
+            for pname, info in conn.parser.player_positions.items():
+                self._zone_pos_seen[(conn.service_id, pname)] = str(info.get("last_seen") or "")
+            conn.last_read_status = ("Näherung aus Connect-/Ereignis-Zeilen – kein "
+                                     "vollständiger PlayerList-Block gefunden")
+            log.info(f"[HYDRATE] {conn.name}: Naeherungs-Roster aus {latest} – "
+                     f"{len(naeherung.player_positions)} Spieler (kein vollst. Block, "
+                     f"Fenster {fenster[-1]} B).")
+        else:
+            conn.last_read_status = "kein vollständiger PlayerList-Block im Log gefunden"
+            log.info(f"[HYDRATE] {conn.name}: kein vollständiger PlayerList-Block in {latest} – "
+                     f"Online-Namen kommen erst mit dem nächsten Block des Servers.")
         return False
 
     async def _pruefe_neustart(self, conn: ServerConnection, log_dir: str, loop):
@@ -7140,9 +7162,21 @@ def _online_liste_embed(conn: ServerConnection, namen: List[str],
     if rest > 0:
         zeilen.append(f"… und {rest} weitere"
                       + (" (Namen zu lang für einen Post)" if abgeschnitten else ""))
+    if zeilen:
+        beschreibung = "\n".join(zeilen)
+    elif anzahl > 0:
+        # anzahl kommt von A2S (siehe oben) und hat Vorrang - "niemand
+        # online" waere hier schlicht falsch und widerspraeche der eigenen
+        # Kopfzeile. Kennt der Log-Parser (noch) keine Namen (z. B. direkt
+        # nach einem Bot-Neustart, bevor der naechste PlayerList-Block kam),
+        # muss das auch so dastehen statt eine leere Liste vorzutaeuschen.
+        beschreibung = (f"{anzahl} Spieler laut Server – Namen aktuell nicht "
+                        f"bekannt (Log-Tracking noch nicht aufgebaut).")
+    else:
+        beschreibung = "Gerade ist niemand online."
     e = discord.Embed(
         title=f"📡 • Online-Liste • {anzahl} Spieler",
-        description="\n".join(zeilen) or "Gerade ist niemand online.",
+        description=beschreibung,
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc))
     e.set_footer(text=f"{notiz} · {conn.name}" if notiz else conn.name)
