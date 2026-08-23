@@ -83,6 +83,23 @@ Auslieferungs-Vorgabe zurück (`_EIGENE_EINSTELLUNGEN`), alles Übrige auf `cfg.
 um einen bestimmten Kundenserver geht – genau daraus sind sämtliche Sicherheitslücken
 entstanden, die in dieser Codebasis gefunden wurden.
 
+## Übersetzung (Frontend)
+
+Alle neuen Oberflächen-Texte werden auf Deutsch geschrieben; die Übersetzung ins
+Englische übernimmt `app.js` automatisch (`GANZER_KNOTEN` für ganze Sätze/Absätze,
+`UEBERSETZUNG` für einzelne Wörter/Phrasen – siehe Kommentare dort). **Jeder neue
+deutsche Text braucht einen passenden Eintrag in einem der beiden Wörterbücher**,
+sonst bleibt er im Englisch-Modus unübersetzt stehen oder wird nur wortweise
+kaputtübersetzt. Nach jeder UI-Änderung mit Playwright einmal im Englisch-Modus
+(`?lang=en` bzw. `SPRACHE`-Session auf `"en"`) gegenprüfen, dass nichts Deutsches
+mehr sichtbar ist – nicht nur den deutschen Screenshot zeigen.
+
+Objekt-Schlüssel in `GANZER_KNOTEN`/`UEBERSETZUNG`, die aus mehreren Zeilen
+zusammengesetzt sind, brauchen `[...]`-Klammern um die `+`-Verkettung
+(`["Teil 1 " + "Teil 2"]: "..."`) – ohne die eckigen Klammern ist `"a" + "b": "..."`
+kein gültiger JavaScript-Objekt-Schlüssel und `app.js` lässt sich gar nicht mehr
+laden. Mit `node --check dashboard_web/static/app.js` vor dem Einbetten prüfen.
+
 ## Vor jedem Commit prüfen
 
 ```bash
