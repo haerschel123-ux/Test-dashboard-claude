@@ -14779,7 +14779,7 @@ def _extract_assets() -> None:
     nur geloggt – die Assets liefert dann _asset_response aus dem Speicher.
     """
     written = updated = kept = failed = 0
-    for sub in ("", "vendor", "locations", "maps"):
+    for sub in ("", "vendor", "locations", "maps", "items"):
         try:
             os.makedirs(os.path.join(_DASH_STATIC, sub), exist_ok=True)
         except OSError as e:
@@ -21453,6 +21453,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "4c2288c9c3eb7376b7f53a5d5c37a89f827fa6825a00723443e302c1021cb9bc",
     ),
     "app.js": (
+        "0a1b1bb61f11f5ced5f2b7312d5b789d998e9f9669091c9aca7189bfffc395b9",
         "ec14b8b4a90c6553d11b22eb5f76c732b47c827e8bf4359e9f2fb793f8ca1b79",
         "82e5da5110b186c3234f7637dd397a87cb2f6939e165b35fbb21d992a4200689",
         "bee4fd3e9b3370dbd02f4f32cb88049eb754892d98fbd4a92cd2b32699d1389f",
