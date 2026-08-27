@@ -1,8 +1,15 @@
 """Waechter gegen die Fehlerklasse aus CLAUDE.md: Frontend-Dateien unter
-dashboard_web/static/ geaendert, aber vergessen, sie wieder in bot.py
-einzubetten (siehe reembed.py) – dann erreicht das Update bestehende
-Installationen nie, weil die dort mitgelieferten Assets stumm veraltet
-bleiben. Reiner Lesezugriff, nichts wird geschrieben oder geloescht.
+dashboard_web/static/ geaendert, aber vergessen, sie wieder einzubetten
+(siehe reembed.py) – dann erreicht das Update bestehende Installationen nie,
+weil die dort mitgelieferten Assets stumm veraltet bleiben. Reiner
+Lesezugriff, nichts wird geschrieben oder geloescht.
+
+Seit der Auslagerung liegt ``_EMBEDDED_ASSETS`` in ``embedded_assets.py``,
+nicht mehr in ``bot.py``. Das Dict wird hier direkt importiert statt wie
+frueher zeilenweise aus dem Quelltext geschnitten: der alte Weg brach
+wortlos mit ``StopIteration`` ab, sobald sich Datei oder Formatierung
+aenderten – ein Waechter, der bei einer Umstrukturierung selbst ausfaellt,
+ist schlimmer als keiner.
 
 Aufruf vor jedem Commit, der dashboard_web/static/* aendert:
     python3 tools/check_embedded_assets.py
@@ -15,34 +22,38 @@ Exit 1: mindestens eine Datei weicht ab -> vor dem Commit reembed.py laufen
 import base64
 import hashlib
 import os
-import re
 import sys
 import zlib
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BOTPY = os.path.join(REPO, "bot.py")
 STATIC = os.path.join(REPO, "dashboard_web", "static")
 DATEIEN = ["app.js", "styles.css", "map.js", "index.html"]
 
 
-def eingebettete_fassung(lines, rel):
-    embed_start = next(i for i, l in enumerate(lines) if l.startswith("_EMBEDDED_ASSETS"))
-    embed_ende = next(i for i in range(embed_start, len(lines)) if lines[i] == "}")
-    muster = r'^    "' + re.escape(rel) + r'": \($'
-    start = None
-    for i in range(embed_start, embed_ende):
-        if re.match(muster, lines[i]):
-            start = i
-            break
-    if start is None:
-        raise SystemExit(f"[FEHLER] Schluessel nicht in bot.py gefunden: {rel}")
-    ende = None
-    for i in range(start + 1, embed_ende):
-        if lines[i] == "    ),":
-            ende = i
-            break
-    b64 = "".join(ln.strip().strip('"') for ln in lines[start + 1:ende])
-    return zlib.decompress(base64.b64decode(b64))
+def lade_eingebettete_assets():
+    """``_EMBEDDED_ASSETS`` aus embedded_assets.py holen.
+
+    Bewusst NICHT ueber ``import bot``: bot.py zieht discord.py, aiohttp und
+    einen ganzen Konfigurations-Startvorgang mit sich. Der Waechter soll auch
+    in einem nackten Checkout ohne installierte Abhaengigkeiten laufen.
+    """
+    pfad = os.path.join(REPO, "embedded_assets.py")
+    if not os.path.exists(pfad):
+        raise SystemExit(f"[FEHLER] embedded_assets.py nicht gefunden: {pfad}")
+    namensraum = {}
+    with open(pfad, "r", encoding="utf-8") as f:
+        exec(compile(f.read(), pfad, "exec"), namensraum)  # noqa: S102
+    assets = namensraum.get("_EMBEDDED_ASSETS")
+    if not isinstance(assets, dict):
+        raise SystemExit("[FEHLER] _EMBEDDED_ASSETS fehlt in embedded_assets.py")
+    return assets
+
+
+def eingebettete_fassung(assets, rel):
+    blob = assets.get(rel)
+    if blob is None:
+        raise SystemExit(f"[FEHLER] Schluessel nicht eingebettet: {rel}")
+    return zlib.decompress(base64.b64decode(blob))
 
 
 def main():
@@ -51,8 +62,7 @@ def main():
               "- nichts zu pruefen.")
         return 0
 
-    with open(BOTPY, "r", encoding="utf-8") as f:
-        lines = f.read().split("\n")
+    assets = lade_eingebettete_assets()
 
     abweichungen = []
     for rel in DATEIEN:
@@ -62,12 +72,12 @@ def main():
             continue
         with open(platte_pfad, "rb") as f:
             platte = f.read()
-        eingebettet = eingebettete_fassung(lines, rel)
+        eingebettet = eingebettete_fassung(assets, rel)
         if hashlib.sha256(platte).digest() == hashlib.sha256(eingebettet).digest():
             print(f"  OK   {rel}: eingebettete Fassung stimmt mit der Platte überein")
         else:
             abweichungen.append(rel)
-            print(f"  ABWEICHUNG {rel}: Platte und eingebettete Fassung in bot.py "
+            print(f"  ABWEICHUNG {rel}: Platte und eingebettete Fassung in embedded_assets.py "
                   f"unterscheiden sich ({len(platte)} vs. {len(eingebettet)} Bytes roh)")
 
     if abweichungen:

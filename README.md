@@ -5,9 +5,20 @@ Web-Dashboard**. Bot und Dashboard laufen in **einem** Prozess (`python bot.py`)
 sich dieselbe Konfiguration und dieselben Live-Daten — alles, was per Slash-Command geht,
 geht auch im Browser.
 
-## Das Einzeldatei-Prinzip
+## Drei Dateien – immer gemeinsam
 
-Zum Betrieb wird **genau eine Datei** gebraucht: `bot.py`.
+Zum Betrieb werden **genau drei Dateien** gebraucht:
+
+| Datei | Inhalt |
+|---|---|
+| `bot.py` | Die gesamte Logik |
+| `log_parser.py` | Die ADM-Log-Auswertung |
+| `embedded_assets.py` | Das eingebettete Frontend |
+
+`bot.py` importiert die beiden anderen. **Immer alle drei aus demselben Stand
+hochladen** – wird nur eine ersetzt, läuft entweder stumm alter Code oder der Start
+bricht mit einem Importfehler ab. Beim Start nennt der Bot Pfad und Prüfsumme aller
+drei Dateien, damit sich das sofort erkennen lässt.
 
 ```bash
 python bot.py
@@ -24,7 +35,8 @@ Beim ersten Start legt `bot.py` alles selbst an:
 | fehlende Python-Pakete | `discord.py`, `aiohttp`, `requests`, `tzdata` werden per pip nachinstalliert, `cryptography` optional für HTTPS |
 
 Das komplette Frontend, die Leaflet-Bibliothek und die Ortslisten (201/60/60 Orte) stecken
-komprimiert (zlib + base64) **in `bot.py`** und werden beim Start herausgeschrieben.
+komprimiert (zlib + base64) **in `embedded_assets.py`** und werden beim Start
+herausgeschrieben.
 
 **Eigene Änderungen gehen nie verloren.** Beim Start vergleicht `bot.py` Prüfsummen:
 

@@ -45,15 +45,36 @@ Pushen – es bezieht sich auf die Arbeit, nicht auf das Veröffentlichen.
 
 # Das Projekt
 
-Ein DayZ-Nitrado-Discord-Bot mit eingebettetem Web-Dashboard – **eine einzige Datei**
-(`bot.py`, ca. 14.000 Zeilen, discord.py + aiohttp in einem Prozess). Läuft auf PebbleHost
-unter `testdashboard.my.pebble.host:25590`.
+Ein DayZ-Nitrado-Discord-Bot mit eingebettetem Web-Dashboard (discord.py + aiohttp in
+einem Prozess). Läuft auf PebbleHost unter `testdashboard.my.pebble.host:25590`.
+
+## Drei Dateien – immer gemeinsam deployen
+
+Der Bot war lange **eine einzige Datei**. Das stimmt nicht mehr:
+
+| Datei | Inhalt |
+|---|---|
+| `bot.py` | Die gesamte Logik (~21.700 Zeilen) |
+| `log_parser.py` | `DayZLogParser` – die ADM-Log-Auswertung |
+| `embedded_assets.py` | `_EMBEDDED_ASSETS` – das eingebettete Frontend |
+
+`bot.py` importiert die beiden anderen ganz oben. **Es reicht nicht mehr, nur `bot.py`
+hochzuladen** – wird nur eine Datei aktualisiert, läuft entweder stumm alter Code oder
+der Start bricht mit einem Importfehler ab. Immer alle drei aus **demselben Commit**
+deployen.
+
+Beim Start nennt der Bot deshalb Pfad, Prüfsumme und Größe aller drei Dateien plus PID
+und Python-Pfad (`_start_kennung_ausgeben`). Bei „läuft der neue Code überhaupt?" ist
+das die erste Stelle zum Nachsehen – genau diese Frage hat bei der Online-Listen-Suche
+Tage gekostet.
 
 Das Frontend (`index.html`, `app.js`, `styles.css`, `map.js`, Leaflet) steckt zlib+base64
-in `_EMBEDDED_ASSETS` in derselben Datei und wird beim Start nach `dashboard_web/static/`
-entpackt. Änderungen daran müssen wieder eingebettet werden, und die Prüfsumme der
-Vorgängerfassung gehört in `_ASSET_KNOWN_HASHES` – sonst erreicht das Update bestehende
-Installationen nicht.
+in `_EMBEDDED_ASSETS` (in `embedded_assets.py`) und wird beim Start nach
+`dashboard_web/static/` entpackt. Änderungen daran müssen wieder eingebettet werden, und
+die Prüfsumme der Vorgängerfassung gehört in `_ASSET_KNOWN_HASHES` (das steht weiterhin
+in `bot.py`) – sonst erreicht das Update bestehende Installationen nicht.
+Mit `python3 tools/check_embedded_assets.py` prüfen, ob Platte und eingebettete Fassung
+übereinstimmen.
 
 ## Das Ziel: Mehrkundenbetrieb
 
@@ -103,8 +124,10 @@ laden. Mit `node --check dashboard_web/static/app.js` vor dem Einbetten prüfen.
 ## Vor jedem Commit prüfen
 
 ```bash
-python3 -m pyflakes bot.py | grep -i undefined     # muss leer sein
-python3 -m pylint --disable=all --enable=E bot.py  # muss 10.00 sein
+python3 -m pyflakes bot.py log_parser.py | grep -i undefined       # muss leer sein
+python3 -m pylint --disable=all --enable=E bot.py log_parser.py    # muss 10.00 sein
+python3 -m pytest tests/ -q                                        # muss grün sein
+python3 tools/check_embedded_assets.py                             # Exit 0
 ```
 
 `pyflakes` findet die Fehlerklasse, die hier zweimal zugeschlagen hat: eine Umbenennung
@@ -117,8 +140,13 @@ einzelne Ersetzungen mit genug Kontext.
 
 ## Testen
 
-Tests laufen als echte Prozesse in Wegwerf-Kopien: `bot.py` in einen Ordner kopieren,
-`config.json` und `connections.json` daneben, `sys.path.insert` + `import bot` +
+Der feste Bestand liegt in `tests/` (`python3 -m pytest tests/ -q`) – vor allem rund um
+die PlayerList/Online-Liste, die hier mehrfach versagt hat. Echte ADM-Dateien des Servers
+liegen als Testdaten unter `tests/adm/`.
+
+Darüber hinaus laufen Tests als echte Prozesse in Wegwerf-Kopien: `bot.py`,
+`log_parser.py` und `embedded_assets.py` in einen Ordner kopieren, `config.json` und
+`connections.json` daneben, `sys.path.insert` + `import bot` +
 `cfg.load_all()`. Nitrado-API und FTP werden gestubbt, ein Discord-Login ist nicht nötig.
 Für die Oberfläche Playwright mit dem vorinstallierten Chromium unter
 `/opt/pw-browsers/`, mit `--no-sandbox`, bei 1280 px und 412 px.

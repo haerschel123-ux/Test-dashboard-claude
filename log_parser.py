@@ -36,6 +36,14 @@ class DayZLogParser:
         # eignet sich also nicht als "was ist neu" – siehe _poll_connection,
         # das dies nach jedem Zyklus wieder leert).
         self.frisch_unerkannt: List[str] = []
+        # Zaehlt JEDEN uebernommenen vollstaendigen PlayerList-Block. Der
+        # Verbindungs-Layer vergleicht den Stand vor und nach dem Parsen und
+        # weiss dadurch, ob live ein Roster committet wurde (siehe
+        # _playerlist_abschliessen). "Generation" statt Zeitstempel, weil ein
+        # Zaehler nicht von der Systemuhr abhaengt und nie rueckwaerts laeuft.
+        self.playerlist_commits: int = 0
+        # Namen des zuletzt uebernommenen Blocks – nur fuer Diagnose/Logging.
+        self.letzte_commit_namen: List[str] = []
         # "##### PlayerList log: N players" – manche Server-Konfigurationen
         # schreiben periodisch eine vollstaendige Momentaufnahme, wer gerade
         # verbunden ist. Verlaesslicher als das last_seen-Zeitfenster: wer
@@ -634,6 +642,15 @@ class DayZLogParser:
         oder er per Connect vermerkt ist (Absturz ohne Disconnect-Zeile)."""
         self.player_positions.clear()
         self.player_positions.update(self._playerlist_pending)
+        # Zaehler HOCH, bevor der Zwischenspeicher geleert wird: der
+        # Verbindungs-Layer (DayZBot._poll_connection) vergleicht ihn vor und
+        # nach dem Parsen und erkennt daran, dass hier LIVE ein vollstaendiger
+        # Block uebernommen wurde. Ohne dieses Signal glaubten roster_datei
+        # und Diagnose weiterhin, der Zustand stamme aus einer alten Datei oder
+        # sei gar nicht hydriert - und die Verwerfen-Zweige loeschten einen
+        # gerade erst korrekt gelesenen Roster wieder.
+        self.playerlist_commits += 1
+        self.letzte_commit_namen = sorted(self._playerlist_pending)
         self._playerlist_offen = False
         self._playerlist_erwartet = 0
         self._playerlist_gesehen = set()

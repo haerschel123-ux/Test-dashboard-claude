@@ -1758,6 +1758,14 @@ def a2s_player_names(ip: str, port: int, timeout: float = 3.0) -> Optional[List[
 # immer im selben Zyklus haengen zu bleiben.
 SIZE_FEHLER_GRENZE = 3
 
+# So viele Poll-Zyklen in Folge darf das gespeicherte Log-Verzeichnis leer
+# bleiben, bevor die FTP-Auto-Erkennung erneut laeuft. Faengt einen
+# GESPEICHERTEN, aber falschen Pfad ab (Server umgezogen, Ordner umbenannt) –
+# der heilte sich frueher nie, weil die Erkennung nur bei komplett leerem
+# ftp_log_dir ansprang. Bewusst nicht 1: ein einzelner FTP-Aussetzer soll
+# nicht sofort eine volle Verzeichnissuche ausloesen.
+_ADM_LEER_GRENZE = 5
+
 # Wie oft je Server auf eine neue .RPT (= Serverneustart) geprueft wird.
 # Nicht in jedem Poll-Zyklus: die Abfrage kostet eine eigene FTP-Runde, aber
 # Neustarts kommen nur ein paar Mal am Tag vor. Siehe _pruefe_neustart.
@@ -2690,6 +2698,10 @@ class ServerConnection:
         # einmaligen Wiederaufbau je Prozess und Datei (siehe
         # DayZBot._hydrate_online_state).
         self.parser_hydrated: bool = False
+        # Wie viele Poll-Zyklen in Folge lieferte das gespeicherte Log-
+        # Verzeichnis keine einzige ADM-Datei? Ab _ADM_LEER_GRENZE laeuft die
+        # FTP-Auto-Erkennung erneut (siehe _poll_connection).
+        self.adm_leer_zaehler: int = 0
         # Datei, fuer die zuletzt ein Hydrierungs-VERSUCH lief (auch ein
         # erfolgloser) - steuert die Drosselung.
         self.hydrated_file: Optional[str] = None
@@ -2728,6 +2740,32 @@ class ServerConnection:
         if self._hydrate_lock is None:
             self._hydrate_lock = asyncio.Lock()
         return self._hydrate_lock
+
+    def online_zustand_zuruecksetzen(self, grund: str) -> None:
+        """Roster UND alle zugehoerigen Hydrierungs-Felder gemeinsam leeren.
+
+        Vorher stand an vier Stellen ein blankes
+        ``conn.parser.player_positions.clear()``, teils ohne die abhaengigen
+        Felder mitzuruecksetzen. Besonders ``_pruefe_neustart`` leerte nur die
+        Namen: ``parser_hydrated`` blieb True und ``roster_datei`` zeigte
+        weiter auf dieselbe Datei, weshalb eine anschliessende Hydrierung sich
+        fuer ueberfluessig hielt und der Roster leer blieb – die Online-Liste
+        meldete dann „Namen aktuell nicht bekannt“, obwohl Spieler da waren.
+
+        Nur an EINER Stelle zu aendern ist hier der eigentliche Gewinn: ein
+        neues Zustandsfeld kann nicht mehr vergessen werden.
+        """
+        if self.parser is not None:
+            self.parser.player_positions.clear()
+        self.parser_hydrated = False
+        self.hydrated_file = None
+        self.roster_datei = None
+        self.roster_quelle_datei = None
+        self.roster_quelle_ts = 0.0
+        # 0.0 statt "jetzt": der naechste Zyklus soll SOFORT neu hydrieren
+        # duerfen, nicht erst nach Ablauf der Wiederholsperre.
+        self.hydrate_versuch_ts = 0.0
+        log.debug(f"[HYDRATE] {self.name}: Online-Zustand zurueckgesetzt ({grund}).")
 
     # ── Stammdaten ──
     @property
@@ -3885,18 +3923,42 @@ class DayZBot(discord.Client):
             await self._pruefe_neustart(conn, log_dir, loop)
             adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
             if not adm_files:
+                # Ein GESPEICHERTER, aber falscher Pfad heilte sich frueher nie:
+                # die Auto-Erkennung lief nur bei komplett leerem ftp_log_dir.
+                # Zeigt der Pfad ins Leere (Server umgezogen, Ordner umbenannt),
+                # lieferte list_adm_files dauerhaft nichts und der Bot meldete
+                # bis in alle Ewigkeit "keine .ADM-Dateien" – ohne je selbst
+                # nachzusehen, wo die Logs jetzt wirklich liegen.
+                conn.adm_leer_zaehler += 1
+                if conn.adm_leer_zaehler >= _ADM_LEER_GRENZE:
+                    conn.adm_leer_zaehler = 0
+                    log.warning(f"[ADM] {conn.name}: seit {_ADM_LEER_GRENZE} Zyklen keine "
+                                f"ADM-Datei in '{log_dir}' – Auto-Erkennung wird erneut "
+                                f"ausgefuehrt.")
+                    try:
+                        await self._auto_discover(conn)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning(f"[FTP] {conn.name}: erneute Auto-Erkennung "
+                                    f"fehlgeschlagen: {e}")
+                    else:
+                        neuer_pfad = conn.get("ftp_log_dir")
+                        if neuer_pfad and neuer_pfad != log_dir:
+                            log.info(f"[ADM] {conn.name}: Log-Verzeichnis korrigiert: "
+                                     f"'{log_dir}' → '{neuer_pfad}'")
                 await _poll_zustand_melden(conn, f"keine .ADM-Dateien in {log_dir} gefunden "
                                            "(ADM-Logging auf dem Server aktiviert? FTP-Pfad richtig?)")
                 await self._check_ftp_health(conn)
                 return
+            conn.adm_leer_zaehler = 0
 
             latest = adm_files[-1]
             # Welche Datei von welchen gewaehlt wurde – die eine Zeile, an der
             # sich eine falsche Dateiwahl (Server schreibt in eine andere ADM
             # als der Bot liest) im Serverlog sofort ablesen laesst.
-            if len(adm_files) > 1:
-                log.debug(f"[ADM] {conn.name}: {len(adm_files)} Datei(en) in {log_dir}, "
-                          f"gewaehlt: {latest}")
+            _cursor = conn.log_state.get("current") or {}
+            log.debug(f"[ADM] {conn.name}: log_dir={log_dir} dateien={len(adm_files)} "
+                      f"gewaehlt={latest} cursor_datei={_cursor.get('file')} "
+                      f"cursor_offset={_cursor.get('offset')}")
 
             # Online-Zustand wiederherstellen, BEVOR die Cursor-Zweige greifen.
             # Muss auch dann laufen, wenn bereits ein Cursor gespeichert ist:
@@ -3917,6 +3979,13 @@ class DayZBot(discord.Client):
             # Zeilen spaeter wieder.
             frisch_hydriert = (conn.roster_quelle_datei == latest
                                and conn.roster_quelle_ts >= zyklus_start)
+            # Die eine Zeile, an der sich im Serverlog ablesen laesst, ob ein
+            # gerade aufgebauter Roster gleich wieder verworfen werden darf.
+            log.debug(f"[HYDRATE] {conn.name}: frisch_hydriert={frisch_hydriert} "
+                      f"roster_datei={conn.roster_datei} "
+                      f"roster_quelle_datei={conn.roster_quelle_datei} "
+                      f"namen_vor_cursor="
+                      f"{sorted(conn.parser.player_positions) if conn.parser else []}")
 
             state = conn.log_state.get("current")
             if state is None:
@@ -3999,7 +4068,8 @@ class DayZBot(discord.Client):
                 # hat (roster_datei), darf der Stand bleiben.
                 if (conn.roster_datei != latest and not frisch_hydriert
                         and conn.parser is not None):
-                    conn.parser.player_positions.clear()
+                    conn.online_zustand_zuruecksetzen(
+                        f"Rotation auf {latest}, Roster stammt aus anderer Datei")
 
             current_size = await loop.run_in_executor(None, conn.ftp.file_size_or_none, latest)
             if current_size is not None:
@@ -4018,11 +4088,8 @@ class DayZBot(discord.Client):
                 # bisherige Roster ist damit hinfaellig. Neu hydrieren lassen,
                 # sonst blieben ausgeloggte Spieler bis zum naechsten Block
                 # in der Online-Liste stehen.
-                if conn.parser is not None:
-                    conn.parser.player_positions.clear()
-                conn.parser_hydrated = False
-                conn.roster_datei = None
-                conn.hydrate_versuch_ts = 0.0
+                conn.online_zustand_zuruecksetzen(
+                    "ADM-Datei wurde geleert (Truncation/Neustart)")
 
             if conn.shop and (restart_detected or conn.shop.cleanup_retry_needed):
                 # Offene Käufe ausliefern; nach FTP-Fehler automatisch erneut versuchen.
@@ -4084,11 +4151,8 @@ class DayZBot(discord.Client):
                     # wieder loeschen. Genau dadurch meldete A2S Spieler,
                     # waehrend der Scheduler keine Namen mehr kannte.
                     if conn.roster_datei != latest and not frisch_hydriert:
-                        if conn.parser is not None:
-                            conn.parser.player_positions.clear()
-                        conn.parser_hydrated = False
-                        conn.roster_datei = None
-                        conn.hydrate_versuch_ts = 0.0
+                        conn.online_zustand_zuruecksetzen(
+                            "Fast-Forward ueber eine Offline-Luecke")
                     conn.log_state["current"] = state
                     conn.log_state["last_poll_ts"] = now
                     connections.save()
@@ -4129,7 +4193,30 @@ class DayZBot(discord.Client):
                 # eigener Task) am Ende ihren Roster zurueckschreiben und die
                 # gerade hier verarbeiteten Connects/Disconnects verwerfen.
                 async with conn.hydrate_lock:
+                    commits_vorher = conn.parser.playerlist_commits
                     events.extend(conn.parser.parse_lines(content))
+                    # Wurde beim Tail-Lesen LIVE ein vollstaendiger
+                    # PlayerList-Block uebernommen? Dann stammt der Roster
+                    # nachweislich aus GENAU dieser Datei und ist frisch. Die
+                    # Metadaten wurden frueher nur in _hydrate_lesen gesetzt –
+                    # ein live geparster Block landete zwar in
+                    # player_positions, galt fuer Diagnose und die
+                    # Verwerfen-Zweige aber weiter als "nicht hydriert" bzw.
+                    # "aus einer anderen Datei", was ihn spaeter loeschen
+                    # konnte. Alle zusammengehoerigen Felder deshalb hier
+                    # gemeinsam nachziehen.
+                    if conn.parser.playerlist_commits > commits_vorher:
+                        conn.parser_hydrated = True
+                        conn.hydrated_file = latest
+                        conn.roster_datei = latest
+                        conn.roster_quelle_datei = latest
+                        conn.roster_quelle_ts = time.time()
+                        conn.last_read_status = ("Online-Zustand aus live gelesenem "
+                                                 "PlayerList-Block")
+                        log.debug(f"[PLAYERLIST] {conn.name}: Block live uebernommen "
+                                  f"(commit #{conn.parser.playerlist_commits}) "
+                                  f"namen={conn.parser.letzte_commit_namen} "
+                                  f"datei={latest} parser_id={id(conn.parser)}")
 
             # Zustand auch bei reiner Rotation (ohne neuen Inhalt) speichern
             conn.log_state["current"] = state
@@ -4649,16 +4736,30 @@ class DayZBot(discord.Client):
             # nur fuer die reine Anzahl als Gegenprobe (die stimmt weiterhin).
             # NUR conn.parser: ein Rueckfall auf self.parser wuerde die
             # Spieler eines FREMDEN Kunden in diese Online-Liste holen.
-            positions = dict(conn.parser.player_positions) if conn.parser else {}
+            # Unter dem Hydrierungs-Lock lesen: sonst koennte der Poller
+            # mitten im Kopieren einen vollstaendigen Block committen und die
+            # Momentaufnahme waere ein Mischzustand aus altem und neuem Roster.
+            async with conn.hydrate_lock:
+                positions = dict(conn.parser.player_positions) if conn.parser else {}
+            roh_namen = sorted(positions)
             namen = _online_spieler_namen(positions)
             gesamt = await _a2s_spielerzahl(conn)
             if gesamt == 0:
-                # In den echten ADM-Dateien wird bei leerem Server nicht
-                # verlaesslich ein "0 players"-Block geschrieben. Die
-                # erfolgreiche A2S-Antwort ist dann die autoritative
-                # Information und entfernt veraltete Log-Namen sofort.
-                if conn.parser is not None:
-                    conn.parser.player_positions.clear()
+                # NUR die Anzeige dieses einen Durchlaufs leeren, NICHT den
+                # Live-Roster. Frueher stand hier ein
+                # `conn.parser.player_positions.clear()` – ein einziger
+                # falscher oder verspaeteter A2S-Wert (Serverneustart, falsch
+                # gespeicherter Query-Port) warf damit echte, frisch aus dem
+                # Log gelesene Namen weg. Schlimmer: der clear() lief NACH
+                # einem `await` und ausserhalb von conn.hydrate_lock, konnte
+                # also einen Roster loeschen, den der Poller in genau dieser
+                # Zeitspanne frisch committet hatte.
+                # Eine reine Ausgabe-Funktion darf den Parserzustand nicht
+                # veraendern; irrt sich A2S, ist der Name beim naechsten
+                # Durchlauf sofort wieder da, statt muehsam neu hydriert zu
+                # werden. Ausgeloggte Spieler verschwinden weiterhin ueber die
+                # Disconnect-Zeile, den naechsten PlayerList-Block und die
+                # Alters-Obergrenze in _online_spieler_namen.
                 namen = []
             elif gesamt is not None and len(namen) != gesamt:
                 # Der Server meldet eine andere Spielerzahl, als wir Namen
@@ -4669,17 +4770,25 @@ class DayZBot(discord.Client):
                 # Namen ist genauso kaputt wie ein leerer, wuerde sich aber nie
                 # von selbst heilen.
                 await self._rehydrate_versuch(conn)
-                positions = dict(conn.parser.player_positions) if conn.parser else {}
+                async with conn.hydrate_lock:
+                    positions = dict(conn.parser.player_positions) if conn.parser else {}
+                roh_namen = sorted(positions)
                 namen = _online_spieler_namen(positions)
             # Beweist im Serverlog, WAS die Online-Liste in dem Moment wusste,
             # in dem sie gepostet hat: die Zahl vom Server (A2S) gegen die
             # Namen aus dem Log-Tracking. Stehen hier dauerhaft "A2S=1" und
             # "Namen=[]", liegt es nicht am Embed, sondern daran, dass der
             # Parser die Zeilen nie zu sehen bekam (falsche Datei? Cursor?).
+            # ROH und GEFILTERT getrennt: steht ein Name in "roh", aber nicht
+            # in "gefiltert", hat ihn die Altersgrenze in
+            # _online_spieler_namen aussortiert – ein voellig anderer Fehler
+            # als "der Parser kennt ihn gar nicht".
             if gesamt is not None and len(namen) != gesamt:
-                log.info(f"[ONLINE] {conn.name}: A2S={gesamt}, Namen={namen}, "
+                log.info(f"[ONLINE] {conn.name}: A2S={gesamt}, roh={roh_namen}, "
+                         f"gefiltert={namen}, "
                          f"Datei={(conn.log_state.get('current') or {}).get('file')}, "
-                         f"hydriert_aus={conn.roster_datei}")
+                         f"hydriert_aus={conn.roster_datei}, "
+                         f"parser_id={id(conn.parser) if conn.parser else None}")
             if not namen and not gesamt and not task.get("post_wenn_leer"):
                 # ``False`` statt ``None``: der Aufrufer soll HIER GAR NICHTS
                 # posten, auch keine allgemeine "erledigt"-Bestaetigung -
@@ -5080,8 +5189,10 @@ class DayZBot(discord.Client):
         # Ein Neustart trennt jeden. Ohne dieses Leeren blieben die per
         # Connect vermerkten Spieler (ohne Positions-Zeilen laeuft fuer sie
         # kein 900s-Fenster ab) bis zur harten Obergrenze faelschlich online.
-        if conn.parser is not None:
-            conn.parser.player_positions.clear()
+        # Zentral statt nur player_positions.clear(): frueher blieben
+        # parser_hydrated/roster_datei stehen, weshalb die naechste Hydrierung
+        # sich fuer ueberfluessig hielt und der Roster leer blieb.
+        conn.online_zustand_zuruecksetzen("Server-Neustart erkannt (neue RPT)")
         await self._dispatch({"type": "server_restart",
                               "timestamp": gestartet,
                               "gestartet": gestartet,
@@ -14527,16 +14638,27 @@ def _apply_gameserver_info(info: Dict, conn: Optional[ServerConnection] = None) 
                  f"(vorher: {ziel.get('map_name')})")
         ziel["map_name"] = detected_map
 
-    # Bonus: Server-IP/Query-Port nur befüllen, wenn noch nicht gesetzt
-    if not ziel.get("server_ip") and info.get("ip"):
+    # Server-IP und Query-Port UNABHAENGIG voneinander pflegen. Frueher stand
+    # das Setzen des Ports in `if not server_ip:` – war die IP schon einmal
+    # gespeichert, blieb ein falscher oder veralteter Port dauerhaft stehen,
+    # obwohl Nitrado laengst den richtigen meldete. Der A2S-Endpunkt zeigte
+    # dann fuer immer ins Leere (Spielerzahl 0 statt der echten Zahl), und die
+    # Online-Liste schrieb „Namen aktuell nicht bekannt“.
+    if info.get("ip") and str(info["ip"]) != str(ziel.get("server_ip") or ""):
+        alt_ip = ziel.get("server_ip") or "(leer)"
         ziel["server_ip"] = str(info["ip"])
-        qport = (info.get("query") or {}).get("connect_port") or info.get("query_port")
-        if qport:
-            try:
-                ziel["query_port"] = int(qport)
-            except (TypeError, ValueError):
-                pass
-        log.info(f"[NITRADO] Server-IP automatisch gesetzt: {info['ip']}")
+        log.info(f"[NITRADO] Server-IP aktualisiert: {alt_ip} → {info['ip']}")
+
+    qport = (info.get("query") or {}).get("connect_port") or info.get("query_port")
+    if qport:
+        try:
+            neuer_port = int(qport)
+        except (TypeError, ValueError):
+            neuer_port = None
+        if neuer_port and neuer_port != int(ziel.get("query_port") or 0):
+            alt_port = ziel.get("query_port") or "(leer)"
+            ziel["query_port"] = neuer_port
+            log.info(f"[NITRADO] Query-Port aktualisiert: {alt_port} → {neuer_port}")
 
 
 async def auto_detect_from_nitrado() -> bool:
@@ -17869,6 +17991,24 @@ async def api_diagnose(request: web.Request) -> web.Response:
             "a2s_namen": a2s_namen,
             "log_namen": log_namen,
             "quellen": _online_quellen(parser.player_positions if parser else {}),
+            # ROH = alles, was der Parser kennt; log_namen oben ist die
+            # bereits nach Alter GEFILTERTE Fassung. Klaffen beide
+            # auseinander, hat nicht der Parser versagt, sondern die
+            # Altersgrenze hat einen bekannten Namen ausgeblendet - ohne
+            # diese Gegenueberstellung war das auf der Seite nicht
+            # unterscheidbar.
+            "roh_namen": sorted(parser.player_positions) if parser else [],
+            "alter_grenze_position_s": 900,
+            "alter_grenze_connect_s": _ONLINE_CONNECT_MAX_ALTER,
+            # Spielerzahl laut Server, damit Anzahl und Namen auf DERSELBEN
+            # Seite vergleichbar sind (vorher musste man dafuer Discord und
+            # Dashboard nebeneinanderlegen).
+            "a2s_anzahl": await _a2s_spielerzahl(conn),
+            # Wie oft hat der Parser bisher einen vollstaendigen
+            # PlayerList-Block uebernommen? Bleibt das bei 0, obwohl Spieler
+            # online sind, erreichen die Bloecke den Parser gar nicht.
+            "playerlist_commits": parser.playerlist_commits if parser else 0,
+            "letzte_commit_namen": parser.letzte_commit_namen if parser else [],
         },
     })
 
@@ -21558,12 +21698,46 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
 # ══════════════════════════════════════════════════════════════
 #  Start
 # ══════════════════════════════════════════════════════════════
+def _start_kennung_ausgeben() -> None:
+    """Welcher Code laeuft hier gerade wirklich?
+
+    Bei der Fehlersuche an der Online-Liste kostete genau diese Frage Tage:
+    das Dashboard lieferte neue Assets aus, waehrend niemand belegen konnte,
+    welche bot.py der Prozess tatsaechlich gestartet hatte. Seit der
+    Auslagerung von log_parser.py/embedded_assets.py reicht es ausserdem
+    nicht mehr, nur bot.py zu ersetzen – ein halbes Update faellt sonst
+    stumm auf alten Code zurueck. Deshalb bei JEDEM Start die Herkunft
+    aller drei Dateien nennen.
+
+    Bewusst ohne jede Zugangsdaten: nur Pfade, Groessen und Pruefsummen.
+    """
+    def _kennung(pfad: str) -> str:
+        try:
+            with open(pfad, "rb") as f:
+                roh = f.read()
+            return f"{hashlib.sha256(roh).hexdigest()[:12]} ({len(roh)} B)"
+        except OSError as e:
+            return f"nicht lesbar ({e})"
+
+    hier = os.path.dirname(os.path.abspath(__file__))
+    print("── Laufende Fassung ──────────────────────────────────")
+    for name in ("bot.py", "log_parser.py", "embedded_assets.py"):
+        pfad = os.path.join(hier, name)
+        print(f"   {name:<20} {pfad}")
+        print(f"   {'':<20} {_kennung(pfad)}")
+    print(f"   {'Python':<20} {sys.executable}")
+    print(f"   {'PID':<20} {os.getpid()}")
+    print("──────────────────────────────────────────────────────")
+    print()
+
+
 def main():
     print()
     print("╔══════════════════════════════════════════════════════╗")
     print("║        DayZ Discord Bot – Server Management          ║")
     print("╚══════════════════════════════════════════════════════╝")
     print()
+    _start_kennung_ausgeben()
 
     cfg.load_all()
 
