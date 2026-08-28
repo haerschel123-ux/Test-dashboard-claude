@@ -2283,8 +2283,8 @@ def _nearest_location(x: float, y: float, map_name: str = "ChernarusPlus") -> Op
 # Kanonischer Map-Name -> Pfad-Baustein der iZurvive-Adresse.
 _IZURVIVE_MAP_SLUG = {
     "ChernarusPlus": "chernarusplussatmap",
-    "Livonia": "livoniasatmap",
-    "Sakhal": "sakhalsatmap",
+    "Livonia": "livonia",
+    "Sakhal": "sakhal",
 }
 
 
