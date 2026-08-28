@@ -2365,6 +2365,24 @@ def _add_location_field(e: discord.Embed, ev: Dict, player_key: str,
 
 
 _LOCATION_FELD = "📍 • Player Location"
+# Praefix statt fester Namen: der KILL-Zweig braucht zwei GETRENNTE
+# Standort-Felder (Killer/Opfer statt eines einzelnen "Player Location"),
+# damit sie jeweils direkt unter der zugehoerigen ID stehen. Der
+# "Standort zeigen"-Schalter in _feed_anwenden muss trotzdem beide treffen -
+# daher ein gemeinsames Praefix statt eines exakten Namens.
+_LOCATION_PRAEFIX = "📍 • "
+
+
+def _add_named_location_field(e: discord.Embed, name: str, eigene_position: Optional[str],
+                              positions: Optional[Dict[str, Dict]], sprache: str = "de") -> None:
+    """Wie _add_location_field, aber mit eigenem Feldnamen (z.B. "Killer-
+    Standort" statt des generischen "Player Location") - fuer Ereignisse mit
+    ZWEI beteiligten Spielern, die je einen eigenen Standort-Link brauchen."""
+    pos = eigene_position or (positions or {}).get(name, {}).get("position")
+    loc_val = _location_field_value(pos)
+    if loc_val:
+        e.add_field(name=_LOCATION_PRAEFIX + _tx(sprache, "Standort", "Location"),
+                   value=loc_val, inline=False)
 
 
 def _feed_anwenden(e: discord.Embed,
@@ -2381,10 +2399,15 @@ def _feed_anwenden(e: discord.Embed,
         if feed.get("colour") is not None:
             e.colour = discord.Colour(int(feed["colour"]))
         if not feed.get("location", True):
-            for i, f in enumerate(list(e.fields)):
-                if f.name == _LOCATION_FELD:
+            # RUECKWAERTS durchgehen und ALLE Treffer entfernen (nicht nur den
+            # ersten): der KILL-Zweig hat inzwischen ZWEI Standort-Felder
+            # (Killer + Opfer) statt eines einzelnen - remove_field
+            # verschiebt die Indizes, deshalb rueckwaerts, damit ein spaeterer
+            # Treffer nicht durch die Verschiebung uebersprungen wird.
+            for i in range(len(e.fields) - 1, -1, -1):
+                name = e.fields[i].name or ""
+                if name == _LOCATION_FELD or name.startswith(_LOCATION_PRAEFIX):
                     e.remove_field(i)
-                    break
         if feed.get("footer_ts"):
             e.timestamp = datetime.now(timezone.utc)
     except Exception:  # noqa: BLE001 – Darstellung darf den Versand nie kippen
@@ -2409,10 +2432,15 @@ class EmbedBuilder:
             e.add_field(name=_tx(sprache, "Waffe", "Weapon"), value=ev["weapon"], inline=True)
             e.add_field(name=_tx(sprache, "Distanz", "Distance"),
                        value=_dist(ev["distance"], sprache), inline=True)
-            _add_location_field(e, ev, "victim", positions)
             e.add_field(name="Killer ID", value=f"`{ev['killer_id']}`", inline=False)
+            # Killer-Position steht NIE in der Kill-Zeile selbst (die ADM
+            # schreibt dort nur die Todesposition des Opfers) - deshalb nur
+            # ueber die zuletzt GETRACKTE Position des Killers moeglich, also
+            # nur der positions-Fallback statt ev["position"].
+            _add_named_location_field(e, ev["killer"], None, positions, sprache)
             e.add_field(name=_tx(sprache, "Opfer ID", "Victim ID"),
                        value=f"`{ev['victim_id']}`", inline=False)
+            _add_named_location_field(e, ev["victim"], ev.get("position"), positions, sprache)
 
         elif t == "suicide":
             e = discord.Embed(
