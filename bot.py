@@ -1793,6 +1793,14 @@ _TASK_MAX_RUECKSTAND = 10 * 365 * 24 * 3600
 #  FTP-Manager  (sync, läuft in ThreadPoolExecutor)
 # ══════════════════════════════════════════════════════════════
 class FTPManager:
+    # Nach so vielen Sekunden wird die gehaltene FTP-Verbindung proaktiv neu
+    # aufgebaut statt nur per NOOP am Leben gehalten - schuetzt gegen einen
+    # moeglichen Verzeichnis-Listing-Cache auf Verbindungsebene beim Hoster
+    # (siehe Kommentar bei _ftp_verbunden_seit). 5 Minuten: kuerzer als jede
+    # beobachtete ADM-Rotation, aber selten genug, dass der zusaetzliche
+    # Login pro Server keine spuerbare Last erzeugt.
+    _FTP_MAX_VERBINDUNGSALTER = 300.0
+
     # Typische Nitrado-Pfade für DayZ Konsolen-Server
     NITRADO_SEARCH_PATHS = [
         "/dayzps/config",
@@ -1830,6 +1838,17 @@ class FTPManager:
         self._ftp_lock = threading.Lock()   # Methoden laufen in Executor-Threads
         self.consecutive_failures = 0       # Zähler für die Adminlog-Ausfall-Warnung
         self.last_error: str = ""
+        # Seit wann steht die gehaltene Verbindung? NOOP prueft nur, ob der
+        # Socket noch lebt - das sagt nichts darueber, ob der FTP-Server (bzw.
+        # ein vorgeschalteter Proxy/Load-Balancer bei Shared Hosting wie
+        # Nitrado) ein Verzeichnis-Listing fuer die Dauer DIESER Verbindung
+        # zwischenspeichert. Genau das erklaerte einen real beobachteten Fall:
+        # der Bot blieb ueber eine Stunde auf einer laengst veralteten .ADM
+        # haengen, obwohl der Server laengst eine neue, gefuellte Datei
+        # geschrieben hatte UND laut Nitrado-API normal lief (kein Ausfall,
+        # kein Neustart) - ein frischer FTP-Login haette die Datei sofort
+        # gesehen. Siehe _FTP_MAX_VERBINDUNGSALTER unten.
+        self._ftp_verbunden_seit: float = 0.0
 
     def _connect(self) -> ftplib.FTP:
         ftp = ftplib.FTP()
@@ -1862,16 +1881,23 @@ class FTPManager:
             except Exception:
                 pass
             self._ftp = None
+            self._ftp_verbunden_seit = 0.0
 
     def _with_conn(self, op):
         """Führt op(ftp) auf der gehaltenen Verbindung aus. Ist der Socket tot
         (Timeout, Server-Trennung), wird genau einmal neu verbunden und wiederholt.
         error_perm (Pfad/Rechte) gilt nicht als Verbindungsfehler."""
         with self._ftp_lock:
+            # Verbindung zu alt? Proaktiv verwerfen statt nur per NOOP am
+            # Leben halten - siehe Kommentar bei _ftp_verbunden_seit.
+            if (self._ftp is not None
+                    and time.time() - self._ftp_verbunden_seit > self._FTP_MAX_VERBINDUNGSALTER):
+                self._drop_conn()
             for attempt in (1, 2):
                 try:
                     if self._ftp is None:
                         self._ftp = self._connect()
+                        self._ftp_verbunden_seit = time.time()
                     else:
                         self._ftp.voidcmd("NOOP")   # lebt die Verbindung noch?
                     result = op(self._ftp)
