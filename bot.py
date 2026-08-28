@@ -3984,9 +3984,18 @@ class DayZBot(discord.Client):
             # sich eine falsche Dateiwahl (Server schreibt in eine andere ADM
             # als der Bot liest) im Serverlog sofort ablesen laesst.
             _cursor = conn.log_state.get("current") or {}
-            log.debug(f"[ADM] {conn.name}: log_dir={log_dir} dateien={len(adm_files)} "
-                      f"gewaehlt={latest} cursor_datei={_cursor.get('file')} "
-                      f"cursor_offset={_cursor.get('offset')}")
+            # INFO statt DEBUG: das Standard-Logging laeuft auf INFO-Stufe
+            # (siehe logging.basicConfig oben) - eine DEBUG-Zeile wird dort
+            # still verworfen und war live nie sichtbar, ausgerechnet bei der
+            # einen Zeile, die im Ernstfall beweist, ob der Bot ueberhaupt
+            # eine neuere Datei sieht. NUR bei jedem NEU gewaehlten "latest"
+            # loggen (nicht jeden Poll-Zyklus) - sonst waere das bei z.B.
+            # 10s Poll-Intervall und mehreren Servern viel zu viele Zeilen.
+            if latest != conn.log_state.get("adm_zuletzt_gemeldet"):
+                conn.log_state["adm_zuletzt_gemeldet"] = latest
+                log.info(f"[ADM] {conn.name}: log_dir={log_dir} dateien={len(adm_files)} "
+                         f"gewaehlt={latest} cursor_datei={_cursor.get('file')} "
+                         f"cursor_offset={_cursor.get('offset')}")
 
             # Online-Zustand wiederherstellen, BEVOR die Cursor-Zweige greifen.
             # Muss auch dann laufen, wenn bereits ein Cursor gespeichert ist:
@@ -4241,10 +4250,13 @@ class DayZBot(discord.Client):
                         conn.roster_quelle_ts = time.time()
                         conn.last_read_status = ("Online-Zustand aus live gelesenem "
                                                  "PlayerList-Block")
-                        log.debug(f"[PLAYERLIST] {conn.name}: Block live uebernommen "
-                                  f"(commit #{conn.parser.playerlist_commits}) "
-                                  f"namen={conn.parser.letzte_commit_namen} "
-                                  f"datei={latest} parser_id={id(conn.parser)}")
+                        # INFO statt DEBUG (siehe Kommentar bei [ADM] oben) -
+                        # feuert nur bei einem echten Commit (alle paar
+                        # Minuten je aktivem Server), also unproblematisch oft.
+                        log.info(f"[PLAYERLIST] {conn.name}: Block live uebernommen "
+                                 f"(commit #{conn.parser.playerlist_commits}) "
+                                 f"namen={conn.parser.letzte_commit_namen} "
+                                 f"datei={latest} parser_id={id(conn.parser)}")
 
             # Zustand auch bei reiner Rotation (ohne neuen Inhalt) speichern
             conn.log_state["current"] = state
