@@ -3378,10 +3378,12 @@ async def _betreiber_alarm(text: str, farbe: int = 0xE67E22) -> None:
 #  API laeuft dagegen ueber gewoehnliches HTTPS je Aufruf - kein Verdacht
 #  auf verbindungsgebundenes Caching.
 #
-#  Bewusst je Server einzeln umschaltbar (siehe conn.get("log_lesen_via_api"),
-#  Standard AUS): eine Umstellung erst an einem Kunden pruefen, ohne alle
-#  anderen zu beeinflussen, und im Fehlerfall per Konfigurationswert
-#  zuruecknehmen, ohne Code zu aendern.
+#  Bewusst je Server einzeln umschaltbar (siehe conn.get("log_lesen_via_api")).
+#  Erst an einem einzelnen Kunden ueber mehrere echte Rotationen bestaetigt
+#  (Namen blieben zuverlaessig bekannt, wo vorher "Namen aktuell nicht
+#  bekannt" stand) - seitdem Standard AN. Ein einzelner Server kann bei
+#  Bedarf mit "log_lesen_via_api": false explizit auf FTP zurueckfallen,
+#  ohne Code zu aendern.
 #
 #  NUR das Tailing der laufenden ADM-Datei und die RPT-Liste (Neustart-
 #  Erkennung) sind betroffen - Banliste, Zonen-Datei und der Shop-Katalog-
@@ -3391,7 +3393,7 @@ async def _betreiber_alarm(text: str, farbe: int = 0xE67E22) -> None:
 #  NitradoAPI.seek_file serverseitig auf 65535 Bytes gedeckelt ist (live
 #  ermittelt, siehe dortiger Kommentar).
 def _log_lesen_via_api(conn: "ServerConnection") -> bool:
-    return bool(conn.get("log_lesen_via_api", False)) and conn.api is not None
+    return bool(conn.get("log_lesen_via_api", True)) and conn.api is not None
 
 
 def _api_pfad(conn: "ServerConnection", ftp_pfad: str) -> str:
