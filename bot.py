@@ -3394,11 +3394,29 @@ def _log_lesen_via_api(conn: "ServerConnection") -> bool:
     return bool(conn.get("log_lesen_via_api", False)) and conn.api is not None
 
 
+def _api_pfad(conn: "ServerConnection", ftp_pfad: str) -> str:
+    """Wandelt einen FTP-RELATIVEN Pfad wie gespeichert (z.B. "/dayzps/config",
+    funktioniert nur ueber FTP, weil FTP je Kunde auf ein eigenes "Zuhause"
+    beschraenkt ist) in den VOLLSTAENDIGEN Pfad um, den die Nitrado-HTTPS-API
+    braucht (z.B. "/games/ni11769331_3/noftp/dayzps/config").
+
+    Live bestaetigt: file_server/list mit dem rohen ftp_log_dir liefert 0
+    Eintraege, mit dem vollen Pfad die echten 124. Die Basis
+    "/games/{ftp_user}/noftp" ist ueberall dort beobachtet worden, wo der
+    FTP-Benutzername bekannt ist (deckt sich mit game_specific.path aus
+    NitradoAPI.get_info()) - kein zusaetzlicher API-Aufruf noetig.
+    """
+    ftp_user = str(conn.get("ftp_user") or "").strip()
+    if not ftp_user or ftp_pfad.startswith("/games/"):
+        return ftp_pfad
+    return f"/games/{ftp_user}/noftp{ftp_pfad}"
+
+
 async def _log_dateien(conn: "ServerConnection", directory: str, endung: str) -> List[str]:
     """Wie FTPManager.list_adm_files/list_rpt_files, wahlweise ueber FTP
     oder die Nitrado-API. ``endung`` z. B. ".adm" oder ".rpt"."""
     if _log_lesen_via_api(conn):
-        entries = await conn.api.list_files(directory)
+        entries = await conn.api.list_files(_api_pfad(conn, directory))
         if entries is None:
             return []
         treffer = [e for e in entries
