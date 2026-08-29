@@ -1486,6 +1486,67 @@ class NitradoAPI:
             log.error(f"[NITRADO] download_file: {e}")
         return None
 
+    async def list_files(self, directory: str) -> Optional[List[Dict]]:
+        """GET file_server/list – Verzeichniseintraege (Name, Groesse,
+        modified_at, ...) direkt ueber HTTPS statt FTP. ``None`` bei Fehler
+        (nicht dasselbe wie eine leere Liste – siehe read_from_offset-Konvention
+        beim FTP-Pendant)."""
+        try:
+            s = await self._s()
+            url = f"{self.base}/services/{self.service_id}/gameservers/file_server/list"
+            async with s.get(url, params={"dir": directory}) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    entries = data.get("data", {}).get("entries")
+                    if isinstance(entries, list):
+                        return entries
+                log.warning(f"[NITRADO] list_files({directory}): HTTP {r.status}")
+        except Exception as e:
+            log.warning(f"[NITRADO] list_files({directory}): {e}")
+        return None
+
+    # Live per Bisektion ermittelt: alles ueber diesem Wert antwortet mit
+    # HTTP 500 "Length limit exceeded. Use file download instead." - in der
+    # Nitrado-Doku nirgends erwaehnt. Fuer groessere Leseabschnitte (z.B. die
+    # Hydrierung, die bis zu 2 MB rueckwaerts liest) muss download_file()
+    # verwendet werden statt seek_file().
+    _SEEK_MAX_LENGTH = 65535
+
+    async def seek_file(self, path: str, offset: int,
+                        length: int = _SEEK_MAX_LENGTH) -> Optional[bytes]:
+        """GET file_server/seek – liest eine Datei ab ``offset`` (negativ =
+        von hinten), analog zu FTPManager.read_from_offset aber ueber HTTPS.
+        ``None`` bei Fehler, ``b""`` heisst "nichts Neues".
+
+        ``length`` ist trotz "optional" in der Nitrado-Doku serverseitig ein
+        PFLICHTPARAMETER (live getestet: ohne length -> HTTP 500 "Parameter
+        must not be None: length"), UND per Bisektion auf maximal
+        _SEEK_MAX_LENGTH begrenzt. Bei einem groesseren Rueckstand als das
+        erlaubt, holt der naechste Poll-Zyklus den Rest nach - kein
+        Datenverlust, nur mehr Zyklen bis zum Aufholen.
+        """
+        length = min(length, self._SEEK_MAX_LENGTH)
+        try:
+            s = await self._s()
+            url = f"{self.base}/services/{self.service_id}/gameservers/file_server/seek"
+            params: Dict[str, Any] = {"file": path, "offset": offset,
+                                      "mode": "raw", "length": length}
+            async with s.get(url, params=params) as r:
+                if r.status != 200:
+                    log.warning(f"[NITRADO] seek_file({path}): HTTP {r.status}")
+                    return None
+                data = await r.json()
+                seek_url = data.get("data", {}).get("token", {}).get("url")
+                if not seek_url:
+                    return None
+                async with s.get(seek_url) as sr:
+                    if sr.status == 200:
+                        return await sr.read()
+                    log.warning(f"[NITRADO] seek_file({path}): Abruf-URL HTTP {sr.status}")
+        except Exception as e:
+            log.warning(f"[NITRADO] seek_file({path}): {e}")
+        return None
+
     # ── Auto-Erkennung (Service-ID, FTP-Zugang, Karte) ────────────
     async def list_services(self) -> List[Dict]:
         """GET /services – alle Services des Tokens. Leere Liste bei Fehler."""
@@ -1890,14 +1951,22 @@ class FTPManager:
         with self._ftp_lock:
             # Verbindung zu alt? Proaktiv verwerfen statt nur per NOOP am
             # Leben halten - siehe Kommentar bei _ftp_verbunden_seit.
-            if (self._ftp is not None
-                    and time.time() - self._ftp_verbunden_seit > self._FTP_MAX_VERBINDUNGSALTER):
-                self._drop_conn()
+            # time.monotonic() statt time.time(): laeuft nie rueckwaerts,
+            # auch wenn sich die Systemuhr per NTP verstellt.
+            if self._ftp is not None:
+                alter = time.monotonic() - self._ftp_verbunden_seit
+                if alter > self._FTP_MAX_VERBINDUNGSALTER:
+                    # INFO statt nur intern: das ist die eine Zeile, die im
+                    # Ernstfall belegt, DASS und WANN ein Zwangs-Reconnect
+                    # ausgeloest wurde - keine Zugangsdaten enthalten.
+                    log.info(f"[FTP] {self.host}: Zwangs-Reconnect nach "
+                             f"{alter:.0f}s (Grenze {self._FTP_MAX_VERBINDUNGSALTER:.0f}s).")
+                    self._drop_conn()
             for attempt in (1, 2):
                 try:
                     if self._ftp is None:
                         self._ftp = self._connect()
-                        self._ftp_verbunden_seit = time.time()
+                        self._ftp_verbunden_seit = time.monotonic()
                     else:
                         self._ftp.voidcmd("NOOP")   # lebt die Verbindung noch?
                     result = op(self._ftp)
@@ -3299,6 +3368,86 @@ async def _betreiber_alarm(text: str, farbe: int = 0xE67E22) -> None:
         log.error(f"[BETREIBER-ALARM] Senden fehlgeschlagen: {e}")
 
 
+# ══════════════════════════════════════════════════════════════
+#  ADM/RPT lesen – wahlweise per FTP oder ueber die Nitrado-HTTPS-API
+# ══════════════════════════════════════════════════════════════
+#  Hintergrund: FTPManager haelt eine einzige Verbindung dauerhaft offen
+#  (siehe _FTP_MAX_VERBINDUNGSALTER) - im Verdacht, dass Nitrado (Shared
+#  Hosting, evtl. hinter Proxy/Load-Balancer) ein Verzeichnis-Listing fuer
+#  die Lebensdauer GENAU DIESER Verbindung zwischenspeichert. Die Nitrado-
+#  API laeuft dagegen ueber gewoehnliches HTTPS je Aufruf - kein Verdacht
+#  auf verbindungsgebundenes Caching.
+#
+#  Bewusst je Server einzeln umschaltbar (siehe conn.get("log_lesen_via_api"),
+#  Standard AUS): eine Umstellung erst an einem Kunden pruefen, ohne alle
+#  anderen zu beeinflussen, und im Fehlerfall per Konfigurationswert
+#  zuruecknehmen, ohne Code zu aendern.
+#
+#  NUR das Tailing der laufenden ADM-Datei und die RPT-Liste (Neustart-
+#  Erkennung) sind betroffen - Banliste, Zonen-Datei und der Shop-Katalog-
+#  Import bleiben unveraendert auf FTP, die sind vom hier untersuchten Bug
+#  nicht betroffen. Die Hydrierung (_hydrate_lesen) bleibt ebenfalls auf FTP:
+#  sie liest bis zu 2 MB rueckwaerts (_HYDRATE_FENSTER), waehrend
+#  NitradoAPI.seek_file serverseitig auf 65535 Bytes gedeckelt ist (live
+#  ermittelt, siehe dortiger Kommentar).
+def _log_lesen_via_api(conn: "ServerConnection") -> bool:
+    return bool(conn.get("log_lesen_via_api", False)) and conn.api is not None
+
+
+async def _log_dateien(conn: "ServerConnection", directory: str, endung: str) -> List[str]:
+    """Wie FTPManager.list_adm_files/list_rpt_files, wahlweise ueber FTP
+    oder die Nitrado-API. ``endung`` z. B. ".adm" oder ".rpt"."""
+    if _log_lesen_via_api(conn):
+        entries = await conn.api.list_files(directory)
+        if entries is None:
+            return []
+        treffer = [e for e in entries
+                  if str(e.get("name", "")).lower().endswith(endung)
+                  and e.get("path")]
+        treffer.sort(key=lambda e: (e.get("modified_at") or 0, e.get("name") or ""))
+        return [e["path"] for e in treffer]
+    loop = asyncio.get_running_loop()
+    fn = conn.ftp.list_adm_files if endung == ".adm" else conn.ftp.list_rpt_files
+    return await loop.run_in_executor(None, fn, directory)
+
+
+async def _log_dateigroesse(conn: "ServerConnection", path: str) -> Optional[int]:
+    """Wie FTPManager.file_size_or_none, wahlweise ueber FTP oder die
+    Nitrado-API."""
+    if _log_lesen_via_api(conn):
+        directory = path.rsplit("/", 1)[0]
+        entries = await conn.api.list_files(directory)
+        if entries is None:
+            return None
+        for e in entries:
+            if e.get("path") == path:
+                return e.get("size")
+        return None
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, conn.ftp.file_size_or_none, path)
+
+
+async def _log_lesen_ab_offset(conn: "ServerConnection", path: str,
+                               offset: int) -> Tuple[Optional[str], int]:
+    """Wie FTPManager.read_from_offset, wahlweise ueber FTP oder die
+    Nitrado-API. ``inhalt is None`` heisst FEHLER, ``""`` heisst "nichts
+    Neues" - dieselbe Konvention wie beim FTP-Original. Ein groesserer
+    Rueckstand als die 65535-Byte-Grenze von seek_file kommt ueber mehrere
+    Poll-Zyklen nach statt in einem Rutsch - kein Datenverlust."""
+    if _log_lesen_via_api(conn):
+        raw = await conn.api.seek_file(path, offset)
+        if raw is None:
+            return None, offset
+        if raw and not raw.endswith(b"\n"):
+            cut = raw.rfind(b"\n")
+            if cut == -1:
+                return "", offset
+            raw = raw[:cut + 1]
+        return raw.decode("utf-8", errors="replace"), offset + len(raw)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, conn.ftp.read_from_offset, path, offset)
+
+
 async def _poll_zustand_melden(conn: ServerConnection, grund: Optional[str]) -> None:
     """Loggt, WARUM der Poll-Zyklus diesen Server gerade uebergeht oder wieder
     normal laeuft – aber nur bei einer AENDERUNG des Grundes, nicht bei jedem
@@ -3845,11 +3994,24 @@ class DayZBot(discord.Client):
                 verbindung.discovered = False
                 log.warning(f"[FTP] {verbindung.name}: Auto-Discovery fehlgeschlagen: {e}")
 
-    async def _auto_discover(self, conn: Optional[ServerConnection] = None):
+    async def _auto_discover(self, conn: Optional[ServerConnection] = None,
+                             heilen: bool = False):
         """Sucht automatisch nach DayZ-Log-Verzeichnissen via FTP.
 
         Die gefundenen Pfade gehoeren zu genau einem Server und landen deshalb
         in dessen Verbindung. Ohne Angabe gilt der Hauptserver.
+
+        ``heilen=True``: ein bereits gesetzter Pfad wird durch den neu
+        gefundenen ERSETZT statt ihn stehen zu lassen. Nur setzen, wenn der
+        Aufrufer schon weiss, dass der gespeicherte Pfad nachweislich nichts
+        mehr liefert (z.B. _ADM_LEER_GRENZE Zyklen ohne eine einzige
+        .ADM-Datei) - im Normalfall (erste Einrichtung, regulaerer Poll)
+        bleibt ein bereits konfigurierter, funktionierender Pfad unangetastet,
+        auch wenn er von der Standardsuche abweicht (z.B. bewusst von Hand
+        gesetzt). Ohne dieses Flag konnte sich ein einmal falsch gespeicherter
+        ftp_log_dir NIE selbst reparieren, selbst wenn _auto_discover erneut
+        lief - "found.get(...) and not conn.get(...)" liess einen bereits
+        gesetzten (aber falschen) Wert immer gewinnen.
         """
         conn = conn or connections.primary()
         if conn is None or conn.ftp is None:
@@ -3866,9 +4028,17 @@ class DayZBot(discord.Client):
                                ("ftp_ban_file", "ban_file"),
                                ("ftp_mission_dir", "mission_dir"),
                                ("cfg_effect_area_path", "cfg_effect_area")):
-            if found.get(found_key) and not conn.get(key):
-                _conn_store(conn, key, found[found_key])
-                log.info(f"[FTP] 💾 {conn.name}: {key}={found[found_key]}")
+            neuer_wert = found.get(found_key)
+            if not neuer_wert:
+                continue
+            alter_wert = conn.get(key)
+            if not alter_wert:
+                _conn_store(conn, key, neuer_wert)
+                log.info(f"[FTP] 💾 {conn.name}: {key}={neuer_wert}")
+            elif heilen and alter_wert != neuer_wert:
+                _conn_store(conn, key, neuer_wert)
+                log.info(f"[FTP] 🩹 {conn.name}: {key} repariert: "
+                         f"'{alter_wert}' → '{neuer_wert}'")
 
         # Selbstheilung: Der konfigurierte cfgEffectArea-Pfad zeigt auf einen Ordner,
         # den es auf dem FTP gar nicht gibt (z.B. Chernarus-Pfad, obwohl der Server
@@ -3975,7 +4145,7 @@ class DayZBot(discord.Client):
         try:
             loop = asyncio.get_running_loop()
             await self._pruefe_neustart(conn, log_dir, loop)
-            adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
+            adm_files = await _log_dateien(conn, log_dir, ".adm")
             if not adm_files:
                 # Ein GESPEICHERTER, aber falscher Pfad heilte sich frueher nie:
                 # die Auto-Erkennung lief nur bei komplett leerem ftp_log_dir.
@@ -3990,7 +4160,12 @@ class DayZBot(discord.Client):
                                 f"ADM-Datei in '{log_dir}' – Auto-Erkennung wird erneut "
                                 f"ausgefuehrt.")
                     try:
-                        await self._auto_discover(conn)
+                        # heilen=True: an dieser Stelle ist bereits bewiesen,
+                        # dass der gespeicherte Pfad seit _ADM_LEER_GRENZE
+                        # Zyklen nichts liefert - ohne das Flag wuerde
+                        # _auto_discover einen bereits gesetzten (aber
+                        # falschen) Pfad nie ersetzen.
+                        await self._auto_discover(conn, heilen=True)
                     except Exception as e:  # noqa: BLE001
                         log.warning(f"[FTP] {conn.name}: erneute Auto-Erkennung "
                                     f"fehlgeschlagen: {e}")
@@ -4057,9 +4232,9 @@ class DayZBot(discord.Client):
                 # Kanaele). Den Online-Zustand hat der Hydrator oben bereits
                 # aus dem letzten vollstaendigen PlayerList-Block gelernt, hier
                 # wird nur noch der Cursor ans Dateiende gesetzt.
-                size_now = await loop.run_in_executor(None, conn.ftp.file_size_or_none, latest)
+                size_now = await _log_dateigroesse(conn, latest)
                 if size_now is None:
-                    # Groesse unbekannt = FTP-Fehler. Jetzt NICHTS speichern:
+                    # Groesse unbekannt = FTP-/API-Fehler. Jetzt NICHTS speichern:
                     # wuerde hier ein Cursor gesetzt, waere `state` beim
                     # naechsten Zyklus nicht mehr None und der uebersprungene
                     # Inhalt fuer immer als "gelesen" abgehakt – ein Fehler
@@ -4100,9 +4275,8 @@ class DayZBot(discord.Client):
                 restart_detected = bool(state.get("file"))
                 old_file = state.get("file")
                 if old_file and old_file in adm_files and not skip_backlog:
-                    old_tail, _ = await loop.run_in_executor(
-                        None, conn.ftp.read_from_offset, old_file, state.get("offset", 0)
-                    )
+                    old_tail, _ = await _log_lesen_ab_offset(
+                        conn, old_file, state.get("offset", 0))
                     if old_tail is None:
                         # LESEFEHLER, nicht "nichts mehr da". Die Rotation jetzt
                         # zu vollziehen wuerde den ungelesenen Rest der alten
@@ -4134,7 +4308,7 @@ class DayZBot(discord.Client):
                     conn.online_zustand_zuruecksetzen(
                         f"Rotation auf {latest}, Roster stammt aus anderer Datei")
 
-            current_size = await loop.run_in_executor(None, conn.ftp.file_size_or_none, latest)
+            current_size = await _log_dateigroesse(conn, latest)
             if current_size is not None:
                 conn.size_fehler = 0
             # "is not None" statt Wahrheitswert: eine frisch rotierte, noch
@@ -4174,7 +4348,7 @@ class DayZBot(discord.Client):
                 # bewusst nur der Cursor gesetzt, statt den ganzen Rueckstand
                 # noch einmal durch den Parser zu schicken.
                 size_now = (current_size if current_size is not None
-                           else await loop.run_in_executor(None, conn.ftp.file_size_or_none, latest))
+                           else await _log_dateigroesse(conn, latest))
                 if size_now is None:
                     # Größe nicht ermittelbar (FTP-Fehler?). Ein paar Zyklen
                     # abwarten (last_poll_ts NICHT aktualisieren, Skip greift
@@ -4235,9 +4409,7 @@ class DayZBot(discord.Client):
                     await _poll_zustand_melden(conn, None)
                     return
 
-            content, new_offset = await loop.run_in_executor(
-                None, conn.ftp.read_from_offset, latest, state["offset"]
-            )
+            content, new_offset = await _log_lesen_ab_offset(conn, latest, state["offset"])
             if content is None:
                 # Echter Lesefehler, nicht bloss "nichts Neues" (das waere "").
                 # last_poll_ts trotzdem fortschreiben – sonst wuerde ein
@@ -5222,7 +5394,7 @@ class DayZBot(discord.Client):
             return
         conn.rpt_geprueft_ts = jetzt
         try:
-            rpt = await loop.run_in_executor(None, conn.ftp.list_rpt_files, log_dir)
+            rpt = await _log_dateien(conn, log_dir, ".rpt")
         except Exception as e:  # noqa: BLE001 – Zugabe, darf den Poll nie kippen
             log.debug(f"[POLL] RPT-Liste ({conn.name}): {e}")
             return
