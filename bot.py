@@ -5027,6 +5027,7 @@ class DayZBot(discord.Client):
             except Exception as e:  # noqa: BLE001
                 return False, str(e), None
         if art == "online_list":
+            jetzt = time.time()
             # A2S_PLAYER ABSICHTLICH NICHT genutzt: DayZ liefert darueber auf
             # echten Servern keine echten Namen, sondern fuer jeden Spieler
             # denselben Platzhalter-Text "player" (an einem echten Nitrado-
@@ -5091,6 +5092,34 @@ class DayZBot(discord.Client):
                          f"Datei={(conn.log_state.get('current') or {}).get('file')}, "
                          f"hydriert_aus={conn.roster_datei}, "
                          f"parser_id={id(conn.parser) if conn.parser else None}")
+            # A2S kennt schon Spieler, das Log-Tracking noch nicht (der naechste
+            # PlayerList-Block kommt erst noch) - lieber kurz stumm abwarten und
+            # gleich mit Namen posten, statt sofort "Namen aktuell nicht
+            # bekannt" zu veroeffentlichen. next_execution wandert dabei in
+            # 30-Sekunden-Schritten weiter (derselbe Takt wie scheduled_tasks_loop),
+            # OHNE das Zeitraster (z.B. :00/:15/:30/:45) zu verlassen - der
+            # urspruengliche Faelligkeitszeitpunkt bleibt in
+            # "_online_faellig_seit" gemerkt, gerade weil next_execution bei
+            # jedem Warteversuch ueberschrieben wird.
+            if gesamt is not None and gesamt > 0 and len(namen) != gesamt:
+                seit = float(task.get("_online_faellig_seit") or task.get("next_execution") or jetzt)
+                if "_online_faellig_seit" not in task:
+                    task["_online_faellig_seit"] = seit
+                if jetzt - seit < _ONLINE_LISTE_MAX_WARTE_SEKUNDEN:
+                    task["next_execution"] = jetzt + _ONLINE_LISTE_RETRY_SEKUNDEN
+                    return (True, "Namen laut Log-Tracking noch nicht bekannt – "
+                                 "warte auf den nächsten PlayerList-Block.", False)
+                # Laenger als das Zeitlimit erfolglos gewartet (z.B. Log-Tracking
+                # dauerhaft kaputt) - jetzt trotzdem posten, mit dem bisherigen
+                # Platzhaltertext, statt fuer immer stumm zu bleiben.
+            if "_online_faellig_seit" in task:
+                # Nachgeholter Post: der naechste REGULAERE Slot laege nur
+                # wenige Minuten spaeter und wuerde sonst gleich nochmal
+                # posten. Bewusst genau diesen einen Slot ueberspringen, alle
+                # weiteren bleiben im urspruenglichen Zeitraster.
+                anker = task.pop("_online_faellig_seit")
+                schritt = max(60, int(task.get("interval_seconds", 60)))
+                task["next_execution"] = _scheduled_task_vorwaerts(anker, schritt, jetzt) + schritt
             if not namen and not gesamt and not task.get("post_wenn_leer"):
                 # ``False`` statt ``None``: der Aufrufer soll HIER GAR NICHTS
                 # posten, auch keine allgemeine "erledigt"-Bestaetigung -
@@ -6817,6 +6846,14 @@ SCHEDULED_TASK_TYPES: Dict[str, Dict[str, Any]] = {
 # Discord den GANZEN Post ab. Deshalb wird zusaetzlich nach Zeichen gekappt.
 _ONLINE_LISTE_MAX = 100
 _ONLINE_LISTE_ZEICHEN_MAX = 3900
+
+# Wie lange die "Online-Liste posten"-Aufgabe hoechstens stumm auf den
+# naechsten PlayerList-Block wartet, bevor sie trotzdem mit dem bisherigen
+# Platzhaltertext postet (siehe _scheduled_task_ausfuehren) - und in welchem
+# Takt sie es zwischendurch erneut versucht. Der Retry-Takt entspricht bewusst
+# scheduled_tasks_loop (30s), ein kuerzerer Wert haette keinen Effekt.
+_ONLINE_LISTE_MAX_WARTE_SEKUNDEN = 600
+_ONLINE_LISTE_RETRY_SEKUNDEN = 30
 
 
 # Obergrenze fuer Eintraege aus einer Connect-Meldung. Sie haben kein
