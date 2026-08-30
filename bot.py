@@ -3882,9 +3882,19 @@ class DayZBot(discord.Client):
     async def on_member_remove(self, member: discord.Member):
         """wipe_money_on_leave (Dashboard → Economy → Grundeinstellungen):
         Guthaben verschwindet, sobald jemand den Discord-Server verlässt.
+        Zusaetzlich: verlaesst ein Kunde das BETREIBER-Discord, faellt seine
+        Premium-Freischaltung in seinem/seinen eigenen Kundenserver(n) weg
+        (siehe _premium_wegen_discord_austritt_entziehen).
 
         Ohne den privilegierten Server-Members-Intent (siehe __init__) würde
         dieses Ereignis nie feuern – der Intent ist dort bereits gesetzt."""
+        try:
+            gid = str(cfg.config.get("premium_role_guild_id") or "").strip()
+            if gid and int(gid) == member.guild.id:
+                await _premium_wegen_discord_austritt_entziehen(member.id, "Verlassen")
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[PREMIUM] on_member_remove: {e}")
+
         try:
             konten = connections.all_for_guild(member.guild.id)
         except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
@@ -3898,6 +3908,40 @@ class DayZBot(discord.Client):
                      f"'{member.guild.name}' gelöscht (wipe_money_on_leave).")
         except Exception as e:  # noqa: BLE001
             log.warning(f"[ECON] wipe_money_on_leave fehlgeschlagen für {member.id}: {e}")
+
+    async def on_member_join(self, member: discord.Member):
+        """Automatisches Nachreichen der Premium-Badge-Rolle im Betreiber-
+        Discord: wurde einem Kunden Premium gegeben, WAEHREND er diesem
+        Discord noch gar nicht beigetreten war, konnte _premium_rolle ihn
+        damals nicht finden (discord.NotFound). Das hier holt es nach,
+        sobald er beitritt - die eigentliche Freischaltung im Kundenserver
+        war davon nie betroffen, nur die Badge-Rolle hier."""
+        try:
+            gid = str(cfg.config.get("premium_role_guild_id") or "").strip()
+            if not gid or int(gid) != member.guild.id:
+                return
+            if not _hat_noch_premium(member.id):
+                return
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[PREMIUM] on_member_join: {e}")
+            return
+        hinweis = await _premium_rolle(member.id, True)
+        if hinweis:
+            log.info(f"[PREMIUM] on_member_join {member}: {hinweis}")
+
+    async def on_member_ban(self, guild: discord.Guild, user: discord.abc.User):
+        """Sofortiger Entzug der Freischaltung bei einem Bann im Betreiber-
+        Discord - unabhaengig davon, ob discord.py zusaetzlich on_member_remove
+        feuert (tut es meistens auch, aber nicht sicher bei Konten, die den
+        Server vorher schon verlassen hatten und danach gebannt werden)."""
+        try:
+            gid = str(cfg.config.get("premium_role_guild_id") or "").strip()
+            if not gid or int(gid) != guild.id:
+                return
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[PREMIUM] on_member_ban: {e}")
+            return
+        await _premium_wegen_discord_austritt_entziehen(user.id, "Bann")
 
     async def on_ready(self):
         log.info(f"[BOT] ✅ Eingeloggt als {self.user} (ID: {self.user.id})")
@@ -15989,6 +16033,12 @@ async def api_discord_callback(request: web.Request) -> web.Response:
     if not user or not user.get("id"):
         return _back("failed")
 
+    # Gebannt im Betreiber-Discord? Dann keine Sitzung anlegen - live geprueft,
+    # damit ein spaeter aufgehobener Bann sich nicht erst durch veraltete
+    # gespeicherte Zustaende korrigieren muss (siehe _betreiber_discord_gebannt).
+    if await _betreiber_discord_gebannt(user["id"]):
+        return _back("banned")
+
     view = _discord_user_view(user)
     is_admin = await _discord_user_is_admin(int(user["id"]))
     eigene = _eigene_guilds(guild_roh)
@@ -16961,6 +17011,51 @@ def _hat_noch_premium(owner_id: Any) -> bool:
         return False
     return any(str(c.data.get("owner_discord_id") or "") == uid and c.guild_id
                for c in connections.all())
+
+
+async def _premium_wegen_discord_austritt_entziehen(owner_id: Any, quelle: str) -> None:
+    """Entzieht ALLE Premium-Zuordnungen eines Kunden, der das Betreiber-
+    Discord verlassen hat oder dort gebannt wurde (siehe on_member_remove/
+    on_member_ban in DayZBot). Die Badge-Rolle selbst braucht hier kein
+    eigenes Entfernen - Discord nimmt sie beim Verlassen/Bannen automatisch
+    weg. Was hier faellt, ist die eigentliche Freischaltung im jeweiligen
+    KUNDENSERVER (die Guild-Zuordnung, die _premium_check abfragt).
+    """
+    betroffen = [c for c in connections.for_owner(owner_id) if c.guild_id]
+    for conn in betroffen:
+        gid = conn.guild_id
+        okay, _msg = connections.assign_guild(conn.service_id, None)
+        if not okay:
+            continue
+        try:
+            await _guild_aufraeumen(gid)
+        except Exception as e:  # noqa: BLE001 – Entzug selbst hat schon gegriffen
+            log.debug(f"[PREMIUM] _guild_aufraeumen nach {quelle}: {e}")
+        log.info(f"[PREMIUM] {quelle} im Betreiber-Discord: Freischaltung fuer "
+                 f"„{conn.name}“ (Kunde {owner_id}) entzogen.")
+
+
+async def _betreiber_discord_gebannt(user_id: Any) -> bool:
+    """Live-Pruefung bei JEDEM Login-Versuch, ob dieses Discord-Konto im
+    Betreiber-Discord (premium_role_guild_id) gerade gebannt ist - bewusst
+    nicht auf einen beim Bannen gespeicherten Zustand verlassen: der wuerde
+    veralten, sobald der Bann spaeter aufgehoben wird, oder fehlen, wenn der
+    Bot beim Bannen selbst offline war.
+    """
+    uid = str(user_id or "").strip()
+    gid = str(cfg.config.get("premium_role_guild_id") or "").strip()
+    if not (uid and gid) or bot is None or getattr(bot, "user", None) is None:
+        return False
+    try:
+        guild = bot.get_guild(int(gid))
+        if guild is None:
+            return False
+        await guild.fetch_ban(discord.Object(id=int(uid)))
+    except discord.NotFound:
+        return False
+    except (discord.HTTPException, discord.Forbidden, TypeError, ValueError):
+        return False
+    return True
 
 
 async def _premium_rolle(owner_id: Any, geben: bool) -> str:
@@ -21804,6 +21899,8 @@ async def stop_dashboard() -> None:
 # neue Fassung ersetzt werden (siehe _extract_assets).
 _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
     "index.html": (
+        "830fc5155fe892d5d1325b0d896965aa0b1f3c5ed6a3486e9c927dc9e47064f0",
+        "3d5e4db5428a79589b9343dc91742cd457f45776c441581c28ecbb9a9b3450f2",
         "ee561c69cf7b299f8b48061b08029fe5e4d60e05632e3950ef7ed115b6020dff",
         "490d3cceb44180fdd4986647676e8a18ec0255e5ee6b9cf645019b6ead1d093b",
         "2dcf10883a586ae06ee8b5b4acccaf61c18a870181755e78ec8f1e579bb8fc29",
@@ -21827,6 +21924,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "2a2022df71837e0c345d43fbdc9a07f751488d839b1964e42fbfe4a8543b18a6",
     ),
     "styles.css": (
+        "0dcb70fa1bee603d45b9b0dca4a0b8437f1b7ae65182c15d242f9eb625a3cfee",
         "f68b843465b48dbe4d294a2f319a1c391eb1b43eed1fea7db39a916c1c1ad804",
         "c178de8eafdc34b2f5bce14ad45a309cf694479c6a2697e9fb52d448347e9e2b",
         "0cb11dc0971824c737ca5505bed58e31dc48263cf1ff26d60f38a6cd6e46a69a",
@@ -21851,6 +21949,9 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "4c2288c9c3eb7376b7f53a5d5c37a89f827fa6825a00723443e302c1021cb9bc",
     ),
     "app.js": (
+        "168a82fc136dc875fb0a633759b6951ca31bd9086784d022f2ecfbeedcf7dc11",
+        "02d7f10fd28fc2a6c2de1c5eb9901cc055c49ddfeffd985c67638da16137bb1e",
+        "89cdbd534f5103fbe67731e86f11354b2b21bbcc6d44774b6d9d737cc4618a92",
         "0a1b1bb61f11f5ced5f2b7312d5b789d998e9f9669091c9aca7189bfffc395b9",
         "ec14b8b4a90c6553d11b22eb5f76c732b47c827e8bf4359e9f2fb793f8ca1b79",
         "82e5da5110b186c3234f7637dd397a87cb2f6939e165b35fbb21d992a4200689",
