@@ -16535,6 +16535,29 @@ def _conn_for_session(sess: Optional[Dict[str, Any]]) -> Optional[ServerConnecti
     return connections.for_service((sess or {}).get("service_id"))
 
 
+def _eigentuemer_wechselt(sess: Optional[Dict[str, Any]],
+                          vorhandene: Optional[ServerConnection]) -> bool:
+    """Wuerde das Verbinden im Onboarding ``vorhandene`` (bereits bestehende
+    Verbindung fuer die gewaehlte service_id) einem ANDEREN Discord-Konto
+    entziehen - auch wenn sie bisher noch niemandem gehoerte?
+
+    ``post_select_server`` erlaubt das Verbinden bewusst weiterhin (Brigarde
+    kann so wie bei jedem neuen Kunden manuell im Dashboard freischalten) -
+    nur die schon gesetzte guild_id (= Premium) darf dabei NIE automatisch
+    mit uebergehen, sonst koennte sich jeder mit demselben (kopierten oder
+    zufaellig identischen) Nitrado-Token fremdes Premium erschleichen. Der
+    Aufrufer setzt bei ``True`` deshalb conn.data["guild_id"] zurueck -
+    bewusst OHNE Admin-Ausnahme: auch Brigarde selbst soll beim Umziehen
+    einer Verbindung auf ein anderes Konto nicht versehentlich Premium
+    mitnehmen, sondern es bewusst neu vergeben.
+    """
+    if vorhandene is None:
+        return False
+    besitzer = str(vorhandene.data.get("owner_discord_id") or "").strip()
+    meine = str(((sess or {}).get("discord") or {}).get("id") or "").strip()
+    return besitzer != meine
+
+
 def _fremder_besitzer(sess: Optional[Dict[str, Any]],
                       conn: Optional[ServerConnection]) -> bool:
     """Gehört ``conn`` inzwischen einem ANDEREN Discord-Konto als dieser
@@ -17564,6 +17587,14 @@ async def post_select_server(request: web.Request) -> web.Response:
     # eingerichtete Kunde zum Hauptserver und seine FTP-Zugangsdaten laegen
     # dort als Rueckfallebene fuer alle anderen bereit.
     vorhandene = connections.for_service(service_id)
+    # Der Eigentuemer darf wechseln (siehe _eigentuemer_wechselt) - eine schon
+    # gesetzte guild_id (Premium) darf dabei aber NIE automatisch mitgehen,
+    # sonst koennte sich jeder mit demselben Token fremdes Premium
+    # erschleichen. Vorher gemerkt, weil upsert() weiter unten owner_discord_id
+    # gleich ueberschreibt.
+    wechsel = _eigentuemer_wechselt(sess, vorhandene)
+    alter_besitzer = (vorhandene.data.get("owner_discord_id")
+                      if (wechsel and vorhandene is not None) else None)
     if vorhandene is not None and vorhandene.token != token:
         for k in ("ftp_log_dir", "ftp_ban_file", "ftp_profile_dir",
                   "ftp_mission_dir", "cfg_effect_area_path", "server_ip"):
@@ -17587,6 +17618,21 @@ async def post_select_server(request: web.Request) -> web.Response:
         nitrado_token=token,
         name=_server_view(service)["name"],
         owner_discord_id=((sess.get("discord") or {}).get("id")))
+
+    # Eigentuemer gewechselt (siehe oben): die alte Freischaltung faellt weg,
+    # der Betreiber vergibt sie fuer das neue Konto bewusst neu - bewusst OHNE
+    # Admin-Ausnahme, auch Brigarde soll sie beim Umziehen neu vergeben statt
+    # versehentlich mitzunehmen.
+    if wechsel:
+        conn.data["guild_id"] = None
+        conn.data.pop("guild_id_requested", None)
+        connections.save()
+        await _betreiber_alarm(
+            f"♻️ Server-Übernahme: Konto `{(sess.get('discord') or {}).get('id')}` hat "
+            f"**{conn.name}** ({service_id}) mit demselben Nitrado-Token neu "
+            f"verbunden – die vorherige Zuordnung (Konto `{alter_besitzer or '–'}`) "
+            f"wurde entfernt. Premium muss neu vergeben werden.",
+            farbe=0xE67E22)
 
     # Die beim Login gewaehlte Guild gilt als Anfrage – das ersetzt das
     # Abtippen der Server-ID. Freischalten bleibt Sache des Betreibers, deshalb
@@ -21952,6 +21998,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "4c2288c9c3eb7376b7f53a5d5c37a89f827fa6825a00723443e302c1021cb9bc",
     ),
     "app.js": (
+        "6f68a543ecadb6d3eeb89c4c6d97d79ec0841a1abc413df34ae02bf2fa491cf4",
+        "60db1ecc03e138a333c3f04ab3f2a740b351835cf2bef6639f1d58d0be6f5900",
         "afc1cb97d5f7f2949b3b0354aef47454b18cbea7a5598f0ea9bc0b8428182d8e",
         "168a82fc136dc875fb0a633759b6951ca31bd9086784d022f2ecfbeedcf7dc11",
         "02d7f10fd28fc2a6c2de1c5eb9901cc055c49ddfeffd985c67638da16137bb1e",
