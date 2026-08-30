@@ -9276,7 +9276,10 @@ async def api_tools_meta(request: web.Request) -> web.Response:
         modul_key = f"tools.{key}"
         erlaubt = await _module_erlaubt(modul_key, sess, conn)
         tier = _module_tier(modul_key)
-        if not erlaubt and tier != "under_review":
+        # "under_review" UND "beta" bleiben sichtbar, aber nicht auswaehlbar -
+        # so sieht ein Kunde ohne Beta-Rolle, DASS es das Tool gibt und WARUM
+        # es gerade nicht geht, statt dass es kommentarlos fehlt.
+        if not erlaubt and tier not in ("under_review", "beta"):
             continue
         tools.append({"key": key, "emoji": emoji, "label": label,
                      "tier": tier, "selectable": erlaubt})
@@ -21949,6 +21952,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "4c2288c9c3eb7376b7f53a5d5c37a89f827fa6825a00723443e302c1021cb9bc",
     ),
     "app.js": (
+        "afc1cb97d5f7f2949b3b0354aef47454b18cbea7a5598f0ea9bc0b8428182d8e",
         "168a82fc136dc875fb0a633759b6951ca31bd9086784d022f2ecfbeedcf7dc11",
         "02d7f10fd28fc2a6c2de1c5eb9901cc055c49ddfeffd985c67638da16137bb1e",
         "89cdbd534f5103fbe67731e86f11354b2b21bbcc6d44774b6d9d737cc4618a92",
