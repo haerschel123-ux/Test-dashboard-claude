@@ -3945,6 +3945,29 @@ class DayZBot(discord.Client):
 
     async def on_ready(self):
         log.info(f"[BOT] ✅ Eingeloggt als {self.user} (ID: {self.user.id})")
+        # Diagnose fuer die Bann/Beitritt/Austritt-Premium-Kopplung (siehe
+        # on_member_join/_remove/_ban, _betreiber_discord_gebannt): die haengen
+        # ALLE an premium_role_guild_id - und die laesst sich nirgends im
+        # Dashboard eintragen, nur direkt in config.json. Eine falsche oder
+        # veraltete ID liess sie bisher voellig lautlos ins Leere laufen (kein
+        # Fehler, keine Wirkung) - das hier macht es beim Start sofort sichtbar.
+        _gid_roh = str(cfg.config.get("premium_role_guild_id") or "").strip()
+        try:
+            _betreiber_guild = self.get_guild(int(_gid_roh)) if _gid_roh else None
+        except (TypeError, ValueError):
+            _betreiber_guild = None
+        if not _gid_roh:
+            log.warning("[PREMIUM] premium_role_guild_id ist nicht gesetzt - "
+                        "Bann/Beitritt/Austritt aus dem Betreiber-Discord haben "
+                        "KEINE Wirkung auf Premium.")
+        elif _betreiber_guild is None:
+            log.warning(f"[PREMIUM] premium_role_guild_id={_gid_roh} zeigt auf "
+                       "keinen Discord-Server, in dem der Bot Mitglied ist - "
+                       "Bann/Beitritt/Austritt dort haben KEINE Wirkung auf "
+                       "Premium. Server-ID in config.json prüfen.")
+        else:
+            log.info(f"[PREMIUM] Betreiber-Discord erkannt: "
+                    f"„{_betreiber_guild.name}“ ({_gid_roh}).")
         await self.change_presence(
             activity=discord.Activity(type=discord.ActivityType.watching, name="DayZ Server Logs 🎮")
         )
@@ -17112,6 +17135,9 @@ async def _betreiber_discord_gebannt(user_id: Any) -> bool:
     try:
         guild = bot.get_guild(int(gid))
         if guild is None:
+            log.warning(f"[PREMIUM] Login-Bann-Pruefung: premium_role_guild_id={gid} "
+                       "zeigt auf keinen Discord-Server, in dem der Bot Mitglied "
+                       "ist - Bann-Sperre greift fuer niemanden.")
             return False
         await guild.fetch_ban(discord.Object(id=int(uid)))
     except discord.NotFound:
