@@ -22011,6 +22011,7 @@ async def stop_dashboard() -> None:
 # neue Fassung ersetzt werden (siehe _extract_assets).
 _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
     "index.html": (
+        "331ab21f9ae834c3bd33a4781197f08cc6fc854dc20f754a8a3a6aeec18b98a8",
         "830fc5155fe892d5d1325b0d896965aa0b1f3c5ed6a3486e9c927dc9e47064f0",
         "3d5e4db5428a79589b9343dc91742cd457f45776c441581c28ecbb9a9b3450f2",
         "ee561c69cf7b299f8b48061b08029fe5e4d60e05632e3950ef7ed115b6020dff",
@@ -22061,6 +22062,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "4c2288c9c3eb7376b7f53a5d5c37a89f827fa6825a00723443e302c1021cb9bc",
     ),
     "app.js": (
+        "60db1ecc03e138a333c3f04ab3f2a740b351835cf2bef6639f1d58d0be6f5900",
         "6f68a543ecadb6d3eeb89c4c6d97d79ec0841a1abc413df34ae02bf2fa491cf4",
         "60db1ecc03e138a333c3f04ab3f2a740b351835cf2bef6639f1d58d0be6f5900",
         "afc1cb97d5f7f2949b3b0354aef47454b18cbea7a5598f0ea9bc0b8428182d8e",
