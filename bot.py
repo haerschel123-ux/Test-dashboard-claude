@@ -16764,6 +16764,35 @@ async def _user_hat_rolle(guild_id: int, user_id: int, role_id: int) -> bool:
     return any(int(r.id) == role_id for r in getattr(member, "roles", []))
 
 
+async def _sitzung_hat_beta_zugriff(sess: Optional[Dict[str, Any]]) -> bool:
+    """Traegt dieses Konto irgendeine der im Modul-Manager hinterlegten
+    Beta-Rollen im Betreiber-Discord? Fuer das Status-Abzeichen in der
+    Kopfzeile (app.js: applyDiscordUser) - unabhaengig von Premium, da Beta
+    ueber eine eigene Rolle laeuft (siehe _module_erlaubt)."""
+    uid = str(((sess or {}).get("discord") or {}).get("id") or "")
+    if not uid:
+        return False
+    rollen = cfg.config.get("module_beta_roles") or {}
+    role_ids: set = set()
+    for wert in rollen.values():
+        try:
+            role_ids.add(int(wert))
+        except (TypeError, ValueError):
+            continue
+    if not role_ids:
+        return False
+    try:
+        gid = int(str(cfg.config.get("premium_role_guild_id") or "0") or 0)
+    except (TypeError, ValueError):
+        return False
+    if not gid:
+        return False
+    for role_id in role_ids:
+        if await _user_hat_rolle(gid, int(uid), role_id):
+            return True
+    return False
+
+
 async def _module_erlaubt(key: str, sess: Optional[Dict[str, Any]],
                           conn: Optional[ServerConnection]) -> bool:
     """Darf diese Sitzung dieses Feed-Modul nutzen? Der Betreiber (Admin-Rolle)
@@ -18057,6 +18086,9 @@ async def api_get_session(request: web.Request) -> web.Response:
         # Seiten das Dashboard ueberhaupt oeffnet.
         "premium": _sitzung_hat_premium(sess, _conn),
         "premium_text": DASHBOARD_PREMIUM_TEXT,
+        # Fuer das Status-Abzeichen unter dem Discord-Namen: unabhaengig von
+        # Premium, siehe _sitzung_hat_beta_zugriff.
+        "beta": await _sitzung_hat_beta_zugriff(sess),
         "guild_id_requested": (str(_conn.data.get("guild_id_requested"))
                                if _conn is not None
                                and _conn.data.get("guild_id_requested") else None),
@@ -22035,6 +22067,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "5e92e5ae6386694e785e5ea02d1e23d0cd280199f5977a61259d146dd3a34299",
         "51654faa7746d29d0f80c66bcac7d3f1d8eeaa09499b2e547a170a68d7e6469a",
         "2a2022df71837e0c345d43fbdc9a07f751488d839b1964e42fbfe4a8543b18a6",
+        "d4b9366fc871538bd2de570fedc637801f6dd8054943789e862953f841284ae1",
     ),
     "styles.css": (
         "0dcb70fa1bee603d45b9b0dca4a0b8437f1b7ae65182c15d242f9eb625a3cfee",
@@ -22060,6 +22093,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "075ebec5c01d30a56ec5b4665bed7fcd98ba14126dddd5720d10d5233ec6e3aa",
         "1fb62bc951d200decaa531e3f8cfa104bd309da52127b30d8ad40f02e953298d",
         "4c2288c9c3eb7376b7f53a5d5c37a89f827fa6825a00723443e302c1021cb9bc",
+        "bc48689c5611a9d34a87fe67ee468b36ca4e058305be35cbdbe0f87c75b719f3",
     ),
     "app.js": (
         "60db1ecc03e138a333c3f04ab3f2a740b351835cf2bef6639f1d58d0be6f5900",
@@ -22145,6 +22179,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "bd7dfcd41aa222deebd4714efe4906392e11c2d5cf0b730d3fbedcc98853e68b",
         "050fe92374d9e6222157ce215729cb667cb5f5f2507722cdf1297927184cfa3c",
         "7ef1fd0ff20205a8ecfd4dbe547bd75e8ab95866e8656c6475c6a4879d5fbb35",
+        "a62f7c4a462ed31c1520843bbd3fd257b90c30a1d9b63c268c6273b7216a2f9e",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
