@@ -17000,6 +17000,12 @@ async def _dash_gate(request: web.Request, conn: Optional["ServerConnection"],
 # fuer Spam-Schutz unproblematisch ist.
 _DASH_RATE_LIMIT_LAST: Dict[Tuple[str, str], float] = {}
 _DASH_RATE_LIMIT_MAX_SECONDS = 15
+# Ohne Aufraeumen waechst das Dict ueber Wochen/Monate unbegrenzt (jedes Konto
+# x jede Aktion bleibt fuer immer drin). Alle 500 Aufrufe abgelaufene
+# Eintraege wegwerfen statt eines eigenen Hintergrund-Tasks – reicht fuer den
+# Umfang hier locker aus und braucht keinen zusaetzlichen Scheduler.
+_DASH_RATE_LIMIT_CLEANUP_EVERY = 500
+_dash_rate_limit_calls = 0
 
 
 def _dash_rate_limited(request: web.Request, action: str, seconds: float
@@ -17009,6 +17015,7 @@ def _dash_rate_limited(request: web.Request, action: str, seconds: float
     Erst NACH den Berechtigungspruefungen aufrufen, damit ein sowieso
     abgelehnter Versuch (403/409 etc.) keinen Cooldown verbraucht.
     """
+    global _dash_rate_limit_calls
     seconds = min(seconds, _DASH_RATE_LIMIT_MAX_SECONDS)
     sess = _sess_get(request)
     discord_id = str((sess.get("discord") or {}).get("id") or "") if sess else ""
@@ -17022,6 +17029,13 @@ def _dash_rate_limited(request: web.Request, action: str, seconds: float
         if rest > 0:
             return err(f"Bitte kurz warten – noch {math.ceil(rest)}s.", 429,
                        code="rate_limit", retry_after=round(rest, 1))
+    _dash_rate_limit_calls += 1
+    if _dash_rate_limit_calls >= _DASH_RATE_LIMIT_CLEANUP_EVERY:
+        _dash_rate_limit_calls = 0
+        veraltet = [k for k, t in _DASH_RATE_LIMIT_LAST.items()
+                   if now - t > _DASH_RATE_LIMIT_MAX_SECONDS]
+        for k in veraltet:
+            _DASH_RATE_LIMIT_LAST.pop(k, None)
     _DASH_RATE_LIMIT_LAST[key] = now
     return None
 
