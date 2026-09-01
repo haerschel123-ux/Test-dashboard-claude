@@ -143,7 +143,13 @@ class DayZLogParser:
             PLAYER + r'\s*(?:died|was killed|killed|has died|perished|bled out'
                      r'|starved|dehydrated|drowned|suffocated|froze to death)'
             r'[.!]?'
-            r'(?:\s+by\s+(.+?))?(?:\s+at\s+pos=<([\d., \-]+)>)?(?:\s+due to\s+(.+?))?(?:[.!]|\s|$)',
+            # Abschluss OHNE "\s": mit ihm endete die faule Gruppe der Ursache
+            # schon am ersten Leerzeichen, aus "killed by EGD-5 Frag Grenade"
+            # wurde die Ursache "EGD-5" - kein Stichwort traf mehr, und jeder
+            # mehrwortige Umwelttod landete unter "Unknown Death". An 683 echten
+            # Todeszeilen gegengeprueft: keine Zeile faellt dadurch heraus, 18
+            # bekommen ihre vollstaendige Ursache (Granaten, Sprengstoff).
+            r'(?:\s+by\s+(.+?))?(?:\s+at\s+pos=<([\d., \-]+)>)?(?:\s+due to\s+(.+?))?(?:[.!]|$)',
             re.IGNORECASE
         ),
         # Suicide
@@ -213,9 +219,20 @@ class DayZLogParser:
         # unzitierter "Player <Klasse><Zeiger>"-Block, dann "Dug in"/"Dug out"
         # <Objekt><Zeiger> "at position" <Hex-Adresse> {<x,y,z>}. Die Verben
         # "buried"/"unburied" kommen in echten Logs gar nicht vor.
+        # An einer ECHTEN Zeile beider Server nachgemessen (3,3 MB .ADM ueber
+        # die Nitrado-API geholt) - das frueher hier angenommene Format traf
+        # keine einzige davon. So sieht die Zeile wirklich aus:
+        #   ...pos=<...>)Player SurvivorBase<0x00000244A8E78B10>
+        #   SurvivorM_Oliver:105619 Dug out UndergroundStash<0x0000024330CBBAF0>
+        #   UndergroundStash:0 at position <4833.35,347.93,857.259>
+        # Drei Abweichungen: der Zeiger ist <0x...> (das "x" faellt nicht unter
+        # [0-9a-fA-F]), zwischen Zeiger und "Dug" steht noch Klasse:ID des
+        # Spielers, und die Position kommt als <x,y,z> statt als Hex-Adresse.
+        # Alles ab dem Objekt-Zeiger ist deshalb bewusst nicht mehr Teil des
+        # Musters - es traegt nichts bei und war genau der Teil, der nicht passte.
         "dig_stash": re.compile(
-            PLAYER + r'Player\s+\w+<[0-9a-fA-F]+>\s+Dug\s+(in|out)\s+'
-                     r'(\w+)<[0-9a-fA-F]+>\s+at\s+position\s+0x[0-9a-fA-F]+',
+            PLAYER + r'Player\s+\w+<0x[0-9a-fA-F]+>\s+(?:\S+\s+)*?'
+                     r'Dug\s+(in|out)\s+(\w+)<0x[0-9a-fA-F]+>',
             re.IGNORECASE
         ),
         # Fahrzeug

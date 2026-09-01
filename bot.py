@@ -566,8 +566,18 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
     # ── Treffer ──────────────────────────────────────────────
     "player_hit":         {"label": "Player Hit",          "gruppe": "Treffer",
                            "emoji": "🩸", "farbe": 0xFF6B35},
-    "zombie_hit":         {"label": "Zombie Hit",          "gruppe": "Treffer",
-                           "emoji": "🧟", "farbe": 0x2ECC71},
+    # "zombie_hit" bewusst NICHT als waehlbarer Feed - wie "chat" und "loot"
+    # weiter unten: an 23.903 echten Log-Zeilen zweier Server nachgezaehlt,
+    # kein einziger Zombie-Treffer. DayZ protokolliert nur, was Spieler und
+    # Umwelt anrichten (Player, explosion, FallDamage, Zaeune, Fahrzeuge,
+    # Fallen, Feuerstellen) - Infizierten-Schlaege stehen nicht in der .ADM.
+    # Zombie-TODE dagegen schon ("killed by ZmbM_Mummy"), die bleiben.
+    # Die Stichworte in _URSACHE_TREFFER/_AMMO_TREFFER bleiben absichtlich
+    # stehen: liefert doch einmal eine Mod solche Zeilen, faellt der Dispatch
+    # ueber die Rueckfallkette (fein -> grob -> catch_all) sauber auf den
+    # groben Treffer-Feed zurueck, statt sie zu verschlucken. Wer den Feed
+    # frueher eingerichtet hatte, behaelt seinen Channel (der Dispatch liest
+    # die Einstellung, nicht FEED_TYPES) - nur neu waehlbar ist er nicht mehr.
     "animal_hit":         {"label": "Animal Hit",          "gruppe": "Treffer",
                            "emoji": "🐾", "farbe": 0xA0522D},
     "trap_hit":           {"label": "Trap Hit",            "gruppe": "Treffer",
@@ -752,6 +762,16 @@ _URSACHE_TODE = (
     ("mine", "explosion_death"), ("c4", "explosion_death"),
     ("vehicle", "vehicle_death"), ("car", "vehicle_death"),
     ("truck", "vehicle_death"), ("transport", "vehicle_death"),
+    # Die Klassennamen der Fahrzeuge - ohne sie blieb ein Fahrzeugtod
+    # "Unknown Death". In echten .ADM-Dateien steht dort NIE "vehicle" oder
+    # "car", sondern der Spielklassenname: Hatchback_02_Blue, Offroad_02,
+    # CivilianSedan_Wine, Sedan_02 (alle vier in den Logs belegt). Bei den
+    # TREFFERN faellt es nicht auf, weil dort zusaetzlich "with TransportHit"
+    # in der Zeile steht - der Todeszeile fehlt dieses Feld.
+    ("hatchback", "vehicle_death"), ("offroad", "vehicle_death"),
+    ("sedan", "vehicle_death"), ("olga", "vehicle_death"),
+    ("gunter", "vehicle_death"), ("sarka", "vehicle_death"),
+    ("v3s", "vehicle_death"), ("m3s", "vehicle_death"),
     ("bled", "bleed_out_death"), ("bleed", "bleed_out_death"),
 )
 # Todesarten, die DayZ als VERB schreibt ("bled out") statt als Ursache hinter
@@ -778,6 +798,12 @@ _URSACHE_TREFFER = (
     ("mine", "explosion_hit"), ("c4", "explosion_hit"),
     ("vehicle", "vehicle_hit"), ("car", "vehicle_hit"),
     ("truck", "vehicle_hit"), ("transport", "vehicle_hit"),
+    # Dieselben Klassennamen wie in _URSACHE_TODE: hier greift zwar meist
+    # schon "TransportHit" aus dem Waffenfeld, aber nicht jede Zeile hat es.
+    ("hatchback", "vehicle_hit"), ("offroad", "vehicle_hit"),
+    ("sedan", "vehicle_hit"), ("olga", "vehicle_hit"),
+    ("gunter", "vehicle_hit"), ("sarka", "vehicle_hit"),
+    ("v3s", "vehicle_hit"), ("m3s", "vehicle_hit"),
 )
 # Munitions-/Schadensklasse aus der Klammer am Zeilenende (siehe
 # _generic_env_damage_event, Feld "ammo") - ein fester Bezeichner aus dem
