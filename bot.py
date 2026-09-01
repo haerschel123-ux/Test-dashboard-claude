@@ -9428,9 +9428,6 @@ async def api_tools_loadout_post(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "tools", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "tools.loadout", 10)
-    if fehler is not None:
-        return fehler
     if not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     data = await body(request)
@@ -9531,9 +9528,6 @@ async def api_tools_gaszone_post(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     fehler = await _dash_gate(request, conn, "tools", "edit")
-    if fehler is not None:
-        return fehler
-    fehler = _dash_rate_limited(request, "tools.gaszone", 10)
     if fehler is not None:
         return fehler
     if conn.shop is None:
@@ -9720,9 +9714,6 @@ async def api_tools_horde_post(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "tools", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "tools.horde", 10)
-    if fehler is not None:
-        return fehler
     if not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     data_in = await body(request)
@@ -9837,9 +9828,6 @@ async def api_tools_heliloot_post(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "tools", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "tools.heliloot", 10)
-    if fehler is not None:
-        return fehler
     if not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     data_in = await body(request)
@@ -9950,9 +9938,6 @@ async def api_tools_vehicle_post(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     fehler = await _dash_gate(request, conn, "tools", "edit")
-    if fehler is not None:
-        return fehler
-    fehler = _dash_rate_limited(request, "tools.vehicle", 10)
     if fehler is not None:
         return fehler
     if not _mission_dir_of(conn):
@@ -10074,9 +10059,6 @@ async def api_tools_spawnable_post(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "tools", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "tools.spawnable", 10)
-    if fehler is not None:
-        return fehler
     if not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     data_in = await body(request)
@@ -10146,9 +10128,6 @@ async def api_tools_event_post(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     fehler = await _dash_gate(request, conn, "tools", "edit")
-    if fehler is not None:
-        return fehler
-    fehler = _dash_rate_limited(request, "tools.event", 10)
     if fehler is not None:
         return fehler
     if not _mission_dir_of(conn):
@@ -10254,9 +10233,6 @@ async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     fehler = await _dash_gate(request, conn, "tools", "edit")
-    if fehler is not None:
-        return fehler
-    fehler = _dash_rate_limited(request, "tools.spawnpoint", 10)
     if fehler is not None:
         return fehler
     if not _mission_dir_of(conn):
@@ -16994,38 +16970,6 @@ async def _dash_gate(request: web.Request, conn: Optional["ServerConnection"],
     return err("Keine Berechtigung für diese Aktion.", 403, code="dash_perm")
 
 
-# Letzter Aufruf pro (Discord-Konto, Aktion) – gilt kontoweit, ueber alle
-# Sessions/Geraete hinweg. Bewusst ein einfaches In-Process-Dict: der Bot
-# laeuft als ein einziger Prozess, ein Neustart setzt Cooldowns zurueck, was
-# fuer Spam-Schutz unproblematisch ist.
-_DASH_RATE_LIMIT_LAST: Dict[Tuple[str, str], float] = {}
-_DASH_RATE_LIMIT_MAX_SECONDS = 15
-
-
-def _dash_rate_limited(request: web.Request, action: str, seconds: float
-                       ) -> Optional[web.Response]:
-    """Spam-Schutz fuer Dashboard-Aktionen – pro Discord-Konto, kontoweit.
-
-    Erst NACH den Berechtigungspruefungen aufrufen, damit ein sowieso
-    abgelehnter Versuch (403/409 etc.) keinen Cooldown verbraucht.
-    """
-    seconds = min(seconds, _DASH_RATE_LIMIT_MAX_SECONDS)
-    sess = _sess_get(request)
-    discord_id = str((sess.get("discord") or {}).get("id") or "") if sess else ""
-    if not discord_id:
-        return None
-    key = (discord_id, action)
-    now = time.monotonic()
-    letzter = _DASH_RATE_LIMIT_LAST.get(key)
-    if letzter is not None:
-        rest = seconds - (now - letzter)
-        if rest > 0:
-            return err(f"Bitte kurz warten – noch {math.ceil(rest)}s.", 429,
-                       code="rate_limit", retry_after=round(rest, 1))
-    _DASH_RATE_LIMIT_LAST[key] = now
-    return None
-
-
 def _dash_guest_conn_for_login(discord_id: str) -> Optional["ServerConnection"]:
     """Server, auf dem dieses Discord-Konto (noch) keinen eigenen Server hat,
     aber als Gast (Person oder Rolle) in dashboard_perms eingetragen ist –
@@ -18469,9 +18413,6 @@ async def set_feed(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "feeds", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "feeds.edit", 3)
-    if fehler is not None:
-        return fehler
     if conn.guild_id and int(conn.guild_id) != int(gid):
         return err("Dieser Discord-Server gehört nicht zu deinem Nitrado-Server.", 403)
     if log_type in FEED_TYPES and not await _module_erlaubt(log_type, _sess_get(request), conn):
@@ -18902,9 +18843,6 @@ async def create_zone(request: web.Request) -> web.Response:
     denied = await _dash_gate(request, _c, "zones", "create")
     if denied is not None:
         return denied
-    denied = _dash_rate_limited(request, "zones.create", 5)
-    if denied is not None:
-        return denied
     data = await body(request)
     name = str(data.get("name", "")).strip()
     if not name or len(name) > 60:
@@ -18958,9 +18896,6 @@ async def update_zone(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     denied = await _dash_gate(request, _c, "zones", "edit")
-    if denied is not None:
-        return denied
-    denied = _dash_rate_limited(request, "zones.edit", 5)
     if denied is not None:
         return denied
     zone = _find(request.match_info["name"], _c)
@@ -19036,9 +18971,6 @@ async def delete_zone(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     denied = await _dash_gate(request, _c, "zones", "delete")
-    if denied is not None:
-        return denied
-    denied = _dash_rate_limited(request, "zones.delete", 5)
     if denied is not None:
         return denied
     zone = _find(request.match_info["name"], _c)
@@ -19172,9 +19104,6 @@ async def create_scheduled_task(request: web.Request) -> web.Response:
     denied = await _dash_gate(request, _c, "autotasks", "create")
     if denied is not None:
         return denied
-    denied = _dash_rate_limited(request, "autotasks.create", 5)
-    if denied is not None:
-        return denied
     data = await body(request)
     werte, fehler = _scheduled_task_aus_anfrage(data)
     if fehler:
@@ -19200,9 +19129,6 @@ async def update_scheduled_task(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     denied = await _dash_gate(request, _c, "autotasks", "edit")
-    if denied is not None:
-        return denied
-    denied = _dash_rate_limited(request, "autotasks.edit", 5)
     if denied is not None:
         return denied
     try:
@@ -19240,9 +19166,6 @@ async def delete_scheduled_task(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     denied = await _dash_gate(request, _c, "autotasks", "delete")
-    if denied is not None:
-        return denied
-    denied = _dash_rate_limited(request, "autotasks.delete", 5)
     if denied is not None:
         return denied
     try:
@@ -19284,9 +19207,6 @@ async def add_allowlist(request: web.Request) -> web.Response:
     denied = await _dash_gate(request, _c, "zones", "edit")
     if denied is not None:
         return denied
-    denied = _dash_rate_limited(request, "zones.allowlist", 3)
-    if denied is not None:
-        return denied
     zone = _find(request.match_info["name"], _c)
     if not zone:
         return err("Zone nicht gefunden.", 404)
@@ -19309,9 +19229,6 @@ async def remove_allowlist(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     denied = await _dash_gate(request, _c, "zones", "edit")
-    if denied is not None:
-        return denied
-    denied = _dash_rate_limited(request, "zones.allowlist", 3)
     if denied is not None:
         return denied
     zone = _find(request.match_info["name"], _c)
@@ -19447,9 +19364,6 @@ async def post_subcmd_permissions(request: web.Request) -> web.Response:
     denied = await _modul_pruefen("permissions.subcommands", request, conn)
     if denied is not None:
         return denied
-    denied = _dash_rate_limited(request, "permissions.subcommands", 5)
-    if denied is not None:
-        return denied
     data = await body(request)
     op = str(data.get("op") or "")
     target_type = str(data.get("target_type") or "")
@@ -19541,9 +19455,6 @@ async def post_dashboard_permissions(request: web.Request) -> web.Response:
     conn, denied = _dash_perm_owner_only(request)
     if denied is not None:
         return denied
-    denied = _dash_rate_limited(request, "permissions.dashboard", 5)
-    if denied is not None:
-        return denied
     data = await body(request)
     op = str(data.get("op") or "")
     target_type = str(data.get("target_type") or "")
@@ -19628,9 +19539,6 @@ async def set_auto_restart(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     denied = await _dash_gate(request, conn, "autotasks", "edit")
-    if denied is not None:
-        return denied
-    denied = _dash_rate_limited(request, "autotasks.auto_restart", 5)
     if denied is not None:
         return denied
     data = await body(request)
@@ -19867,9 +19775,6 @@ async def create_item(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "shop", "create")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "shop.item", 5)
-    if fehler is not None:
-        return fehler
     katalog = conn.catalog
     data = await body(request)
     parts = _split_classnames(data.get("classnames") or data.get("classname"))
@@ -19940,9 +19845,6 @@ async def update_item(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "shop", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "shop.item", 5)
-    if fehler is not None:
-        return fehler
     katalog = conn.catalog
     it = katalog.find(request.match_info["name"])
     if not it:
@@ -20006,9 +19908,6 @@ async def delete_item(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     fehler = await _dash_gate(request, conn, "shop", "delete")
-    if fehler is not None:
-        return fehler
-    fehler = _dash_rate_limited(request, "shop.item", 5)
     if fehler is not None:
         return fehler
     katalog = conn.catalog
@@ -20099,9 +19998,6 @@ async def add_category(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "shop", "create")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "shop.category", 5)
-    if fehler is not None:
-        return fehler
     data = await body(request)
     cat = str(data.get("name", "")).strip()
     if not cat:
@@ -20121,9 +20017,6 @@ async def api_shop_refresh_types(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     fehler = await _dash_gate(request, conn, "shop", "edit")
-    if fehler is not None:
-        return fehler
-    fehler = _dash_rate_limited(request, "shop.types", 15)
     if fehler is not None:
         return fehler
     n, meldung = await katalog_von_server_holen(conn)
@@ -20149,9 +20042,6 @@ async def api_shop_upload_types(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     fehler = await _dash_gate(request, conn, "shop", "edit")
-    if fehler is not None:
-        return fehler
-    fehler = _dash_rate_limited(request, "shop.types", 15)
     if fehler is not None:
         return fehler
     data = await body(request)
@@ -20242,9 +20132,6 @@ async def api_shop_import(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     fehler = await _dash_gate(request, conn, "shop", "create")
-    if fehler is not None:
-        return fehler
-    fehler = _dash_rate_limited(request, "shop.import", 10)
     if fehler is not None:
         return fehler
     katalog = conn.catalog
@@ -20526,9 +20413,6 @@ def _make_add(kind: str, dash_cat: str):
         denied = await _dash_gate(request, conn, dash_cat, "create")
         if denied is not None:
             return denied
-        denied = _dash_rate_limited(request, f"{kind}.add", 3)
-        if denied is not None:
-            return denied
         try:
             names, cat, key = await _read(kind, conn)
         except Exception as e:  # noqa: BLE001
@@ -20549,9 +20433,6 @@ def _make_remove(kind: str, dash_cat: str):
         if denied is not None:
             return denied
         denied = await _dash_gate(request, conn, dash_cat, "delete")
-        if denied is not None:
-            return denied
-        denied = _dash_rate_limited(request, f"{kind}.remove", 3)
         if denied is not None:
             return denied
         try:
@@ -20645,9 +20526,6 @@ async def api_economy_money(request: web.Request) -> web.Response:
     if gid not in _session_guilds(request):
         return err("Dieser Discord-Server gehört nicht zu deinem Nitrado-Server.", 403)
     denied = await _dash_gate(request, connections.for_guild(gid), "economy", "edit")
-    if denied is not None:
-        return denied
-    denied = _dash_rate_limited(request, "economy.money", 5)
     if denied is not None:
         return denied
     op = str(data.get("op", "add"))
@@ -20757,9 +20635,6 @@ async def api_economy_set_config(request: web.Request) -> web.Response:
     denied = await _dash_gate(request, conn, "economy", "edit")
     if denied is not None:
         return denied
-    denied = _dash_rate_limited(request, "economy.config", 5)
-    if denied is not None:
-        return denied
     data = await body(request)
     for key in ("currency_name", "currency_symbol"):
         if key in data:
@@ -20867,9 +20742,6 @@ async def create_announcement(request: web.Request) -> web.Response:
     denied = await _dash_gate(request, conn, "announce", "create")
     if denied is not None:
         return denied
-    denied = _dash_rate_limited(request, "announce.create", 5)
-    if denied is not None:
-        return denied
     d = _data()
     data = await body(request)
     day = str(data.get("day", "")).strip().lower()
@@ -20917,9 +20789,6 @@ async def delete_announcement(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     denied = await _dash_gate(request, _conn_for_session(_sess_get(request)), "announce", "delete")
-    if denied is not None:
-        return denied
-    denied = _dash_rate_limited(request, "announce.delete", 5)
     if denied is not None:
         return denied
     d = _data()
@@ -20985,9 +20854,6 @@ async def api_server_restart(request: web.Request) -> web.Response:
     denied = await _dash_gate(request, _conn_for_session(_sess_get(request)), "server", "edit")
     if denied is not None:
         return denied
-    denied = _dash_rate_limited(request, "server.power", 15)
-    if denied is not None:
-        return denied
     nit, e = require_nitrado(request)
     if e:
         return e
@@ -20997,9 +20863,6 @@ async def api_server_restart(request: web.Request) -> web.Response:
 
 async def api_server_stop(request: web.Request) -> web.Response:
     denied = await _dash_gate(request, _conn_for_session(_sess_get(request)), "server", "edit")
-    if denied is not None:
-        return denied
-    denied = _dash_rate_limited(request, "server.power", 15)
     if denied is not None:
         return denied
     nit, e = require_nitrado(request)
