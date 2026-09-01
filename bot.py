@@ -19721,7 +19721,7 @@ async def api_shop_classnames(request: web.Request) -> web.Response:
         if key in seen:
             continue
         name = str(it.get("name") or cn)
-        if not q or q in key or q in name.lower():
+        if not q or key.startswith(q) or name.lower().startswith(q):
             seen.add(key)
             out.append({"classname": cn, "name": name,
                         "category": str(it.get("category", "Misc"))})
