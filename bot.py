@@ -749,6 +749,15 @@ _URSACHE_TODE = (
     # "tripwire" MUSS vor "wire" stehen – siehe _URSACHE_TREFFER.
     ("tripwire", "trap_death"),
     ("barbed", "barbed_wire_death"), ("wire", "barbed_wire_death"),
+    # "Fence" OHNE erkennbaren Stacheldraht-Bezug in der Todesursache: in
+    # 61 echten .ADM-Dateien (beide aktiven Server) kam kein einziger
+    # Barbed-Wire-Tod vor, um das zu belegen - aber alle 55 TREFFER lauten
+    # ausnahmslos "hit by Fence with BarbedWireHit". Ein Zaun ohne
+    # Stacheldraht verursacht in DayZ keinen Schaden, "Fence" als
+    # Schadensquelle heisst deshalb praktisch immer Stacheldraht. Sollte
+    # sich das an einem echten Todesfall als falsch erweisen, hier zuerst
+    # nachsehen.
+    ("fence", "barbed_wire_death"),
     ("zmb", "zombie_death"), ("zombie", "zombie_death"), ("infected", "zombie_death"),
     # DayZ schreibt die Klassennamen, nicht die Tiernamen: Animal_CanisLupus,
     # Animal_UrsusArctos. Beide Schreibweisen stehen drin.

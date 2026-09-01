@@ -132,4 +132,23 @@ def test_zombie_treffer_ist_kein_waehlbarer_feed():
     """DayZ protokolliert Zombie-TREFFER nicht (0 in 23.903 echten Zeilen) -
     der Feed waere immer leer. Der Zombie-TOD bleibt dagegen waehlbar."""
     assert "zombie_hit" not in bot.FEED_TYPES
+
+
+def test_bled_out_ueber_verb_erkannt():
+    """Echte Zeile von Brigarde_Erkelen (zwei echte Vorkommen im Log) -
+    "bled out" steht als VERB da, nie hinter "killed by"."""
+    zeile = ('18:27:27 | Player "Brigarde_Erkelen" (DEAD) '
+             '(id=pJ8wQQS1teCqTArq2aZoDMlVfy_LmtX05vC44dOIM6c= '
+             'pos=<8682.5, 12841.7, 107.9>) bled out')
+    ev = DayZLogParser().parse_line(zeile)
+    assert ev is not None and ev["type"] == "kill_env"
+    assert bot._feed_key(ev) == "bleed_out_death"
+
+
+def test_barbed_wire_tod_ueber_fence():
+    """Unbelegt durch einen echten Todesfall (kam im geprueften Zeitraum
+    nicht vor) - aber alle 55 echten TREFFER lauten "hit by Fence with
+    BarbedWireHit", und ein Zaun ohne Stacheldraht schadet in DayZ nicht."""
+    ev = {"type": "kill_env", "cause": "Fence", "raw": ""}
+    assert bot._feed_key(ev) == "barbed_wire_death"
     assert "zombie_death" in bot.FEED_TYPES
