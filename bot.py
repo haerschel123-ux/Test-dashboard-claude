@@ -17312,7 +17312,14 @@ async def api_options(request: web.Request) -> web.Response:
     conn = _conn_for_session(sess)
     if conn is None:
         return ok({"connected": False})
-    if _fremder_besitzer(sess, conn):
+    # Der fremde Besitzer sperrt hier die ALTE Sitzung eines frueheren
+    # Eigentuemers aus. Ein eingetragener Gast ist dagegen genau richtig hier:
+    # ihm gehoert der Server nie, und die Gast-Karte weiter unten ist die
+    # Ansicht, die fuer ihn gebaut wurde. Ohne diese Ausnahme sah er statt
+    # dessen "Bitte neu anmelden" und kam auf der Optionen-Seite nie weiter.
+    # Der Token bleibt fuer ihn trotzdem gesperrt (_token_sichtbar).
+    _uid = str((sess.get("discord") or {}).get("id") or "")
+    if _fremder_besitzer(sess, conn) and not _dash_guest_actions(_uid, conn):
         return err(_BESITZER_GEWECHSELT, 403)
     guild = (bot.get_guild(conn.guild_id)
              if (bot is not None and conn.guild_id) else None)
@@ -17332,6 +17339,13 @@ async def api_options(request: web.Request) -> web.Response:
         # Zugang zu tun haben – bewusst fest verdrahtet, nicht ueber
         # dashboard_perms delegierbar UND ausdruecklich auch fuer den
         # Bot-Betreiber, sobald er nur zu Besuch ist (Gast-Zugang).
+        #
+        # WEM der Server gehoert, steht trotzdem dabei: sonst sieht auch der
+        # Betreiber nur "kein Token" und muss raten, warum. Das ist der
+        # Anzeigename des Kontos, nie sein Token oder seine Zugangsdaten - die
+        # Sperre oben bleibt davon unberuehrt.
+        besitzer = str(conn.data.get("owner_discord_id") or "").strip()
+        out["owner"] = await _discord_konto_kurz(besitzer) if besitzer else None
         return ok(out)
     out["map_name"] = conn.get("map_name")
     out["token_masked"] = conn.masked_token()
@@ -17509,7 +17523,47 @@ async def api_my_guilds(request: web.Request) -> web.Response:
                            "&disable_guild_select=true"),
         })
     out.sort(key=lambda e: ((not e["bot_drin"]), str(e["name"] or "").lower()))
-    return ok({"guilds": out, "gewaehlt": sess.get("guild_id")})
+
+    # Discord-Server, auf die dieses Konto Zugriff hat, ohne ihr Eigentuemer zu
+    # sein. Dieselbe Regel wie im Server-Umschalter (api_servers_mine), damit
+    # Kachel-Auswahl und Auswahlliste nicht verschiedene Server zeigen: ein Gast
+    # sieht, wofuer er unter Dashboard Permissions eingetragen ist, der
+    # Bot-Betreiber alle uebrigen. Ohne zugeordnete Guild gibt es keine Kachel -
+    # solche Server bleiben wie bisher nur ueber die Auswahlliste erreichbar.
+    meine_id = str((sess.get("discord") or {}).get("id") or "")
+    gruppen: Dict[str, List[ServerConnection]] = {}
+    for conn in connections.all():
+        if not conn.guild_id:
+            continue
+        if meine_id and str(conn.data.get("owner_discord_id") or "") == meine_id:
+            continue
+        if not (sess.get("is_admin") or _dash_guest_actions(meine_id, conn)):
+            continue
+        gruppen.setdefault(str(conn.guild_id), []).append(conn)
+
+    gast = []
+    for gid, conns in list(gruppen.items())[:25]:
+        guild = bot.get_guild(int(gid)) if bot is not None else None
+        icon = getattr(guild, "icon", None) if guild is not None else None
+        gast.append({
+            "id": gid,
+            "name": (guild.name if guild is not None else None),
+            "icon_url": (str(icon.url) if icon is not None else None),
+            "bot_drin": guild is not None,
+            # Wie oben: nur der Anzeigename, nie Token oder Zugangsdaten.
+            "server_name": conns[0].name,
+            "server_anzahl": len(conns),
+            "premium": True,
+            # Beides nur bei Gast-Kacheln: das Frontend schaltet damit ueber
+            # /api/servers/select um statt ueber /api/my-guilds/select - Letzteres
+            # verlangt zu Recht Eigentum an der Guild (_gehoert_mir).
+            "gast": True,
+            "service_id": conns[0].service_id,
+            "invite_url": None,
+        })
+    gast.sort(key=lambda e: str(e["name"] or e["id"]).lower())
+    return ok({"guilds": out, "gast_guilds": gast,
+               "gewaehlt": sess.get("guild_id")})
 
 
 async def post_my_guilds_select(request: web.Request) -> web.Response:
@@ -22181,6 +22235,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "7ef1fd0ff20205a8ecfd4dbe547bd75e8ab95866e8656c6475c6a4879d5fbb35",
         "a62f7c4a462ed31c1520843bbd3fd257b90c30a1d9b63c268c6273b7216a2f9e",
         "1cb3525ee42c2288ce8c1d54c9fa96646b9da3fbdcd51a982ffc7de3fb4a3d96",
+        "8721a76e6f9a79335b90720a4e9510d1568ec6ffbd05e22b3ea827a989fed264",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
