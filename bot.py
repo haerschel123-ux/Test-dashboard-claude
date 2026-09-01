@@ -15626,6 +15626,11 @@ def _sess_create(token: str, gameservers: list,
         # guild_id aus dem Anfrage-Body.
         "owned_guilds": list(owned_guilds or []),
         "guild_id": guild_id,
+        # Der zuletzt besuchte Server, der diesem Konto WIRKLICH gehoert – fuer
+        # den "Zurueck zu meinem Server"-Knopf im Gast-Zugang (siehe
+        # post_servers_select). Bei einer Gast-Anmeldung gibt es dafuer noch
+        # nichts zu merken.
+        "eigener_service_id": (service_id if not is_guest else None),
         # Gesetzt, wenn ein gespeicherter Token von Nitrado abgelehnt wurde –
         # das Frontend erklaert dann, warum die Eingabe wieder erscheint.
         "token_invalid": bool(token_invalid),
@@ -17346,6 +17351,17 @@ async def api_options(request: web.Request) -> web.Response:
         # Sperre oben bleibt davon unberuehrt.
         besitzer = str(conn.data.get("owner_discord_id") or "").strip()
         out["owner"] = await _discord_konto_kurz(besitzer) if besitzer else None
+        # Fuer den "Zurueck zu meinem Server"-Knopf: der zuletzt besuchte
+        # EIGENE Server dieser Sitzung (siehe post_servers_select) - nur wenn
+        # er tatsaechlich noch existiert und wirklich diesem Konto gehoert
+        # (nicht bloss aus einer veralteten Sitzung uebrig).
+        eigener = connections.for_service(sess.get("eigener_service_id"))
+        if (eigener is not None and eigener.service_id != conn.service_id
+                and str(eigener.data.get("owner_discord_id") or "") == _uid):
+            out["own_service_id"] = eigener.service_id
+            out["own_service_name"] = eigener.name
+        else:
+            out["own_service_id"] = None
         return ok(out)
     out["map_name"] = conn.get("map_name")
     out["token_masked"] = conn.masked_token()
@@ -17685,8 +17701,19 @@ async def post_servers_select(request: web.Request) -> web.Response:
 
     meine_id = str((sess.get("discord") or {}).get("id") or "")
     besitzer = str(conn.data.get("owner_discord_id") or "")
-    ist_gast = (not sess.get("is_admin")) and besitzer != meine_id
+    # Bewusst OHNE Admin-Ausnahme, wie schon bei _token_sichtbar: der
+    # Bot-Betreiber ist auf einem fremden Server ebenfalls nur zu Besuch.
+    # Die fruehere Ausnahme hier hat NUR die Anzeige verfaelscht ("richtest du
+    # ein" statt "moechtest du ansehen") - seine Rechte haengen ohnehin nie an
+    # is_guest, sondern ueberall separat an is_admin.
+    ist_gast = besitzer != "" and besitzer != meine_id
     sess["is_guest"] = ist_gast
+    if not ist_gast:
+        # Merkt sich den zuletzt besuchten EIGENEN Server, damit der
+        # "Zurueck zu meinem Server"-Knopf im Gast-Zugang weiss, wohin (siehe
+        # api_options). Ein Wechsel zu einem fremden Server loescht das
+        # bewusst nicht - man soll von dort ohne Token zurueckkommen.
+        sess["eigener_service_id"] = conn.service_id
 
     sess["service_id"] = conn.service_id
     sess["map_name"] = conn.get("map_name")
@@ -22236,6 +22263,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "a62f7c4a462ed31c1520843bbd3fd257b90c30a1d9b63c268c6273b7216a2f9e",
         "1cb3525ee42c2288ce8c1d54c9fa96646b9da3fbdcd51a982ffc7de3fb4a3d96",
         "8721a76e6f9a79335b90720a4e9510d1568ec6ffbd05e22b3ea827a989fed264",
+        "5595bc0874a8f05dd5f35ec13fc10c61a1b69605246f91e51dc3a6aba399a49b",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
