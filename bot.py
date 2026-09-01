@@ -22264,6 +22264,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "1cb3525ee42c2288ce8c1d54c9fa96646b9da3fbdcd51a982ffc7de3fb4a3d96",
         "8721a76e6f9a79335b90720a4e9510d1568ec6ffbd05e22b3ea827a989fed264",
         "5595bc0874a8f05dd5f35ec13fc10c61a1b69605246f91e51dc3a6aba399a49b",
+        "6daf56b9ac7fb0181311d5d9491754201416d2d4eb38a37e61ed79844cf629c2",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
