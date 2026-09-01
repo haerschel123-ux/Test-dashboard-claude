@@ -20026,6 +20026,54 @@ async def api_shop_refresh_types(request: web.Request) -> web.Response:
                "source": conn.catalog.source, "server": conn.name})
 
 
+async def api_shop_upload_types(request: web.Request) -> web.Response:
+    """types.xml von Hand hochladen statt per FTP/API zu holen.
+
+    Fuer Konsolen-Server (PS4/Xbox) gibt Nitrado den Mission-Ordner gar nicht
+    frei - "Items vom Server laden" (katalog_von_server_holen) findet dort
+    nie eine types.xml, live an drei echten PS4-Servern geprueft (nur
+    dayzps/config mit Logs/Baenen/Whitelist erreichbar, kein mpmissions/db).
+    Nutzt denselben Generator wie der FTP-Weg, nur mit hochgeladenem statt
+    abgeholtem Text."""
+    conn, fehler = _session_conn(request, "shop.catalog_admin")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("shop.catalog_admin", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "shop", "edit")
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    xml_text = str(data.get("xml") or "")
+    if "<type" not in xml_text:
+        return err("Das sieht nicht nach einer types.xml aus (kein <type>-Eintrag gefunden).")
+
+    tmp = f"types_upload_{conn.service_id or 'server'}.xml"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(xml_text)
+    except OSError as e:
+        return err(f"Hochgeladene Datei konnte nicht zwischengespeichert werden: {e}")
+
+    loop = asyncio.get_running_loop()
+    katalog = conn.catalog
+    try:
+        n = await loop.run_in_executor(
+            None, functools.partial(generate_shop_items_from_types, tmp, katalog.path, conn))
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    if n is None:
+        return err("Die Datei konnte nicht ausgewertet werden – keine <type name=...>-Einträge gefunden.")
+    katalog.load()
+    log.info(f"[SHOP] {conn.name}: Katalog aus hochgeladener types.xml erzeugt ({n} Items).")
+    return ok({"items": n, "message": f"{n} Items übernommen.",
+               "source": conn.catalog.source, "server": conn.name})
+
+
 # Kennung in der Exportdatei – daran erkennt der Import, dass die Datei aus
 # einem Dashboard stammt und nicht irgendein JSON ist.
 _SHOP_EXPORT_FORMAT = "dayz-dashboard-shop"
@@ -21531,6 +21579,7 @@ def build_app() -> web.Application:
     r.add_delete("/api/shop/items/{name}", delete_item)
     r.add_post("/api/shop/categories", add_category)
     r.add_post("/api/shop/refresh-types", api_shop_refresh_types)
+    r.add_post("/api/shop/upload-types", api_shop_upload_types)
     r.add_get("/api/shop/export", api_shop_export)
     r.add_post("/api/shop/import", api_shop_import)
 
@@ -22300,6 +22349,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "8721a76e6f9a79335b90720a4e9510d1568ec6ffbd05e22b3ea827a989fed264",
         "5595bc0874a8f05dd5f35ec13fc10c61a1b69605246f91e51dc3a6aba399a49b",
         "6daf56b9ac7fb0181311d5d9491754201416d2d4eb38a37e61ed79844cf629c2",
+        "4f59a8373d0814dfb5ddccb2013e20e87d7c01a70eae0dcd3a7fffaff72e420d",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
