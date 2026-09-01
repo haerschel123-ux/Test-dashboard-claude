@@ -9428,13 +9428,17 @@ async def api_tools_loadout_post(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "tools", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "tools.loadout", 10)
-    if fehler is not None:
-        return fehler
     if not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     data = await body(request)
     commit = bool(data.get("commit"))
+    # Erst ab dem echten Speichern (commit) limitieren, nicht schon bei der
+    # Vorschau - sonst wuerde die Vorschau den direkt folgenden Speichern-Klick
+    # selbst blockieren.
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.loadout", 10)
+        if fehler is not None:
+            return fehler
     name = str(data.get("name") or "").strip() or "MeinLoadout"
     preset = data.get("preset")
     if not isinstance(preset, dict):
@@ -9533,9 +9537,6 @@ async def api_tools_gaszone_post(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "tools", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "tools.gaszone", 10)
-    if fehler is not None:
-        return fehler
     if conn.shop is None:
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     pfad = conn.shop.effect_area_path()
@@ -9543,6 +9544,10 @@ async def api_tools_gaszone_post(request: web.Request) -> web.Response:
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     data_in = await body(request)
     commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.gaszone", 10)
+        if fehler is not None:
+            return fehler
     name = str(data_in.get("name") or "").strip() or "MeineGasZone"
     if name.startswith(ShopManager.AREA_PREFIX):
         return err(f"Der Name darf nicht mit „{ShopManager.AREA_PREFIX}“ beginnen "
@@ -9720,13 +9725,14 @@ async def api_tools_horde_post(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "tools", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "tools.horde", 10)
-    if fehler is not None:
-        return fehler
     if not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     data_in = await body(request)
     commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.horde", 10)
+        if fehler is not None:
+            return fehler
     name = str(data_in.get("name") or "").strip() or "InfectedHorde"
     zombies = data_in.get("zombies") or []
     positions = data_in.get("positions") or []
@@ -9837,13 +9843,14 @@ async def api_tools_heliloot_post(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "tools", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "tools.heliloot", 10)
-    if fehler is not None:
-        return fehler
     if not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     data_in = await body(request)
     commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.heliloot", 10)
+        if fehler is not None:
+            return fehler
     loot = data_in.get("loot") or []
     if not loot:
         return err("Bitte mindestens ein Loot-Item angeben.")
@@ -9952,13 +9959,14 @@ async def api_tools_vehicle_post(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "tools", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "tools.vehicle", 10)
-    if fehler is not None:
-        return fehler
     if not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     data_in = await body(request)
     commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.vehicle", 10)
+        if fehler is not None:
+            return fehler
     typ = str(data_in.get("type") or "").strip()
     if typ not in TOOL_VEHICLES:
         return err("Unbekannter Fahrzeugtyp.")
@@ -10074,13 +10082,14 @@ async def api_tools_spawnable_post(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "tools", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "tools.spawnable", 10)
-    if fehler is not None:
-        return fehler
     if not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     data_in = await body(request)
     commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.spawnable", 10)
+        if fehler is not None:
+            return fehler
     target = str(data_in.get("target") or "").strip()
     if not target:
         return err("Bitte einen Ziel-Typ angeben.")
@@ -10148,13 +10157,14 @@ async def api_tools_event_post(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "tools", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "tools.event", 10)
-    if fehler is not None:
-        return fehler
     if not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     data_in = await body(request)
     commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.event", 10)
+        if fehler is not None:
+            return fehler
     name = str(data_in.get("name") or "").strip() or "StaticMeinEvent"
     kinder_in = data_in.get("children") or []
     kinder = []
@@ -10256,13 +10266,14 @@ async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "tools", "edit")
     if fehler is not None:
         return fehler
-    fehler = _dash_rate_limited(request, "tools.spawnpoint", 10)
-    if fehler is not None:
-        return fehler
     if not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     data_in = await body(request)
     commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.spawnpoint", 10)
+        if fehler is not None:
+            return fehler
     mode = str(data_in.get("mode") or "replace")
     positions_in = data_in.get("positions") or []
     positions = []
@@ -16994,18 +17005,35 @@ async def _dash_gate(request: web.Request, conn: Optional["ServerConnection"],
     return err("Keine Berechtigung für diese Aktion.", 403, code="dash_perm")
 
 
-# Letzter Aufruf pro (Discord-Konto, Aktion) – gilt kontoweit, ueber alle
-# Sessions/Geraete hinweg. Bewusst ein einfaches In-Process-Dict: der Bot
-# laeuft als ein einziger Prozess, ein Neustart setzt Cooldowns zurueck, was
-# fuer Spam-Schutz unproblematisch ist.
+# Ablaufzeitpunkt der Sperre pro (Discord-Konto, Aktion) – gilt kontoweit,
+# ueber alle Sessions/Geraete hinweg. Bewusst ein einfaches In-Process-Dict:
+# der Bot laeuft als ein einziger Prozess, ein Neustart setzt Cooldowns
+# zurueck, was fuer Spam-Schutz unproblematisch ist.
 _DASH_RATE_LIMIT_LAST: Dict[Tuple[str, str], float] = {}
 _DASH_RATE_LIMIT_MAX_SECONDS = 15
+_DASH_RATE_LIMIT_ABBRUCH_SECONDS = 10
 # Ohne Aufraeumen waechst das Dict ueber Wochen/Monate unbegrenzt (jedes Konto
 # x jede Aktion bleibt fuer immer drin). Alle 500 Aufrufe abgelaufene
 # Eintraege wegwerfen statt eines eigenen Hintergrund-Tasks – reicht fuer den
 # Umfang hier locker aus und braucht keinen zusaetzlichen Scheduler.
 _DASH_RATE_LIMIT_CLEANUP_EVERY = 500
 _dash_rate_limit_calls = 0
+
+
+def _dash_rate_limit_key(request: web.Request) -> Optional[str]:
+    sess = _sess_get(request)
+    return str((sess.get("discord") or {}).get("id") or "") or None if sess else None
+
+
+def _dash_rate_limit_cleanup(now: float) -> None:
+    global _dash_rate_limit_calls
+    _dash_rate_limit_calls += 1
+    if _dash_rate_limit_calls < _DASH_RATE_LIMIT_CLEANUP_EVERY:
+        return
+    _dash_rate_limit_calls = 0
+    veraltet = [k for k, ablauf in _DASH_RATE_LIMIT_LAST.items() if now >= ablauf]
+    for k in veraltet:
+        _DASH_RATE_LIMIT_LAST.pop(k, None)
 
 
 def _dash_rate_limited(request: web.Request, action: str, seconds: float
@@ -17015,29 +17043,47 @@ def _dash_rate_limited(request: web.Request, action: str, seconds: float
     Erst NACH den Berechtigungspruefungen aufrufen, damit ein sowieso
     abgelehnter Versuch (403/409 etc.) keinen Cooldown verbraucht.
     """
-    global _dash_rate_limit_calls
     seconds = min(seconds, _DASH_RATE_LIMIT_MAX_SECONDS)
-    sess = _sess_get(request)
-    discord_id = str((sess.get("discord") or {}).get("id") or "") if sess else ""
+    discord_id = _dash_rate_limit_key(request)
     if not discord_id:
         return None
     key = (discord_id, action)
     now = time.monotonic()
-    letzter = _DASH_RATE_LIMIT_LAST.get(key)
-    if letzter is not None:
-        rest = seconds - (now - letzter)
-        if rest > 0:
-            return err(f"Bitte kurz warten – noch {math.ceil(rest)}s.", 429,
-                       code="rate_limit", retry_after=round(rest, 1))
-    _dash_rate_limit_calls += 1
-    if _dash_rate_limit_calls >= _DASH_RATE_LIMIT_CLEANUP_EVERY:
-        _dash_rate_limit_calls = 0
-        veraltet = [k for k, t in _DASH_RATE_LIMIT_LAST.items()
-                   if now - t > _DASH_RATE_LIMIT_MAX_SECONDS]
-        for k in veraltet:
-            _DASH_RATE_LIMIT_LAST.pop(k, None)
-    _DASH_RATE_LIMIT_LAST[key] = now
+    ablauf = _DASH_RATE_LIMIT_LAST.get(key)
+    if ablauf is not None and now < ablauf:
+        rest = ablauf - now
+        return err(f"Bitte kurz warten – noch {math.ceil(rest)}s.", 429,
+                   code="rate_limit", retry_after=round(rest, 1))
+    _dash_rate_limit_cleanup(now)
+    _DASH_RATE_LIMIT_LAST[key] = now + seconds
     return None
+
+
+def _dash_rate_limit_abort(request: web.Request, action: str) -> Optional[web.Response]:
+    """Ein abgebrochenes Formular (Abbrechen/Fenster schliessen ohne zu
+    speichern) zaehlt genauso als Aktion – sonst liesse sich das Limit durch
+    Abbrechen-und-neu-Oeffnen umgehen. Fester Cooldown von
+    ``_DASH_RATE_LIMIT_ABBRUCH_SECONDS``, verkuerzt aber nie eine laengere
+    bereits laufende Sperre (z. B. nach einem echten Neustart-Klick).
+    """
+    discord_id = _dash_rate_limit_key(request)
+    if not discord_id:
+        return ok()
+    key = (discord_id, action)
+    now = time.monotonic()
+    neu = now + _DASH_RATE_LIMIT_ABBRUCH_SECONDS
+    bisher = _DASH_RATE_LIMIT_LAST.get(key)
+    _dash_rate_limit_cleanup(now)
+    _DASH_RATE_LIMIT_LAST[key] = max(bisher or 0.0, neu)
+    return ok()
+
+
+async def api_dash_rate_limit_abort(request: web.Request) -> web.Response:
+    data = await body(request)
+    action = str(data.get("action") or "").strip()
+    if not action:
+        return err("action fehlt.")
+    return _dash_rate_limit_abort(request, action)
 
 
 def _dash_guest_conn_for_login(discord_id: str) -> Optional["ServerConnection"]:
@@ -21683,6 +21729,7 @@ def build_app() -> web.Application:
     r.add_post("/api/auth/logout", post_logout)
     r.add_get("/api/session", api_get_session)
     r.add_post("/api/consent", post_consent)
+    r.add_post("/api/dashboard/rate-limit-abort", api_dash_rate_limit_abort)
     r.add_post("/api/sprache", post_sprache)
 
     # ── Feeds ──
@@ -22505,6 +22552,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "4efb7067753a20731e4931b0bddcd91ce69c3544a7fcf1a5bdc5353733d9c0c2",
         "aa04dee7ce0003d91492cbbc23de3c19e60c1ba5575feee5896f38049ee62e77",
         "4f33ff8989e343a3123f49a115477768d0466b9f9fd12f05885c4461687c7298",
+        "e1eed7713dcc3341c44ed25dd7ab450cf32d318e9d27cb846bfbaf222d832d98",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
