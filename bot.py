@@ -4178,16 +4178,6 @@ class DayZBot(discord.Client):
                 if found.get("mission_dir"):
                     _conn_store(conn, "ftp_mission_dir", found["mission_dir"])
 
-        # Shop-Katalog dieses Servers: ist er noch leer, die types.xml direkt
-        # vom Server holen. So bekommt jeder Kunde genau seine eigenen Items,
-        # ohne den Katalog von Hand pflegen zu muessen.
-        if not conn.catalog.items:
-            n, meldung = await katalog_von_server_holen(conn)
-            if n:
-                log.info(f"[SHOP] {conn.name}: {meldung}")
-            else:
-                log.info(f"[SHOP] {conn.name}: Katalog bleibt leer – {meldung}")
-
     @tasks.loop(seconds=10)
     async def log_poll(self):
         """Alle verbundenen Server abfragen – **gleichzeitig, nicht nacheinander**.
@@ -14886,6 +14876,28 @@ def _gen_prettify(classname: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def _types_xml_classnames_aus_text(xml_text: str) -> List[Dict[str, str]]:
+    """Reine Classname-Liste aus einer types.xml (Text, nicht Datei) fuers
+    Autofill – bewusst OHNE Katalog-Aufbau/-Schreiben (siehe
+    api_shop_upload_types): das Hochladen soll nur Autofill-Vorschlaege
+    liefern, niemals von sich aus Shop-Items anlegen."""
+    category = "UNCATEGORIZED"
+    out: List[Dict[str, str]] = []
+    seen: set = set()
+    for line in xml_text.splitlines():
+        m_cat = _GEN_RE_CATEGORY.search(line)
+        if m_cat:
+            category = m_cat.group(1).strip()
+            continue
+        m_type = _GEN_RE_TYPE.search(line)
+        if m_type:
+            cn = m_type.group(1).strip()
+            if cn.lower() not in seen:
+                seen.add(cn.lower())
+                out.append({"classname": cn, "name": _gen_prettify(cn), "category": category})
+    return out
+
+
 def generate_shop_items_from_types(input_path: str = TYPES_XML_FILE,
                                    output_path: Optional[str] = None,
                                    conn: Optional["ServerConnection"] = None) -> Optional[int]:
@@ -15016,79 +15028,6 @@ def generate_shop_items_from_types(input_path: str = TYPES_XML_FILE,
         return None
     log.info(f"[GEN] Katalog generiert: {len(items)} Items -> {out_file}")
     return len(items)
-
-
-def _types_xml_kandidaten(conn: "ServerConnection") -> List[str]:
-    """Wo die types.xml auf dem FTP dieses Servers liegen kann."""
-    pfade: List[str] = []
-    eigener = str(conn.get("types_xml_path") or "").strip()
-    if eigener:
-        pfade.append(eigener)
-    mission = str(conn.get("ftp_mission_dir") or "").rstrip("/")
-    if mission:
-        pfade += [f"{mission}/db/types.xml", f"{mission}/types.xml"]
-    # Ohne erkanntes Mission-Verzeichnis die üblichen Ablagen probieren
-    if not mission:
-        karte = str(conn.get("map_name") or "").strip()
-        if karte:
-            pfade.append(f"/dayzxb_missions/dayzOffline.{karte.lower()}/db/types.xml")
-            pfade.append(f"/dayzstandalone/mpmissions/dayzOffline.{karte.lower()}/db/types.xml")
-    # Duplikate raus, Reihenfolge behalten
-    gesehen, out = set(), []
-    for p in pfade:
-        if p not in gesehen:
-            gesehen.add(p)
-            out.append(p)
-    return out
-
-
-async def katalog_von_server_holen(conn: "ServerConnection") -> Tuple[Optional[int], str]:
-    """Holt die ``types.xml`` **dieses** Servers per FTP und baut daraus seinen Katalog.
-
-    Jeder Kunde bekommt damit genau die Items, die auf seinem eigenen Server
-    existieren – ein gemeinsamer Katalog wuerde fremde Classnames anbieten,
-    die dort gar nicht spawnen koennen.
-    Rueckgabe: ``(Item-Anzahl, Meldung)``; Anzahl ``None`` bei Fehlschlag.
-    """
-    if conn.ftp is None:
-        return None, ("Für diesen Server ist kein FTP-Zugang eingerichtet – "
-                      "ohne ihn ist die types.xml nicht erreichbar.")
-    kandidaten = _types_xml_kandidaten(conn)
-    if not kandidaten:
-        return None, ("Das Mission-Verzeichnis ist noch unbekannt. "
-                      "Bitte wende dich an den Bot-Betreiber.")
-
-    loop = asyncio.get_running_loop()
-    roh, gefunden = None, ""
-    for pfad in kandidaten:
-        roh = await loop.run_in_executor(None, conn.ftp.read_file, pfad)
-        if roh and "<type" in roh:
-            gefunden = pfad
-            break
-        roh = None
-    if roh is None:
-        return None, ("Keine types.xml gefunden. Geprüft: "
-                      + ", ".join(f"`{p}`" for p in kandidaten))
-
-    tmp = f"types_{conn.service_id or 'server'}.xml"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(roh)
-    except Exception as e:  # noqa: BLE001
-        return None, f"Konnte die geladene types.xml nicht zwischenspeichern: {e}"
-
-    katalog = conn.catalog
-    n = await loop.run_in_executor(
-        None, functools.partial(generate_shop_items_from_types, tmp, katalog.path, conn))
-    try:
-        os.remove(tmp)
-    except OSError:
-        pass
-    if n is None:
-        return None, f"`{gefunden}` konnte nicht ausgewertet werden."
-    katalog.load()
-    log.info(f"[SHOP] {conn.name}: Katalog aus {gefunden} erzeugt ({n} Items).")
-    return n, f"{n} Items aus `{gefunden}` übernommen."
 
 
 # ══════════════════════════════════════════════════════════════
@@ -16393,7 +16332,6 @@ _AUDIT_LABELS = {
     ("POST", "/api/zones"): "Zone angelegt",
     ("POST", "/api/shop/items"): "Shop-Item angelegt",
     ("POST", "/api/shop/categories"): "Shop-Kategorie angelegt",
-    ("POST", "/api/shop/refresh-types"): "Shop-Katalog aus types.xml erneuert",
     ("POST", "/api/shop/import"): "Shop-Katalog importiert",
     ("POST", "/api/economy/money"): "Guthaben geändert",
     ("POST", "/api/economy/config"): "Economy-Einstellungen geändert",
@@ -19963,6 +19901,24 @@ async def api_shop_classnames(request: web.Request) -> web.Response:
                         "category": str(it.get("category", "Misc"))})
             if len(out) >= limit:
                 break
+    # Zusaetzlich Classnames aus einer per "types.xml hochladen" hinterlegten
+    # Referenzliste (siehe api_shop_upload_types) - die dient AUSSCHLIESSLICH
+    # dem Autofill, legt selbst nie Shop-Items an.
+    if len(out) < limit:
+        for entry in (conn.data.get("shop_autofill_classnames") or []):
+            cn = str(entry.get("classname") or "").strip()
+            if not cn:
+                continue
+            key = cn.lower()
+            if key in seen:
+                continue
+            name = str(entry.get("name") or cn)
+            if not q or key.startswith(q) or name.lower().startswith(q):
+                seen.add(key)
+                out.append({"classname": cn, "name": name,
+                            "category": str(entry.get("category", "Misc"))})
+                if len(out) >= limit:
+                    break
     return ok({"classnames": out})
 
 
@@ -20256,36 +20212,20 @@ async def add_category(request: web.Request) -> web.Response:
     return ok({"category": cat})
 
 
-async def api_shop_refresh_types(request: web.Request) -> web.Response:
-    """Holt die types.xml vom eigenen Nitrado-Server und baut den Katalog neu."""
-    conn, fehler = _session_conn(request, "shop.catalog_admin")
-    if fehler is not None:
-        return fehler
-    fehler = await _modul_pruefen("shop.catalog_admin", request, conn)
-    if fehler is not None:
-        return fehler
-    fehler = await _dash_gate(request, conn, "shop", "edit")
-    if fehler is not None:
-        return fehler
-    fehler = _dash_rate_limited(request, "shop.types", 15)
-    if fehler is not None:
-        return fehler
-    n, meldung = await katalog_von_server_holen(conn)
-    if n is None:
-        return err(meldung)
-    return ok({"items": n, "message": meldung,
-               "source": conn.catalog.source, "server": conn.name})
-
-
 async def api_shop_upload_types(request: web.Request) -> web.Response:
-    """types.xml von Hand hochladen statt per FTP/API zu holen.
+    """types.xml von Hand hochladen – AUSSCHLIESSLICH fuers Autofill.
 
     Fuer Konsolen-Server (PS4/Xbox) gibt Nitrado den Mission-Ordner gar nicht
     frei - "Items vom Server laden" (katalog_von_server_holen) findet dort
     nie eine types.xml, live an drei echten PS4-Servern geprueft (nur
     dayzps/config mit Logs/Baenen/Whitelist erreichbar, kein mpmissions/db).
-    Nutzt denselben Generator wie der FTP-Weg, nur mit hochgeladenem statt
-    abgeholtem Text."""
+
+    Anders als "Items vom Server laden" legt das Hochladen NIE von sich aus
+    Shop-Items an - es speichert nur eine Classname-Referenzliste, aus der
+    api_shop_classnames (Autofill) zusaetzlich vorschlaegt. Was tatsaechlich
+    im Katalog landet, entscheidet weiterhin ausschliesslich der Kunde selbst
+    ueber "Item anlegen"/"Bundle anlegen".
+    """
     conn, fehler = _session_conn(request, "shop.catalog_admin")
     if fehler is not None:
         return fehler
@@ -20303,29 +20243,17 @@ async def api_shop_upload_types(request: web.Request) -> web.Response:
     if "<type" not in xml_text:
         return err("Das sieht nicht nach einer types.xml aus (kein <type>-Eintrag gefunden).")
 
-    tmp = f"types_upload_{conn.service_id or 'server'}.xml"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(xml_text)
-    except OSError as e:
-        return err(f"Hochgeladene Datei konnte nicht zwischengespeichert werden: {e}")
-
     loop = asyncio.get_running_loop()
-    katalog = conn.catalog
-    try:
-        n = await loop.run_in_executor(
-            None, functools.partial(generate_shop_items_from_types, tmp, katalog.path, conn))
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-    if n is None:
+    entries = await loop.run_in_executor(None, _types_xml_classnames_aus_text, xml_text)
+    if not entries:
         return err("Die Datei konnte nicht ausgewertet werden – keine <type name=...>-Einträge gefunden.")
-    katalog.load()
-    log.info(f"[SHOP] {conn.name}: Katalog aus hochgeladener types.xml erzeugt ({n} Items).")
-    return ok({"items": n, "message": f"{n} Items übernommen.",
-               "source": conn.catalog.source, "server": conn.name})
+    conn.data["shop_autofill_classnames"] = entries
+    connections.save()
+    log.info(f"[SHOP] {conn.name}: {len(entries)} Classnames aus hochgeladener "
+             f"types.xml fürs Autofill übernommen (Katalog unverändert).")
+    return ok({"items": len(entries),
+               "message": f"{len(entries)} Classnames für Autofill übernommen.",
+               "server": conn.name})
 
 
 # Kennung in der Exportdatei – daran erkennt der Import, dass die Datei aus
@@ -21861,7 +21789,6 @@ def build_app() -> web.Application:
     r.add_put("/api/shop/items/{name}", update_item)
     r.add_delete("/api/shop/items/{name}", delete_item)
     r.add_post("/api/shop/categories", add_category)
-    r.add_post("/api/shop/refresh-types", api_shop_refresh_types)
     r.add_post("/api/shop/upload-types", api_shop_upload_types)
     r.add_get("/api/shop/export", api_shop_export)
     r.add_post("/api/shop/import", api_shop_import)
@@ -22643,6 +22570,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "b8cda47e8271cb55ef199d667dc55499e5c0966987c5e0047529c7f774829a36",
         "67f8d3db3038a8813b2aaac52538044096aeee883fb2ec2671cc28ed06c3ab0f",
         "b70ca8f94527923414416efdeb449d25ab7441916d04030d9a46a268fa37b5d7",
+        "d249496f30648dbda20a68a5dc2114a1656dab51e02d33e01a73007881b6ce10",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
