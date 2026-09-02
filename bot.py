@@ -10053,7 +10053,6 @@ async def api_tools_vehicle_get(request: web.Request) -> web.Response:
                     node = kandidat
                     color_suffix = suffix
                     break
-        detail["fit"] = node is not None
         detail["parts"] = _tool_vehicle_rows_lesen(node)
         detail["color_suffix"] = color_suffix
         events.append(detail)
@@ -10138,26 +10137,26 @@ async def api_tools_vehicle_post(request: web.Request) -> web.Response:
     st_block = None
     farb_typ = f"{typ}_{color_suffix}" if color_suffix else typ
     rows = []
-    if data_in.get("fit"):
-        # Jedes Teil ist ein einzeln angehaktes Checkbox-Element mit eigener
-        # Chance (siehe toolVehicleModal) - kein gemeinsamer Regler mehr, ein
-        # "num"-Feld gibt es dafuer nicht mehr, jede Zeile ist eine Instanz.
-        for part in (data_in.get("parts") or []):
-            it = str(part.get("item") or "").strip()
-            if not it:
-                continue
-            try:
-                chance = max(0.0, min(1.0, float(part.get("chance", 1.0))))
-            except (TypeError, ValueError):
-                chance = 1.0
-            try:
-                item_chance = max(0.0, min(1.0, float(part.get("item_chance", 1.0))))
-            except (TypeError, ValueError):
-                item_chance = 1.0
-            rows.append({"kind": "attachments", "item": it,
-                        "chance": chance, "item_chance": item_chance})
-    # Kofferraum-Inhalt ist unabhaengig vom "komplett fahrbereit"-Haken - ein
-    # Wrack kann Beute enthalten, ohne fahrbereit zu sein.
+    # Jedes Teil ist ein einzeln angehaktes Checkbox-Element mit eigener
+    # Chance (siehe toolVehicleModal) - kein gemeinsamer "komplett fahrbereit"-
+    # Haken mehr davor, der war ueberfluessig: nichts angehakt heisst schon
+    # leere parts-Liste, also keine Zeilen.
+    for part in (data_in.get("parts") or []):
+        it = str(part.get("item") or "").strip()
+        if not it:
+            continue
+        try:
+            chance = max(0.0, min(1.0, float(part.get("chance", 1.0))))
+        except (TypeError, ValueError):
+            chance = 1.0
+        try:
+            item_chance = max(0.0, min(1.0, float(part.get("item_chance", 1.0))))
+        except (TypeError, ValueError):
+            item_chance = 1.0
+        rows.append({"kind": "attachments", "item": it,
+                    "chance": chance, "item_chance": item_chance})
+    # Kofferraum-Inhalt bleibt unabhaengig - ein Wrack kann Beute enthalten,
+    # ohne fahrbereit zu sein.
     for c in (data_in.get("cargo") or []):
         it = str(c.get("item") or "").strip()
         if not it:
@@ -16429,6 +16428,7 @@ _AUDIT_LABELS = {
     ("POST", "/api/shop/items"): "Shop-Item angelegt",
     ("POST", "/api/shop/categories"): "Shop-Kategorie angelegt",
     ("POST", "/api/shop/import"): "Shop-Katalog importiert",
+    ("POST", "/api/shop/reset"): "Shop-Katalog komplett geleert",
     ("POST", "/api/economy/money"): "Guthaben geändert",
     ("POST", "/api/economy/config"): "Economy-Einstellungen geändert",
     ("POST", "/api/bans"): "Spieler gebannt",
@@ -20220,6 +20220,39 @@ async def delete_item(request: web.Request) -> web.Response:
     return ok({"removed": str(it.get("name")), "saved": saved})
 
 
+async def api_shop_reset(request: web.Request) -> web.Response:
+    """Kompletten Shop-Katalog DIESES Servers leeren - unwiderruflich.
+
+    Bewusst ein eigener Endpunkt statt einer Schleife ueber ``delete_item``:
+    eine einzelne Bestaetigung, ein Ratenlimit, ein Audit-Eintrag - nicht
+    hunderte. Verlangt ``confirm: true`` im Body, damit ein versehentlicher
+    Klick (z. B. durch einen doppelten Request) nicht reicht.
+    """
+    conn, fehler = _session_conn(request, "shop.catalog_admin")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("shop.catalog_admin", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "shop", "delete")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "shop.reset", 15)
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    if not data.get("confirm"):
+        return err("Bestätigung fehlt.")
+    katalog = conn.catalog
+    anzahl = len(katalog.items)
+    for it in list(katalog.items):
+        _merke_geloescht(conn, it)
+    katalog.items.clear()
+    saved = _shop_persist(katalog)
+    log.info(f"[SHOP] {conn.name}: kompletter Katalog geleert ({anzahl} Einträge entfernt).")
+    return ok({"removed": anzahl, "saved": saved})
+
+
 def _eigene_kategorien(conn: "ServerConnection") -> List[str]:
     """Selbst angelegte Shop-Kategorien **dieses** Servers.
 
@@ -21888,6 +21921,7 @@ def build_app() -> web.Application:
     r.add_post("/api/shop/upload-types", api_shop_upload_types)
     r.add_get("/api/shop/export", api_shop_export)
     r.add_post("/api/shop/import", api_shop_import)
+    r.add_post("/api/shop/reset", api_shop_reset)
 
     # ── Tools (DayZ-Mission-Editor) ──
     r.add_get("/api/tools/meta", api_tools_meta)
@@ -22675,6 +22709,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "a33c042c875eda4d412e663c7f5d7fd51c1ce5e2c5ef962ca249cf67adf9012e",
         "74b7a0f16e4c13d8ed43c33e07b118a34fd018e5fd6ae6fdc35b74ca8e20a807",
         "3169406ab6804fbc9f4b88b541ba09dc0bf9524f52e40c91a009f75303fdf220",
+        "6634545892d6b12cd0043ecad2fd1e344491691e01d7bf1e66f431d07e08fc99",
+        "b696490a896438327e8692e0a4d1710e576e1504732d12840efcc25305dc8ace",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
