@@ -8941,35 +8941,61 @@ TOOL_ZOMBIE_DATA = {
 }
 
 TOOL_VEHICLES = {
-    "OffroadHatchback": {"label": "ADA 4x4 (Lada)", "parts": [
+    # "farben": Farbvarianten-Suffixe fuer den cfgspawnabletypes.xml-Classname
+    # (z. B. Hatchback_02_Blue). Nur Werte, die in echten .ADM-Dateien von
+    # Brigardes Servern belegt sind - siehe bot.py:774-777 (Hatchback_02_Blue,
+    # CivilianSedan_Wine) sowie eine gezielte Nachsuche ueber die Nitrado-API
+    # am 02.09.2026 (weitere Funde: OffroadHatchback_White, Hatchback_02_Black,
+    # CivilianSedan_Black, Sedan_02_Red). Fuer Offroad_02/Truck_01_Covered kein
+    # einziger Farb-Fund trotz Suche - deshalb bewusst keine Liste, statt eine
+    # zu raten.
+    "OffroadHatchback": {"label": "ADA 4x4 (Lada)", "farben": ["White"], "parts": [
         ["HatchbackWheel", 4], ["HatchbackHood", 1], ["HatchbackTrunk", 1],
         ["HatchbackDoors_Driver", 1], ["HatchbackDoors_CoDriver", 1],
         ["CarBattery", 1], ["SparkPlug", 1], ["CarRadiator", 1], ["HeadlightH7", 2]]},
-    "Hatchback_02": {"label": "Gunter 2 (Golf)", "parts": [
+    "Hatchback_02": {"label": "Gunter 2 (Golf)", "farben": ["Black", "Blue"], "parts": [
         ["Hatchback_02_Wheel", 4], ["Hatchback_02_Hood", 1], ["Hatchback_02_Trunk", 1],
         ["Hatchback_02_Door_1_1", 1], ["Hatchback_02_Door_1_2", 1],
         ["Hatchback_02_Door_2_1", 1], ["Hatchback_02_Door_2_2", 1],
         ["CarBattery", 1], ["SparkPlug", 1], ["CarRadiator", 1], ["HeadlightH7", 2]]},
-    "CivilianSedan": {"label": "Olga 24 (Wolga)", "parts": [
+    "CivilianSedan": {"label": "Olga 24 (Wolga)", "farben": ["Black", "Wine"], "parts": [
         ["CivSedanWheel", 4], ["CivSedanHood", 1], ["CivSedanTrunk", 1],
         ["CivSedanDoors_Driver", 1], ["CivSedanDoors_CoDriver", 1],
         ["CivSedanDoors_BackLeft", 1], ["CivSedanDoors_BackRight", 1],
         ["CarBattery", 1], ["SparkPlug", 1], ["CarRadiator", 1], ["HeadlightH7", 2]]},
-    "Sedan_02": {"label": "Sarka 120 (Skoda)", "parts": [
+    "Sedan_02": {"label": "Sarka 120 (Skoda)", "farben": ["Red"], "parts": [
         ["Sedan_02_Wheel", 4], ["Sedan_02_Hood", 1], ["Sedan_02_Trunk", 1],
         ["Sedan_02_Door_1_1", 1], ["Sedan_02_Door_1_2", 1],
         ["Sedan_02_Door_2_1", 1], ["Sedan_02_Door_2_2", 1],
         ["CarBattery", 1], ["SparkPlug", 1], ["CarRadiator", 1], ["HeadlightH7", 2]]},
-    "Truck_01_Covered": {"label": "M3S Truck (V3S)", "parts": [
+    "Truck_01_Covered": {"label": "M3S Truck (V3S)", "farben": [], "parts": [
         ["Truck_01_Wheel", 2], ["Truck_01_WheelDouble", 4], ["Truck_01_Hood", 1],
         ["Truck_01_Door_1_1", 1], ["Truck_01_Door_2_1", 1],
         ["TruckBattery", 1], ["GlowPlug", 1], ["HeadlightH7", 2]]},
-    "Offroad_02": {"label": "M1025 Humvee", "parts": [
+    "Offroad_02": {"label": "M1025 Humvee", "farben": [], "parts": [
         ["Offroad_02_Wheel", 4], ["Offroad_02_Hood", 1], ["Offroad_02_Trunk", 1],
         ["Offroad_02_Door_1_1", 1], ["Offroad_02_Door_1_2", 1],
         ["Offroad_02_Door_2_1", 1], ["Offroad_02_Door_2_2", 1],
         ["CarBattery", 1], ["GlowPlug", 1], ["HeadlightH7", 2]]},
 }
+
+# Rein optische Gruppierung der immer gleichen Fahrzeug-Teile-Classnames in
+# Kategorien-Tabs (Required Parts/Wheels/Lights/Doors/Body Parts) - erfindet
+# keine neuen Daten, ordnet nur TOOL_VEHICLES[...]["parts"] ein.
+_VEHICLE_PART_KATEGORIEN = (
+    ("Wheel", "wheels"),
+    ("Headlight", "lights"),
+    ("Door", "doors"),
+    ("Battery", "required"), ("SparkPlug", "required"),
+    ("GlowPlug", "required"), ("Radiator", "required"),
+)
+
+
+def _vehicle_part_kategorie(classname: str) -> str:
+    for stichwort, kategorie in _VEHICLE_PART_KATEGORIEN:
+        if stichwort.lower() in classname.lower():
+            return kategorie
+    return "body"
 
 
 def _mission_dir_of(conn: ServerConnection) -> Optional[str]:
@@ -9385,7 +9411,14 @@ async def api_tools_meta(request: web.Request) -> web.Response:
         "gas_particles": [{"value": v, "label": l} for v, l in TOOL_GAS_PARTICLES],
         "horde_movement": {k: v for k, v in TOOL_HORDE_MOVEMENT.items()},
         "zombie_data": TOOL_ZOMBIE_DATA,
-        "vehicles": {k: {"label": v["label"], "parts": v["parts"]}
+        "vehicles": {k: {"label": v["label"], "parts": v["parts"],
+                         "farben": v.get("farben", []),
+                         "image": (f"/static/vehicles/{k}.png"
+                                  if f"vehicles/{k}.png" in _EMBEDDED_ASSETS else None),
+                         "parts_kategorisiert": [
+                             {"classname": cn, "anzahl": anzahl,
+                              "kategorie": _vehicle_part_kategorie(cn)}
+                             for cn, anzahl in v["parts"]]}
                     for k, v in TOOL_VEHICLES.items()},
     })
 
@@ -9942,9 +9975,21 @@ async def api_tools_vehicle_get(request: web.Request) -> web.Response:
         typ = next((c["type"] for c in detail.get("children", []) if c["type"] in TOOL_VEHICLES), None)
         detail["type"] = typ
         detail["positions"] = _tool_spawn_positionen(sp_root, n)
-        node = st_root.find(f'type[@name="{typ}"]') if (st_root is not None and typ) else None
+        node = None
+        color_suffix = ""
+        if st_root is not None and typ:
+            # Erst ohne Farbe suchen, dann jede belegte Variante - so findet ein
+            # zuvor mit Farbe gespeichertes Fahrzeug seinen Block beim Nachladen
+            # wieder, ohne die Farbe extra zu speichern.
+            for suffix in [""] + list(TOOL_VEHICLES[typ].get("farben", [])):
+                kandidat = st_root.find(f'type[@name="{typ}{("_" + suffix) if suffix else ""}"]')
+                if kandidat is not None:
+                    node = kandidat
+                    color_suffix = suffix
+                    break
         detail["fit"] = node is not None
         detail["parts"] = _tool_spawnable_rows_lesen(node)
+        detail["color_suffix"] = color_suffix
         events.append(detail)
     return ok({"vehicle_events": events})
 
@@ -9970,6 +10015,9 @@ async def api_tools_vehicle_post(request: web.Request) -> web.Response:
     typ = str(data_in.get("type") or "").strip()
     if typ not in TOOL_VEHICLES:
         return err("Unbekannter Fahrzeugtyp.")
+    color_suffix = str(data_in.get("color_suffix") or "").strip()
+    if color_suffix and color_suffix not in TOOL_VEHICLES[typ].get("farben", []):
+        return err("Unbekannte Farbvariante für diesen Fahrzeugtyp.")
     event_name = str(data_in.get("name") or "").strip() or ("Vehicle" + typ.replace("_", ""))
     pos_mode = "append" if data_in.get("pos_mode") == "append" else "replace"
     positions = data_in.get("positions") or []
@@ -10014,10 +10062,10 @@ async def api_tools_vehicle_post(request: web.Request) -> web.Response:
     if not await _tools_datei_schreiben_wenn(commit, conn, "cfgeventspawns.xml", neu_sp, loop):
         return err("Event gespeichert, aber Positionen konnten nicht gespeichert werden.", 502)
     st_block = None
+    farb_typ = f"{typ}_{color_suffix}" if color_suffix else typ
+    rows = []
     if data_in.get("fit"):
-        parts = data_in.get("parts") or []
-        rows = []
-        for part in parts:
+        for part in (data_in.get("parts") or []):
             it = str(part.get("item") or "").strip()
             if not it:
                 continue
@@ -10026,13 +10074,27 @@ async def api_tools_vehicle_post(request: web.Request) -> web.Response:
             except (TypeError, ValueError):
                 n = 1
             rows.extend([{"kind": "attachments", "item": it, "chance": 1.0}] * n)
-        if rows:
-            st_text, st_status = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
-            basis = st_text if st_status == "ok" else _TOOL_LEERE_SPAWNABLETYPES
-            if st_status != "error":
-                neu_st = _tool_upsert_spawnable_type(basis, typ, rows)
-                await _tools_datei_schreiben_wenn(commit, conn, "cfgspawnabletypes.xml", neu_st, loop)
-                st_block = _tool_finde_benannten_block(neu_st, "type", typ)
+    # Kofferraum-Inhalt ist unabhaengig vom "komplett fahrbereit"-Haken - ein
+    # Wrack kann Beute enthalten, ohne fahrbereit zu sein.
+    for c in (data_in.get("cargo") or []):
+        it = str(c.get("item") or "").strip()
+        if not it:
+            continue
+        try:
+            chance = max(0.0, min(1.0, float(c.get("num", 100)) / 100))
+        except (TypeError, ValueError):
+            chance = 1.0
+        rows.append({"kind": "cargo", "item": it, "chance": chance})
+    if rows:
+        st_text, st_status = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
+        basis = st_text if st_status == "ok" else _TOOL_LEERE_SPAWNABLETYPES
+        if st_status != "error":
+            # Farbvariante NUR hier am Ausstattungs-Classname - das Fahrzeug-
+            # Event/der Spawn (oben) bleibt am Basis-Typ, Nitrado-Events
+            # laufen generisch pro Fahrzeugtyp, nicht pro Farbe.
+            neu_st = _tool_upsert_spawnable_type(basis, farb_typ, rows)
+            await _tools_datei_schreiben_wenn(commit, conn, "cfgspawnabletypes.xml", neu_st, loop)
+            st_block = _tool_finde_benannten_block(neu_st, "type", farb_typ)
     if commit:
         _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Fahrzeug gespeichert",
                   f"{event_name} ({TOOL_VEHICLES[typ]['label']}), {added} neue Position(en) · {conn.name}")
@@ -15336,7 +15398,7 @@ def _extract_assets() -> None:
     nur geloggt – die Assets liefert dann _asset_response aus dem Speicher.
     """
     written = updated = kept = failed = 0
-    for sub in ("", "vendor", "locations", "maps", "items"):
+    for sub in ("", "vendor", "locations", "maps", "items", "vehicles"):
         try:
             os.makedirs(os.path.join(_DASH_STATIC, sub), exist_ok=True)
         except OSError as e:
@@ -22577,6 +22639,10 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "4f33ff8989e343a3123f49a115477768d0466b9f9fd12f05885c4461687c7298",
         "e1eed7713dcc3341c44ed25dd7ab450cf32d318e9d27cb846bfbaf222d832d98",
         "904f0ec867142c2d33e0c01ad58d17fc78ee3923f08d5d3e1a475cc2b57aaf26",
+        "1b729cb3fd42bba7d109ea20c7b5ad73cca474622b8b425eac7a91f0bb98a505",
+        "b8cda47e8271cb55ef199d667dc55499e5c0966987c5e0047529c7f774829a36",
+        "67f8d3db3038a8813b2aaac52538044096aeee883fb2ec2671cc28ed06c3ab0f",
+        "b70ca8f94527923414416efdeb449d25ab7441916d04030d9a46a268fa37b5d7",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
