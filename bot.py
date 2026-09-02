@@ -8939,34 +8939,71 @@ TOOL_VEHICLES = {
     # CivilianSedan_Black, Sedan_02_Red). Fuer Offroad_02/Truck_01_Covered kein
     # einziger Farb-Fund trotz Suche - deshalb bewusst keine Liste, statt eine
     # zu raten.
+    # Farbabhaengige Tuer-/Karosserie-Classnames (z. B. HatchbackDoors_Driver_Blue)
+    # stammen NICHT aus Brigardes eigenen Server-Logs, sondern aus der Codex-
+    # Analyse der Referenzseite doordiehub.com/VehicleBuilder (02.09.2026) -
+    # von Brigarde ausdruecklich zur Uebernahme freigegeben ("Ja, uebernehmen").
+    # Anders als die "farben"-Liste oben (die den Fahrzeug-Classname selbst
+    # bestimmt und deshalb streng belegt sein muss) sind das nur zusaetzliche,
+    # optionale Ausstattungs-Checkboxen innerhalb des <type>-Blocks.
     "OffroadHatchback": {"label": "ADA 4x4 (Lada)", "farben": ["White"], "parts": [
         ["HatchbackWheel", 4], ["HatchbackHood", 1], ["HatchbackTrunk", 1],
         ["HatchbackDoors_Driver", 1], ["HatchbackDoors_CoDriver", 1],
+        ["HatchbackDoors_Driver_Blue", 1], ["HatchbackDoors_CoDriver_Blue", 1],
+        ["HatchbackDoors_Driver_White", 1], ["HatchbackDoors_CoDriver_White", 1],
+        ["HatchbackHood_Blue", 1], ["HatchbackTrunk_Blue", 1],
+        ["HatchbackHood_White", 1], ["HatchbackTrunk_White", 1],
         ["CarBattery", 1], ["SparkPlug", 1], ["CarRadiator", 1], ["HeadlightH7", 2]]},
     "Hatchback_02": {"label": "Gunter 2 (Golf)", "farben": ["Black", "Blue"], "parts": [
         ["Hatchback_02_Wheel", 4], ["Hatchback_02_Hood", 1], ["Hatchback_02_Trunk", 1],
         ["Hatchback_02_Door_1_1", 1], ["Hatchback_02_Door_1_2", 1],
         ["Hatchback_02_Door_2_1", 1], ["Hatchback_02_Door_2_2", 1],
+        ["Hatchback_02_Door_1_1_Black", 1], ["Hatchback_02_Door_1_2_Black", 1],
+        ["Hatchback_02_Door_2_1_Black", 1], ["Hatchback_02_Door_2_2_Black", 1],
+        ["Hatchback_02_Door_1_1_Blue", 1], ["Hatchback_02_Door_1_2_Blue", 1],
+        ["Hatchback_02_Door_2_1_Blue", 1], ["Hatchback_02_Door_2_2_Blue", 1],
+        ["Hatchback_02_Hood_Black", 1], ["Hatchback_02_Trunk_Black", 1],
+        ["Hatchback_02_Hood_Blue", 1], ["Hatchback_02_Trunk_Blue", 1],
         ["CarBattery", 1], ["SparkPlug", 1], ["CarRadiator", 1], ["HeadlightH7", 2]]},
     "CivilianSedan": {"label": "Olga 24 (Wolga)", "farben": ["Black", "Wine"], "parts": [
         ["CivSedanWheel", 4], ["CivSedanHood", 1], ["CivSedanTrunk", 1],
         ["CivSedanDoors_Driver", 1], ["CivSedanDoors_CoDriver", 1],
         ["CivSedanDoors_BackLeft", 1], ["CivSedanDoors_BackRight", 1],
+        ["CivSedanDoors_Driver_Wine", 1], ["CivSedanDoors_CoDriver_Wine", 1],
+        ["CivSedanDoors_BackLeft_Wine", 1], ["CivSedanDoors_BackRight_Wine", 1],
+        ["CivSedanDoors_Driver_Black", 1], ["CivSedanDoors_CoDriver_Black", 1],
+        ["CivSedanDoors_BackLeft_Black", 1], ["CivSedanDoors_BackRight_Black", 1],
+        ["CivSedanHood_Wine", 1], ["CivSedanTrunk_Wine", 1],
+        ["CivSedanHood_Black", 1], ["CivSedanTrunk_Black", 1],
         ["CarBattery", 1], ["SparkPlug", 1], ["CarRadiator", 1], ["HeadlightH7", 2]]},
     "Sedan_02": {"label": "Sarka 120 (Skoda)", "farben": ["Red"], "parts": [
         ["Sedan_02_Wheel", 4], ["Sedan_02_Hood", 1], ["Sedan_02_Trunk", 1],
         ["Sedan_02_Door_1_1", 1], ["Sedan_02_Door_1_2", 1],
         ["Sedan_02_Door_2_1", 1], ["Sedan_02_Door_2_2", 1],
+        ["Sedan_02_Door_1_1_Red", 1], ["Sedan_02_Door_1_2_Red", 1],
+        ["Sedan_02_Door_2_1_Red", 1], ["Sedan_02_Door_2_2_Red", 1],
+        ["Sedan_02_Door_1_1_Grey", 1], ["Sedan_02_Door_1_2_Grey", 1],
+        ["Sedan_02_Door_2_1_Grey", 1], ["Sedan_02_Door_2_2_Grey", 1],
+        ["Sedan_02_Hood_Red", 1], ["Sedan_02_Trunk_Red", 1],
+        ["Sedan_02_Hood_Grey", 1], ["Sedan_02_Trunk_Grey", 1],
         ["CarBattery", 1], ["SparkPlug", 1], ["CarRadiator", 1], ["HeadlightH7", 2]]},
     "Truck_01_Covered": {"label": "M3S Truck (V3S)", "farben": [], "parts": [
         ["Truck_01_Wheel", 2], ["Truck_01_WheelDouble", 4], ["Truck_01_Hood", 1],
         ["Truck_01_Door_1_1", 1], ["Truck_01_Door_2_1", 1],
+        ["Truck_01_Door_1_1_Blue", 1], ["Truck_01_Door_2_1_Blue", 1],
+        ["Truck_01_Door_1_1_Orange", 1], ["Truck_01_Door_2_1_Orange", 1],
+        ["Truck_01_Hood_Blue", 1], ["Truck_01_Hood_Orange", 1],
         ["TruckBattery", 1], ["GlowPlug", 1], ["HeadlightH7", 2]]},
     "Offroad_02": {"label": "M1025 Humvee", "farben": [], "parts": [
         ["Offroad_02_Wheel", 4], ["Offroad_02_Hood", 1], ["Offroad_02_Trunk", 1],
         ["Offroad_02_Door_1_1", 1], ["Offroad_02_Door_1_2", 1],
         ["Offroad_02_Door_2_1", 1], ["Offroad_02_Door_2_2", 1],
         ["CarBattery", 1], ["GlowPlug", 1], ["HeadlightH7", 2]]},
+    # Boot: nur Pflichtteil, keine Wheels/Lights/Doors/Body Parts und kein
+    # Kofferraum-Inhalt (siehe "kein_inventar" - Referenzseite zeigt dort
+    # "Inventory not available for boats"). Kein eigenes Bild vorhanden.
+    "Boat_01": {"label": "Boot", "farben": ["Blue", "Camo", "Orange"],
+                "kein_inventar": True, "parts": [["SparkPlug", 1]]},
 }
 
 # Rein optische Gruppierung der immer gleichen Fahrzeug-Teile-Classnames in
@@ -9230,9 +9267,13 @@ def _tool_upsert_spawnable_type(text: str, name: str, rows: List[Dict[str, Any]]
             chance = float(r.get("chance") or 0)
         except (TypeError, ValueError):
             chance = 0.0
+        try:
+            item_chance = float(r.get("item_chance", 1.0))
+        except (TypeError, ValueError):
+            item_chance = 1.0
         blocks.append(
             f'        <{r["kind"]} chance="{chance:.2f}">\n'
-            f'            <item name="{_tool_esc_xml(r["item"])}" chance="1.00"/>\n'
+            f'            <item name="{_tool_esc_xml(r["item"])}" chance="{item_chance:.2f}"/>\n'
             f'        </{r["kind"]}>')
     snippet = f'<type name="{_tool_esc_xml(name)}">\n' + "\n".join(blocks) + "\n    </type>"
     return _tool_benannten_block_ersetzen(text, "spawnabletypes", "type", name, snippet)
@@ -9356,6 +9397,40 @@ def _tool_spawnable_rows_lesen(node: Optional[ET.Element]) -> List[Dict[str, Any
     return rows
 
 
+def _tool_vehicle_rows_lesen(node: Optional[ET.Element]) -> List[Dict[str, Any]]:
+    """Wie ``_tool_spawnable_rows_lesen``, aber fuers Fahrzeug-Builder-Nachladen:
+    liefert zusaetzlich die Item-Chance (fuer die pro-Teil-Regler in
+    toolVehicleModal) und haelt beide Chancen als 0..1-Bruch statt Prozent -
+    Cargo-Zeilen bleiben unveraendert in Prozent (eigenes UI-Feld)."""
+    if node is None:
+        return []
+    rows = []
+    for b in node.findall("attachments"):
+        item = b.find("item")
+        if item is None or not item.get("name"):
+            continue
+        try:
+            chance = max(0.0, min(1.0, float(b.get("chance") or 0)))
+        except (TypeError, ValueError):
+            chance = 0.0
+        try:
+            item_chance = max(0.0, min(1.0, float(item.get("chance") or 0)))
+        except (TypeError, ValueError):
+            item_chance = 0.0
+        rows.append({"kind": "attachments", "item": item.get("name"),
+                     "chance": chance, "item_chance": item_chance})
+    for b in node.findall("cargo"):
+        item = b.find("item")
+        if item is None or not item.get("name"):
+            continue
+        try:
+            chance = round(max(0.0, min(1.0, float(b.get("chance") or 0))) * 100)
+        except (TypeError, ValueError):
+            chance = 0
+        rows.append({"kind": "cargo", "item": item.get("name"), "chance": chance})
+    return rows
+
+
 # ── Dashboard-Routen: Tools ───────────────────────────────────────────────
 _TOOL_KEIN_MISSION_ORDNER = "Mission-Ordner unbekannt – FTP-Zugangsdaten prüfen."
 
@@ -9403,6 +9478,7 @@ async def api_tools_meta(request: web.Request) -> web.Response:
         "zombie_data": TOOL_ZOMBIE_DATA,
         "vehicles": {k: {"label": v["label"], "parts": v["parts"],
                          "farben": v.get("farben", []),
+                         "kein_inventar": v.get("kein_inventar", False),
                          "image": (f"/static/vehicles/{k}.png"
                                   if f"vehicles/{k}.png" in _EMBEDDED_ASSETS else None),
                          "parts_kategorisiert": [
@@ -9978,7 +10054,7 @@ async def api_tools_vehicle_get(request: web.Request) -> web.Response:
                     color_suffix = suffix
                     break
         detail["fit"] = node is not None
-        detail["parts"] = _tool_spawnable_rows_lesen(node)
+        detail["parts"] = _tool_vehicle_rows_lesen(node)
         detail["color_suffix"] = color_suffix
         events.append(detail)
     return ok({"vehicle_events": events})
@@ -10055,15 +10131,23 @@ async def api_tools_vehicle_post(request: web.Request) -> web.Response:
     farb_typ = f"{typ}_{color_suffix}" if color_suffix else typ
     rows = []
     if data_in.get("fit"):
+        # Jedes Teil ist ein einzeln angehaktes Checkbox-Element mit eigener
+        # Chance (siehe toolVehicleModal) - kein gemeinsamer Regler mehr, ein
+        # "num"-Feld gibt es dafuer nicht mehr, jede Zeile ist eine Instanz.
         for part in (data_in.get("parts") or []):
             it = str(part.get("item") or "").strip()
             if not it:
                 continue
             try:
-                n = max(1, round(float(part.get("num", 1))))
+                chance = max(0.0, min(1.0, float(part.get("chance", 1.0))))
             except (TypeError, ValueError):
-                n = 1
-            rows.extend([{"kind": "attachments", "item": it, "chance": 1.0}] * n)
+                chance = 1.0
+            try:
+                item_chance = max(0.0, min(1.0, float(part.get("item_chance", 1.0))))
+            except (TypeError, ValueError):
+                item_chance = 1.0
+            rows.append({"kind": "attachments", "item": it,
+                        "chance": chance, "item_chance": item_chance})
     # Kofferraum-Inhalt ist unabhaengig vom "komplett fahrbereit"-Haken - ein
     # Wrack kann Beute enthalten, ohne fahrbereit zu sein.
     for c in (data_in.get("cargo") or []):
@@ -22571,6 +22655,9 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "67f8d3db3038a8813b2aaac52538044096aeee883fb2ec2671cc28ed06c3ab0f",
         "b70ca8f94527923414416efdeb449d25ab7441916d04030d9a46a268fa37b5d7",
         "d249496f30648dbda20a68a5dc2114a1656dab51e02d33e01a73007881b6ce10",
+        "ed5605b1ef63cf84d58a71eb59b3c660f1f6ce77df163b334b82d058b4786b79",
+        "ff159d844fff09e1e307b905fc355564dce20d413d2a96edf51849602be4e45d",
+        "677d77bfd5e1290d2cad5c34480cefc1d6f44c6e6ccaf00a287ed71a52650e5b",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
