@@ -10087,46 +10087,54 @@ async def api_tools_vehicle_post(request: web.Request) -> web.Response:
     event_name = str(data_in.get("name") or "").strip() or ("Vehicle" + typ.replace("_", ""))
     pos_mode = "append" if data_in.get("pos_mode") == "append" else "replace"
     positions = data_in.get("positions") or []
-    if not positions:
+    # "Spawnpunkte jetzt anlegen" ist optional (Haken im Formular) - wer nur
+    # die Ausstattung (cfgspawnabletypes.xml) bauen will, braucht weder
+    # Event noch Position. Ohne den Haken bleiben db/events.xml und
+    # cfgeventspawns.xml unangetastet.
+    spawn_erstellen = bool(data_in.get("spawn_erstellen", True))
+    if spawn_erstellen and not positions:
         return err("Bitte mindestens eine Position angeben.")
-    try:
-        nominal = int(float(data_in.get("nominal", 3)))
-        minv = int(float(data_in.get("min", 2)))
-        maxv = int(float(data_in.get("max", 4)))
-    except (TypeError, ValueError):
-        return err("Ungültige Zahl bei nominal/min/max.")
-    definition = {
-        "name": event_name, "nominal": nominal, "min": minv, "max": maxv,
-        "lifetime": 300, "restock": 0, "saferadius": 500, "distanceradius": 500,
-        "cleanupradius": 2500, "flags": {"deletable": 0, "init_random": 0, "remove_damaged": 1},
-        "position": "fixed", "limit": "custom", "active": 1,
-        "children": [{"type": typ, "min": minv, "max": maxv, "lootmin": 0, "lootmax": 0}],
-    }
-    pts = []
-    for p in positions:
-        try:
-            pts.append({"x": float(p["x"]), "z": float(p["z"]), "a": float(p.get("a", 0))})
-        except (TypeError, ValueError, KeyError):
-            return err("Ungültige Position.")
     loop = asyncio.get_running_loop()
-    ev_text, ev_status = await _tools_datei_lesen(conn, "db/events.xml", loop)
-    if ev_status != "ok":
-        return err("db/events.xml nicht lesbar.", 502)
-    try:
-        neu_ev = _tool_upsert_event(ev_text, definition)
-    except ValueError as e:
-        return err(str(e))
-    sp_text, sp_status = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
-    if sp_status != "ok":
-        return err("cfgeventspawns.xml nicht lesbar.", 502)
-    try:
-        neu_sp, added = _tool_upsert_eventspawns(sp_text, event_name, pts, pos_mode)
-    except ValueError as e:
-        return err(str(e))
-    if not await _tools_datei_schreiben_wenn(commit, conn, "db/events.xml", neu_ev, loop):
-        return err("db/events.xml konnte nicht gespeichert werden.", 502)
-    if not await _tools_datei_schreiben_wenn(commit, conn, "cfgeventspawns.xml", neu_sp, loop):
-        return err("Event gespeichert, aber Positionen konnten nicht gespeichert werden.", 502)
+    neu_ev = neu_sp = None
+    added = 0
+    if spawn_erstellen:
+        try:
+            nominal = int(float(data_in.get("nominal", 3)))
+            minv = int(float(data_in.get("min", 2)))
+            maxv = int(float(data_in.get("max", 4)))
+        except (TypeError, ValueError):
+            return err("Ungültige Zahl bei nominal/min/max.")
+        definition = {
+            "name": event_name, "nominal": nominal, "min": minv, "max": maxv,
+            "lifetime": 300, "restock": 0, "saferadius": 500, "distanceradius": 500,
+            "cleanupradius": 2500, "flags": {"deletable": 0, "init_random": 0, "remove_damaged": 1},
+            "position": "fixed", "limit": "custom", "active": 1,
+            "children": [{"type": typ, "min": minv, "max": maxv, "lootmin": 0, "lootmax": 0}],
+        }
+        pts = []
+        for p in positions:
+            try:
+                pts.append({"x": float(p["x"]), "z": float(p["z"]), "a": float(p.get("a", 0))})
+            except (TypeError, ValueError, KeyError):
+                return err("Ungültige Position.")
+        ev_text, ev_status = await _tools_datei_lesen(conn, "db/events.xml", loop)
+        if ev_status != "ok":
+            return err("db/events.xml nicht lesbar.", 502)
+        try:
+            neu_ev = _tool_upsert_event(ev_text, definition)
+        except ValueError as e:
+            return err(str(e))
+        sp_text, sp_status = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
+        if sp_status != "ok":
+            return err("cfgeventspawns.xml nicht lesbar.", 502)
+        try:
+            neu_sp, added = _tool_upsert_eventspawns(sp_text, event_name, pts, pos_mode)
+        except ValueError as e:
+            return err(str(e))
+        if not await _tools_datei_schreiben_wenn(commit, conn, "db/events.xml", neu_ev, loop):
+            return err("db/events.xml konnte nicht gespeichert werden.", 502)
+        if not await _tools_datei_schreiben_wenn(commit, conn, "cfgeventspawns.xml", neu_sp, loop):
+            return err("Event gespeichert, aber Positionen konnten nicht gespeichert werden.", 502)
     st_block = None
     farb_typ = f"{typ}_{color_suffix}" if color_suffix else typ
     rows = []
@@ -10169,13 +10177,17 @@ async def api_tools_vehicle_post(request: web.Request) -> web.Response:
             neu_st = _tool_upsert_spawnable_type(basis, farb_typ, rows)
             await _tools_datei_schreiben_wenn(commit, conn, "cfgspawnabletypes.xml", neu_st, loop)
             st_block = _tool_finde_benannten_block(neu_st, "type", farb_typ)
+    if not spawn_erstellen and not rows:
+        return err("Bitte mindestens ein Teil auswählen oder Spawnpunkte anlegen.")
     if commit:
         _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Fahrzeug gespeichert",
                   f"{event_name} ({TOOL_VEHICLES[typ]['label']}), {added} neue Position(en) · {conn.name}")
-    ev_block = _tool_finde_benannten_block(neu_ev, "event", event_name)
-    sp_block = _tool_finde_benannten_block(neu_sp, "event", event_name)
-    generated = [{"filename": "db/events.xml", "content": ev_block["block"] if ev_block else neu_ev},
-                {"filename": "cfgeventspawns.xml", "content": sp_block["block"] if sp_block else neu_sp}]
+    generated = []
+    if spawn_erstellen:
+        ev_block = _tool_finde_benannten_block(neu_ev, "event", event_name)
+        sp_block = _tool_finde_benannten_block(neu_sp, "event", event_name)
+        generated.append({"filename": "db/events.xml", "content": ev_block["block"] if ev_block else neu_ev})
+        generated.append({"filename": "cfgeventspawns.xml", "content": sp_block["block"] if sp_block else neu_sp})
     if st_block:
         generated.append({"filename": "cfgspawnabletypes.xml", "content": st_block["block"]})
     return ok({"name": event_name, "positions_added": added, "generated": generated})
@@ -22658,6 +22670,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "ed5605b1ef63cf84d58a71eb59b3c660f1f6ce77df163b334b82d058b4786b79",
         "ff159d844fff09e1e307b905fc355564dce20d413d2a96edf51849602be4e45d",
         "677d77bfd5e1290d2cad5c34480cefc1d6f44c6e6ccaf00a287ed71a52650e5b",
+        "a33c042c875eda4d412e663c7f5d7fd51c1ce5e2c5ef962ca249cf67adf9012e",
+        "74b7a0f16e4c13d8ed43c33e07b118a34fd018e5fd6ae6fdc35b74ca8e20a807",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
