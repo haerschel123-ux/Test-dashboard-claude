@@ -17086,6 +17086,28 @@ async def api_dash_rate_limit_abort(request: web.Request) -> web.Response:
     return _dash_rate_limit_abort(request, action)
 
 
+def _dash_rate_limit_remaining(request: web.Request, action: str) -> float:
+    """Restsekunden einer laufenden Sperre, ohne selbst welche auszuloesen –
+    fuers Frontend, um ein Formular gar nicht erst zu oeffnen, statt erst
+    beim Speichern-Klick abzublitzen."""
+    discord_id = _dash_rate_limit_key(request)
+    if not discord_id:
+        return 0.0
+    ablauf = _DASH_RATE_LIMIT_LAST.get((discord_id, action))
+    if ablauf is None:
+        return 0.0
+    rest = ablauf - time.monotonic()
+    return rest if rest > 0 else 0.0
+
+
+async def api_dash_rate_limit_status(request: web.Request) -> web.Response:
+    action = str(request.query.get("action") or "").strip()
+    if not action:
+        return err("action fehlt.")
+    rest = _dash_rate_limit_remaining(request, action)
+    return ok({"blocked": rest > 0, "retry_after": round(rest, 1)})
+
+
 def _dash_guest_conn_for_login(discord_id: str) -> Optional["ServerConnection"]:
     """Server, auf dem dieses Discord-Konto (noch) keinen eigenen Server hat,
     aber als Gast (Person oder Rolle) in dashboard_perms eingetragen ist –
@@ -21730,6 +21752,7 @@ def build_app() -> web.Application:
     r.add_get("/api/session", api_get_session)
     r.add_post("/api/consent", post_consent)
     r.add_post("/api/dashboard/rate-limit-abort", api_dash_rate_limit_abort)
+    r.add_get("/api/dashboard/rate-limit-status", api_dash_rate_limit_status)
     r.add_post("/api/sprache", post_sprache)
 
     # ── Feeds ──
@@ -22553,6 +22576,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "aa04dee7ce0003d91492cbbc23de3c19e60c1ba5575feee5896f38049ee62e77",
         "4f33ff8989e343a3123f49a115477768d0466b9f9fd12f05885c4461687c7298",
         "e1eed7713dcc3341c44ed25dd7ab450cf32d318e9d27cb846bfbaf222d832d98",
+        "904f0ec867142c2d33e0c01ad58d17fc78ee3923f08d5d3e1a475cc2b57aaf26",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
