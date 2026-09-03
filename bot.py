@@ -9007,13 +9007,17 @@ TOOL_VEHICLES = {
 }
 
 # Rucksack-Builder ("Inhalte & Aufsaetze") - Taschen-Classnames, Kategorie und
-# Slot-Zahl stammen ausschliesslich aus Brigardes eigenen Screenshots von
-# https://doordiehub.com/BuildABag (02.09.2026). Anders als bei TOOL_VEHICLES
-# ist jede Farbe hier ein eigener, vollstaendiger Classname (kein Suffix) -
-# deshalb kein "farben"-Feld. Weitere Kategorien (Attack2, Canvas/Duffel,
-# Child/Courier, Coyote, Improvised, Leather Sacks, Mountain, Smersh/Taloon)
-# waren in den Screenshots nur als zugeklappte Ueberschrift sichtbar, ohne
-# belegte Classnames - bewusst ausgelassen statt geraten.
+# Slot-Zahl fuer die ersten 6 Kategorien stammen aus Brigardes eigenen
+# Screenshots von https://doordiehub.com/BuildABag (02.09.2026). Die
+# restlichen 8 Kategorien (Attack2, Canvas/Duffel, Child/Courier, Coyote,
+# Improvised, Leather Sacks, Mountain, Smersh/Taloon) waren dort nur als
+# zugeklappte Ueberschrift sichtbar - deren Classnames/Slots stammen aus
+# einer gezielten Nachrecherche (DayZ-Wiki, 03.09.2026): "Attack2" ist keine
+# eigene DayZ-Kategorie, sondern der interne Classname-Praefix des "Long Haul
+# Backpack". "Leather Duffel Bag" (Canvas/Duffel) blieb ohne bestaetigten
+# Classname und wurde bewusst ausgelassen statt geraten. Anders als bei
+# TOOL_VEHICLES ist jede Farbe hier ein eigener, vollstaendiger Classname
+# (kein Suffix) - deshalb kein "farben"-Feld.
 TOOL_BAGS = {
     "AliceBag_Black": {"label": "Alice Bag (Black)", "kategorie": "Alice / Army", "slots": 64},
     "AliceBag_Camo": {"label": "Alice Bag (Camo)", "kategorie": "Alice / Army", "slots": 64},
@@ -9035,6 +9039,29 @@ TOOL_BAGS = {
     "Slingbag_Black": {"label": "Slingbag (Black)", "kategorie": "Sling", "slots": 12},
     "Slingbag_Brown": {"label": "Slingbag (Brown)", "kategorie": "Sling", "slots": 12},
     "Slingbag_Gray": {"label": "Slingbag (Gray)", "kategorie": "Sling", "slots": 12},
+    "Attack2Bag_Black": {"label": "Long Haul Backpack (Black)", "kategorie": "Attack2", "slots": 42},
+    "Attack2Bag_Green": {"label": "Long Haul Backpack (Green)", "kategorie": "Attack2", "slots": 42},
+    "Attack2Bag_Ttsko": {"label": "Long Haul Backpack (TTsKO)", "kategorie": "Attack2", "slots": 42},
+    "Attack2Bag_Yeger": {"label": "Long Haul Backpack (Yeger)", "kategorie": "Attack2", "slots": 42},
+    "CanvasBag_Medical": {"label": "Canvas Bag (Medical)", "kategorie": "Canvas / Duffel", "slots": 20},
+    "CanvasBag_Olive": {"label": "Canvas Bag (Olive)", "kategorie": "Canvas / Duffel", "slots": 25},
+    "CourierBag": {"label": "Burlap Courier Bag", "kategorie": "Child / Courier", "slots": 48},
+    "FurCourierBag": {"label": "Fur Courier Bag", "kategorie": "Child / Courier", "slots": 48},
+    "CoyoteBag_Brown": {"label": "Tactical Backpack (Brown)", "kategorie": "Coyote", "slots": 56},
+    "CoyoteBag_Green": {"label": "Tactical Backpack (Green)", "kategorie": "Coyote", "slots": 56},
+    "CoyoteBag_Winter": {"label": "Tactical Backpack (Winter)", "kategorie": "Coyote", "slots": 56},
+    "ImprovisedBag": {"label": "Burlap Backpack", "kategorie": "Improvised", "slots": 20},
+    "FurImprovisedBag": {"label": "Fur Backpack", "kategorie": "Improvised", "slots": 35},
+    "LeatherSack_Natural": {"label": "Leather Backpack (Natural)", "kategorie": "Leather Sacks", "slots": 42},
+    "LeatherSack_Black": {"label": "Leather Backpack (Black)", "kategorie": "Leather Sacks", "slots": 42},
+    "LeatherSack_Beige": {"label": "Leather Backpack (Beige)", "kategorie": "Leather Sacks", "slots": 42},
+    "LeatherSack_Brown": {"label": "Leather Backpack (Brown)", "kategorie": "Leather Sacks", "slots": 42},
+    "TaloonBag_Blue": {"label": "Hiking Backpack (Blue)", "kategorie": "Mountain", "slots": 30},
+    "TaloonBag_Green": {"label": "Hiking Backpack (Green)", "kategorie": "Mountain", "slots": 30},
+    "TaloonBag_Orange": {"label": "Hiking Backpack (Orange)", "kategorie": "Mountain", "slots": 30},
+    "TaloonBag_Violet": {"label": "Hiking Backpack (Violet)", "kategorie": "Mountain", "slots": 30},
+    "SmershBag": {"label": "Smersh Bag", "kategorie": "Smersh / Taloon", "slots": 16},
+    "TortillaBag": {"label": "Combat Backpack", "kategorie": "Smersh / Taloon", "slots": 56},
 }
 
 # Rein optische Gruppierung der immer gleichen Fahrzeug-Teile-Classnames in
