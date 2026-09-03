@@ -9007,17 +9007,19 @@ TOOL_VEHICLES = {
 }
 
 # Rucksack-Builder ("Inhalte & Aufsaetze") - Taschen-Classnames, Kategorie und
-# Slot-Zahl fuer die ersten 6 Kategorien stammen aus Brigardes eigenen
-# Screenshots von https://doordiehub.com/BuildABag (02.09.2026). Die
-# restlichen 8 Kategorien (Attack2, Canvas/Duffel, Child/Courier, Coyote,
-# Improvised, Leather Sacks, Mountain, Smersh/Taloon) waren dort nur als
-# zugeklappte Ueberschrift sichtbar - deren Classnames/Slots stammen aus
-# einer gezielten Nachrecherche (DayZ-Wiki, 03.09.2026): "Attack2" ist keine
-# eigene DayZ-Kategorie, sondern der interne Classname-Praefix des "Long Haul
-# Backpack". "Leather Duffel Bag" (Canvas/Duffel) blieb ohne bestaetigten
-# Classname und wurde bewusst ausgelassen statt geraten. Anders als bei
-# TOOL_VEHICLES ist jede Farbe hier ein eigener, vollstaendiger Classname
-# (kein Suffix) - deshalb kein "farben"-Feld.
+# Slot-Zahl stammen bevorzugt aus Brigardes eigenen Screenshots von
+# https://doordiehub.com/BuildABag (Alice/Army, Assault, Ghillie, Dry Bags,
+# Sling, Leather Sacks, Mountain, Canvas/Duffel inkl. Duffel-Baggs, Hunting/
+# Outdoor - Stand 03.09.2026). Fuer Kategorien, die dort nur als zugeklappte
+# Ueberschrift sichtbar waren (Attack2, Child/Courier, Coyote, Improvised,
+# Smersh/Taloon), stammen Classnames/Slots aus einer DayZ-Wiki-Nachrecherche
+# - von Brigarde nachtraeglich als korrekt bestaetigt (03.09.2026), obwohl
+# das Mountain-Beispiel zuvor gezeigt hatte, dass diese Referenzseite auch
+# eigene, vom Wiki abweichende Classnames/Slot-Zahlen verwenden kann.
+# "Leather Duffel Bag" blieb ohne bestaetigten Classname und wurde bewusst
+# ausgelassen statt geraten. Anders als bei TOOL_VEHICLES ist jede Farbe hier
+# ein eigener, vollstaendiger Classname (kein Suffix) - deshalb kein
+# "farben"-Feld.
 TOOL_BAGS = {
     "AliceBag_Black": {"label": "Alice Bag (Black)", "kategorie": "Alice / Army", "slots": 64},
     "AliceBag_Camo": {"label": "Alice Bag (Camo)", "kategorie": "Alice / Army", "slots": 64},
@@ -9056,10 +9058,19 @@ TOOL_BAGS = {
     "LeatherSack_Black": {"label": "Leather Backpack (Black)", "kategorie": "Leather Sacks", "slots": 42},
     "LeatherSack_Beige": {"label": "Leather Backpack (Beige)", "kategorie": "Leather Sacks", "slots": 42},
     "LeatherSack_Brown": {"label": "Leather Backpack (Brown)", "kategorie": "Leather Sacks", "slots": 42},
+    "MountainBag_Blue": {"label": "Mountain Bag (Blue)", "kategorie": "Mountain", "slots": 42},
+    "MountainBag_Green": {"label": "Mountain Bag (Green)", "kategorie": "Mountain", "slots": 42},
+    "MountainBag_Orange": {"label": "Mountain Bag (Orange)", "kategorie": "Mountain", "slots": 42},
+    "MountainBag_Red": {"label": "Mountain Bag (Red)", "kategorie": "Mountain", "slots": 42},
     "TaloonBag_Blue": {"label": "Hiking Backpack (Blue)", "kategorie": "Mountain", "slots": 30},
     "TaloonBag_Green": {"label": "Hiking Backpack (Green)", "kategorie": "Mountain", "slots": 30},
     "TaloonBag_Orange": {"label": "Hiking Backpack (Orange)", "kategorie": "Mountain", "slots": 30},
     "TaloonBag_Violet": {"label": "Hiking Backpack (Violet)", "kategorie": "Mountain", "slots": 30},
+    "DuffelBagSmall_Camo": {"label": "Duffel Bag Small (Camo)", "kategorie": "Canvas / Duffel", "slots": 25},
+    "DuffelBagSmall_Green": {"label": "Duffel Bag Small (Green)", "kategorie": "Canvas / Duffel", "slots": 25},
+    "DuffelBagSmall_Medical": {"label": "Duffel Bag Small (Medical)", "kategorie": "Canvas / Duffel", "slots": 25},
+    "HuntingBag": {"label": "Hunting Bag", "kategorie": "Hunting / Outdoor", "slots": 42},
+    "HuntingBag_Hannah": {"label": "Hunting Bag (Hannah)", "kategorie": "Hunting / Outdoor", "slots": 42},
     "SmershBag": {"label": "Smersh Bag", "kategorie": "Smersh / Taloon", "slots": 16},
     "TortillaBag": {"label": "Combat Backpack", "kategorie": "Smersh / Taloon", "slots": 56},
 }
