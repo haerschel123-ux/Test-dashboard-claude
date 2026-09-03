@@ -708,7 +708,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.horde":                       {"label": "Zombie-Horden Generator", "gruppe": "Tools"},
     "tools.heliloot":                    {"label": "Heli-Crash Loot", "gruppe": "Tools"},
     "tools.vehicle":                     {"label": "Fahrzeug-Builder", "gruppe": "Tools"},
-    "tools.spawnable":                   {"label": "Inhalte & Aufsätze", "gruppe": "Tools"},
+    "tools.spawnable":                   {"label": "Rucksack-Builder", "gruppe": "Tools"},
     "tools.event":                       {"label": "Event-Vorlagen", "gruppe": "Tools"},
     "tools.spawnpoint":                  {"label": "Spawn Point Generator", "gruppe": "Tools"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
@@ -9006,6 +9006,37 @@ TOOL_VEHICLES = {
                 "kein_inventar": True, "parts": [["SparkPlug", 1]]},
 }
 
+# Rucksack-Builder ("Inhalte & Aufsaetze") - Taschen-Classnames, Kategorie und
+# Slot-Zahl stammen ausschliesslich aus Brigardes eigenen Screenshots von
+# https://doordiehub.com/BuildABag (02.09.2026). Anders als bei TOOL_VEHICLES
+# ist jede Farbe hier ein eigener, vollstaendiger Classname (kein Suffix) -
+# deshalb kein "farben"-Feld. Weitere Kategorien (Attack2, Canvas/Duffel,
+# Child/Courier, Coyote, Improvised, Leather Sacks, Mountain, Smersh/Taloon)
+# waren in den Screenshots nur als zugeklappte Ueberschrift sichtbar, ohne
+# belegte Classnames - bewusst ausgelassen statt geraten.
+TOOL_BAGS = {
+    "AliceBag_Black": {"label": "Alice Bag (Black)", "kategorie": "Alice / Army", "slots": 64},
+    "AliceBag_Camo": {"label": "Alice Bag (Camo)", "kategorie": "Alice / Army", "slots": 64},
+    "AliceBag_Green": {"label": "Alice Bag (Green)", "kategorie": "Alice / Army", "slots": 64},
+    "ArmyPouch_Beige": {"label": "Army Pouch (Beige)", "kategorie": "Alice / Army", "slots": 20},
+    "ArmyPouch_Black": {"label": "Army Pouch (Black)", "kategorie": "Alice / Army", "slots": 20},
+    "ArmyPouch_Camo": {"label": "Army Pouch (Camo)", "kategorie": "Alice / Army", "slots": 20},
+    "AssaultBag_Black": {"label": "Assault Bag (Black)", "kategorie": "Assault", "slots": 30},
+    "AssaultBag_Green": {"label": "Assault Bag (Green)", "kategorie": "Assault", "slots": 30},
+    "AssaultBag_Ttsko": {"label": "Assault Bag (TTsKO)", "kategorie": "Assault", "slots": 30},
+    "AssaultBag_Winter": {"label": "Assault Bag (Winter)", "kategorie": "Assault", "slots": 30},
+    "GhillieBushrag_Mossy": {"label": "Ghillie Bushrag (Mossy)", "kategorie": "Ghillie", "slots": 0},
+    "GhillieBushrag_Tan": {"label": "Ghillie Bushrag (Tan)", "kategorie": "Ghillie", "slots": 0},
+    "GhillieBushrag_Winter": {"label": "Ghillie Bushrag (Winter)", "kategorie": "Ghillie", "slots": 0},
+    "GhillieBushrag_Woodland": {"label": "Ghillie Bushrag (Woodland)", "kategorie": "Ghillie", "slots": 0},
+    "DryBag_Black": {"label": "Dry Bag (Black)", "kategorie": "Dry Bags", "slots": 20},
+    "DryBag_Blue": {"label": "Dry Bag (Blue)", "kategorie": "Dry Bags", "slots": 20},
+    "DryBag_Green": {"label": "Dry Bag (Green)", "kategorie": "Dry Bags", "slots": 20},
+    "Slingbag_Black": {"label": "Slingbag (Black)", "kategorie": "Sling", "slots": 12},
+    "Slingbag_Brown": {"label": "Slingbag (Brown)", "kategorie": "Sling", "slots": 12},
+    "Slingbag_Gray": {"label": "Slingbag (Gray)", "kategorie": "Sling", "slots": 12},
+}
+
 # Rein optische Gruppierung der immer gleichen Fahrzeug-Teile-Classnames in
 # Kategorien-Tabs (Required Parts/Wheels/Lights/Doors/Body Parts) - erfindet
 # keine neuen Daten, ordnet nur TOOL_VEHICLES[...]["parts"] ein.
@@ -9441,7 +9472,7 @@ _TOOL_LISTE = (
     ("horde",     "🧟", "Zombie-Horden Generator"),
     ("heliloot",  "🚁", "Heli-Crash Loot"),
     ("vehicle",   "🚗", "Fahrzeug-Builder"),
-    ("spawnable", "🎒", "Inhalte & Aufsätze"),
+    ("spawnable", "🎒", "Rucksack-Builder"),
     ("event",     "📅", "Event-Vorlagen"),
     ("spawnpoint", "📍", "Spawn Point Generator"),
 )
@@ -9486,6 +9517,10 @@ async def api_tools_meta(request: web.Request) -> web.Response:
                               "kategorie": _vehicle_part_kategorie(cn)}
                              for cn, anzahl in v["parts"]]}
                     for k, v in TOOL_VEHICLES.items()},
+        "bags": {k: {"label": v["label"], "kategorie": v["kategorie"], "slots": v["slots"],
+                     "image": (f"/static/items/{k.lower()}.avif"
+                              if f"items/{k.lower()}.avif" in _EMBEDDED_ASSETS else None)}
+                for k, v in TOOL_BAGS.items()},
     })
 
 
@@ -10192,8 +10227,45 @@ async def api_tools_vehicle_post(request: web.Request) -> web.Response:
     return ok({"name": event_name, "positions_added": added, "generated": generated})
 
 
-# ── 6. Inhalte & Aufsätze (Spawnable) ─────────────────────────────────────
-async def api_tools_spawnable_get(request: web.Request) -> web.Response:
+# ── 6. Rucksack-Builder (Inhalte & Aufsätze) ──────────────────────────────
+def _tool_upsert_bag_cargo(text: str, name: str, items: List[Dict[str, Any]]) -> str:
+    """Wie ``_tool_upsert_spawnable_type``, aber mit EINEM gemeinsamen
+    ``<cargo>``-Block fuer alle Items statt einem Block je Zeile - so baut es
+    auch die Referenzseite (doordiehub.com/BuildABag), naeher an echter
+    DayZ-Server-Praxis als das alte Ein-Block-pro-Zeile-Muster."""
+    zeilen = []
+    for it in items:
+        try:
+            chance = max(0.0, min(1.0, float(it.get("chance", 1.0))))
+        except (TypeError, ValueError):
+            chance = 1.0
+        zeilen.append(f'            <item name="{_tool_esc_xml(it["item"])}" chance="{chance:.2f}"/>')
+    snippet = (f'<type name="{_tool_esc_xml(name)}">\n'
+               f'        <cargo chance="1.00">\n' + "\n".join(zeilen) +
+               f'\n        </cargo>\n    </type>')
+    return _tool_benannten_block_ersetzen(text, "spawnabletypes", "type", name, snippet)
+
+
+def _tool_bag_cargo_lesen(node: Optional[ET.Element]) -> List[Dict[str, Any]]:
+    """Liest die Cargo-Items eines ``<type>``-Knotens fuers Vorbelegen - liest
+    ALLE ``<cargo>``-Bloecke (falls von Hand/frueher mehrere angelegt wurden),
+    nicht nur den ersten."""
+    if node is None:
+        return []
+    rows = []
+    for b in node.findall("cargo"):
+        for item in b.findall("item"):
+            if not item.get("name"):
+                continue
+            try:
+                chance = max(0.0, min(1.0, float(item.get("chance") or 0)))
+            except (TypeError, ValueError):
+                chance = 0.0
+            rows.append({"item": item.get("name"), "chance": chance})
+    return rows
+
+
+async def api_tools_bag_get(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request, "tools.spawnable")
     if fehler is not None:
         return fehler
@@ -10204,22 +10276,19 @@ async def api_tools_spawnable_get(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     if not _mission_dir_of(conn):
-        return ok({"types": [], "kein_mission_ordner": True})
+        return ok({"bags": {}, "kein_mission_ordner": True})
     loop = asyncio.get_running_loop()
     st_root, _s = await _tools_xml_lesen(conn, "cfgspawnabletypes.xml", loop)
-    namen = []
-    entries = {}
+    bags = {}
     if st_root is not None:
-        for t in st_root.findall("type"):
-            n = t.get("name")
-            if not n:
-                continue
-            namen.append(n)
-            entries[n] = _tool_spawnable_rows_lesen(t)
-    return ok({"types": namen, "entries": entries})
+        for bag in TOOL_BAGS:
+            node = st_root.find(f'type[@name="{bag}"]')
+            if node is not None:
+                bags[bag] = _tool_bag_cargo_lesen(node)
+    return ok({"bags": bags})
 
 
-async def api_tools_spawnable_post(request: web.Request) -> web.Response:
+async def api_tools_bag_post(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request, "tools.spawnable")
     if fehler is not None:
         return fehler
@@ -10237,36 +10306,35 @@ async def api_tools_spawnable_post(request: web.Request) -> web.Response:
         fehler = _dash_rate_limited(request, "tools.spawnable", 10)
         if fehler is not None:
             return fehler
-    target = str(data_in.get("target") or "").strip()
-    if not target:
-        return err("Bitte einen Ziel-Typ angeben.")
-    rows = []
-    for kind_key in ("attachments", "cargo"):
-        for r in data_in.get(kind_key) or []:
-            it = str(r.get("item") or "").strip()
-            if not it:
-                continue
-            try:
-                chance = max(0.0, min(1.0, float(r.get("num", 100)) / 100))
-            except (TypeError, ValueError):
-                chance = 1.0
-            rows.append({"kind": kind_key, "item": it, "chance": chance})
-    if not rows:
-        return err("Bitte mindestens einen Aufsatz oder Inhalt angeben.")
+    bag = str(data_in.get("bag") or "").strip()
+    if bag not in TOOL_BAGS:
+        return err("Unbekannte Tasche.")
+    items = []
+    for c in (data_in.get("cargo") or []):
+        it = str(c.get("item") or "").strip()
+        if not it:
+            continue
+        try:
+            chance = max(0.0, min(1.0, float(c.get("chance", 1.0))))
+        except (TypeError, ValueError):
+            chance = 1.0
+        items.append({"item": it, "chance": chance})
+    if not items:
+        return err("Bitte mindestens ein Item hinzufügen.")
     loop = asyncio.get_running_loop()
     st_text, st_status = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
     basis = st_text if st_status == "ok" else _TOOL_LEERE_SPAWNABLETYPES
     if st_status == "error":
         return err("cfgspawnabletypes.xml per FTP nicht lesbar.", 502)
-    neu = _tool_upsert_spawnable_type(basis, target, rows)
+    neu = _tool_upsert_bag_cargo(basis, bag, items)
     if not await _tools_datei_schreiben_wenn(commit, conn, "cfgspawnabletypes.xml", neu, loop):
         return err("cfgspawnabletypes.xml konnte nicht gespeichert werden.", 502)
     if commit:
-        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Inhalte/Aufsätze gespeichert",
-                  f"{target}: {len(rows)} Eintrag/Einträge · {conn.name}")
-    block = _tool_finde_benannten_block(neu, "type", target)
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Rucksack gespeichert",
+                  f"{TOOL_BAGS[bag]['label']}: {len(items)} Item(s) · {conn.name}")
+    block = _tool_finde_benannten_block(neu, "type", bag)
     generated = [{"filename": "cfgspawnabletypes.xml", "content": block["block"] if block else neu}]
-    return ok({"target": target, "rows": len(rows), "generated": generated})
+    return ok({"bag": bag, "items": len(items), "generated": generated})
 
 
 # ── 7. Event-Vorlagen ──────────────────────────────────────────────────────
@@ -21935,8 +22003,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/heliloot", api_tools_heliloot_post)
     r.add_get("/api/tools/vehicle", api_tools_vehicle_get)
     r.add_post("/api/tools/vehicle", api_tools_vehicle_post)
-    r.add_get("/api/tools/spawnable", api_tools_spawnable_get)
-    r.add_post("/api/tools/spawnable", api_tools_spawnable_post)
+    r.add_get("/api/tools/spawnable", api_tools_bag_get)
+    r.add_post("/api/tools/spawnable", api_tools_bag_post)
     r.add_get("/api/tools/event", api_tools_event_get)
     r.add_post("/api/tools/event", api_tools_event_post)
     r.add_get("/api/tools/spawnpoint", api_tools_spawnpoint_get)
@@ -22601,6 +22669,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "bc48689c5611a9d34a87fe67ee468b36ca4e058305be35cbdbe0f87c75b719f3",
         "150cd6667526fcb50102994f4a389764c0b1a097b50fe79f21740ba45c4b919a",
         "68ab9ed411dad70e648915ead33184cbebc0b2791e2b8955492da95d2ec1d531",
+        "02627c9d93c5d1d7a8a640158e828b48acac1f420619f7c7e33c714aebb7877f",
     ),
     "app.js": (
         "60db1ecc03e138a333c3f04ab3f2a740b351835cf2bef6639f1d58d0be6f5900",
@@ -22711,6 +22780,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "3169406ab6804fbc9f4b88b541ba09dc0bf9524f52e40c91a009f75303fdf220",
         "6634545892d6b12cd0043ecad2fd1e344491691e01d7bf1e66f431d07e08fc99",
         "b696490a896438327e8692e0a4d1710e576e1504732d12840efcc25305dc8ace",
+        "34e5077345c63cb794b3073a7d8b10a6a9ddff701d7767b0c372113cab7e0208",
+        "203c5c5086646d14b1d4b18e9ba31a031d91c7c828fd99ddfd85375b05533443",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
