@@ -3743,6 +3743,28 @@ _BEFEHL_BESCHREIBUNG_EN = {
         "🩺 Delivery diagnostics: checks cfgEffectArea.json & repairs missing entries (admin)",
     "✏️ Bearbeitet eine geplante Ankündigung (Nachricht/Bild)":
         "✏️ Edits a scheduled announcement (message/image)",
+    # Factions
+    "🚩 Fraktions-Befehle": "🚩 Faction commands",
+    "ℹ️ Zeigt die Details einer Fraktion": "ℹ️ Show a faction's details",
+    "📋 Zeigt alle Fraktionen dieses Servers (Admin)": "📋 Show all factions on this server (admin)",
+    "💳 Zeigt den Kontostand deiner Fraktionskasse": "💳 Show your faction's treasury balance",
+    "🏦 Geld aus deinem Wallet in die Fraktionskasse einzahlen":
+        "🏦 Move money from your wallet into your faction's treasury",
+    "👛 Geld aus der Fraktionskasse in dein Wallet abheben (Leader/Officer)":
+        "👛 Move money from your faction's treasury into your wallet (leader/officer)",
+    "💸 Zahlt einem Fraktionsmitglied Geld aus der Kasse (Leader/Officer)":
+        "💸 Pay a fellow member from the faction treasury (leader/officer)",
+    "📊 Zeigt die PvP-Statistiken einer Fraktion": "📊 Show a faction's PvP stats",
+    "🗺️ Postet ein Kartenbild mit den Online-Mitgliedern einer Fraktion":
+        "🗺️ Post a map image with a faction's online members",
+    "👥 Fraktionsmitglieder verwalten (Leader/Officer)": "👥 Manage faction members (leader/officer)",
+    "➕ Fügt ein Mitglied zu deiner Fraktion hinzu (Leader/Officer)":
+        "➕ Add a member to your faction (leader/officer)",
+    "➖ Entfernt ein Mitglied aus deiner Fraktion (Leader/Officer)":
+        "➖ Remove a member from your faction (leader/officer)",
+    "⭐ Officer-Rechte vergeben/entziehen (nur Leader)": "⭐ Grant/revoke officer permissions (leader only)",
+    "⭐ Befördert ein Mitglied zum Officer (nur Leader)": "⭐ Promote a member to officer (leader only)",
+    "⬇️ Stuft einen Officer zurück zum Mitglied (nur Leader)": "⬇️ Demote an officer back to member (leader only)",
 }
 
 
@@ -6035,6 +6057,7 @@ _SUBCMD_DEFS: Tuple[Tuple[str, str, str, str, str], ...] = (
     ("shop_cleanup", "Shop", "Shop", "/shop cleanup – Markiert Käufe als geliefert", "/shop cleanup – Marks purchases as delivered"),
     ("shop_check", "Shop", "Shop", "/shop check – Delivery-Diagnose", "/shop check – Delivery diagnostics"),
     ("shop_enable", "Shop", "Shop", "/shop enable – Aktiviert/deaktiviert ein Shop-Item", "/shop enable – Enables/disables a shop item"),
+    ("faction_list", "Fraktionen", "Factions", "/faction list – Zeigt alle Fraktionen dieses Servers", "/faction list – Shows all factions on this server"),
 )
 _SUBCMD_KEYS = frozenset(k for k, *_ in _SUBCMD_DEFS)
 
@@ -7742,11 +7765,12 @@ async def _faction_name_autocomplete(interaction: discord.Interaction, current: 
 
 # ── /faction – Slash-Commands (Anlegen/Bearbeiten/Löschen bleibt Dashboard,
 #  siehe Kommentar oben; hier nur Ansicht, Kasse und Mitgliederverwaltung) ──
-faction_group = app_commands.Group(name="faction", description="🚩 Faction commands")
+faction_group = app_commands.Group(
+    name="faction", description=app_commands.locale_str("🚩 Fraktions-Befehle"))
 
 
-@faction_group.command(name="info", description="ℹ️ Show a faction's details")
-@app_commands.describe(faction="Faction name (leave empty for your own)")
+@faction_group.command(name="info", description=app_commands.locale_str("ℹ️ Zeigt die Details einer Fraktion"))
+@app_commands.describe(faction="Name der Fraktion (leer = deine eigene)")
 async def faction_info(interaction: discord.Interaction, faction: Optional[str] = None):
     if not await _require_guild(interaction):
         return
@@ -7789,8 +7813,11 @@ async def faction_info(interaction: discord.Interaction, faction: Optional[str] 
 faction_info.autocomplete("faction")(_faction_name_autocomplete)
 
 
-@faction_group.command(name="list", description="📋 Show all factions on this server")
+@faction_group.command(name="list",
+                       description=app_commands.locale_str("📋 Zeigt alle Fraktionen dieses Servers (Admin)"))
 async def faction_list(interaction: discord.Interaction):
+    if not _subcmd_allowed(interaction, "faction_list"):
+        return await _deny_subcmd(interaction)
     if not await _require_guild(interaction):
         return
     conn = _conn_of(interaction)
@@ -7817,8 +7844,9 @@ async def faction_list(interaction: discord.Interaction):
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
-@faction_group.command(name="balance", description="💳 Show your faction's treasury balance")
-@app_commands.describe(faction="Faction name (leave empty for your own)")
+@faction_group.command(name="balance",
+                       description=app_commands.locale_str("💳 Zeigt den Kontostand deiner Fraktionskasse"))
+@app_commands.describe(faction="Name der Fraktion (leer = deine eigene)")
 async def faction_balance(interaction: discord.Interaction, faction: Optional[str] = None):
     if not await _require_guild(interaction):
         return
@@ -7847,8 +7875,10 @@ async def faction_balance(interaction: discord.Interaction, faction: Optional[st
 faction_balance.autocomplete("faction")(_faction_name_autocomplete)
 
 
-@faction_group.command(name="deposit", description="🏦 Move money from your wallet into your faction's treasury")
-@app_commands.describe(betrag="Amount from your wallet")
+@faction_group.command(
+    name="deposit",
+    description=app_commands.locale_str("🏦 Geld aus deinem Wallet in die Fraktionskasse einzahlen"))
+@app_commands.describe(betrag="Betrag aus deinem Wallet")
 async def faction_deposit(interaction: discord.Interaction, betrag: app_commands.Range[int, 1]):
     if not await _require_guild(interaction):
         return
@@ -7875,9 +7905,11 @@ async def faction_deposit(interaction: discord.Interaction, betrag: app_commands
     await interaction.response.send_message(embed=e)
 
 
-@faction_group.command(name="withdraw",
-                       description="👛 Move money from your faction's treasury into your wallet (leader/officer)")
-@app_commands.describe(betrag="Amount from the faction treasury")
+@faction_group.command(
+    name="withdraw",
+    description=app_commands.locale_str(
+        "👛 Geld aus der Fraktionskasse in dein Wallet abheben (Leader/Officer)"))
+@app_commands.describe(betrag="Betrag aus der Fraktionskasse")
 async def faction_withdraw(interaction: discord.Interaction, betrag: app_commands.Range[int, 1]):
     if not await _require_guild(interaction):
         return
@@ -7908,10 +7940,12 @@ async def faction_withdraw(interaction: discord.Interaction, betrag: app_command
     await interaction.response.send_message(embed=e)
 
 
-@faction_group.command(name="pay",
-                       description="💸 Pay a fellow member from the faction treasury (leader/officer)")
-@app_commands.describe(mitglied="Recipient (must be a member of your faction)",
-                       betrag="Amount from the faction treasury")
+@faction_group.command(
+    name="pay",
+    description=app_commands.locale_str(
+        "💸 Zahlt einem Fraktionsmitglied Geld aus der Kasse (Leader/Officer)"))
+@app_commands.describe(mitglied="Empfänger (muss Mitglied deiner Fraktion sein)",
+                       betrag="Betrag aus der Fraktionskasse")
 async def faction_pay(interaction: discord.Interaction, mitglied: discord.Member,
                       betrag: app_commands.Range[int, 1]):
     if not await _require_guild(interaction):
@@ -7946,8 +7980,9 @@ async def faction_pay(interaction: discord.Interaction, mitglied: discord.Member
     await interaction.response.send_message(embed=e)
 
 
-@faction_group.command(name="stats", description="📊 Show a faction's PvP stats")
-@app_commands.describe(faction="Faction name (leave empty for your own)")
+@faction_group.command(name="stats",
+                       description=app_commands.locale_str("📊 Zeigt die PvP-Statistiken einer Fraktion"))
+@app_commands.describe(faction="Name der Fraktion (leer = deine eigene)")
 async def faction_stats(interaction: discord.Interaction, faction: Optional[str] = None):
     if not await _require_guild(interaction):
         return
@@ -7984,8 +8019,10 @@ async def faction_stats(interaction: discord.Interaction, faction: Optional[str]
 faction_stats.autocomplete("faction")(_faction_name_autocomplete)
 
 
-@faction_group.command(name="map", description="🗺️ Post a map image with a faction's online members")
-@app_commands.describe(faction="Faction name (leave empty for your own)")
+@faction_group.command(
+    name="map",
+    description=app_commands.locale_str("🗺️ Postet ein Kartenbild mit den Online-Mitgliedern einer Fraktion"))
+@app_commands.describe(faction="Name der Fraktion (leer = deine eigene)")
 async def faction_map(interaction: discord.Interaction, faction: Optional[str] = None):
     if not await _require_guild(interaction):
         return
@@ -8041,12 +8078,15 @@ faction_map.autocomplete("faction")(_faction_name_autocomplete)
 
 
 # ── /faction member – Mitglieder verwalten (Leader/Officer) ──
-member_group = app_commands.Group(name="member", description="👥 Manage faction members (leader/officer)",
-                                  parent=faction_group)
+member_group = app_commands.Group(
+    name="member",
+    description=app_commands.locale_str("👥 Fraktionsmitglieder verwalten (Leader/Officer)"),
+    parent=faction_group)
 
 
-@member_group.command(name="add", description="➕ Add a member to your faction (leader/officer)")
-@app_commands.describe(spieler="Discord member to add")
+@member_group.command(
+    name="add", description=app_commands.locale_str("➕ Fügt ein Mitglied zu deiner Fraktion hinzu (Leader/Officer)"))
+@app_commands.describe(spieler="Discord-Mitglied")
 async def faction_member_add(interaction: discord.Interaction, spieler: discord.Member):
     if not await _require_guild(interaction):
         return
@@ -8088,8 +8128,10 @@ async def faction_member_add(interaction: discord.Interaction, spieler: discord.
     await interaction.response.send_message(embed=e)
 
 
-@member_group.command(name="remove", description="➖ Remove a member from your faction (leader/officer)")
-@app_commands.describe(spieler="Discord member to remove")
+@member_group.command(
+    name="remove",
+    description=app_commands.locale_str("➖ Entfernt ein Mitglied aus deiner Fraktion (Leader/Officer)"))
+@app_commands.describe(spieler="Discord-Mitglied")
 async def faction_member_remove(interaction: discord.Interaction, spieler: discord.Member):
     if not await _require_guild(interaction):
         return
@@ -8130,11 +8172,14 @@ async def faction_member_remove(interaction: discord.Interaction, spieler: disco
 
 # ── /faction permission – Officer-Rechte vergeben/entziehen (nur Leader) ──
 permission_group = app_commands.Group(
-    name="permission", description="⭐ Grant/revoke officer permissions (leader only)", parent=faction_group)
+    name="permission",
+    description=app_commands.locale_str("⭐ Officer-Rechte vergeben/entziehen (nur Leader)"),
+    parent=faction_group)
 
 
-@permission_group.command(name="grant", description="⭐ Promote a member to officer (leader only)")
-@app_commands.describe(mitglied="Member of your faction")
+@permission_group.command(
+    name="grant", description=app_commands.locale_str("⭐ Befördert ein Mitglied zum Officer (nur Leader)"))
+@app_commands.describe(mitglied="Mitglied deiner Fraktion")
 async def faction_permission_grant(interaction: discord.Interaction, mitglied: discord.Member):
     if not await _require_guild(interaction):
         return
@@ -8171,8 +8216,9 @@ async def faction_permission_grant(interaction: discord.Interaction, mitglied: d
     await interaction.response.send_message(embed=e)
 
 
-@permission_group.command(name="revoke", description="⬇️ Demote an officer back to member (leader only)")
-@app_commands.describe(mitglied="Member of your faction")
+@permission_group.command(
+    name="revoke", description=app_commands.locale_str("⬇️ Stuft einen Officer zurück zum Mitglied (nur Leader)"))
+@app_commands.describe(mitglied="Mitglied deiner Fraktion")
 async def faction_permission_revoke(interaction: discord.Interaction, mitglied: discord.Member):
     if not await _require_guild(interaction):
         return
