@@ -19,6 +19,9 @@ backups/
 shop_items.json
 types.xml
 
+# Kartenbild-Cache für /faction map (aus static.xam.nu-Kacheln zusammengesetzt)
+faction_map_cache/
+
 # Vom Bot beim Start selbst erzeugt (stecken eingebettet in bot.py)
 dashboard_web/
 requirements.txt

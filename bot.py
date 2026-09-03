@@ -50,9 +50,19 @@ import ipaddress
 import urllib.parse
 from collections import deque
 from datetime import datetime, timezone, timedelta, date
-from typing import Optional, Dict, List, Tuple, Any, Deque, Set
+from typing import Optional, Dict, List, Tuple, Any, Deque, Set, Iterable
 from zoneinfo import ZoneInfo
 from embedded_assets import _EMBEDDED_ASSETS  # riesiges Dict-Literal ausgelagert (siehe dortige Docstring)
+
+# Pillow: NUR für /faction map (Kartenbild mit Online-Mitgliedern). Bewusst
+# optional statt hart importiert – ohne das Paket soll der ganze Bot weiter
+# starten, nur der eine Befehl meldet dann verständlich, was fehlt, statt den
+# Start mit einem ImportError abzubrechen (siehe _PIL_AVAILABLE unten).
+try:
+    from PIL import Image as _PILImage, ImageDraw as _PILImageDraw, ImageFont as _PILImageFont
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 from log_parser import DayZLogParser  # ausgelagert (siehe dortige Docstring)
 
 
@@ -711,6 +721,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.spawnable":                   {"label": "Rucksack-Builder", "gruppe": "Tools"},
     "tools.event":                       {"label": "Event-Vorlagen", "gruppe": "Tools"},
     "tools.spawnpoint":                  {"label": "Spawn Point Generator", "gruppe": "Tools"},
+    "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
     "permissions.subcommands":           {"label": "Subcommand Permissions", "gruppe": "Permissions"},
 }
@@ -720,6 +731,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
 # alles andere laeuft weiter ueber den bisherigen Premium-Check.
 _DISCORD_MODUL_MAP: Dict[str, str] = {
     "zone": "zones",
+    "faction": "factions",
     "auto": "auto_tasks.restart_schedule",
     "shop": "shop.buy",
     "buy":  "shop.buy",
@@ -980,7 +992,9 @@ def _canonical_map_name(raw: str) -> Optional[str]:
 def _create_helper_files():
     req = ("discord.py>=2.3.0\naiohttp>=3.9.0\nrequests>=2.31.0\n"
            "# optional – nur für HTTPS im Dashboard (selbstsigniertes Zertifikat)\n"
-           "cryptography>=41.0\n")
+           "cryptography>=41.0\n"
+           "# optional – nur für /faction map (Kartenbild mit Online-Mitgliedern)\n"
+           "Pillow>=10.0\n")
     if not os.path.exists("requirements.txt"):
         with open("requirements.txt", "w", encoding="utf-8") as f:
             f.write(req)
@@ -7537,6 +7551,660 @@ bot.tree.add_command(zone_group)
 
 
 # ══════════════════════════════════════════════════════════════
+#  /faction – Fraktionen: dashboard-verwaltete Gruppen mit
+#  gemeinsamer Kasse (SQLite, siehe EconomyDB.*_faction_balance) und
+#  optionaler Zonen-Verknüpfung (Mitglieder landen automatisch in der
+#  Allowlist der zugeordneten Zone, siehe _faction_sync_zone_allowlist).
+#  Anlegen/Bearbeiten/Löschen einer Fraktion nur im Dashboard, wie bei
+#  Zonen (kein /faction create – siehe Kommentar dort).
+# ══════════════════════════════════════════════════════════════
+_FACTION_MEMBER_LIMIT_DEFAULT = 30
+_FACTION_MEMBER_LIMIT_MAX = 200
+_FACTION_COLOUR_DEFAULT = 0x5865F2
+
+def _factions(conn: Optional[ServerConnection] = None) -> List[Dict]:
+    """Die Fraktionen eines Servers. Ohne Angabe die des Hauptservers."""
+    src = conn or connections.primary()
+    if src is None:
+        fs = cfg.config.get("factions")
+        if not isinstance(fs, list):
+            fs = []
+            cfg.config["factions"] = fs
+        return fs
+    # Bewusst src.data statt src.get, aus demselben Grund wie bei _zones:
+    # der Rueckfall auf die globale config wuerde allen Servern DIESELBE
+    # Fraktionsliste geben.
+    fs = src.data.get("factions")
+    if not isinstance(fs, list):
+        fs = []
+        src.set("factions", fs)
+    return fs
+
+
+def _factions_save(conn: Optional[ServerConnection] = None) -> None:
+    """Fraktionen sichern – beim Hauptserver zusaetzlich in der config.json."""
+    src = conn or connections.primary()
+    if src is not None:
+        _conn_store(src, "factions", _factions(src))
+    else:
+        cfg.save_config()
+
+
+def _find_faction(name: str, conn: Optional[ServerConnection] = None) -> Optional[Dict]:
+    key = (name or "").strip().lower()
+    for f in _factions(conn):
+        if isinstance(f, dict) and str(f.get("name", "")).strip().lower() == key:
+            return f
+    return None
+
+
+def _find_faction_by_id(faction_id: Any, conn: Optional[ServerConnection] = None) -> Optional[Dict]:
+    try:
+        fid = int(faction_id)
+    except (TypeError, ValueError):
+        return None
+    for f in _factions(conn):
+        if isinstance(f, dict) and f.get("id") == fid:
+            return f
+    return None
+
+
+def _find_zone_by_id(zone_id: Any, conn: Optional[ServerConnection] = None) -> Optional[Dict]:
+    try:
+        zid = int(zone_id)
+    except (TypeError, ValueError):
+        return None
+    for z in _zones(conn):
+        if isinstance(z, dict) and z.get("id") == zid:
+            return z
+    return None
+
+
+def _ensure_faction_ids(factions: List[Dict]) -> bool:
+    """Vergibt fortlaufende `id`-Felder an Fraktionen ohne eins (analog `_ensure_zone_ids`)."""
+    changed = False
+    next_id = 1 + max([int(f.get("id", 0)) for f in factions if isinstance(f, dict)] or [0])
+    for f in factions:
+        if isinstance(f, dict) and not f.get("id"):
+            f["id"] = next_id
+            next_id += 1
+            changed = True
+    return changed
+
+
+def _faction_payload(f: Dict) -> Dict:
+    """Normalisierte Ansicht einer Fraktion fuer API/Embeds (füllt Defaults, wie `_zone_payload`)."""
+    out = dict(f)
+    mitglieder = []
+    for u in (f.get("member_user_ids") or []):
+        try:
+            mitglieder.append(int(u))
+        except (TypeError, ValueError):
+            continue
+    out["member_user_ids"] = mitglieder
+    roles = f.get("member_roles")
+    out["member_roles"] = roles if isinstance(roles, dict) else {}
+    out["member_limit"] = int(f.get("member_limit") or _FACTION_MEMBER_LIMIT_DEFAULT)
+    out["colour"] = int(f.get("colour") or _FACTION_COLOUR_DEFAULT)
+    out["armband"] = f.get("armband") or ""
+    out["flag_url"] = f.get("flag_url") or None
+    out["discord_invite"] = f.get("discord_invite") or None
+    out["icon_url"] = f.get("icon_url") or None
+    out["zone_id"] = f.get("zone_id") or None
+    return out
+
+
+def _faction_of_member(conn: Optional[ServerConnection], user_id: Any) -> Optional[Dict]:
+    """Die Fraktion, in der dieses Discord-Mitglied gerade Mitglied ist (falls ueberhaupt)."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    for f in _factions(conn):
+        if not isinstance(f, dict):
+            continue
+        for m in (f.get("member_user_ids") or []):
+            try:
+                if int(m) == uid:
+                    return f
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _faction_role(faction: Dict, user_id: Any) -> Optional[str]:
+    roles = faction.get("member_roles")
+    if not isinstance(roles, dict):
+        return None
+    rolle = roles.get(str(user_id))
+    return rolle if rolle in ("leader", "officer", "member") else None
+
+
+async def _faction_sync_zone_allowlist(conn: ServerConnection, faction: Dict,
+                                       add_ids: Iterable[Any] = (),
+                                       remove_ids: Iterable[Any] = ()) -> None:
+    """Traegt Fraktionsmitglieder in die Allowlist der verknuepften Zone ein/aus.
+
+    Loest jede Discord-User-ID ueber `/link` (`EconomyDB.get_link_by_user`) in
+    ihren Ingame-Namen auf – ohne Verlinkung gibt es fuer diese ID (noch)
+    nichts einzutragen; ein spaeteres `/link` synct erst beim naechsten
+    member add/remove oder Dashboard-Save nach, nicht automatisch.
+    """
+    zone = _find_zone_by_id(faction.get("zone_id"), conn)
+    if zone is None:
+        return
+    try:
+        gid = int(faction.get("guild_id") or 0)
+    except (TypeError, ValueError):
+        return
+    if not gid:
+        return
+    al = _zone_allowlist(zone)
+    changed = False
+    for uid in remove_ids:
+        try:
+            row = db.get_link_by_user(gid, int(uid))
+        except (TypeError, ValueError):
+            continue
+        name = row["ingame_name"] if row else None
+        if name and _player_in_allowlist(zone, name):
+            al[:] = [n for n in al if str(n).strip().lower() != name.strip().lower()]
+            changed = True
+    for uid in add_ids:
+        try:
+            row = db.get_link_by_user(gid, int(uid))
+        except (TypeError, ValueError):
+            continue
+        name = row["ingame_name"] if row else None
+        if name and not _player_in_allowlist(zone, name):
+            al.append(name)
+            changed = True
+    if changed:
+        _zones_save(conn)
+
+
+async def _faction_name_autocomplete(interaction: discord.Interaction, current: str):
+    cur = (current or "").lower()
+    conns = _ac_conns(interaction)
+    mehrere = len(conns) > 1
+    out: List[app_commands.Choice] = []
+    for c in conns:
+        for f in _factions(c):
+            if not (isinstance(f, dict) and f.get("name")):
+                continue
+            nm = str(f["name"])
+            if cur not in nm.lower():
+                continue
+            out.append(app_commands.Choice(
+                name=f"{nm} – {c.name}"[:100] if mehrere else nm, value=nm))
+    return out[:25]
+
+
+# ── /faction – Slash-Commands (Anlegen/Bearbeiten/Löschen bleibt Dashboard,
+#  siehe Kommentar oben; hier nur Ansicht, Kasse und Mitgliederverwaltung) ──
+faction_group = app_commands.Group(name="faction", description="🚩 Faction commands")
+
+
+@faction_group.command(name="info", description="ℹ️ Show a faction's details")
+@app_commands.describe(faction="Faction name (leave empty for your own)")
+async def faction_info(interaction: discord.Interaction, faction: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    f = _find_faction(faction, conn) if faction else _faction_of_member(conn, interaction.user.id)
+    if f is None:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Fraktion nicht gefunden." if faction else "❌ Du bist in keiner Fraktion.",
+            "❌ Faction not found." if faction else "❌ You're not in a faction."), ephemeral=True)
+    payload = _faction_payload(f)
+    roles = payload["member_roles"]
+    officers = [f"<@{uid}>" for uid in payload["member_user_ids"] if roles.get(str(uid)) == "officer"]
+    members = [f"<@{uid}>" for uid in payload["member_user_ids"]
+              if roles.get(str(uid)) not in ("leader", "officer")]
+    e = discord.Embed(title=f"🚩 {f['name']}", color=payload["colour"])
+    if payload["armband"]:
+        e.add_field(name=_t(interaction, "Armbinde", "Armband"), value=payload["armband"], inline=True)
+    e.add_field(name="👑 Leader", value=f"<@{payload['leader_user_id']}>", inline=True)
+    e.add_field(name=_t(interaction, "👥 Mitglieder", "👥 Members"),
+                value=f"{len(payload['member_user_ids'])}/{payload['member_limit']}", inline=True)
+    if officers:
+        e.add_field(name="⭐ Officers", value=" ".join(officers)[:1024], inline=False)
+    if members:
+        e.add_field(name=_t(interaction, "Mitglieder", "Members"), value=" ".join(members)[:1024], inline=False)
+    if payload["zone_id"]:
+        zone = _find_zone_by_id(payload["zone_id"], conn)
+        if zone:
+            e.add_field(name=_t(interaction, "🛡️ Zone", "🛡️ Zone"), value=str(zone.get("name")), inline=True)
+    if payload["discord_invite"]:
+        e.add_field(name=_t(interaction, "🔗 Einladung", "🔗 Invite"), value=payload["discord_invite"], inline=False)
+    if payload["icon_url"]:
+        e.set_thumbnail(url=payload["icon_url"])
+    if payload["flag_url"]:
+        e.set_image(url=payload["flag_url"])
+    await interaction.response.send_message(embed=e)
+
+faction_info.autocomplete("faction")(_faction_name_autocomplete)
+
+
+@faction_group.command(name="list", description="📋 Show all factions on this server")
+async def faction_list(interaction: discord.Interaction):
+    if not await _require_guild(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    factions = [f for f in _factions(conn) if isinstance(f, dict) and f.get("name")]
+    if not factions:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "ℹ️ Keine Fraktionen angelegt. Im Dashboard unter „Factions“ eine Fraktion erstellen.",
+            "ℹ️ No factions set up. Create one in the dashboard under „Factions“."), ephemeral=True)
+    e = discord.Embed(title=_t(interaction, f"🚩 Fraktionen ({len(factions)})",
+                               f"🚩 Factions ({len(factions)})"), color=0x3498DB)
+    mitglieder_wort = _t(interaction, "Mitglieder", "members")
+    for f in factions[:25]:
+        payload = _faction_payload(f)
+        e.add_field(name=f"🚩 {f['name']}",
+                    value=(f"👑 <@{payload['leader_user_id']}> · "
+                          f"{len(payload['member_user_ids'])}/{payload['member_limit']} {mitglieder_wort}"),
+                    inline=False)
+    if len(factions) > 25:
+        e.set_footer(text=_t(interaction, f"… und {len(factions) - 25} weitere (Embed-Limit)",
+                             f"… and {len(factions) - 25} more (embed limit)"))
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@faction_group.command(name="balance", description="💳 Show your faction's treasury balance")
+@app_commands.describe(faction="Faction name (leave empty for your own)")
+async def faction_balance(interaction: discord.Interaction, faction: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    f = _find_faction(faction, conn) if faction else _faction_of_member(conn, interaction.user.id)
+    if f is None:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Fraktion nicht gefunden." if faction else "❌ Du bist in keiner Fraktion.",
+            "❌ Faction not found." if faction else "❌ You're not in a faction."), ephemeral=True)
+    if _faction_role(f, interaction.user.id) is None and not _is_admin(interaction):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Nur Mitglieder dieser Fraktion können den Kontostand sehen.",
+            "❌ Only members of this faction can see its balance."), ephemeral=True)
+    balance = db.get_faction_balance(int(f["guild_id"]), int(f["id"]))
+    e = discord.Embed(title=_t(interaction, f"💳 Fraktionskonto – {f['name']}",
+                               f"💳 Faction Balance – {f['name']}"),
+                      description=f"🏦 {_fmt_money(balance, conn)}",
+                      color=int(f.get("colour") or _FACTION_COLOUR_DEFAULT))
+    await interaction.response.send_message(embed=e)
+
+faction_balance.autocomplete("faction")(_faction_name_autocomplete)
+
+
+@faction_group.command(name="deposit", description="🏦 Move money from your wallet into your faction's treasury")
+@app_commands.describe(betrag="Amount from your wallet")
+async def faction_deposit(interaction: discord.Interaction, betrag: app_commands.Range[int, 1]):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    f = _faction_of_member(conn, interaction.user.id)
+    if f is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Du bist in keiner Fraktion.", "❌ You're not in a faction."), ephemeral=True)
+    if not db.try_spend_wallet(interaction.guild_id, interaction.user.id, int(betrag)):
+        wallet, _bank = db.get_balance(interaction.guild_id, interaction.user.id)
+        return await interaction.response.send_message(
+            embed=_insufficient_embed(int(betrag), wallet), ephemeral=True)
+    neu = db.add_faction_balance(int(f["guild_id"]), int(f["id"]), int(betrag))
+    e = discord.Embed(
+        title=_t(interaction, "🏦 Einzahlung erfolgreich", "🏦 Deposit successful"),
+        description=_t(interaction, f"**{_fmt_money(betrag, conn)}** in die Kasse von **{f['name']}** eingezahlt.",
+                       f"Deposited **{_fmt_money(betrag, conn)}** into **{f['name']}**'s treasury."),
+        color=0x2ECC71)
+    e.add_field(name=_t(interaction, "🏦 Fraktionskasse", "🏦 Faction Treasury"), value=_fmt_money(neu, conn))
+    await interaction.response.send_message(embed=e)
+
+
+@faction_group.command(name="withdraw",
+                       description="👛 Move money from your faction's treasury into your wallet (leader/officer)")
+@app_commands.describe(betrag="Amount from the faction treasury")
+async def faction_withdraw(interaction: discord.Interaction, betrag: app_commands.Range[int, 1]):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    f = _faction_of_member(conn, interaction.user.id)
+    if f is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Du bist in keiner Fraktion.", "❌ You're not in a faction."), ephemeral=True)
+    if _faction_role(f, interaction.user.id) not in ("leader", "officer") and not _is_admin(interaction):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Nur Leader/Officer dürfen aus der Fraktionskasse abheben.",
+            "❌ Only leaders/officers can withdraw from the faction treasury."), ephemeral=True)
+    gid, fid = int(f["guild_id"]), int(f["id"])
+    if not db.try_spend_faction_balance(gid, fid, int(betrag)):
+        return await interaction.response.send_message(
+            embed=_insufficient_embed(int(betrag), db.get_faction_balance(gid, fid)), ephemeral=True)
+    wallet, _bank = db.add_wallet(interaction.guild_id, interaction.user.id, int(betrag))
+    e = discord.Embed(
+        title=_t(interaction, "👛 Abhebung erfolgreich", "👛 Withdraw successful"),
+        description=_t(interaction, f"**{_fmt_money(betrag, conn)}** aus **{f['name']}**s Kasse abgehoben.",
+                       f"Withdrew **{_fmt_money(betrag, conn)}** from **{f['name']}**'s treasury."),
+        color=0x2ECC71)
+    e.add_field(name="👛 Wallet", value=_fmt_money(wallet, conn))
+    await interaction.response.send_message(embed=e)
+
+
+@faction_group.command(name="pay",
+                       description="💸 Pay a fellow member from the faction treasury (leader/officer)")
+@app_commands.describe(mitglied="Recipient (must be a member of your faction)",
+                       betrag="Amount from the faction treasury")
+async def faction_pay(interaction: discord.Interaction, mitglied: discord.Member,
+                      betrag: app_commands.Range[int, 1]):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    f = _faction_of_member(conn, interaction.user.id)
+    if f is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Du bist in keiner Fraktion.", "❌ You're not in a faction."), ephemeral=True)
+    if _faction_role(f, interaction.user.id) not in ("leader", "officer") and not _is_admin(interaction):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Nur Leader/Officer dürfen aus der Fraktionskasse auszahlen.",
+            "❌ Only leaders/officers can pay out of the faction treasury."), ephemeral=True)
+    if _faction_role(f, mitglied.id) is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Diese Person ist kein Mitglied deiner Fraktion.",
+            "❌ That person is not a member of your faction."), ephemeral=True)
+    gid, fid = int(f["guild_id"]), int(f["id"])
+    if not db.try_spend_faction_balance(gid, fid, int(betrag)):
+        return await interaction.response.send_message(
+            embed=_insufficient_embed(int(betrag), db.get_faction_balance(gid, fid)), ephemeral=True)
+    db.add_wallet(interaction.guild_id, mitglied.id, int(betrag))
+    e = discord.Embed(
+        title=_t(interaction, "💸 Auszahlung erfolgreich", "💸 Payment successful"),
+        description=_t(interaction, f"**{_fmt_money(betrag, conn)}** an {mitglied.mention} ausgezahlt.",
+                       f"Paid **{_fmt_money(betrag, conn)}** to {mitglied.mention}."),
+        color=0x2ECC71)
+    await interaction.response.send_message(embed=e)
+
+
+@faction_group.command(name="stats", description="📊 Show a faction's PvP stats")
+@app_commands.describe(faction="Faction name (leave empty for your own)")
+async def faction_stats(interaction: discord.Interaction, faction: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    f = _find_faction(faction, conn) if faction else _faction_of_member(conn, interaction.user.id)
+    if f is None:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Fraktion nicht gefunden." if faction else "❌ Du bist in keiner Fraktion.",
+            "❌ Faction not found." if faction else "❌ You're not in a faction."), ephemeral=True)
+    gid = int(f["guild_id"])
+    kills = deaths = 0
+    for uid in (f.get("member_user_ids") or []):
+        try:
+            row = db.get_link_by_user(gid, int(uid))
+        except (TypeError, ValueError):
+            continue
+        if not row:
+            continue
+        st = db.player_stats(conn.service_id, str(row["ingame_name"]))
+        if st:
+            kills += int(st["kills"])
+            deaths += int(st["deaths"])
+    kd = (kills / deaths) if deaths else float(kills)
+    e = discord.Embed(title=_t(interaction, f"📊 Statistiken – {f['name']}", f"📊 Stats – {f['name']}"),
+                      color=int(f.get("colour") or _FACTION_COLOUR_DEFAULT))
+    e.add_field(name="☠️ Kills", value=str(kills), inline=True)
+    e.add_field(name=_t(interaction, "💀 Tode", "💀 Deaths"), value=str(deaths), inline=True)
+    e.add_field(name="⚖️ K/D", value=f"{kd:.2f}", inline=True)
+    await interaction.response.send_message(embed=e)
+
+faction_stats.autocomplete("faction")(_faction_name_autocomplete)
+
+
+@faction_group.command(name="map", description="🗺️ Post a map image with a faction's online members")
+@app_commands.describe(faction="Faction name (leave empty for your own)")
+async def faction_map(interaction: discord.Interaction, faction: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    f = _find_faction(faction, conn) if faction else _faction_of_member(conn, interaction.user.id)
+    if f is None:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Fraktion nicht gefunden." if faction else "❌ Du bist in keiner Fraktion.",
+            "❌ Faction not found." if faction else "❌ You're not in a faction."), ephemeral=True)
+    if not _PIL_AVAILABLE:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Kartenbilder brauchen das Python-Paket „Pillow“ – der Bot-Betreiber muss es "
+            "auf dem Server nachinstallieren (`pip install Pillow`).",
+            "❌ Map images need the Python package „Pillow“ – the bot operator needs to "
+            "install it on the server (`pip install Pillow`)."), ephemeral=True)
+    await interaction.response.defer()
+    players = _faction_online_positions(conn, f)
+    if not players:
+        return await interaction.followup.send(_t(
+            interaction,
+            f"> **Fehler**\nNiemand aus der Fraktion **{f['name']}** ist gerade auf "
+            f"**{conn.name}** online.",
+            f"> **Error**\nNobody from the faction **{f['name']}** is currently online "
+            f"on **{conn.name}**."))
+    map_name = conn.get("map_name", "ChernarusPlus")
+    base = await _build_faction_map_base(map_name)
+    if base is None:
+        return await interaction.followup.send(_t(
+            interaction,
+            "❌ Kartenbild konnte nicht geladen werden (Kachel-Server nicht erreichbar).",
+            "❌ Could not load the map image (tile server unreachable)."))
+    world_size = _world_size(map_name)
+    farbe = int(f.get("colour") or _FACTION_COLOUR_DEFAULT)
+    loop = asyncio.get_running_loop()
+    img = await loop.run_in_executor(None, _draw_faction_map, base, world_size, players)
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    buf.seek(0)
+    datei = discord.File(buf, filename="faction_map.png")
+    anzahl_wort = _t(interaction, "online", "online")
+    e = discord.Embed(
+        title=_t(interaction, f"🗺️ Karte – {f['name']}", f"🗺️ Map – {f['name']}"),
+        description=f"{len(players)} {anzahl_wort}",
+        color=farbe)
+    e.set_image(url="attachment://faction_map.png")
+    await interaction.followup.send(embed=e, file=datei)
+
+faction_map.autocomplete("faction")(_faction_name_autocomplete)
+
+
+# ── /faction member – Mitglieder verwalten (Leader/Officer) ──
+member_group = app_commands.Group(name="member", description="👥 Manage faction members (leader/officer)",
+                                  parent=faction_group)
+
+
+@member_group.command(name="add", description="➕ Add a member to your faction (leader/officer)")
+@app_commands.describe(spieler="Discord member to add")
+async def faction_member_add(interaction: discord.Interaction, spieler: discord.Member):
+    if not await _require_guild(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    f = _faction_of_member(conn, interaction.user.id)
+    if f is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Du bist in keiner Fraktion.", "❌ You're not in a faction."), ephemeral=True)
+    if _faction_role(f, interaction.user.id) not in ("leader", "officer") and not _is_admin(interaction):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Nur Leader/Officer dürfen Mitglieder hinzufügen.",
+            "❌ Only leaders/officers can add members."), ephemeral=True)
+    if _faction_of_member(conn, spieler.id) is not None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Diese Person ist bereits in einer Fraktion.",
+            "❌ That person is already in a faction."), ephemeral=True)
+    limit = int(f.get("member_limit") or _FACTION_MEMBER_LIMIT_DEFAULT)
+    mitglieder = f.get("member_user_ids") or []
+    if len(mitglieder) >= limit:
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Fraktion ist voll ({len(mitglieder)}/{limit}).",
+            f"❌ Faction is full ({len(mitglieder)}/{limit})."), ephemeral=True)
+    mitglieder.append(spieler.id)
+    f["member_user_ids"] = mitglieder
+    roles = f.get("member_roles")
+    if not isinstance(roles, dict):
+        roles = {}
+        f["member_roles"] = roles
+    roles[str(spieler.id)] = "member"
+    _factions_save(conn)
+    await _faction_sync_zone_allowlist(conn, f, add_ids=[spieler.id])
+    e = discord.Embed(
+        title=_t(interaction, "➕ Mitglied hinzugefügt", "➕ Member added"),
+        description=_t(interaction, f"{spieler.mention} ist jetzt Mitglied von **{f['name']}**.",
+                       f"{spieler.mention} is now a member of **{f['name']}**."),
+        color=0x2ECC71)
+    await interaction.response.send_message(embed=e)
+
+
+@member_group.command(name="remove", description="➖ Remove a member from your faction (leader/officer)")
+@app_commands.describe(spieler="Discord member to remove")
+async def faction_member_remove(interaction: discord.Interaction, spieler: discord.Member):
+    if not await _require_guild(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    f = _faction_of_member(conn, interaction.user.id)
+    if f is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Du bist in keiner Fraktion.", "❌ You're not in a faction."), ephemeral=True)
+    if _faction_role(f, interaction.user.id) not in ("leader", "officer") and not _is_admin(interaction):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Nur Leader/Officer dürfen Mitglieder entfernen.",
+            "❌ Only leaders/officers can remove members."), ephemeral=True)
+    if _faction_role(f, spieler.id) is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Diese Person ist kein Mitglied dieser Fraktion.",
+            "❌ That person is not a member of this faction."), ephemeral=True)
+    if int(f.get("leader_user_id") or 0) == spieler.id:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Der Leader kann nicht per Befehl entfernt werden – Leader im Dashboard ändern.",
+            "❌ The leader can't be removed via command – change the leader in the dashboard."),
+            ephemeral=True)
+    f["member_user_ids"] = [u for u in (f.get("member_user_ids") or []) if int(u) != spieler.id]
+    roles = f.get("member_roles")
+    if isinstance(roles, dict):
+        roles.pop(str(spieler.id), None)
+    _factions_save(conn)
+    await _faction_sync_zone_allowlist(conn, f, remove_ids=[spieler.id])
+    e = discord.Embed(
+        title=_t(interaction, "➖ Mitglied entfernt", "➖ Member removed"),
+        description=_t(interaction, f"{spieler.mention} wurde aus **{f['name']}** entfernt.",
+                       f"{spieler.mention} was removed from **{f['name']}**."),
+        color=0xE67E22)
+    await interaction.response.send_message(embed=e)
+
+
+# ── /faction permission – Officer-Rechte vergeben/entziehen (nur Leader) ──
+permission_group = app_commands.Group(
+    name="permission", description="⭐ Grant/revoke officer permissions (leader only)", parent=faction_group)
+
+
+@permission_group.command(name="grant", description="⭐ Promote a member to officer (leader only)")
+@app_commands.describe(mitglied="Member of your faction")
+async def faction_permission_grant(interaction: discord.Interaction, mitglied: discord.Member):
+    if not await _require_guild(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    f = _faction_of_member(conn, interaction.user.id)
+    if f is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Du bist in keiner Fraktion.", "❌ You're not in a faction."), ephemeral=True)
+    if _faction_role(f, interaction.user.id) != "leader" and not _is_admin(interaction):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Nur der Leader darf Officer-Rechte vergeben.",
+            "❌ Only the leader can grant officer permissions."), ephemeral=True)
+    if _faction_role(f, mitglied.id) is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Diese Person ist kein Mitglied dieser Fraktion.",
+            "❌ That person is not a member of this faction."), ephemeral=True)
+    if mitglied.id == int(f.get("leader_user_id") or 0):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Der Leader hat bereits alle Rechte.",
+            "❌ The leader already has all permissions."), ephemeral=True)
+    roles = f.get("member_roles")
+    if not isinstance(roles, dict):
+        roles = {}
+        f["member_roles"] = roles
+    roles[str(mitglied.id)] = "officer"
+    _factions_save(conn)
+    e = discord.Embed(
+        title=_t(interaction, "⭐ Officer befördert", "⭐ Promoted to officer"),
+        description=_t(interaction, f"{mitglied.mention} ist jetzt Officer in **{f['name']}**.",
+                       f"{mitglied.mention} is now an officer in **{f['name']}**."),
+        color=0x2ECC71)
+    await interaction.response.send_message(embed=e)
+
+
+@permission_group.command(name="revoke", description="⬇️ Demote an officer back to member (leader only)")
+@app_commands.describe(mitglied="Member of your faction")
+async def faction_permission_revoke(interaction: discord.Interaction, mitglied: discord.Member):
+    if not await _require_guild(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    f = _faction_of_member(conn, interaction.user.id)
+    if f is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Du bist in keiner Fraktion.", "❌ You're not in a faction."), ephemeral=True)
+    if _faction_role(f, interaction.user.id) != "leader" and not _is_admin(interaction):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Nur der Leader darf Officer-Rechte entziehen.",
+            "❌ Only the leader can revoke officer permissions."), ephemeral=True)
+    if _faction_role(f, mitglied.id) != "officer":
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Diese Person ist kein Officer dieser Fraktion.",
+            "❌ That person is not an officer of this faction."), ephemeral=True)
+    f["member_roles"][str(mitglied.id)] = "member"
+    _factions_save(conn)
+    e = discord.Embed(
+        title=_t(interaction, "⬇️ Officer-Rechte entzogen", "⬇️ Officer permissions revoked"),
+        description=_t(interaction, f"{mitglied.mention} ist jetzt normales Mitglied in **{f['name']}**.",
+                       f"{mitglied.mention} is now a regular member in **{f['name']}**."),
+        color=0xE67E22)
+    await interaction.response.send_message(embed=e)
+
+
+bot.tree.add_command(faction_group)
+
+
+# ══════════════════════════════════════════════════════════════
 #  Ban-Hilfsfunktionen (Banliste in den Nitrado-Servereinstellungen –
 #  dasselbe Settings-Feld wie im Webinterface, 1 Name pro Zeile)
 # ══════════════════════════════════════════════════════════════
@@ -11878,6 +12546,15 @@ class EconomyDB:
                 status      TEXT DEFAULT 'open',
                 claimed_by  INTEGER,
                 claimed_at  REAL)""")
+            # Fraktionskassen – faction_id verweist auf die id in
+            # conn.data["factions"] (Stammdaten liegen dort, nicht hier, damit
+            # sie dashboard-editierbar bleiben; nur das Geld selbst braucht die
+            # atomare Abbuchung, die eine JSON-Datei nicht bieten kann).
+            c.execute("""CREATE TABLE IF NOT EXISTS faction_balances (
+                guild_id    INTEGER NOT NULL,
+                faction_id  INTEGER NOT NULL,
+                balance     INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, faction_id))""")
             # Offene Spielzeit-Sitzungen (connect → disconnect/Restart).
             # service_id gehoert in den Primaerschluessel: derselbe Spielername
             # kann gleichzeitig auf mehreren Servern online sein.
@@ -12096,6 +12773,49 @@ class EconomyDB:
                 (move, move, guild_id, user_id))
             self._conn.commit()
             return move, int(row["wallet"]) + move, int(row["bank"]) - move
+
+    # ── Fraktionskassen ───────────────────────────────────────
+    def get_faction_balance(self, guild_id: int, faction_id: int) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT balance FROM faction_balances WHERE guild_id=? AND faction_id=?",
+                (guild_id, faction_id)).fetchone()
+        return int(row["balance"]) if row else 0
+
+    def add_faction_balance(self, guild_id: int, faction_id: int, delta: int) -> int:
+        """Addiert delta (auch negativ) zur Fraktionskasse – nie unter 0."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO faction_balances (guild_id, faction_id, balance) "
+                "VALUES (?,?,0)", (guild_id, faction_id))
+            self._conn.execute(
+                "UPDATE faction_balances SET balance = MIN(?, MAX(0, balance + ?)) "
+                "WHERE guild_id=? AND faction_id=?",
+                (_SQLITE_INT_MAX, int(delta), guild_id, faction_id))
+            self._conn.commit()
+        return self.get_faction_balance(guild_id, faction_id)
+
+    def try_spend_faction_balance(self, guild_id: int, faction_id: int, amount: int) -> bool:
+        """Atomare Abbuchung aus der Fraktionskasse (kein Race möglich)."""
+        if amount < 0:
+            return False
+        if amount == 0:
+            return True
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE faction_balances SET balance = balance - ? "
+                "WHERE guild_id=? AND faction_id=? AND balance >= ?",
+                (amount, guild_id, faction_id, amount))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def delete_faction_balance(self, guild_id: int, faction_id: int) -> None:
+        """Räumt die Kasse einer gelöschten Fraktion auf."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM faction_balances WHERE guild_id=? AND faction_id=?",
+                (guild_id, faction_id))
+            self._conn.commit()
 
     # ── Cooldowns ─────────────────────────────────────────────
     def cooldown_remaining(self, guild_id: int, user_id: int, action: str) -> float:
@@ -17130,6 +17850,7 @@ _DASH_PERM_CATS: Tuple[Tuple[str, str, str, Tuple[str, ...]], ...] = (
     ("feeds", "Feeds", "Feeds", ("view", "edit")),
     ("diagnose", "Diagnose", "Diagnostics", ("view",)),
     ("zones", "Zones", "Zones", ("view", "create", "edit", "delete")),
+    ("factions", "Factions", "Factions", ("view", "create", "edit", "delete")),
     ("autotasks", "Auto-Aufgaben", "Scheduled Tasks", ("view", "create", "edit", "delete")),
     ("shop", "Shop", "Shop", ("view", "create", "edit", "delete")),
     ("tools", "Tools", "Tools", ("view", "edit")),
@@ -19342,6 +20063,337 @@ async def delete_zone(request: web.Request) -> web.Response:
 
 
 # ══════════════════════════════════════════════════════════════
+#  Fraktionen verwalten (Dashboard – kein /faction create|edit|remove
+#  per Discord, wie bei Zonen: nur /faction list und die
+#  Mitglieder-/Geld-Befehle sind Slash-Commands).
+#
+#  Fraktionen liegen in ``connections.json["factions"]``. Schema (siehe
+#  ``_faction_payload``): ``{id, name, guild_id, leader_user_id,
+#  member_user_ids, member_roles: {user_id: "leader"|"officer"|"member"},
+#  member_limit, armband, flag_url?, discord_invite?, icon_url?, colour,
+#  zone_id?}``. Das Guthaben liegt NICHT hier, sondern in SQLite
+#  (``EconomyDB.faction_balances``, atomare Abbuchung).
+# ══════════════════════════════════════════════════════════════
+def _faction_ziel(request: web.Request, conn: ServerConnection, data: dict,
+                  alt: Optional[dict] = None
+                  ) -> Tuple[Optional[dict], Optional[web.Response]]:
+    """Guild, Leader und Mitgliederliste einer Fraktion gegen die Anmeldung
+    pruefen – dieselbe Absicherung wie ``_zonen_ziel``, aus demselben Grund:
+    ohne sie liesse sich eine Discord-User-ID eintragen, die gar nicht zu
+    DIESER Guild gehoert (siehe Kommentar dort).
+    """
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    if not gid:
+        return None, err("Für diesen Server ist noch kein Discord-Server "
+                         "zugeordnet – der Bot-Betreiber schaltet ihn frei.", 409)
+    g = bot.get_guild(gid) if bot else None
+
+    try:
+        leader_id = int(data.get("leader_user_id"))
+    except (TypeError, ValueError):
+        return None, err("leader_user_id muss eine Zahl sein.")
+
+    roh_mitglieder = data.get("member_user_ids")
+    if not isinstance(roh_mitglieder, list):
+        return None, err("member_user_ids muss eine Liste sein.")
+    mitglieder: List[int] = []
+    for roh in roh_mitglieder:
+        try:
+            uid = int(roh)
+        except (TypeError, ValueError):
+            return None, err("Jede Mitglieder-ID muss eine Zahl sein.")
+        if uid not in mitglieder:
+            mitglieder.append(uid)
+    if leader_id not in mitglieder:
+        mitglieder.append(leader_id)
+
+    alt_mitglieder = set((alt or {}).get("member_user_ids") or [])
+    alt_gid = int((alt or {}).get("guild_id") or 0)
+    neue = [m for m in mitglieder if not (m in alt_mitglieder and alt_gid == gid)]
+    if neue:
+        if g is None:
+            if bot is None or not bot.is_ready():
+                return None, err("Der Bot ist gerade nicht bei Discord angemeldet – "
+                                 "neue Mitglieder lassen sich erst prüfen, wenn er "
+                                 "wieder verbunden ist.", 409)
+            return None, err("Der Bot erreicht diesen Discord-Server nicht – "
+                             "Mitglieder können deshalb nicht geprüft werden. "
+                             "Ist der Bot dort eingeladen?", 409)
+        for uid in neue:
+            if g.get_member(uid) is None:
+                return None, err(f"Discord-Mitglied `{uid}` ist nicht auf diesem "
+                                 "Discord-Server.")
+
+    return {"guild_id": gid, "leader_user_id": leader_id,
+            "member_user_ids": mitglieder}, None
+
+
+def _faction_member_konflikt(conn: ServerConnection, mitglieder: List[int],
+                             ausser: Optional[Dict] = None) -> Optional[int]:
+    """Erste Mitglieder-ID, die bereits einer ANDEREN Fraktion angehört
+    (eine Person ist immer nur in höchstens einer Fraktion pro Server)."""
+    for f in _factions(conn):
+        if not isinstance(f, dict) or f is ausser:
+            continue
+        bestehend = set(int(u) for u in (f.get("member_user_ids") or [])
+                        if isinstance(u, (int, str)) and str(u).strip().lstrip("-").isdigit())
+        treffer = bestehend & set(mitglieder)
+        if treffer:
+            return next(iter(treffer))
+    return None
+
+
+def _faction_colour_aus_anfrage(data: dict) -> Tuple[Optional[int], Optional[web.Response]]:
+    """Farbe wie ``set_feed``: Hex-String ('#rrggbb') oder Zahl, sonst Vorgabe."""
+    roh = data.get("colour")
+    if roh in (None, ""):
+        return _FACTION_COLOUR_DEFAULT, None
+    try:
+        farbe = (int(str(roh).lstrip("#"), 16) if isinstance(roh, str)
+                 else int(roh)) & 0xFFFFFF
+    except (TypeError, ValueError):
+        return None, err("Ungültige Farbe.")
+    return farbe, None
+
+
+async def list_factions(request: web.Request) -> web.Response:
+    _c, denied = _session_conn(request, "factions")
+    if denied is not None:
+        return denied
+    denied = await _modul_pruefen("factions", request, _c)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, _c, "factions", "view")
+    if denied is not None:
+        return denied
+    factions = [f for f in _factions(_c) if isinstance(f, dict) and f.get("name")]
+    if _ensure_faction_ids(factions):
+        _factions_save(_c)
+    gid = int(_c.guild_id) if _c.guild_id else 0
+    out = []
+    for f in factions:
+        payload = _faction_payload(f)
+        payload["balance"] = db.get_faction_balance(gid, int(f["id"])) if gid else 0
+        out.append(payload)
+    return ok({"factions": out, "kategorie_stufe": _module_tier("factions")})
+
+
+async def create_faction(request: web.Request) -> web.Response:
+    _c, denied = _session_conn(request, "factions")
+    if denied is not None:
+        return denied
+    denied = await _modul_pruefen("factions", request, _c)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, _c, "factions", "create")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "factions.create", 5)
+    if denied is not None:
+        return denied
+    data = await body(request)
+
+    name = str(data.get("name", "")).strip()
+    if not name or len(name) > 60:
+        return err("Fraktions-Name fehlt oder ist länger als 60 Zeichen.")
+    if _find_faction(name, _c):
+        return err(f"Fraktion '{name}' existiert bereits.")
+
+    ziel, denied = _faction_ziel(request, _c, data)
+    if denied is not None:
+        return denied
+    mitglieder = ziel["member_user_ids"]
+
+    try:
+        limit = int(data.get("member_limit") or _FACTION_MEMBER_LIMIT_DEFAULT)
+    except (TypeError, ValueError):
+        return err("member_limit muss eine Zahl sein.")
+    limit = max(1, min(limit, _FACTION_MEMBER_LIMIT_MAX))
+    if len(mitglieder) > limit:
+        return err(f"Mitgliederzahl ({len(mitglieder)}) übersteigt das Limit ({limit}).")
+
+    konflikt = _faction_member_konflikt(_c, mitglieder)
+    if konflikt is not None:
+        return err(f"Discord-Mitglied `{konflikt}` ist bereits in einer anderen Fraktion.")
+
+    zone = None
+    zone_id_raw = data.get("zone_id")
+    if zone_id_raw not in (None, ""):
+        zone = _find_zone_by_id(zone_id_raw, _c)
+        if zone is None:
+            return err("Zone nicht gefunden.")
+
+    farbe, denied = _faction_colour_aus_anfrage(data)
+    if denied is not None:
+        return denied
+
+    faction: Dict[str, Any] = {
+        "name": name,
+        "guild_id": ziel["guild_id"],
+        "leader_user_id": ziel["leader_user_id"],
+        "member_user_ids": mitglieder,
+        "member_roles": {str(uid): ("leader" if uid == ziel["leader_user_id"] else "member")
+                         for uid in mitglieder},
+        "member_limit": limit,
+        "armband": str(data.get("armband") or "").strip()[:64],
+        "flag_url": (str(data.get("flag_url")).strip()[:300] or None) if data.get("flag_url") else None,
+        "discord_invite": (str(data.get("discord_invite")).strip()[:300]
+                           or None) if data.get("discord_invite") else None,
+        "icon_url": (str(data.get("icon_url")).strip()[:300] or None) if data.get("icon_url") else None,
+        "colour": farbe,
+        "zone_id": int(zone["id"]) if zone else None,
+    }
+
+    factions = _factions(_c)
+    factions.append(faction)
+    _ensure_faction_ids(factions)
+    _factions_save(_c)
+    if faction["zone_id"]:
+        await _faction_sync_zone_allowlist(_c, faction, add_ids=mitglieder)
+    return ok(_faction_payload(faction))
+
+
+async def update_faction(request: web.Request) -> web.Response:
+    _c, denied = _session_conn(request, "factions")
+    if denied is not None:
+        return denied
+    denied = await _modul_pruefen("factions", request, _c)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, _c, "factions", "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "factions.edit", 5)
+    if denied is not None:
+        return denied
+    faction = _find_faction(request.match_info["name"], _c)
+    if not faction:
+        return err("Fraktion nicht gefunden.", 404)
+    data = await body(request)
+
+    new_name = str(data.get("name", faction["name"])).strip() or faction["name"]
+    if new_name.lower() != str(faction["name"]).lower() and _find_faction(new_name, _c):
+        return err(f"Fraktion '{new_name}' existiert bereits.")
+
+    ziel, denied = _faction_ziel(request, _c, data, alt=faction)
+    if denied is not None:
+        return denied
+    mitglieder = ziel["member_user_ids"]
+
+    try:
+        limit = int(data.get("member_limit") or faction.get("member_limit")
+                   or _FACTION_MEMBER_LIMIT_DEFAULT)
+    except (TypeError, ValueError):
+        return err("member_limit muss eine Zahl sein.")
+    limit = max(1, min(limit, _FACTION_MEMBER_LIMIT_MAX))
+    if len(mitglieder) > limit:
+        return err(f"Mitgliederzahl ({len(mitglieder)}) übersteigt das Limit ({limit}).")
+
+    konflikt = _faction_member_konflikt(_c, mitglieder, ausser=faction)
+    if konflikt is not None:
+        return err(f"Discord-Mitglied `{konflikt}` ist bereits in einer anderen Fraktion.")
+
+    zone = None
+    zone_id_raw = data.get("zone_id", faction.get("zone_id"))
+    if zone_id_raw not in (None, ""):
+        zone = _find_zone_by_id(zone_id_raw, _c)
+        if zone is None:
+            return err("Zone nicht gefunden.")
+
+    farbe, denied = _faction_colour_aus_anfrage(
+        data if "colour" in data else {"colour": faction.get("colour")})
+    if denied is not None:
+        return denied
+
+    alte_mitglieder = set(int(u) for u in (faction.get("member_user_ids") or []))
+    alte_zone_id = faction.get("zone_id")
+    alte_rollen = faction.get("member_roles") if isinstance(faction.get("member_roles"), dict) else {}
+    alter_leader = faction.get("leader_user_id")
+
+    faction["name"] = new_name
+    faction["guild_id"] = ziel["guild_id"]
+    faction["leader_user_id"] = ziel["leader_user_id"]
+    faction["member_user_ids"] = mitglieder
+    faction["member_limit"] = limit
+    if "armband" in data:
+        faction["armband"] = str(data.get("armband") or "").strip()[:64]
+    if "flag_url" in data:
+        faction["flag_url"] = (str(data.get("flag_url")).strip()[:300]
+                               or None) if data.get("flag_url") else None
+    if "discord_invite" in data:
+        faction["discord_invite"] = (str(data.get("discord_invite")).strip()[:300]
+                                     or None) if data.get("discord_invite") else None
+    if "icon_url" in data:
+        faction["icon_url"] = (str(data.get("icon_url")).strip()[:300]
+                               or None) if data.get("icon_url") else None
+    faction["colour"] = farbe
+    faction["zone_id"] = int(zone["id"]) if zone else None
+
+    # Rollen: bestehende Mitglieder behalten ihre Rolle, ein neuer Leader
+    # wird "leader", ein bisheriger Leader (falls noch Mitglied) faellt auf
+    # "officer" statt ganz rauszufallen, neue Mitglieder starten als "member".
+    neue_rollen: Dict[str, str] = {}
+    for uid in mitglieder:
+        key = str(uid)
+        if uid == ziel["leader_user_id"]:
+            neue_rollen[key] = "leader"
+        elif alte_rollen.get(key) in ("officer", "member"):
+            neue_rollen[key] = alte_rollen[key]
+        elif uid == alter_leader:
+            neue_rollen[key] = "officer"
+        else:
+            neue_rollen[key] = "member"
+    faction["member_roles"] = neue_rollen
+
+    _factions_save(_c)
+
+    neue_mitglieder = set(mitglieder)
+    neue_zone_id = faction["zone_id"]
+    if alte_zone_id != neue_zone_id:
+        if alte_zone_id:
+            _faction_temp = dict(faction); _faction_temp["zone_id"] = alte_zone_id
+            await _faction_sync_zone_allowlist(_c, _faction_temp, remove_ids=alte_mitglieder)
+        if neue_zone_id:
+            await _faction_sync_zone_allowlist(_c, faction, add_ids=neue_mitglieder)
+    else:
+        await _faction_sync_zone_allowlist(
+            _c, faction,
+            add_ids=neue_mitglieder - alte_mitglieder,
+            remove_ids=alte_mitglieder - neue_mitglieder)
+
+    return ok(_faction_payload(faction))
+
+
+async def delete_faction(request: web.Request) -> web.Response:
+    _c, denied = _session_conn(request, "factions")
+    if denied is not None:
+        return denied
+    denied = await _modul_pruefen("factions", request, _c)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, _c, "factions", "delete")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "factions.delete", 5)
+    if denied is not None:
+        return denied
+    faction = _find_faction(request.match_info["name"], _c)
+    if not faction:
+        return err("Fraktion nicht gefunden.", 404)
+    name = str(faction["name"])
+    if faction.get("zone_id"):
+        mitglieder = set(int(u) for u in (faction.get("member_user_ids") or []))
+        await _faction_sync_zone_allowlist(_c, faction, remove_ids=mitglieder)
+    gid = int(faction.get("guild_id") or 0)
+    fid = faction.get("id")
+    _factions(_c).remove(faction)
+    _factions_save(_c)
+    if gid and fid:
+        db.delete_faction_balance(gid, int(fid))
+    return ok({"removed": name})
+
+
+# ══════════════════════════════════════════════════════════════
 #  Auto-Aufgaben (Scheduled Tasks): mehrere geplante Aufgaben je Server
 # ══════════════════════════════════════════════════════════════
 def _scheduled_task_payload(t: Dict) -> Dict[str, Any]:
@@ -20683,6 +21735,160 @@ def _tile_url(map_name: str) -> str:
     return _XAM_TEMPLATE.format(folder=folder) if folder else ""
 
 
+# ──────────────────────────────────────────────────────────────────────────
+#  /faction map – Kartenbild mit den Online-Mitgliedern EINER Fraktion, als
+#  Datei in Discord gepostet (nicht im Dashboard, s. Wunsch von Brigarde).
+#  Baut dieselbe Pixel-Position nach, die das Dashboard per Leaflet
+#  (CRS.Simple) berechnet: siehe Herleitung im Kommentar bei _game_to_pixel.
+# ──────────────────────────────────────────────────────────────────────────
+_FACTION_MAP_ZOOM = 2          # 4×4 = 16 Kacheln, 1024×1024px Basisbild –
+                                # genug fuer eine Uebersicht, ohne bei jedem
+                                # /faction map dutzende Kacheln laden zu muessen.
+_FACTION_MAP_CACHE_DIR = "faction_map_cache"
+_faction_map_base_cache: Dict[str, Any] = {}   # map_name -> PIL.Image (Prozess-Cache)
+
+
+def _game_to_pixel(x: float, z: float, world_size: int, canvas_px: int) -> Tuple[float, float]:
+    """Game-Koordinaten (x=Ost, z=Nord) → Pixel im Kartenbild.
+
+    Exakt dieselbe Transformation, die das Dashboard ueber Leaflet CRS.Simple
+    verwendet (map.js: g2ll + DZTileLayer): CRS.Simple projiziert (lng, -lat)
+    und skaliert mit 2^zoom; mit lat=z*factor, lng=x*factor (factor=256/world_size)
+    und der +2^zoom-Verschiebung der Kachel-Y (siehe Kommentar dort) ergibt sich
+    fuer die Bildzeile: py = canvas - (z/world_size)*canvas – Norden ist oben,
+    exakt wie im Dashboard."""
+    px = (x / world_size) * canvas_px
+    py = canvas_px - (z / world_size) * canvas_px
+    return px, py
+
+
+async def _fetch_tile(session: "aiohttp.ClientSession", url: str) -> Optional[bytes]:
+    """Eine einzelne Kachel laden – ein Fehler hier soll nie die ganze Karte
+    kippen, nur diese eine Kachel bleibt dann leer (Hintergrundfarbe)."""
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                return None
+            return await r.read()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _build_faction_map_base(map_name: str) -> Optional[Any]:
+    """Setzt das Basis-Kartenbild fuer /faction map zusammen (Kacheln von
+    static.xam.nu bei Zoom _FACTION_MAP_ZOOM) und cacht es auf Platte UND im
+    Prozessspeicher – ein /faction map lädt die Kacheln nur beim allerersten
+    Aufruf pro Karte neu, jeder weitere Aufruf (auch nach einem Neustart)
+    nutzt die gespeicherte Fassung."""
+    if not _PIL_AVAILABLE:
+        return None
+    cached = _faction_map_base_cache.get(map_name)
+    if cached is not None:
+        return cached
+    try:
+        os.makedirs(_FACTION_MAP_CACHE_DIR, exist_ok=True)
+    except OSError:
+        pass
+    disk_path = os.path.join(_FACTION_MAP_CACHE_DIR, f"{map_name}_z{_FACTION_MAP_ZOOM}.webp")
+    if os.path.exists(disk_path):
+        try:
+            img = _PILImage.open(disk_path).convert("RGB")
+            _faction_map_base_cache[map_name] = img
+            return img
+        except Exception:  # noqa: BLE001 – beschaedigte Cache-Datei: neu laden statt abstuerzen
+            pass
+    template = _tile_url(map_name)
+    if not template:
+        return None
+    n = 2 ** _FACTION_MAP_ZOOM
+    tile_px = 256
+    canvas = _PILImage.new("RGB", (n * tile_px, n * tile_px), (26, 30, 20))
+    coords = [(tx, ty) for ty in range(n) for tx in range(n)]
+    async with aiohttp.ClientSession() as session:
+        urls = [template.format(z=_FACTION_MAP_ZOOM, x=tx, y=ty) for tx, ty in coords]
+        ergebnisse = await asyncio.gather(*(_fetch_tile(session, u) for u in urls))
+    geladen = 0
+    for (tx, ty), data in zip(coords, ergebnisse):
+        if data is None:
+            continue
+        try:
+            tile_img = _PILImage.open(io.BytesIO(data)).convert("RGB")
+            canvas.paste(tile_img, (tx * tile_px, ty * tile_px))
+            geladen += 1
+        except Exception:  # noqa: BLE001
+            continue
+    if geladen == 0:
+        return None  # Kachel-Server komplett nicht erreichbar
+    try:
+        canvas.save(disk_path, "WEBP", quality=85)
+    except Exception:  # noqa: BLE001 – Cache ist nur eine Beschleunigung, kein Muss
+        pass
+    _faction_map_base_cache[map_name] = canvas
+    return canvas
+
+
+def _faction_online_positions(conn: "ServerConnection", faction: Dict) -> List[Dict[str, Any]]:
+    """Name+Position der gerade ONLINEN, per /link verknuepften Mitglieder
+    dieser Fraktion – fuer /faction map. Dieselbe Online-Quelle
+    (_online_spieler_namen) wie die normale Karte."""
+    parser = conn.parser
+    positions = getattr(parser, "player_positions", {}) if parser else {}
+    try:
+        gid = int(faction.get("guild_id") or 0)
+    except (TypeError, ValueError):
+        gid = 0
+    if not gid:
+        return []
+    verlinkte_namen = set()
+    for uid in (faction.get("member_user_ids") or []):
+        try:
+            row = db.get_link_by_user(gid, int(uid))
+        except (TypeError, ValueError):
+            continue
+        if row:
+            verlinkte_namen.add(str(row["ingame_name"]).strip().lower())
+    online = {n.strip().lower() for n in _online_spieler_namen(positions)}
+    treffer = verlinkte_namen & online
+    out: List[Dict[str, Any]] = []
+    for name, entry in positions.items():
+        if name.strip().lower() not in treffer or not isinstance(entry, dict):
+            continue
+        nums = _MAP_POS_RE.findall(str(entry.get("position", "")))
+        if len(nums) < 2:
+            continue
+        try:
+            x, z = float(nums[0]), float(nums[1])
+        except ValueError:
+            continue
+        out.append({"name": name, "x": x, "z": z})
+    return out
+
+
+def _draw_faction_map(base: Any, world_size: int, players: List[Dict[str, Any]]) -> Any:
+    """Zeichnet Punkt+Name je Online-Mitglied auf eine Kopie des Basisbilds.
+    Synchron/blockierend (PIL) – wird ueber run_in_executor aufgerufen."""
+    img = base.copy()
+    draw = _PILImageDraw.Draw(img)
+    canvas_px = img.size[0]
+    try:
+        font = _PILImageFont.load_default(size=20)
+    except TypeError:  # aeltere Pillow-Version ohne size-Parameter
+        font = _PILImageFont.load_default()
+    punkt_farbe = (90, 200, 250)   # #5ac8fa – dieselbe Spielerfarbe wie im Dashboard
+    for p in players:
+        px, py = _game_to_pixel(p["x"], p["z"], world_size, canvas_px)
+        r = 8
+        draw.ellipse([px - r, py - r, px + r, py + r], fill=punkt_farbe,
+                    outline=(255, 255, 255), width=2)
+        name = p["name"]
+        tw = draw.textlength(name, font=font)
+        tx0, ty0 = px - tw / 2, py + r + 4
+        for dx, dy in ((-1, -1), (1, -1), (-1, 1), (1, 1)):
+            draw.text((tx0 + dx, ty0 + dy), name, font=font, fill=(0, 0, 0))
+        draw.text((tx0, ty0), name, font=font, fill=(255, 255, 255))
+    return img
+
+
 # Gebündelte, exakte Ortslisten (dashboard/static/locations/<Karte>.json),
 # generiert aus den Kartendaten von dayz.xam.nu – einmal geladen, dann gecacht.
 _locations_cache: dict = {}
@@ -21996,6 +23202,11 @@ def build_app() -> web.Application:
     r.add_get("/api/zones/{name}/allowlist", get_allowlist)
     r.add_post("/api/zones/{name}/allowlist", add_allowlist)
     r.add_delete("/api/zones/{name}/allowlist/{player}", remove_allowlist)
+    # ── Factions ──
+    r.add_get("/api/factions", list_factions)
+    r.add_post("/api/factions", create_faction)
+    r.add_put("/api/factions/{name}", update_faction)
+    r.add_delete("/api/factions/{name}", delete_faction)
     # ── Auto-Aufgaben (Scheduled Tasks) ──
     r.add_get("/api/scheduled-tasks", list_scheduled_tasks)
     r.add_post("/api/scheduled-tasks", create_scheduled_task)
@@ -22679,6 +23890,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "51654faa7746d29d0f80c66bcac7d3f1d8eeaa09499b2e547a170a68d7e6469a",
         "2a2022df71837e0c345d43fbdc9a07f751488d839b1964e42fbfe4a8543b18a6",
         "d4b9366fc871538bd2de570fedc637801f6dd8054943789e862953f841284ae1",
+        "98c473f8eae479d9e32c477769e317b53b5ef8ebb4493d0bcae6324db67514e3",
     ),
     "styles.css": (
         "0dcb70fa1bee603d45b9b0dca4a0b8437f1b7ae65182c15d242f9eb625a3cfee",
@@ -22827,6 +24039,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "1a39134253951040bae21db1cbda048f4a16e0228c58abb9324b01d31cd7bd63",
         "1fc83289875abfc221f402f523f1bbfc8725bea1d1d550f690e3a9f9e681bf43",
         "51e3f7410f2c57907075abe96b5cb5a44c3a35c327133810c46c82d0d73fdbf8",
+        "ad3d41b110860daddbaccf68b9e6581b3f5805168b5220e0319f8e1356adb6ee",
     ),
     "vendor/leaflet.css": (
         "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",
