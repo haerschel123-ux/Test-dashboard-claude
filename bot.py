@@ -20741,6 +20741,33 @@ async def guild_members(request: web.Request) -> web.Response:
     return ok({"members": members})
 
 
+async def guild_member_lookup(request: web.Request) -> web.Response:
+    """EIN Mitglied direkt bei Discord nachschlagen (nicht nur im Gateway-
+    Cache von guild_members) – für Fraktions-Mitglieder/Leader, die dort
+    (noch) nicht auftauchen, z. B. kurz nach einem Bot-Neustart, bevor das
+    Chunking durch ist, oder ein selten aktives Mitglied. Ohne das zeigte das
+    Formular für solche Chips nur die rohe Discord-ID statt eines Namens."""
+    try:
+        gid = int(request.match_info["guild_id"])
+        uid = int(request.match_info["user_id"])
+    except (TypeError, ValueError):
+        return err("Keine gültige ID.", 400)
+    if gid not in _session_guilds(request):
+        return err("Dieser Discord-Server gehört nicht zu deinem Nitrado-Server.", 403)
+    g = bot.get_guild(gid) if bot else None
+    if g is None:
+        return ok({"member": None})
+    m = g.get_member(uid)
+    if m is None:
+        try:
+            m = await g.fetch_member(uid)
+        except (discord.NotFound, discord.HTTPException):
+            return ok({"member": None})
+    if m.bot:
+        return ok({"member": None})
+    return ok({"member": {"id": str(m.id), "name": str(m)}})
+
+
 async def guild_channels(request: web.Request) -> web.Response:
     try:
         gid = int(request.match_info["guild_id"])
@@ -23260,6 +23287,7 @@ def build_app() -> web.Application:
     r.add_delete("/api/scheduled-tasks/{id}", delete_scheduled_task)
     r.add_get("/api/guild/{guild_id}/roles", guild_roles)
     r.add_get("/api/guild/{guild_id}/members", guild_members)
+    r.add_get("/api/guild/{guild_id}/member/{user_id}", guild_member_lookup)
     r.add_get("/api/guild/{guild_id}/channels", guild_channels)
     r.add_get("/api/guild/{guild_id}/seen-players", guild_seen_players)
 
