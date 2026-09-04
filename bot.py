@@ -495,6 +495,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # Beide Felder leer = die Funktion ist aus.
     "premium_role_guild_id": "1534352039713439855",
     "premium_role_id":       "1534356139758588097",
+    # ─────────── ZAHLUNG (Dashboard-Kategorie "Payment") ───────────
+    # Kunden sehen hier den Preis und einen Button zu einem PayPal.me-Link.
+    # Freigeschaltet wird NICHT automatisch – der Button erklaert, dass nach
+    # der Zahlung ein Ticket im Support-Discord mit Zahlungsnachweis noetig
+    # ist; Brigarde schaltet danach wie bisher manuell frei (Serverliste).
+    "paypal_me_link": "https://www.paypal.me/stillbrook21",
+    "premium_price_eur": 50,
     # Optionale Leaflet-Kachel-URLs je Karte, z. B.
     #   {"ChernarusPlus": "https://.../{z}/{x}/{y}.png"}
     "dashboard_map_tiles":   {},
@@ -18387,6 +18394,33 @@ async def _premium_rolle(owner_id: Any, geben: bool) -> str:
         return f"Premium-Rolle: Discord lehnte die Änderung ab ({e})."
 
 
+def _premium_preis_eur() -> float:
+    try:
+        preis = float(cfg.config.get("premium_price_eur") or 50)
+    except (TypeError, ValueError):
+        preis = 50.0
+    return round(max(preis, 0.01), 2)
+
+
+async def api_payment_info(request: web.Request) -> web.Response:
+    """Preis + PayPal.me-Link fuer die Payment-Seite.
+
+    Bewusst KEINE automatische Freischaltung: der Kunde zahlt manuell ueber
+    PayPal.me, meldet sich danach mit Zahlungsnachweis im Support-Ticket, und
+    Brigarde schaltet wie bisher manuell frei (Dashboard -> Serverliste).
+    """
+    _c, denied = _session_conn(request, "payment")
+    if denied is not None:
+        return denied
+    preis = _premium_preis_eur()
+    link = str(cfg.config.get("paypal_me_link") or "").strip()
+    if link:
+        betrag = f"{preis:.2f}".rstrip("0").rstrip(".")
+        link = f"{link.rstrip('/')}/{betrag}EUR"
+    return ok({"price_eur": preis, "already_premium": bool(_c.guild_id),
+              "paypal_link": link or None})
+
+
 async def delete_admin_server(request: web.Request) -> web.Response:
     """Einen Nitrado-Server aus der Verwaltung entfernen.
 
@@ -23261,6 +23295,7 @@ def build_app() -> web.Application:
     r.add_get("/api/admin/servers", api_admin_servers)
     r.add_post("/api/admin/servers/{service_id}/guild", post_admin_server_guild)
     r.add_delete("/api/admin/servers/{service_id}", delete_admin_server)
+    r.add_get("/api/payment/info", api_payment_info)
     r.add_post("/api/auth/logout", post_logout)
     r.add_get("/api/session", api_get_session)
     r.add_post("/api/consent", post_consent)
