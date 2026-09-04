@@ -45,6 +45,7 @@ import secrets
 import mimetypes
 mimetypes.add_type("image/avif", ".avif")
 import hashlib
+import hmac
 import ssl
 import ipaddress
 import urllib.parse
@@ -181,6 +182,7 @@ LOG_STATE_FILE    = "log_state.json"
 WHITELIST_REQ_FILE = "whitelist_requests.json"
 CONSENT_FILE      = "consent.json"
 SPRACHE_FILE      = "sprache.json"
+STRIPE_TICKETS_FILE = "stripe_tickets.json"
 
 # Groesste Zahl, die SQLite als INTEGER speichern kann (signed 64 Bit). Alles
 # darueber bricht beim Binden mit OverflowError ab. Dient als Obergrenze fuer
@@ -496,12 +498,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "premium_role_guild_id": "1534352039713439855",
     "premium_role_id":       "1534356139758588097",
     # ─────────── ZAHLUNG (Dashboard-Kategorie "Payment") ───────────
-    # Kunden sehen hier den Preis und einen Button zu einem PayPal.me-Link.
-    # Freigeschaltet wird NICHT automatisch – der Button erklaert, dass nach
-    # der Zahlung ein Ticket im Support-Discord mit Zahlungsnachweis noetig
-    # ist; Brigarde schaltet danach wie bisher manuell frei (Serverliste).
+    # Premium-Kauf laeuft ueber einen fertigen Stripe Payment Link (automatische
+    # Freischaltung per Webhook, siehe stripe_webhook_secret unten) - die
+    # freiwillige Spende weiterhin ueber PayPal.me (manuell, Support-Ticket).
     "paypal_me_link": "https://www.paypal.me/stillbrook21",
     "premium_price_eur": 50,
+    # Fertiger Stripe Payment Link (Stripe-Dashboard -> Zahlungslinks), fest auf
+    # premium_price_eur EUR eingestellt.
+    "stripe_payment_link": "https://buy.stripe.com/8x27sMdj30rxdJl1UG2wU00",
+    # Signing Secret des Webhook-Endpunkts, der auf
+    # https://<dashboard_public_host>/api/payment/stripe/webhook zeigt
+    # (Stripe-Dashboard -> Entwickler -> Webhooks -> Endpunkt -> "Signing
+    # secret"). Damit wird geprueft, dass eine Zahlungsbestaetigung wirklich
+    # von Stripe kommt, bevor automatisch freigeschaltet wird.
+    "stripe_webhook_secret": "",
     # Aktiv/Sperren-Schalter fuer die beiden Payment-Buttons - im Dashboard
     # unter "Modul Manager" umschaltbar (siehe post_payment_settings). Texte
     # stehen bewusst fest in app.js (mit DE/EN-Uebersetzung dort), nicht hier -
@@ -1199,6 +1209,7 @@ class ConfigManager:
         self.whitelist_reqs: Dict = {}
         self.consent: Dict = {}
         self.sprache: Dict = {}
+        self.stripe_tickets: Dict = {}
 
     def load_all(self):
         _create_helper_files()
@@ -1209,6 +1220,7 @@ class ConfigManager:
         self.whitelist_reqs = self._load_or_create(WHITELIST_REQ_FILE, {})
         self.consent = self._load_or_create(CONSENT_FILE, {})
         self.sprache = self._load_or_create(SPRACHE_FILE, {})
+        self.stripe_tickets = self._load_or_create(STRIPE_TICKETS_FILE, {})
         # Fehlende neue Felder (Shop/Economy/Casino) in bestehende config.json ergänzen
         if self._merge_defaults(self.config, DEFAULT_CONFIG):
             self.save_config()
@@ -1261,6 +1273,7 @@ class ConfigManager:
     def save_bans(self):     self.save(BANLIST_FILE,   self.bans)
     def save_log_state(self):self.save(LOG_STATE_FILE, self.log_state)
     def save_whitelist_reqs(self): self.save(WHITELIST_REQ_FILE, self.whitelist_reqs)
+    def save_stripe_tickets(self): self.save(STRIPE_TICKETS_FILE, self.stripe_tickets)
 
     def server_feeds(self, guild_id: int, service_id: str,
                      anlegen: bool = False) -> Dict[str, Any]:
@@ -16637,7 +16650,10 @@ _SESS_STORE: Dict[str, Dict[str, Any]] = {}
 
 # Pfade, die ohne Session erreichbar sind
 _SESS_PUBLIC_PREFIXES = ("/api/auth/", "/static/", "/vendor/", "/maps/")
-_SESS_PUBLIC_EXACT = ("/", "/index.html", "/api/session", "/favicon.ico", "/api/health")
+_SESS_PUBLIC_EXACT = ("/", "/index.html", "/api/session", "/favicon.ico", "/api/health",
+                      # Stripe ruft das ohne Session-Cookie auf - die eigentliche
+                      # Absicherung ist die Signaturpruefung im Handler selbst.
+                      "/api/payment/stripe/webhook")
 # Erreichbar mit Discord-Anmeldung, aber noch OHNE Nitrado-Token: die Auswahl
 # des eigenen Discord-Servers und die Optionen-Seite, auf der der Token
 # nachgetragen wird. Bewusst eine kurze, feste Liste – alles andere bleibt
@@ -18420,36 +18436,182 @@ def _payment_settings() -> Dict[str, Any]:
 
 
 async def api_payment_info(request: web.Request) -> web.Response:
-    """Preis + PayPal.me-Links fuer die Payment-Seite.
+    """Preis + Spenden-Link fuer die Payment-Seite.
 
-    Bewusst KEINE automatische Freischaltung: der Kunde zahlt manuell ueber
-    PayPal.me, meldet sich danach mit Zahlungsnachweis im Support-Ticket, und
-    Brigarde schaltet wie bisher manuell frei (Dashboard -> Serverliste).
+    Premium-Kauf laeuft NICHT ueber diesen Endpunkt, sondern erst beim Klick
+    ueber ``create_stripe_ticket`` (dort wird die Guild-Zuordnung fuer den
+    Webhook hinterlegt) - hier steht nur, OB der Button ueberhaupt aktiv ist
+    (``stripe_available``). Die Spende laeuft weiterhin manuell ueber
+    PayPal.me, meldet sich danach mit Zahlungsnachweis im Support-Ticket.
 
-    Ein Link fehlt in der Antwort (``None``), sobald der zugehoerige Bereich
-    im Modul Manager gesperrt ist ODER kein PayPal.me-Link hinterlegt ist -
-    das Frontend zeigt dann in beiden Faellen dieselbe feste Hinweismeldung
-    statt des Buttons, ohne selbst zwischen den Gruenden unterscheiden zu
-    muessen. Titel/Beschreibungen stehen bewusst fest in app.js (siehe dort),
-    nicht hier - nur der Preis und die Aktiv/Sperren-Schalter sind dynamisch.
+    Ein Link/Verfuegbarkeit fehlt, sobald der zugehoerige Bereich im Modul
+    Manager gesperrt ist ODER nichts hinterlegt ist - das Frontend zeigt dann
+    in beiden Faellen dieselbe feste Hinweismeldung statt des Buttons, ohne
+    selbst zwischen den Gruenden unterscheiden zu muessen. Titel/
+    Beschreibungen stehen bewusst fest in app.js (siehe dort), nicht hier.
     """
     _c, denied = _session_conn(request, "payment")
     if denied is not None:
         return denied
     einst = _payment_settings()
-    basis = str(cfg.config.get("paypal_me_link") or "").strip().rstrip("/")
     preis = _premium_preis_eur()
+    stripe_link = str(cfg.config.get("stripe_payment_link") or "").strip()
 
-    premium_link = None
-    if basis and einst.get("premium_active"):
-        betrag = f"{preis:.2f}".rstrip("0").rstrip(".")
-        premium_link = f"{basis}/{betrag}EUR"
+    basis = str(cfg.config.get("paypal_me_link") or "").strip().rstrip("/")
     spenden_link = basis if (basis and einst.get("donation_active")) else None
 
     return ok({
         "price_eur": preis, "already_premium": bool(_c.guild_id),
-        "paypal_link": premium_link, "donation_link": spenden_link,
+        "stripe_available": bool(stripe_link and einst.get("premium_active")),
+        "donation_link": spenden_link,
     })
+
+
+_STRIPE_TICKET_GUELTIGKEIT_STUNDEN = 24
+
+
+def _stripe_tickets_aufraeumen() -> None:
+    """Alte, nie eingeloeste Tickets entfernen (abgebrochene Zahlungen)."""
+    grenze = time.time() - _STRIPE_TICKET_GUELTIGKEIT_STUNDEN * 3600
+    veraltet = [t for t, d in cfg.stripe_tickets.items() if d.get("erstellt", 0) < grenze]
+    if veraltet:
+        for t in veraltet:
+            cfg.stripe_tickets.pop(t, None)
+        cfg.save_stripe_tickets()
+
+
+async def create_stripe_ticket(request: web.Request) -> web.Response:
+    """Legt ein Ticket an und liefert den Stripe-Payment-Link mit angehaengter
+    ``client_reference_id`` - darueber findet der Webhook nach der Zahlung
+    wieder zu Server/Guild/Kunde zurueck. Die eigentliche Berechtigung
+    (welcher Server/welche Guild) steckt NUR hier im Ticket, nie in Daten,
+    die der Client dem Webhook mitgeben koennte.
+    """
+    conn, denied = _session_conn(request, "payment")
+    if denied is not None:
+        return denied
+    if conn.guild_id:
+        return err("Dieser Server ist bereits freigeschaltet.")
+    einst = _payment_settings()
+    link = str(cfg.config.get("stripe_payment_link") or "").strip()
+    if not (link and einst.get("premium_active")):
+        return err("Premium-Kauf ist gerade nicht verfügbar.", 503)
+
+    sess = _sess_get(request)
+    gid = (sess or {}).get("guild_id")
+    if not gid:
+        return err("Für diese Sitzung ist kein Discord-Server ausgewählt.", 409)
+    besitzer = ((sess or {}).get("discord") or {}).get("id")
+    if not besitzer:
+        return err("Discord-Anmeldung fehlt.", 401)
+
+    _stripe_tickets_aufraeumen()
+    token = secrets.token_urlsafe(24)
+    cfg.stripe_tickets[token] = {
+        "service_id": conn.service_id, "guild_id": int(gid),
+        "discord_user_id": str(besitzer), "erstellt": time.time(),
+    }
+    cfg.save_stripe_tickets()
+
+    trenner = "&" if "?" in link else "?"
+    return ok({"url": f"{link}{trenner}client_reference_id={token}"})
+
+
+def _stripe_signatur_pruefen(payload: bytes, header: str, secret: str) -> bool:
+    """Verifiziert eine Stripe-Webhook-Signatur von Hand (kein stripe-SDK
+    installiert - der Bot bleibt so abhaengigkeitsfrei). Ablauf laut Stripe-
+    Dokumentation: ``t=<Zeitstempel>,v1=<Signatur>[,v0=...]``, Signatur =
+    HMAC-SHA256(secret, "<Zeitstempel>.<roher Body>"). Zeitstempel darf nicht
+    aelter als 5 Minuten sein (Schutz gegen Replay einer alten Nachricht).
+    """
+    teile = dict(t.split("=", 1) for t in header.split(",") if "=" in t)
+    zeitstempel = teile.get("t")
+    signatur = teile.get("v1")
+    if not (zeitstempel and signatur and zeitstempel.isdigit()):
+        return False
+    if abs(time.time() - int(zeitstempel)) > 300:
+        return False
+    erwartet = hmac.new(secret.encode("utf-8"),
+                        f"{zeitstempel}.".encode("utf-8") + payload,
+                        hashlib.sha256).hexdigest()
+    return hmac.compare_digest(erwartet, signatur)
+
+
+async def stripe_webhook(request: web.Request) -> web.Response:
+    """Nimmt Stripe-Zahlungsbestaetigungen entgegen und schaltet bei Erfolg
+    automatisch frei - ohne dass Brigarde etwas bestaetigen muss.
+
+    Vertraut NUR Nachrichten mit gueltiger Signatur (siehe
+    ``_stripe_signatur_pruefen``); alles andere wird mit 400 abgelehnt, bevor
+    der Inhalt ueberhaupt ausgewertet wird. Antwortet auf inhaltliche Fehler
+    trotzdem mit 200 (Ticket unbekannt/schon verbraucht, Betrag falsch) -
+    Stripe wuerde eine Nicht-2xx-Antwort sonst endlos wiederholen; der Fehler
+    steht stattdessen im Bot-Log.
+    """
+    secret = str(cfg.config.get("stripe_webhook_secret") or "").strip()
+    if not secret:
+        log.warning("[STRIPE] Webhook aufgerufen, aber stripe_webhook_secret ist leer.")
+        return web.Response(status=503, text="not configured")
+    payload = await request.read()
+    signatur = request.headers.get("Stripe-Signature", "")
+    if not _stripe_signatur_pruefen(payload, signatur, secret):
+        log.warning("[STRIPE] Webhook mit ungueltiger Signatur abgelehnt.")
+        return web.Response(status=400, text="invalid signature")
+
+    try:
+        event = json.loads(payload)
+    except json.JSONDecodeError:
+        return web.Response(status=400, text="invalid json")
+    if event.get("type") != "checkout.session.completed":
+        return web.Response(status=200, text="ignored")
+
+    session_obj = event.get("data", {}).get("object", {})
+    if session_obj.get("payment_status") != "paid":
+        return web.Response(status=200, text="not paid")
+    token = session_obj.get("client_reference_id")
+    ticket = cfg.stripe_tickets.pop(token, None) if token else None
+    if ticket is None:
+        log.warning(f"[STRIPE] Webhook ohne bekanntes Ticket (client_reference_id={token}).")
+        return web.Response(status=200, text="unknown ticket")
+    cfg.save_stripe_tickets()
+
+    erwartet_cent = round(_premium_preis_eur() * 100)
+    if (session_obj.get("currency") or "").lower() != "eur" \
+            or int(session_obj.get("amount_total") or 0) != erwartet_cent:
+        log.warning(f"[STRIPE] Betrag stimmt nicht: {session_obj.get('amount_total')} "
+                   f"{session_obj.get('currency')}, erwartet {erwartet_cent} eur "
+                   f"(Ticket fuer Service {ticket['service_id']}).")
+        return web.Response(status=200, text="amount mismatch")
+
+    conn = connections.for_service(ticket["service_id"])
+    if conn is None:
+        log.warning(f"[STRIPE] Zahlung bestätigt, Server {ticket['service_id']} "
+                   "existiert aber nicht mehr.")
+        return web.Response(status=200, text="server gone")
+
+    besitzer = ticket["discord_user_id"]
+    gid = ticket["guild_id"]
+    conn.data["owner_discord_id"] = besitzer
+    okay, msg = connections.assign_guild(conn.service_id, gid)
+    if not okay:
+        log.warning(f"[STRIPE] Zahlung bestätigt, Freischaltung fehlgeschlagen: {msg}")
+        return web.Response(status=200, text="assign failed")
+    conn.data.pop("guild_id_requested", None)
+    connections.save()
+
+    ids = _configured_guild_ids()
+    if gid not in ids:
+        ids.append(gid)
+        cfg.config["guild_ids"] = ids
+        cfg.save_config()
+    await _register_guild_commands(gid)
+    rollen_hinweis = await _premium_rolle(besitzer, True)
+
+    log.info(f"[STRIPE] Zahlung bestätigt – Server {conn.service_id} für Guild {gid} "
+             f"freigeschaltet (Kunde {besitzer}).")
+    if rollen_hinweis:
+        log.info(f"[STRIPE] {rollen_hinweis}")
+    return web.Response(status=200, text="ok")
 
 
 async def api_get_payment_settings(request: web.Request) -> web.Response:
@@ -23352,6 +23514,8 @@ def build_app() -> web.Application:
     r.add_get("/api/payment/info", api_payment_info)
     r.add_get("/api/payment/settings", api_get_payment_settings)
     r.add_post("/api/payment/settings", post_payment_settings)
+    r.add_post("/api/payment/stripe/start", create_stripe_ticket)
+    r.add_post("/api/payment/stripe/webhook", stripe_webhook)
     r.add_post("/api/auth/logout", post_logout)
     r.add_get("/api/session", api_get_session)
     r.add_post("/api/consent", post_consent)
