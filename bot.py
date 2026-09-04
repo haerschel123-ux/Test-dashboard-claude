@@ -502,6 +502,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # ist; Brigarde schaltet danach wie bisher manuell frei (Serverliste).
     "paypal_me_link": "https://www.paypal.me/stillbrook21",
     "premium_price_eur": 50,
+    # Texte + Aktiv/Sperren-Schalter fuer die Payment-Seite - im Dashboard
+    # unter "Modul Manager" bearbeitbar (siehe post_payment_settings), nicht
+    # nur hier in der Datei. Gesperrt heisst: der Button zeigt statt des
+    # echten Links nur locked_message (z. B. waehrend einer Umstellung).
+    "payment_settings": {
+        "premium_active": True,
+        "premium_title": "Premium – Einmalzahlung",
+        "premium_subtitle": "Zonen · Auto-Aufgaben · Feeds · Shop · Factions",
+        "premium_description": "Schaltet alle Premium-Funktionen für diesen Server dauerhaft frei.",
+        "donation_active": True,
+        "donation_title": "Freiwillige Spende",
+        "donation_description": "Gefällt dir der Bot? Über eine freiwillige Spende freue ich mich "
+                                "sehr – jeder Betrag hilft.",
+        "locked_message": "Diese Zahlungsoption ist aktuell nicht verfügbar. Tritt unserem "
+                          "Discord bei für mehr Infos.",
+    },
     # Optionale Leaflet-Kachel-URLs je Karte, z. B.
     #   {"ChernarusPlus": "https://.../{z}/{x}/{y}.png"}
     "dashboard_map_tiles":   {},
@@ -18402,23 +18418,77 @@ def _premium_preis_eur() -> float:
     return round(max(preis, 0.01), 2)
 
 
+def _payment_settings() -> Dict[str, Any]:
+    roh = cfg.config.get("payment_settings")
+    out = dict(DEFAULT_CONFIG["payment_settings"])
+    if isinstance(roh, dict):
+        out.update(roh)
+    return out
+
+
 async def api_payment_info(request: web.Request) -> web.Response:
-    """Preis + PayPal.me-Link fuer die Payment-Seite.
+    """Preis, Texte und PayPal.me-Links fuer die Payment-Seite.
 
     Bewusst KEINE automatische Freischaltung: der Kunde zahlt manuell ueber
     PayPal.me, meldet sich danach mit Zahlungsnachweis im Support-Ticket, und
     Brigarde schaltet wie bisher manuell frei (Dashboard -> Serverliste).
+
+    Ein Link fehlt in der Antwort (``None``), sobald der zugehoerige Bereich
+    im Modul Manager gesperrt ist ODER kein PayPal.me-Link hinterlegt ist -
+    das Frontend zeigt dann in beiden Faellen dieselbe locked_message statt
+    des Buttons, ohne selbst zwischen den Gruenden unterscheiden zu muessen.
     """
     _c, denied = _session_conn(request, "payment")
     if denied is not None:
         return denied
+    einst = _payment_settings()
+    basis = str(cfg.config.get("paypal_me_link") or "").strip().rstrip("/")
     preis = _premium_preis_eur()
-    link = str(cfg.config.get("paypal_me_link") or "").strip()
-    if link:
+
+    premium_link = None
+    if basis and einst.get("premium_active"):
         betrag = f"{preis:.2f}".rstrip("0").rstrip(".")
-        link = f"{link.rstrip('/')}/{betrag}EUR"
-    return ok({"price_eur": preis, "already_premium": bool(_c.guild_id),
-              "paypal_link": link or None})
+        premium_link = f"{basis}/{betrag}EUR"
+    spenden_link = basis if (basis and einst.get("donation_active")) else None
+
+    return ok({
+        "price_eur": preis, "already_premium": bool(_c.guild_id),
+        "paypal_link": premium_link,
+        "premium_title": einst.get("premium_title"),
+        "premium_subtitle": einst.get("premium_subtitle"),
+        "premium_description": einst.get("premium_description"),
+        "donation_link": spenden_link,
+        "donation_title": einst.get("donation_title"),
+        "donation_description": einst.get("donation_description"),
+        "locked_message": einst.get("locked_message"),
+    })
+
+
+async def api_get_payment_settings(request: web.Request) -> web.Response:
+    """Die Payment-Texte/-Schalter fuer den Modul Manager (nur Betreiber)."""
+    denied = await _require_admin(request)
+    if denied is not None:
+        return denied
+    return ok(_payment_settings())
+
+
+async def post_payment_settings(request: web.Request) -> web.Response:
+    """Payment-Texte/-Schalter aus dem Modul Manager speichern (nur Betreiber)."""
+    denied = await _require_admin(request)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    einst = _payment_settings()
+    for schluessel in ("premium_active", "donation_active"):
+        if schluessel in data:
+            einst[schluessel] = bool(data[schluessel])
+    for schluessel in ("premium_title", "premium_subtitle", "premium_description",
+                      "donation_title", "donation_description", "locked_message"):
+        if schluessel in data:
+            einst[schluessel] = str(data[schluessel]).strip()[:500]
+    cfg.config["payment_settings"] = einst
+    cfg.save_config()
+    return ok(einst)
 
 
 async def delete_admin_server(request: web.Request) -> web.Response:
@@ -23296,6 +23366,8 @@ def build_app() -> web.Application:
     r.add_post("/api/admin/servers/{service_id}/guild", post_admin_server_guild)
     r.add_delete("/api/admin/servers/{service_id}", delete_admin_server)
     r.add_get("/api/payment/info", api_payment_info)
+    r.add_get("/api/payment/settings", api_get_payment_settings)
+    r.add_post("/api/payment/settings", post_payment_settings)
     r.add_post("/api/auth/logout", post_logout)
     r.add_get("/api/session", api_get_session)
     r.add_post("/api/consent", post_consent)
