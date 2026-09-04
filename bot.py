@@ -183,6 +183,7 @@ WHITELIST_REQ_FILE = "whitelist_requests.json"
 CONSENT_FILE      = "consent.json"
 SPRACHE_FILE      = "sprache.json"
 STRIPE_TICKETS_FILE = "stripe_tickets.json"
+STRIPE_SUBS_FILE = "stripe_subscriptions.json"
 
 # Groesste Zahl, die SQLite als INTEGER speichern kann (signed 64 Bit). Alles
 # darueber bricht beim Binden mit OverflowError ab. Dient als Obergrenze fuer
@@ -498,27 +499,37 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "premium_role_guild_id": "1534352039713439855",
     "premium_role_id":       "1534356139758588097",
     # ─────────── ZAHLUNG (Dashboard-Kategorie "Payment") ───────────
-    # Premium-Kauf laeuft ueber einen fertigen Stripe Payment Link (automatische
-    # Freischaltung per Webhook, siehe stripe_webhook_secret unten) - die
-    # freiwillige Spende weiterhin ueber PayPal.me (manuell, Support-Ticket).
+    # Premium laesst sich auf zwei Wegen kaufen, beide ueber Stripe Payment
+    # Links mit automatischer Freischaltung per Webhook (stripe_webhook_secret
+    # unten): einmalig (lifetime) oder monatliches Abo. Kuendigt das Abo oder
+    # schlaegt eine Monatszahlung endgueltig fehl, wird automatisch WIEDER
+    # gesperrt (siehe stripe_webhook, Ereignis customer.subscription.deleted/
+    # .updated) - die Lifetime-Zahlung wird davon nie beruehrt. Die freiwillige
+    # Spende laeuft weiterhin ueber PayPal.me (manuell, Support-Ticket).
     "paypal_me_link": "https://www.paypal.me/stillbrook21",
     "premium_price_eur": 50,
-    # Fertiger Stripe Payment Link (Stripe-Dashboard -> Zahlungslinks), fest auf
-    # premium_price_eur EUR eingestellt.
+    "premium_subscription_price_eur": 5,
+    # Fertige Stripe Payment Links (Stripe-Dashboard -> Zahlungslinks): einer
+    # einmalig auf premium_price_eur EUR, einer wiederkehrend (monatlich) auf
+    # premium_subscription_price_eur EUR eingestellt.
     "stripe_payment_link": "https://buy.stripe.com/14AbJ2ceZ7TZdJl6aW2wU01",
+    "stripe_subscription_link": "https://buy.stripe.com/8x214ogvf4HNcFh8j42wU02",
     # Signing Secret des Webhook-Endpunkts, der auf
     # https://<dashboard_public_host>/api/payment/stripe/webhook zeigt
     # (Stripe-Dashboard -> Entwickler -> Webhooks -> Endpunkt -> "Signing
-    # secret"). Damit wird geprueft, dass eine Zahlungsbestaetigung wirklich
-    # von Stripe kommt, bevor automatisch freigeschaltet wird.
+    # secret"). Fuer das Abo muessen dort zusaetzlich zu checkout.session.
+    # completed auch customer.subscription.deleted und
+    # customer.subscription.updated aktiviert sein, sonst wird eine Kuendigung
+    # nie bemerkt. Ohne Secret wird nichts automatisch freigeschaltet.
     "stripe_webhook_secret": "",
-    # Aktiv/Sperren-Schalter fuer die beiden Payment-Buttons - im Dashboard
+    # Aktiv/Sperren-Schalter fuer die drei Payment-Buttons - im Dashboard
     # unter "Modul Manager" umschaltbar (siehe post_payment_settings). Texte
     # stehen bewusst fest in app.js (mit DE/EN-Uebersetzung dort), nicht hier -
     # nur die Buttons selbst sind ein-/ausschaltbar. Gesperrt heisst: der
     # Button zeigt statt des echten Links nur eine feste Hinweismeldung.
     "payment_settings": {
         "premium_active": True,
+        "subscription_active": True,
         "donation_active": True,
     },
     # Optionale Leaflet-Kachel-URLs je Karte, z. B.
@@ -1210,6 +1221,7 @@ class ConfigManager:
         self.consent: Dict = {}
         self.sprache: Dict = {}
         self.stripe_tickets: Dict = {}
+        self.stripe_subscriptions: Dict = {}
 
     def load_all(self):
         _create_helper_files()
@@ -1221,6 +1233,7 @@ class ConfigManager:
         self.consent = self._load_or_create(CONSENT_FILE, {})
         self.sprache = self._load_or_create(SPRACHE_FILE, {})
         self.stripe_tickets = self._load_or_create(STRIPE_TICKETS_FILE, {})
+        self.stripe_subscriptions = self._load_or_create(STRIPE_SUBS_FILE, {})
         # Fehlende neue Felder (Shop/Economy/Casino) in bestehende config.json ergänzen
         if self._merge_defaults(self.config, DEFAULT_CONFIG):
             self.save_config()
@@ -1274,6 +1287,7 @@ class ConfigManager:
     def save_log_state(self):self.save(LOG_STATE_FILE, self.log_state)
     def save_whitelist_reqs(self): self.save(WHITELIST_REQ_FILE, self.whitelist_reqs)
     def save_stripe_tickets(self): self.save(STRIPE_TICKETS_FILE, self.stripe_tickets)
+    def save_stripe_subscriptions(self): self.save(STRIPE_SUBS_FILE, self.stripe_subscriptions)
 
     def server_feeds(self, guild_id: int, service_id: str,
                      anlegen: bool = False) -> Dict[str, Any]:
@@ -18427,6 +18441,14 @@ def _premium_preis_eur() -> float:
     return round(max(preis, 0.01), 2)
 
 
+def _premium_abo_preis_eur() -> float:
+    try:
+        preis = float(cfg.config.get("premium_subscription_price_eur") or 5)
+    except (TypeError, ValueError):
+        preis = 5.0
+    return round(max(preis, 0.01), 2)
+
+
 def _payment_settings() -> Dict[str, Any]:
     roh = cfg.config.get("payment_settings")
     out = dict(DEFAULT_CONFIG["payment_settings"])
@@ -18455,14 +18477,18 @@ async def api_payment_info(request: web.Request) -> web.Response:
         return denied
     einst = _payment_settings()
     preis = _premium_preis_eur()
+    abo_preis = _premium_abo_preis_eur()
     stripe_link = str(cfg.config.get("stripe_payment_link") or "").strip()
+    abo_link = str(cfg.config.get("stripe_subscription_link") or "").strip()
 
     basis = str(cfg.config.get("paypal_me_link") or "").strip().rstrip("/")
     spenden_link = basis if (basis and einst.get("donation_active")) else None
 
     return ok({
-        "price_eur": preis, "already_premium": bool(_c.guild_id),
+        "price_eur": preis, "subscription_price_eur": abo_preis,
+        "already_premium": bool(_c.guild_id),
         "stripe_available": bool(stripe_link and einst.get("premium_active")),
+        "subscription_available": bool(abo_link and einst.get("subscription_active")),
         "donation_link": spenden_link,
     })
 
@@ -18481,21 +18507,35 @@ def _stripe_tickets_aufraeumen() -> None:
 
 
 async def create_stripe_ticket(request: web.Request) -> web.Response:
-    """Legt ein Ticket an und liefert den Stripe-Payment-Link mit angehaengter
-    ``client_reference_id`` - darueber findet der Webhook nach der Zahlung
-    wieder zu Server/Guild/Kunde zurueck. Die eigentliche Berechtigung
-    (welcher Server/welche Guild) steckt NUR hier im Ticket, nie in Daten,
-    die der Client dem Webhook mitgeben koennte.
+    """Legt ein Ticket an und liefert den passenden Stripe-Payment-Link mit
+    angehaengter ``client_reference_id`` - darueber findet der Webhook nach
+    der Zahlung wieder zu Server/Guild/Kunde zurueck. Die eigentliche
+    Berechtigung (welcher Server/welche Guild) steckt NUR hier im Ticket, nie
+    in Daten, die der Client dem Webhook mitgeben koennte.
+
+    ``plan`` im Body waehlt zwischen "lifetime" (Standard, Einmalzahlung) und
+    "subscription" (monatliches Abo, wird bei Kuendigung automatisch wieder
+    gesperrt - siehe stripe_webhook).
     """
     conn, denied = _session_conn(request, "payment")
     if denied is not None:
         return denied
     if conn.guild_id:
         return err("Dieser Server ist bereits freigeschaltet.")
+    data = await body(request)
+    plan = str(data.get("plan") or "lifetime").strip()
+    if plan not in ("lifetime", "subscription"):
+        return err("Unbekannter Tarif.", 400)
+
     einst = _payment_settings()
-    link = str(cfg.config.get("stripe_payment_link") or "").strip()
-    if not (link and einst.get("premium_active")):
-        return err("Premium-Kauf ist gerade nicht verfügbar.", 503)
+    if plan == "subscription":
+        link = str(cfg.config.get("stripe_subscription_link") or "").strip()
+        aktiv = einst.get("subscription_active")
+    else:
+        link = str(cfg.config.get("stripe_payment_link") or "").strip()
+        aktiv = einst.get("premium_active")
+    if not (link and aktiv):
+        return err("Dieser Tarif ist gerade nicht verfügbar.", 503)
 
     sess = _sess_get(request)
     gid = (sess or {}).get("guild_id")
@@ -18509,7 +18549,7 @@ async def create_stripe_ticket(request: web.Request) -> web.Response:
     token = secrets.token_urlsafe(24)
     cfg.stripe_tickets[token] = {
         "service_id": conn.service_id, "guild_id": int(gid),
-        "discord_user_id": str(besitzer), "erstellt": time.time(),
+        "discord_user_id": str(besitzer), "plan": plan, "erstellt": time.time(),
     }
     cfg.save_stripe_tickets()
 
@@ -18537,16 +18577,86 @@ def _stripe_signatur_pruefen(payload: bytes, header: str, secret: str) -> bool:
     return hmac.compare_digest(erwartet, signatur)
 
 
+async def _stripe_freischalten(ticket: Dict[str, Any], quelle: str) -> web.Response:
+    """Server anhand eines eingeloesten Tickets freischalten - fuer Lifetime-
+    Kauf und Abo-Erstzahlung identisch."""
+    conn = connections.for_service(ticket["service_id"])
+    if conn is None:
+        log.warning(f"[STRIPE] {quelle}: Server {ticket['service_id']} existiert nicht mehr.")
+        return web.Response(status=200, text="server gone")
+
+    besitzer = ticket["discord_user_id"]
+    gid = ticket["guild_id"]
+    conn.data["owner_discord_id"] = besitzer
+    okay, msg = connections.assign_guild(conn.service_id, gid)
+    if not okay:
+        log.warning(f"[STRIPE] {quelle}: Freischaltung fehlgeschlagen: {msg}")
+        return web.Response(status=200, text="assign failed")
+    conn.data.pop("guild_id_requested", None)
+    connections.save()
+
+    ids = _configured_guild_ids()
+    if gid not in ids:
+        ids.append(gid)
+        cfg.config["guild_ids"] = ids
+        cfg.save_config()
+    await _register_guild_commands(gid)
+    rollen_hinweis = await _premium_rolle(besitzer, True)
+
+    log.info(f"[STRIPE] {quelle}: Server {conn.service_id} für Guild {gid} "
+             f"freigeschaltet (Kunde {besitzer}).")
+    if rollen_hinweis:
+        log.info(f"[STRIPE] {rollen_hinweis}")
+    return web.Response(status=200, text="ok")
+
+
+async def _stripe_sperren(subscription_id: str, grund: str) -> web.Response:
+    """Freischaltung eines Abo-Servers zurueckziehen (Kuendigung oder
+    endgueltig fehlgeschlagene Zahlung) - spiegelt den Entzug-Zweig von
+    ``post_admin_server_guild``. Die Lifetime-Zahlung ist davon nie
+    betroffen, weil dafuer nie ein Eintrag in stripe_subscriptions landet.
+    """
+    eintrag = cfg.stripe_subscriptions.pop(subscription_id, None)
+    if eintrag is None:
+        return web.Response(status=200, text="unknown subscription")
+    cfg.save_stripe_subscriptions()
+
+    conn = connections.for_service(eintrag["service_id"])
+    if conn is None or conn.guild_id != eintrag["guild_id"]:
+        # Server wurde zwischenzeitlich entfernt oder anders zugeordnet -
+        # nichts mehr zurueckzunehmen.
+        return web.Response(status=200, text="nothing to revoke")
+    alte_gid = conn.guild_id
+    besitzer = conn.data.get("owner_discord_id")
+    okay, msg = connections.assign_guild(conn.service_id, None)
+    if not okay:
+        log.warning(f"[STRIPE] Sperren ({grund}) fehlgeschlagen: {msg}")
+        return web.Response(status=200, text="revoke failed")
+    await _guild_aufraeumen(alte_gid)
+    if not _hat_noch_premium(besitzer):
+        hinweis = await _premium_rolle(besitzer, False)
+        if hinweis:
+            log.info(f"[STRIPE] {hinweis}")
+    log.info(f"[STRIPE] Abo beendet ({grund}) – Server {conn.service_id} "
+             f"(Guild {alte_gid}, Kunde {besitzer}) wieder gesperrt.")
+    return web.Response(status=200, text="revoked")
+
+
+_STRIPE_ABO_ENDZUSTAENDE = ("canceled", "unpaid", "incomplete_expired")
+
+
 async def stripe_webhook(request: web.Request) -> web.Response:
-    """Nimmt Stripe-Zahlungsbestaetigungen entgegen und schaltet bei Erfolg
-    automatisch frei - ohne dass Brigarde etwas bestaetigen muss.
+    """Nimmt Stripe-Ereignisse entgegen: schaltet nach bezahlter Lifetime-
+    oder Abo-Erstzahlung automatisch frei, entzieht die Freischaltung wieder,
+    sobald ein Abo endet (gekuendigt oder endgueltig nicht mehr bezahlt) -
+    ohne dass Brigarde etwas bestaetigen muss.
 
     Vertraut NUR Nachrichten mit gueltiger Signatur (siehe
     ``_stripe_signatur_pruefen``); alles andere wird mit 400 abgelehnt, bevor
     der Inhalt ueberhaupt ausgewertet wird. Antwortet auf inhaltliche Fehler
-    trotzdem mit 200 (Ticket unbekannt/schon verbraucht, Betrag falsch) -
-    Stripe wuerde eine Nicht-2xx-Antwort sonst endlos wiederholen; der Fehler
-    steht stattdessen im Bot-Log.
+    trotzdem mit 200 (Ticket/Abo unbekannt, Betrag falsch) - Stripe wuerde
+    eine Nicht-2xx-Antwort sonst endlos wiederholen; der Fehler steht
+    stattdessen im Bot-Log.
     """
     secret = str(cfg.config.get("stripe_webhook_secret") or "").strip()
     if not secret:
@@ -18562,56 +18672,46 @@ async def stripe_webhook(request: web.Request) -> web.Response:
         event = json.loads(payload)
     except json.JSONDecodeError:
         return web.Response(status=400, text="invalid json")
-    if event.get("type") != "checkout.session.completed":
+    typ = event.get("type")
+    objekt = event.get("data", {}).get("object", {})
+
+    if typ == "customer.subscription.deleted":
+        return await _stripe_sperren(objekt.get("id") or "", "gekündigt")
+    if typ == "customer.subscription.updated":
+        if (objekt.get("status") or "") in _STRIPE_ABO_ENDZUSTAENDE:
+            return await _stripe_sperren(objekt.get("id") or "",
+                                         f"Status {objekt.get('status')}")
+        return web.Response(status=200, text="ignored")
+    if typ != "checkout.session.completed":
         return web.Response(status=200, text="ignored")
 
-    session_obj = event.get("data", {}).get("object", {})
-    if session_obj.get("payment_status") != "paid":
+    if objekt.get("payment_status") != "paid":
         return web.Response(status=200, text="not paid")
-    token = session_obj.get("client_reference_id")
+    token = objekt.get("client_reference_id")
     ticket = cfg.stripe_tickets.pop(token, None) if token else None
     if ticket is None:
         log.warning(f"[STRIPE] Webhook ohne bekanntes Ticket (client_reference_id={token}).")
         return web.Response(status=200, text="unknown ticket")
     cfg.save_stripe_tickets()
 
-    erwartet_cent = round(_premium_preis_eur() * 100)
-    if (session_obj.get("currency") or "").lower() != "eur" \
-            or int(session_obj.get("amount_total") or 0) != erwartet_cent:
-        log.warning(f"[STRIPE] Betrag stimmt nicht: {session_obj.get('amount_total')} "
-                   f"{session_obj.get('currency')}, erwartet {erwartet_cent} eur "
-                   f"(Ticket fuer Service {ticket['service_id']}).")
+    plan = ticket.get("plan", "lifetime")
+    erwartet_cent = round((_premium_abo_preis_eur() if plan == "subscription"
+                           else _premium_preis_eur()) * 100)
+    if (objekt.get("currency") or "").lower() != "eur" \
+            or int(objekt.get("amount_total") or 0) != erwartet_cent:
+        log.warning(f"[STRIPE] Betrag stimmt nicht: {objekt.get('amount_total')} "
+                   f"{objekt.get('currency')}, erwartet {erwartet_cent} eur "
+                   f"(Ticket fuer Service {ticket['service_id']}, Tarif {plan}).")
         return web.Response(status=200, text="amount mismatch")
 
-    conn = connections.for_service(ticket["service_id"])
-    if conn is None:
-        log.warning(f"[STRIPE] Zahlung bestätigt, Server {ticket['service_id']} "
-                   "existiert aber nicht mehr.")
-        return web.Response(status=200, text="server gone")
-
-    besitzer = ticket["discord_user_id"]
-    gid = ticket["guild_id"]
-    conn.data["owner_discord_id"] = besitzer
-    okay, msg = connections.assign_guild(conn.service_id, gid)
-    if not okay:
-        log.warning(f"[STRIPE] Zahlung bestätigt, Freischaltung fehlgeschlagen: {msg}")
-        return web.Response(status=200, text="assign failed")
-    conn.data.pop("guild_id_requested", None)
-    connections.save()
-
-    ids = _configured_guild_ids()
-    if gid not in ids:
-        ids.append(gid)
-        cfg.config["guild_ids"] = ids
-        cfg.save_config()
-    await _register_guild_commands(gid)
-    rollen_hinweis = await _premium_rolle(besitzer, True)
-
-    log.info(f"[STRIPE] Zahlung bestätigt – Server {conn.service_id} für Guild {gid} "
-             f"freigeschaltet (Kunde {besitzer}).")
-    if rollen_hinweis:
-        log.info(f"[STRIPE] {rollen_hinweis}")
-    return web.Response(status=200, text="ok")
+    antwort = await _stripe_freischalten(ticket, f"Zahlung bestätigt ({plan})")
+    sub_id = objekt.get("subscription")
+    if plan == "subscription" and sub_id and antwort.text == "ok":
+        cfg.stripe_subscriptions[sub_id] = {
+            "service_id": ticket["service_id"], "guild_id": ticket["guild_id"],
+        }
+        cfg.save_stripe_subscriptions()
+    return antwort
 
 
 async def api_get_payment_settings(request: web.Request) -> web.Response:
@@ -18629,7 +18729,7 @@ async def post_payment_settings(request: web.Request) -> web.Response:
         return denied
     data = await body(request)
     einst = _payment_settings()
-    for schluessel in ("premium_active", "donation_active"):
+    for schluessel in ("premium_active", "subscription_active", "donation_active"):
         if schluessel in data:
             einst[schluessel] = bool(data[schluessel])
     cfg.config["payment_settings"] = einst

@@ -9,6 +9,7 @@ announcements.json
 events_recent.json
 bot_audit.json
 stripe_tickets.json
+stripe_subscriptions.json
 
 # Economy-Datenbank & Backups
 economy.db
