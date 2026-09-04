@@ -758,6 +758,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.spawnable":                   {"label": "Rucksack-Builder", "gruppe": "Tools"},
     "tools.event":                       {"label": "Event-Vorlagen", "gruppe": "Tools"},
     "tools.spawnpoint":                  {"label": "Spawn Point Generator", "gruppe": "Tools"},
+    "tools.typesbooster":                {"label": "Types Booster", "gruppe": "Tools"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
     "permissions.subcommands":           {"label": "Subcommand Permissions", "gruppe": "Permissions"},
@@ -10390,6 +10391,7 @@ _TOOL_LISTE = (
     ("spawnable", "🎒", "Rucksack-Builder"),
     ("event",     "📅", "Event-Vorlagen"),
     ("spawnpoint", "📍", "Spawn Point Generator"),
+    ("typesbooster", "📈", "Types Booster"),
 )
 
 
@@ -11510,6 +11512,187 @@ async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
     # Kunde nur ein <fresh>-Fragment herunter, das server-seitig ungueltig ist.
     generated = [{"filename": "cfgplayerspawnpoints.xml", "content": neu}]
     return ok({"total": total, "generated": generated})
+
+
+# ── 9. Types Booster ──────────────────────────────────────────────────────
+def _tool_types_kategorien_lesen(root: Optional[ET.Element]) -> List[str]:
+    """Eindeutige Kategorien aus db/types.xml, "" steht fuer "ohne Kategorie" -
+    das Frontend zeigt dafuer ein eigenes Label."""
+    if root is None:
+        return []
+    kategorien = set()
+    for t in root.findall("type"):
+        cat = t.find("category")
+        kategorien.add(cat.get("name") or "" if cat is not None else "")
+    return sorted(kategorien, key=lambda k: (k == "", k.lower()))
+
+
+def _tool_types_filter_trifft(kategorie: str, modus: str, gewaehlte: Any) -> bool:
+    if modus == "include":
+        return kategorie in gewaehlte
+    if modus == "exclude":
+        return kategorie not in gewaehlte
+    return True
+
+
+def _tool_types_block_werte_setzen(block: str, neuer_nominal: int, neuer_min: Optional[int]) -> str:
+    """Setzt nur <nominal> und optional <min> innerhalb eines <type>-Blocks -
+    alle anderen Tags (usage, value, flags, category, ...) bleiben unangetastet."""
+    if re.search(r'<nominal\s*>[^<]*</nominal\s*>', block):
+        block = re.sub(r'(<nominal\s*>)[^<]*(</nominal\s*>)',
+                       lambda m: m.group(1) + str(neuer_nominal) + m.group(2), block, count=1)
+    else:
+        block = re.sub(r'(<type\b[^>]*>)',
+                       lambda m: m.group(1) + f'<nominal>{neuer_nominal}</nominal>', block, count=1)
+    if neuer_min is not None:
+        if re.search(r'<min\s*>[^<]*</min\s*>', block):
+            block = re.sub(r'(<min\s*>)[^<]*(</min\s*>)',
+                           lambda m: m.group(1) + str(neuer_min) + m.group(2), block, count=1)
+        else:
+            block = re.sub(r'(</nominal\s*>)',
+                           lambda m: m.group(1) + f'<min>{neuer_min}</min>', block, count=1)
+    return block
+
+
+def _tool_types_boost_anwenden(text: str, root: ET.Element, optionen: Dict[str, Any]) -> Dict[str, Any]:
+    """Multipliziert Nominal-Werte in db/types.xml chirurgisch je <type>-Block -
+    reine Transformation, kein FTP-Zugriff. `root` muss aus `text` geparst sein;
+    gelesen wird aus dem unveraenderten root (keine Doppel-Boosts), geschrieben
+    chirurgisch in den fortlaufend aktualisierten Text."""
+    faktor = optionen["faktor"]
+    auto_min = optionen["auto_min"]
+    smart_boost = optionen["smart_boost"]
+    smart_start = optionen.get("smart_boost_start", 1)
+    modus = optionen.get("filter_mode", "all")
+    gewaehlte = set(optionen.get("categories") or [])
+    neu = text
+    aenderungen = []
+    geprueft = 0
+    uebersprungen = 0
+    for t in root.findall("type"):
+        name = t.get("name")
+        if not name:
+            continue
+        geprueft += 1
+        cat_el = t.find("category")
+        kategorie = (cat_el.get("name") or "") if cat_el is not None else ""
+        if not _tool_types_filter_trifft(kategorie, modus, gewaehlte):
+            continue
+        nom_el = t.find("nominal")
+        try:
+            alt_nominal = int(nom_el.text.strip()) if nom_el is not None and nom_el.text else 0
+        except ValueError:
+            uebersprungen += 1
+            continue
+        if alt_nominal <= 0:
+            if not smart_boost:
+                uebersprungen += 1
+                continue
+            basis = smart_start
+        else:
+            basis = alt_nominal
+        neuer_nominal = math.floor(basis * faktor)
+        neuer_min = min(neuer_nominal, math.floor(neuer_nominal * 0.60)) if auto_min else None
+        found = _tool_finde_benannten_block(neu, "type", name)
+        if not found:
+            uebersprungen += 1
+            continue
+        neuer_block = _tool_types_block_werte_setzen(found["block"], neuer_nominal, neuer_min)
+        neu = neu[:found["start"]] + neuer_block + neu[found["end"]:]
+        min_el = t.find("min")
+        alt_min = min_el.text.strip() if min_el is not None and min_el.text else None
+        aenderungen.append({"name": name, "category": kategorie,
+                            "nominal_alt": alt_nominal, "nominal_neu": neuer_nominal,
+                            "min_alt": alt_min, "min_neu": neuer_min})
+    return {"text": neu, "geprueft": geprueft, "geaendert": len(aenderungen),
+           "uebersprungen": uebersprungen, "aenderungen": aenderungen}
+
+
+async def api_tools_typesbooster_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.typesbooster")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.typesbooster", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"types_count": 0, "categories": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+    if status != "ok":
+        return err("db/types.xml per FTP nicht lesbar.", 502)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return err("db/types.xml ist kein gültiges XML.")
+    return ok({"types_count": len(root.findall("type")),
+              "categories": _tool_types_kategorien_lesen(root),
+              "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()})
+
+
+async def api_tools_typesbooster_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.typesbooster")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.typesbooster", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    quelle_lokal = str(data_in.get("source_xml") or "").strip()
+    if commit and quelle_lokal:
+        return err("Eine lokal eingefügte types.xml kann nur zur Vorschau genutzt werden, nicht hochgeladen.")
+    if not quelle_lokal and not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    try:
+        faktor = float(data_in.get("factor", 2.0))
+    except (TypeError, ValueError):
+        return err("Ungültiger Boost-Multiplikator.")
+    if not 1.0 <= faktor <= 100.0:
+        return err("Der Boost-Multiplikator muss zwischen 1.0 und 100 liegen.")
+    try:
+        smart_start = max(0, int(float(data_in.get("smart_boost_start", 1))))
+    except (TypeError, ValueError):
+        smart_start = 1
+    optionen = {
+        "faktor": faktor, "auto_min": bool(data_in.get("auto_min", True)),
+        "smart_boost": bool(data_in.get("smart_boost")), "smart_boost_start": smart_start,
+        "filter_mode": str(data_in.get("filter_mode") or "all"),
+        "categories": data_in.get("categories") or [],
+    }
+    loop = asyncio.get_running_loop()
+    if quelle_lokal:
+        text = quelle_lokal
+    else:
+        if commit:
+            fehler = _dash_rate_limited(request, "tools.typesbooster", 10)
+            if fehler is not None:
+                return fehler
+        text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+        if status != "ok":
+            return err("db/types.xml per FTP nicht lesbar.", 502)
+        quell_hash = str(data_in.get("source_hash") or "")
+        if quell_hash and quell_hash != hashlib.sha256(text.encode("utf-8")).hexdigest():
+            return err("db/types.xml wurde inzwischen geändert – bitte neu laden und Vorschau erneut erzeugen.", 409)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return err("Das ist kein gültiges XML (types.xml).")
+    ergebnis = _tool_types_boost_anwenden(text, root, optionen)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "db/types.xml", ergebnis["text"], loop):
+        return err("db/types.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Types Booster gespeichert",
+                  f"Faktor {optionen['faktor']}× · {ergebnis['geaendert']} geändert · {conn.name}")
+    return ok({"geprueft": ergebnis["geprueft"], "geaendert": ergebnis["geaendert"],
+              "uebersprungen": ergebnis["uebersprungen"], "aenderungen": ergebnis["aenderungen"][:200],
+              "generated": [{"filename": "db/types.xml", "content": ergebnis["text"]}]})
 
 
 cmd_change_damage_settings.autocomplete("server")(_server_autocomplete)
@@ -23877,6 +24060,8 @@ def build_app() -> web.Application:
     r.add_get("/api/tools/event", api_tools_event_get)
     r.add_post("/api/tools/event", api_tools_event_post)
     r.add_post("/api/tools/event/batch", api_tools_event_batch_post)
+    r.add_get("/api/tools/typesbooster", api_tools_typesbooster_get)
+    r.add_post("/api/tools/typesbooster", api_tools_typesbooster_post)
     r.add_get("/api/tools/spawnpoint", api_tools_spawnpoint_get)
     r.add_post("/api/tools/spawnpoint", api_tools_spawnpoint_post)
 
@@ -24542,6 +24727,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "68ab9ed411dad70e648915ead33184cbebc0b2791e2b8955492da95d2ec1d531",
         "02627c9d93c5d1d7a8a640158e828b48acac1f420619f7c7e33c714aebb7877f",
         "1b32821e705a7cd784d3a55f39812331d4d331930d0cff59934971c2d333e0c1",
+        "13f516a00d633c30378a08ce78972670d8b55e1e47078b9d001268f03b488e6d",
     ),
     "app.js": (
         "60db1ecc03e138a333c3f04ab3f2a740b351835cf2bef6639f1d58d0be6f5900",
@@ -24655,6 +24841,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "34e5077345c63cb794b3073a7d8b10a6a9ddff701d7767b0c372113cab7e0208",
         "203c5c5086646d14b1d4b18e9ba31a031d91c7c828fd99ddfd85375b05533443",
         "c4333cbf0af540308264f7ec5527ec6289dfd20996d3d7a27dd4bf604e8d1aa4",
+        "2b740f983345f9a426303f50263a6d8d499890919fbd856cf4f97ac0a6e5deff",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
