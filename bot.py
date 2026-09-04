@@ -23067,9 +23067,7 @@ Verbinden wieder vorliegen; eine Löschung kannst du jederzeit per E-Mail an die
 genannte Adresse verlangen.</p>
 <h2>9. Hosting</h2>
 <p>Dieses Dashboard läuft auf Servern von PebbleHost. Beim Aufruf verarbeitet PebbleHost
-technisch notwendige Verbindungsdaten (u. a. IP-Adresse). Ein Vertrag zur
-Auftragsverarbeitung nach Art. 28 DSGVO mit PebbleHost wird abgeschlossen bzw. befindet
-sich in Vorbereitung.</p>
+technisch notwendige Verbindungsdaten (u. a. IP-Adresse).</p>
 <h2>10. Protokolldateien</h2>
 <p>Das technische Anwendungsprotokoll auf dem Server hält Betriebsmeldungen fest und
 kann dabei Servernamen sowie Namen aus verarbeiteten Ereignissen enthalten; es wird
@@ -23179,8 +23177,7 @@ you can request deletion at any time via email to the address above.</p>
 <h2>9. Hosting</h2>
 <p>This dashboard runs on servers provided by PebbleHost. When you access it,
 PebbleHost processes technically necessary connection data (including your IP
-address). A data processing agreement under Art. 28 GDPR with PebbleHost is being
-concluded or is in preparation.</p>
+address).</p>
 <h2>10. Log files</h2>
 <p>The technical application log on the server records operational messages and may
 contain server names as well as names from processed events; it is not automatically
