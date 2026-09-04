@@ -10207,6 +10207,153 @@ def _tool_write_event_zones(text: str, name: str, zones: List[Dict[str, Any]]) -
     return text[:found["start"]] + block + text[found["end"]:]
 
 
+_TOOL_LEERE_ZOMBIE_TERRITORIES = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<territory-type>\n'
+    '    <territory color="1">\n'
+    '    </territory>\n'
+    '</territory-type>\n'
+)
+
+
+def _tool_zombie_zonen_lesen(root: Optional[ET.Element]) -> Dict[str, List[Dict[str, Any]]]:
+    """Liest alle <zone name="..."/> aus env/zombie_territories.xml, gruppiert
+    nach Name - anders als bei Events kommt hier derselbe Name mehrfach vor
+    (mehrere Zonen je Horde), auch über mehrere <territory>-Bloecke verteilt."""
+    zonen: Dict[str, List[Dict[str, Any]]] = {}
+    if root is None:
+        return zonen
+    for t in root.findall("territory"):
+        for z in t.findall("zone"):
+            name = z.get("name")
+            if not name:
+                continue
+            zonen.setdefault(name, []).append({
+                "x": z.get("x"), "z": z.get("z"), "r": z.get("r"),
+                "smin": z.get("smin"), "smax": z.get("smax"),
+                "dmin": z.get("dmin"), "dmax": z.get("dmax")})
+    return zonen
+
+
+def _tool_zombie_zonen_ersetzen(text: str, name: str, zonen: List[Dict[str, Any]]) -> str:
+    """Ersetzt alle <zone name="..."/>-Eintraege mit diesem Namen durch die neue
+    Liste. Ein Name kann hier - anders als bei benannten Bloecken wie <event> -
+    mehrfach vorkommen; deshalb werden alle Fundstellen entfernt und geschlossen
+    an der ersten Fundstelle wieder eingefuegt. Gibt es noch keine, werden sie
+    vor dem letzten </territory> angehängt (bzw. ein Grundgerüst angelegt, falls
+    die Datei noch leer ist)."""
+    muster = re.compile(r'[ \t]*<zone\b[^>]*\bname=(["\'])' + re.escape(name) + r'\1[^>]*/>[ \t]*\r?\n?')
+    funde = list(muster.finditer(text))
+    nl = _tool_eol(text)
+    zeilen = "".join(
+        f'        <zone name="{_tool_esc_xml(name)}" smin="{z["smin"]}" smax="{z["smax"]}" '
+        f'dmin="{z["dmin"]}" dmax="{z["dmax"]}" x="{_tool_fmt_zahl(z["x"])}" '
+        f'z="{_tool_fmt_zahl(z["z"])}" r="{_tool_fmt_zahl(z["r"])}"/>' + nl
+        for z in zonen)
+    if funde:
+        start = funde[0].start()
+        neu = text
+        for m in reversed(funde):
+            neu = neu[:m.start()] + neu[m.end():]
+        return neu[:start] + zeilen + neu[start:]
+    if not zonen:
+        return text
+    if "<territory" not in text:
+        text = _TOOL_LEERE_ZOMBIE_TERRITORIES
+    idx = text.rfind("</territory>")
+    if idx == -1:
+        return text
+    head = text[:idx]
+    m = re.search(r'(?:^|\n)([ \t]*)$', head)
+    einzug = m.group(1) if m else ""
+    head = head[:len(head) - len(einzug)]
+    if head and not head.endswith("\n"):
+        head += nl
+    return head + zeilen + einzug + text[idx:]
+
+
+def _tool_horde_definition_aus_payload(op: Dict[str, Any]) -> Dict[str, Any]:
+    """Baut Event-Definition + Zonenliste aus einer Batch-Zeile fuer eine Horde.
+    Nominal/Min/Max ergeben sich - wie beim bisherigen Einzel-Endpunkt - aus der
+    Anzahl Zonen, nicht aus der Zombie-Anzahl."""
+    name = str(op.get("name") or "").strip()
+    if not name:
+        raise ValueError("Horden-Name darf nicht leer sein.")
+    zonen_in = op.get("zones") or []
+    if not zonen_in:
+        raise ValueError(f'Horde „{name}" braucht mindestens eine Zone.')
+    try:
+        lootmin = float(op.get("lootmin", 0))
+        lootmax = float(op.get("lootmax", 0))
+        lifetime = int(float(op.get("lifetime", 300)))
+        cleanup = int(float(op.get("cleanup", 400)))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f'Ungültige Zahl in Horde „{name}".') from e
+    kinder = []
+    for z in (op.get("zombies") or []):
+        typ = str(z.get("item") or "").strip()
+        if not typ:
+            continue
+        try:
+            n = max(1, round(float(z.get("num", 1))))
+        except (TypeError, ValueError):
+            n = 1
+        kinder.append({"type": typ, "min": n, "max": n, "lootmin": lootmin, "lootmax": lootmax})
+    if not kinder:
+        raise ValueError(f'Horde „{name}" braucht mindestens einen gültigen Zombie-Typ.')
+    zonen = []
+    for z in zonen_in:
+        try:
+            zonen.append({
+                "x": float(z["x"]), "z": float(z["z"]), "r": float(z.get("r") or 25),
+                "smin": int(float(z.get("smin") or 0)), "smax": int(float(z.get("smax") or 0)),
+                "dmin": int(float(z.get("dmin") or 0)), "dmax": int(float(z.get("dmax") or 0)),
+            })
+        except (TypeError, ValueError, KeyError) as e:
+            raise ValueError(f'Ungültige Zone in Horde „{name}".') from e
+    anzahl = len(zonen)
+    definition = {
+        "name": name, "nominal": anzahl, "min": anzahl, "max": anzahl, "lifetime": lifetime,
+        "restock": 0, "saferadius": 10, "distanceradius": 300, "cleanupradius": cleanup,
+        "flags": {"deletable": 0, "init_random": 0, "remove_damaged": 1},
+        "position": "fixed", "limit": "custom", "active": 1, "children": kinder,
+    }
+    return {"definition": definition, "zones": zonen, "gesamt": sum(k["max"] for k in kinder)}
+
+
+def _tool_apply_horde_batch(ev_text: str, zt_text: str, ops: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Wendet eine Liste von Horden-Operationen (Loeschen/Anlegen/Aendern/
+    Umbenennen) einmal im Speicher an - reine Transformation, kein FTP-Zugriff.
+    `ops`-Eintraege fuer "upsert" sind bereits vollstaendige, in
+    _tool_horde_definition_aus_payload gebaute Definitionen plus "zones" und
+    "original_name"."""
+    neu_ev = ev_text
+    neu_zt = zt_text
+    erstellt = geaendert = geloescht = 0
+    for op in ops:
+        original = op.get("original_name") or op.get("name")
+        if op.get("op") == "delete":
+            neu_ev, gefunden = _tool_delete_event(neu_ev, original)
+            if gefunden:
+                geloescht += 1
+            neu_zt = _tool_zombie_zonen_ersetzen(neu_zt, original, [])
+            continue
+        name = op["name"]
+        vorhanden_vorher = _tool_finde_benannten_block(neu_ev, "event", original) is not None
+        if original != name and vorhanden_vorher:
+            neu_ev, _ = _tool_delete_event(neu_ev, original)
+            neu_zt = _tool_zombie_zonen_ersetzen(neu_zt, original, [])
+            vorhanden_vorher = False
+        neu_ev = _tool_upsert_event(neu_ev, op)
+        neu_zt = _tool_zombie_zonen_ersetzen(neu_zt, name, op["zones"])
+        if vorhanden_vorher:
+            geaendert += 1
+        else:
+            erstellt += 1
+    return {"events_xml": neu_ev, "zombie_territories_xml": neu_zt,
+           "erstellt": erstellt, "geaendert": geaendert, "geloescht": geloescht}
+
+
 def _tool_upsert_spawnable_type(text: str, name: str, rows: List[Dict[str, Any]]) -> str:
     blocks = []
     for r in rows:
@@ -10858,6 +11005,106 @@ async def api_tools_horde_post(request: web.Request) -> web.Response:
     generated = [{"filename": "db/events.xml", "content": ev_block["block"] if ev_block else neu_ev},
                 {"filename": "cfgeventspawns.xml", "content": sp_block["block"] if sp_block else neu_sp}]
     return ok({"name": name, "total": gesamt, "zones": anzahl, "generated": generated})
+
+
+async def api_tools_horde_batch_get(request: web.Request) -> web.Response:
+    """Tabellen-Editor der Zombie-Horden: Zonen kommen jetzt aus
+    env/zombie_territories.xml statt aus cfgeventspawns.xml. Alte, dort noch
+    gespeicherte Zonen werden zusaetzlich als `legacy_zones` mitgeliefert, damit
+    das Frontend eine Migrationshilfe anbieten kann."""
+    conn, fehler = _session_conn(request, "tools.horde")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.horde", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"hordes": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    ev_root, _s1 = await _tools_xml_lesen(conn, "db/events.xml", loop)
+    zt_root, _s2 = await _tools_xml_lesen(conn, "env/zombie_territories.xml", loop)
+    sp_root, _s3 = await _tools_xml_lesen(conn, "cfgeventspawns.xml", loop)
+    namen = _tool_events_liste(ev_root, nur_zombies=True)
+    zonen_map = _tool_zombie_zonen_lesen(zt_root)
+    hordes = []
+    for n in namen:
+        detail = _tool_event_details(ev_root, n) or {}
+        detail["zones"] = zonen_map.get(n, [])
+        if not detail["zones"]:
+            alte = _tool_spawn_zonen(sp_root, n)
+            if alte:
+                detail["legacy_zones"] = alte
+        hordes.append(detail)
+    return ok({"hordes": hordes})
+
+
+async def api_tools_horde_batch_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.horde")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.horde", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.horde", 10)
+        if fehler is not None:
+            return fehler
+    ops_in = data_in.get("ops") or []
+    if not ops_in:
+        return err("Keine Änderungen im Entwurf.")
+    ops = []
+    for o in ops_in:
+        art = str(o.get("op") or "").strip()
+        if art == "delete":
+            name = str(o.get("name") or "").strip()
+            if not name:
+                return err("Horden-Name zum Löschen fehlt.")
+            ops.append({"op": "delete", "name": name, "original_name": str(o.get("original_name") or name)})
+            continue
+        if art != "upsert":
+            return err(f'Unbekannte Operation „{art}".')
+        try:
+            gebaut = _tool_horde_definition_aus_payload(o)
+        except ValueError as e:
+            return err(str(e))
+        eintrag = dict(gebaut["definition"])
+        eintrag["op"] = "upsert"
+        eintrag["original_name"] = str(o.get("original_name") or eintrag["name"]).strip()
+        eintrag["zones"] = gebaut["zones"]
+        ops.append(eintrag)
+    finale_namen = [o["name"] for o in ops if o.get("op") == "upsert"]
+    if len(finale_namen) != len(set(finale_namen)):
+        return err("Zwei Horden im Entwurf haben denselben Namen.")
+    loop = asyncio.get_running_loop()
+    ev_text, ev_status = await _tools_datei_lesen(conn, "db/events.xml", loop)
+    if ev_status != "ok":
+        return err("db/events.xml nicht lesbar.", 502)
+    zt_text, zt_status = await _tools_datei_lesen(conn, "env/zombie_territories.xml", loop)
+    zt_text_fuer_batch = zt_text if zt_status == "ok" else _TOOL_LEERE_ZOMBIE_TERRITORIES
+    ergebnis = _tool_apply_horde_batch(ev_text, zt_text_fuer_batch, ops)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "db/events.xml", ergebnis["events_xml"], loop):
+        return err("db/events.xml konnte nicht gespeichert werden.", 502)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "env/zombie_territories.xml",
+                                             ergebnis["zombie_territories_xml"], loop):
+        return err("env/zombie_territories.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Zombie-Horden (Batch) gespeichert",
+                  f"{ergebnis['erstellt']} neu, {ergebnis['geaendert']} geändert, "
+                  f"{ergebnis['geloescht']} gelöscht · {conn.name}")
+    generated = [{"filename": "db/events.xml", "content": ergebnis["events_xml"]},
+                {"filename": "env/zombie_territories.xml", "content": ergebnis["zombie_territories_xml"]}]
+    return ok({"erstellt": ergebnis["erstellt"], "geaendert": ergebnis["geaendert"],
+              "geloescht": ergebnis["geloescht"], "generated": generated})
 
 
 # ── 4. Heli-Crash Loot ────────────────────────────────────────────────────
@@ -24062,6 +24309,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/event/batch", api_tools_event_batch_post)
     r.add_get("/api/tools/typesbooster", api_tools_typesbooster_get)
     r.add_post("/api/tools/typesbooster", api_tools_typesbooster_post)
+    r.add_get("/api/tools/horde/batch", api_tools_horde_batch_get)
+    r.add_post("/api/tools/horde/batch", api_tools_horde_batch_post)
     r.add_get("/api/tools/spawnpoint", api_tools_spawnpoint_get)
     r.add_post("/api/tools/spawnpoint", api_tools_spawnpoint_post)
 
@@ -24842,6 +25091,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "203c5c5086646d14b1d4b18e9ba31a031d91c7c828fd99ddfd85375b05533443",
         "c4333cbf0af540308264f7ec5527ec6289dfd20996d3d7a27dd4bf604e8d1aa4",
         "2b740f983345f9a426303f50263a6d8d499890919fbd856cf4f97ac0a6e5deff",
+        "6cccee27686cdfcd87ffadef967d80172a8543334bea5c27a38adc788ecc0758",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
