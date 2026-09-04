@@ -10027,6 +10027,117 @@ def _tool_upsert_event(text: str, definition: Dict[str, Any]) -> str:
     return _tool_benannten_block_ersetzen(text, "events", "event", definition["name"], snippet)
 
 
+def _tool_entferne_benannten_block(text: str, tag: str, name: str) -> Tuple[str, bool]:
+    """Entfernt genau einen benannten Block (inkl. Einrückung und einer folgenden
+    Zeilenschaltung) - alles andere in der Datei bleibt Byte für Byte erhalten,
+    genau wie bei _tool_benannten_block_ersetzen."""
+    found = _tool_finde_benannten_block(text, tag, name)
+    if not found:
+        return text, False
+    start, end = found["start"], found["end"]
+    m = re.match(r'\r?\n', text[end:])
+    if m:
+        end += m.end()
+    return text[:start] + text[end:], True
+
+
+def _tool_delete_event(text: str, name: str) -> Tuple[str, bool]:
+    return _tool_entferne_benannten_block(text, "event", name)
+
+
+def _tool_delete_eventspawns(text: str, name: str) -> Tuple[str, bool]:
+    return _tool_entferne_benannten_block(text, "event", name)
+
+
+def _tool_event_definition_aus_payload(data_in: Dict[str, Any]) -> Dict[str, Any]:
+    """Baut eine vollstaendige Event-Definition aus einem Batch-Zeilen-Payload -
+    anders als beim bestehenden Einzel-Event-Endpunkt sind hier auch Events ganz
+    ohne Kinder erlaubt (naeher an der Referenzseite)."""
+    name = str(data_in.get("name") or "").strip()
+    if not name:
+        raise ValueError("Event-Name darf nicht leer sein.")
+    kinder = []
+    for c in (data_in.get("children") or []):
+        typ = str(c.get("type") or "").strip()
+        if not typ:
+            continue
+        try:
+            kmin = max(0, round(float(c.get("min", 1))))
+            kmax = max(kmin, round(float(c.get("max", kmin))))
+            lootmin = max(0, round(float(c.get("lootmin", 0))))
+            lootmax = max(lootmin, round(float(c.get("lootmax", 0))))
+        except (TypeError, ValueError):
+            kmin, kmax, lootmin, lootmax = 1, 1, 0, 0
+        kinder.append({"type": typ, "min": kmin, "max": kmax, "lootmin": lootmin, "lootmax": lootmax})
+    try:
+        return {
+            "name": name,
+            "nominal": int(float(data_in.get("nominal", 1))),
+            "min": int(float(data_in.get("min", 1))),
+            "max": int(float(data_in.get("max", 1))),
+            "lifetime": int(float(data_in.get("lifetime", 1800))),
+            "restock": int(float(data_in.get("restock", 0))),
+            "saferadius": int(float(data_in.get("saferadius", 500))),
+            "distanceradius": int(float(data_in.get("distanceradius", 500))),
+            "cleanupradius": int(float(data_in.get("cleanupradius", 1000))),
+            "flags": {"deletable": 1 if data_in.get("deletable") else 0,
+                     "init_random": 1 if data_in.get("init_random") else 0,
+                     "remove_damaged": 1 if data_in.get("remove_damaged") else 0},
+            "position": str(data_in.get("position") or "fixed"),
+            "limit": str(data_in.get("limit") or "custom"),
+            "active": 1 if data_in.get("active", True) else 0,
+            "children": kinder,
+        }
+    except (TypeError, ValueError) as e:
+        raise ValueError(f'Ungültige Zahl im Event „{name}".') from e
+
+
+def _tool_apply_event_batch(ev_text: str, sp_text: Optional[str],
+                            ops: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Wendet eine Liste von Event-Operationen (Loeschen/Anlegen/Aendern/Umbenennen)
+    einmal im Speicher an - reine Transformation, kein FTP-Zugriff. `ops`-Eintraege
+    fuer "upsert" sind vollstaendige Definitionen (siehe _tool_event_definition_aus_payload)
+    plus "original_name" (bei Umbenennung der bisherige Name) und optional "positions"."""
+    neu_ev = ev_text
+    neu_sp = sp_text
+    erstellt = geaendert = geloescht = 0
+    for op in ops:
+        original = op.get("original_name") or op.get("name")
+        if op.get("op") == "delete":
+            neu_ev, gefunden = _tool_delete_event(neu_ev, original)
+            if gefunden:
+                geloescht += 1
+            if neu_sp is not None:
+                neu_sp, _ = _tool_delete_eventspawns(neu_sp, original)
+            continue
+        name = op["name"]
+        vorhanden_vorher = _tool_finde_benannten_block(neu_ev, "event", original) is not None
+        if original != name and vorhanden_vorher:
+            neu_ev, _ = _tool_delete_event(neu_ev, original)
+            if neu_sp is not None:
+                neu_sp, _ = _tool_delete_eventspawns(neu_sp, original)
+            vorhanden_vorher = False
+        neu_ev = _tool_upsert_event(neu_ev, op)
+        if vorhanden_vorher:
+            geaendert += 1
+        else:
+            erstellt += 1
+        positions = op.get("positions")
+        if neu_sp is not None and positions is not None:
+            pts = []
+            for p in positions:
+                try:
+                    pts.append({"x": float(p["x"]), "z": float(p["z"]), "a": float(p.get("a", 0))})
+                except (TypeError, ValueError, KeyError):
+                    continue
+            if pts:
+                neu_sp, _added = _tool_upsert_eventspawns(neu_sp, name, pts, "replace")
+            else:
+                neu_sp, _ = _tool_delete_eventspawns(neu_sp, name)
+    return {"events_xml": neu_ev, "eventspawns_xml": neu_sp,
+            "erstellt": erstellt, "geaendert": geaendert, "geloescht": geloescht}
+
+
 def _tool_update_event_counts(text: str, name: str, values: Dict[str, Any]) -> str:
     found = _tool_finde_benannten_block(text, "event", name)
     if not found:
@@ -11252,6 +11363,80 @@ async def api_tools_event_post(request: web.Request) -> web.Response:
     if sp_block:
         generated.append({"filename": "cfgeventspawns.xml", "content": sp_block["block"]})
     return ok({"name": name, "generated": generated})
+
+
+async def api_tools_event_batch_post(request: web.Request) -> web.Response:
+    """Tabellen-Editor der Event-Vorlagen: mehrere Events in einem Rutsch anlegen,
+    aendern, umbenennen oder loeschen. Anders als api_tools_event_post (die bleibt
+    unveraendert bestehen) liest diese Route beide Dateien genau einmal, wendet
+    alle Operationen im Speicher an und schreibt beide Dateien nur einmal zusammen."""
+    conn, fehler = _session_conn(request, "tools.event")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.event", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.event", 10)
+        if fehler is not None:
+            return fehler
+    ops_in = data_in.get("ops") or []
+    if not ops_in:
+        return err("Keine Änderungen im Entwurf.")
+    ops = []
+    for o in ops_in:
+        art = str(o.get("op") or "").strip()
+        if art == "delete":
+            name = str(o.get("name") or "").strip()
+            if not name:
+                return err("Event-Name zum Löschen fehlt.")
+            ops.append({"op": "delete", "name": name, "original_name": str(o.get("original_name") or name)})
+            continue
+        if art != "upsert":
+            return err(f'Unbekannte Operation „{art}".')
+        try:
+            definition = _tool_event_definition_aus_payload(o)
+        except ValueError as e:
+            return err(str(e))
+        definition["op"] = "upsert"
+        definition["original_name"] = str(o.get("original_name") or definition["name"]).strip()
+        definition["positions"] = o.get("positions")
+        ops.append(definition)
+    finale_namen = [o["name"] for o in ops if o.get("op") == "upsert"]
+    if len(finale_namen) != len(set(finale_namen)):
+        return err("Zwei Events im Entwurf haben denselben Namen.")
+    loop = asyncio.get_running_loop()
+    ev_text, ev_status = await _tools_datei_lesen(conn, "db/events.xml", loop)
+    if ev_status != "ok":
+        return err("db/events.xml nicht lesbar.", 502)
+    sp_text, sp_status = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
+    sp_text_fuer_batch = sp_text if sp_status == "ok" else None
+    try:
+        ergebnis = _tool_apply_event_batch(ev_text, sp_text_fuer_batch, ops)
+    except ValueError as e:
+        return err(str(e))
+    if not await _tools_datei_schreiben_wenn(commit, conn, "db/events.xml", ergebnis["events_xml"], loop):
+        return err("db/events.xml konnte nicht gespeichert werden.", 502)
+    if ergebnis["eventspawns_xml"] is not None:
+        if not await _tools_datei_schreiben_wenn(commit, conn, "cfgeventspawns.xml",
+                                                 ergebnis["eventspawns_xml"], loop):
+            return err("cfgeventspawns.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Event-Vorlagen (Batch) gespeichert",
+                  f"{ergebnis['erstellt']} neu, {ergebnis['geaendert']} geändert, "
+                  f"{ergebnis['geloescht']} gelöscht · {conn.name}")
+    generated = [{"filename": "db/events.xml", "content": ergebnis["events_xml"]}]
+    if ergebnis["eventspawns_xml"] is not None:
+        generated.append({"filename": "cfgeventspawns.xml", "content": ergebnis["eventspawns_xml"]})
+    return ok({"erstellt": ergebnis["erstellt"], "geaendert": ergebnis["geaendert"],
+              "geloescht": ergebnis["geloescht"], "generated": generated})
 
 
 # ── 8. Spawn Point Generator ──────────────────────────────────────────────
@@ -23691,6 +23876,7 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/spawnable", api_tools_bag_post)
     r.add_get("/api/tools/event", api_tools_event_get)
     r.add_post("/api/tools/event", api_tools_event_post)
+    r.add_post("/api/tools/event/batch", api_tools_event_batch_post)
     r.add_get("/api/tools/spawnpoint", api_tools_spawnpoint_get)
     r.add_post("/api/tools/spawnpoint", api_tools_spawnpoint_post)
 
@@ -24355,6 +24541,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "150cd6667526fcb50102994f4a389764c0b1a097b50fe79f21740ba45c4b919a",
         "68ab9ed411dad70e648915ead33184cbebc0b2791e2b8955492da95d2ec1d531",
         "02627c9d93c5d1d7a8a640158e828b48acac1f420619f7c7e33c714aebb7877f",
+        "1b32821e705a7cd784d3a55f39812331d4d331930d0cff59934971c2d333e0c1",
     ),
     "app.js": (
         "60db1ecc03e138a333c3f04ab3f2a740b351835cf2bef6639f1d58d0be6f5900",
@@ -24467,6 +24654,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "b696490a896438327e8692e0a4d1710e576e1504732d12840efcc25305dc8ace",
         "34e5077345c63cb794b3073a7d8b10a6a9ddff701d7767b0c372113cab7e0208",
         "203c5c5086646d14b1d4b18e9ba31a031d91c7c828fd99ddfd85375b05533443",
+        "c4333cbf0af540308264f7ec5527ec6289dfd20996d3d7a27dd4bf604e8d1aa4",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
