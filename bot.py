@@ -505,7 +505,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "premium_price_eur": 50,
     # Fertiger Stripe Payment Link (Stripe-Dashboard -> Zahlungslinks), fest auf
     # premium_price_eur EUR eingestellt.
-    "stripe_payment_link": "https://buy.stripe.com/8x27sMdj30rxdJl1UG2wU00",
+    "stripe_payment_link": "https://buy.stripe.com/14AbJ2ceZ7TZdJl6aW2wU01",
     # Signing Secret des Webhook-Endpunkts, der auf
     # https://<dashboard_public_host>/api/payment/stripe/webhook zeigt
     # (Stripe-Dashboard -> Entwickler -> Webhooks -> Endpunkt -> "Signing
