@@ -7656,15 +7656,24 @@ def _ensure_faction_ids(factions: List[Dict]) -> bool:
 
 
 def _faction_payload(f: Dict) -> Dict:
-    """Normalisierte Ansicht einer Fraktion fuer API/Embeds (füllt Defaults, wie `_zone_payload`)."""
+    """Normalisierte Ansicht einer Fraktion fuer API/Embeds (füllt Defaults, wie `_zone_payload`).
+
+    Discord-IDs werden als String ausgegeben, nicht als Zahl: Discord-IDs haben bis
+    zu 19 Ziffern und ueberschreiten JS' sicheren Ganzzahlbereich – als rohe JSON-Zahl
+    wuerde JSON.parse() im Browser die ID stillschweigend auf eine benachbarte,
+    falsche Zahl runden (dasselbe Problem wie bei ``guild_members``, siehe dort)."""
     out = dict(f)
     mitglieder = []
     for u in (f.get("member_user_ids") or []):
         try:
-            mitglieder.append(int(u))
+            mitglieder.append(str(int(u)))
         except (TypeError, ValueError):
             continue
     out["member_user_ids"] = mitglieder
+    try:
+        out["leader_user_id"] = str(int(f.get("leader_user_id")))
+    except (TypeError, ValueError):
+        out["leader_user_id"] = None
     roles = f.get("member_roles")
     out["member_roles"] = roles if isinstance(roles, dict) else {}
     out["member_limit"] = int(f.get("member_limit") or _FACTION_MEMBER_LIMIT_DEFAULT)
