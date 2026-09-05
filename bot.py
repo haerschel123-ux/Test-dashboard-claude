@@ -11801,16 +11801,18 @@ def _tool_types_block_werte_setzen(block: str, neuer_nominal: int, neuer_min: Op
     return block
 
 
-def _tool_types_boost_anwenden(text: str, root: ET.Element, optionen: Dict[str, Any]) -> Dict[str, Any]:
-    """Multipliziert Nominal-Werte in db/types.xml chirurgisch je <type>-Block -
+def _tool_types_transform_anwenden(text: str, root: ET.Element, optionen: Dict[str, Any]) -> Dict[str, Any]:
+    """Veraendert Nominal-Werte in db/types.xml chirurgisch je <type>-Block -
     reine Transformation, kein FTP-Zugriff. `root` muss aus `text` geparst sein;
-    gelesen wird aus dem unveraenderten root (keine Doppel-Boosts), geschrieben
-    chirurgisch in den fortlaufend aktualisierten Text."""
-    faktor = optionen["faktor"]
+    gelesen wird aus dem unveraenderten root (keine Doppel-Anwendung), geschrieben
+    chirurgisch in den fortlaufend aktualisierten Text. `optionen["modus"]`
+    entscheidet zwischen "boost" (multiplizieren, mit optionalem Smart Boost fuer
+    0-Werte) und "reduce" (prozentual verringern - 0-Werte bleiben immer 0,
+    Smart Boost gibt es hier bewusst nicht: ein Nullwert vor der Reduktion
+    kuenstlich anzuheben waere das Gegenteil von reduzieren)."""
+    modus_rechnung = optionen.get("modus", "boost")
     auto_min = optionen["auto_min"]
-    smart_boost = optionen["smart_boost"]
-    smart_start = optionen.get("smart_boost_start", 1)
-    modus = optionen.get("filter_mode", "all")
+    filter_modus = optionen.get("filter_mode", "all")
     gewaehlte = set(optionen.get("categories") or [])
     neu = text
     aenderungen = []
@@ -11823,7 +11825,7 @@ def _tool_types_boost_anwenden(text: str, root: ET.Element, optionen: Dict[str, 
         geprueft += 1
         cat_el = t.find("category")
         kategorie = (cat_el.get("name") or "") if cat_el is not None else ""
-        if not _tool_types_filter_trifft(kategorie, modus, gewaehlte):
+        if not _tool_types_filter_trifft(kategorie, filter_modus, gewaehlte):
             continue
         nom_el = t.find("nominal")
         try:
@@ -11831,14 +11833,20 @@ def _tool_types_boost_anwenden(text: str, root: ET.Element, optionen: Dict[str, 
         except ValueError:
             uebersprungen += 1
             continue
-        if alt_nominal <= 0:
-            if not smart_boost:
+        if modus_rechnung == "reduce":
+            if alt_nominal <= 0:
                 uebersprungen += 1
                 continue
-            basis = smart_start
+            neuer_nominal = math.floor(alt_nominal * (1 - optionen["reduction_percent"] / 100))
         else:
-            basis = alt_nominal
-        neuer_nominal = math.floor(basis * faktor)
+            if alt_nominal <= 0:
+                if not optionen["smart_boost"]:
+                    uebersprungen += 1
+                    continue
+                basis = optionen.get("smart_boost_start", 1)
+            else:
+                basis = alt_nominal
+            neuer_nominal = math.floor(basis * optionen["faktor"])
         neuer_min = min(neuer_nominal, math.floor(neuer_nominal * 0.60)) if auto_min else None
         found = _tool_finde_benannten_block(neu, "type", name)
         if not found:
@@ -11897,22 +11905,36 @@ async def api_tools_typesbooster_post(request: web.Request) -> web.Response:
         return err("Eine lokal eingefügte types.xml kann nur zur Vorschau genutzt werden, nicht hochgeladen.")
     if not quelle_lokal and not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
-    try:
-        faktor = float(data_in.get("factor", 2.0))
-    except (TypeError, ValueError):
-        return err("Ungültiger Boost-Multiplikator.")
-    if not 1.0 <= faktor <= 100.0:
-        return err("Der Boost-Multiplikator muss zwischen 1.0 und 100 liegen.")
-    try:
-        smart_start = max(0, int(float(data_in.get("smart_boost_start", 1))))
-    except (TypeError, ValueError):
-        smart_start = 1
+    modus_rechnung = str(data_in.get("modus") or "boost")
+    if modus_rechnung not in ("boost", "reduce"):
+        return err("Unbekannter Modus.")
     optionen = {
-        "faktor": faktor, "auto_min": bool(data_in.get("auto_min", True)),
-        "smart_boost": bool(data_in.get("smart_boost")), "smart_boost_start": smart_start,
+        "modus": modus_rechnung, "auto_min": bool(data_in.get("auto_min", True)),
         "filter_mode": str(data_in.get("filter_mode") or "all"),
         "categories": data_in.get("categories") or [],
     }
+    if modus_rechnung == "reduce":
+        try:
+            reduction_percent = float(data_in.get("reduction_percent", 50))
+        except (TypeError, ValueError):
+            return err("Ungültiger Reduktions-Prozentsatz.")
+        if not 10.0 <= reduction_percent <= 90.0:
+            return err("Der Reduktions-Prozentsatz muss zwischen 10 und 90 liegen.")
+        optionen["reduction_percent"] = reduction_percent
+    else:
+        try:
+            faktor = float(data_in.get("factor", 2.0))
+        except (TypeError, ValueError):
+            return err("Ungültiger Boost-Multiplikator.")
+        if not 1.0 <= faktor <= 100.0:
+            return err("Der Boost-Multiplikator muss zwischen 1.0 und 100 liegen.")
+        try:
+            smart_start = max(0, int(float(data_in.get("smart_boost_start", 1))))
+        except (TypeError, ValueError):
+            smart_start = 1
+        optionen["faktor"] = faktor
+        optionen["smart_boost"] = bool(data_in.get("smart_boost"))
+        optionen["smart_boost_start"] = smart_start
     loop = asyncio.get_running_loop()
     if quelle_lokal:
         text = quelle_lokal
@@ -11931,12 +11953,16 @@ async def api_tools_typesbooster_post(request: web.Request) -> web.Response:
         root = ET.fromstring(text)
     except ET.ParseError:
         return err("Das ist kein gültiges XML (types.xml).")
-    ergebnis = _tool_types_boost_anwenden(text, root, optionen)
+    ergebnis = _tool_types_transform_anwenden(text, root, optionen)
     if not await _tools_datei_schreiben_wenn(commit, conn, "db/types.xml", ergebnis["text"], loop):
         return err("db/types.xml konnte nicht gespeichert werden.", 502)
     if commit:
-        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Types Booster gespeichert",
-                  f"Faktor {optionen['faktor']}× · {ergebnis['geaendert']} geändert · {conn.name}")
+        if modus_rechnung == "reduce":
+            _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Types reduziert gespeichert",
+                      f"{optionen['reduction_percent']:.0f}% · {ergebnis['geaendert']} geändert · {conn.name}")
+        else:
+            _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Types Booster gespeichert",
+                      f"Faktor {optionen['faktor']}× · {ergebnis['geaendert']} geändert · {conn.name}")
     return ok({"geprueft": ergebnis["geprueft"], "geaendert": ergebnis["geaendert"],
               "uebersprungen": ergebnis["uebersprungen"], "aenderungen": ergebnis["aenderungen"][:200],
               "generated": [{"filename": "db/types.xml", "content": ergebnis["text"]}]})
@@ -25093,6 +25119,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "2b740f983345f9a426303f50263a6d8d499890919fbd856cf4f97ac0a6e5deff",
         "6cccee27686cdfcd87ffadef967d80172a8543334bea5c27a38adc788ecc0758",
         "36a71171115841113f43ce0bfd45b581315fe8a4b55137f590dc7b48b96d3f77",
+        "3d8885b770b0f573c02bc478d4373f2b30997872d264ebc06bd2bc0875ce5350",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
