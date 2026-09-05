@@ -759,6 +759,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.event":                       {"label": "Event-Vorlagen", "gruppe": "Tools"},
     "tools.spawnpoint":                  {"label": "Spawn Point Generator", "gruppe": "Tools"},
     "tools.typesbooster":                {"label": "Types Booster", "gruppe": "Tools"},
+    "tools.typesorganizer":              {"label": "Types Organizer", "gruppe": "Tools"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
     "permissions.subcommands":           {"label": "Subcommand Permissions", "gruppe": "Permissions"},
@@ -10539,6 +10540,7 @@ _TOOL_LISTE = (
     ("event",     "📅", "Event-Vorlagen"),
     ("spawnpoint", "📍", "Spawn Point Generator"),
     ("typesbooster", "📈", "Types Booster"),
+    ("typesorganizer", "🗂️", "Types Organizer"),
 )
 
 
@@ -11965,6 +11967,227 @@ async def api_tools_typesbooster_post(request: web.Request) -> web.Response:
                       f"Faktor {optionen['faktor']}× · {ergebnis['geaendert']} geändert · {conn.name}")
     return ok({"geprueft": ergebnis["geprueft"], "geaendert": ergebnis["geaendert"],
               "uebersprungen": ergebnis["uebersprungen"], "aenderungen": ergebnis["aenderungen"][:200],
+              "generated": [{"filename": "db/types.xml", "content": ergebnis["text"]}]})
+
+
+# ── 10. Types Organizer ───────────────────────────────────────────────────
+# Anders als Types Booster/Reducer keine chirurgische Teiländerung: die ganze
+# Datei wird nach Kategorien gruppiert neu zusammengesetzt. Freie Kommentare,
+# Leerzeilen und die urspruengliche Reihenfolge ausserhalb der einzelnen
+# <type>-Bloecke gehen dabei bewusst verloren - das Frontend zeigt dazu eine
+# deutliche Warnung. Die Zuordnung Classname->Kategorie ist Heuristik: alles
+# nicht eindeutig Erkannte landet sichtbar unter "Misc Items".
+_TOOL_ORGANIZER_KATEGORIEN = (
+    "Armbands", "Ammo", "Animals", "Attachments", "Bags", "Belts", "Clothing",
+    "Clothing Improvised", "Feet", "Firearms", "Flags", "Food", "Gas Gear",
+    "Gas Masks", "Ghillies", "Gloves", "Hats", "Helmets", "Infected",
+    "Land Items", "Lights", "Magazines", "Masks", "Medical Items",
+    "Melee Items", "Misc Items", "Nades & Traps", "Navigation Items",
+    "Pelts", "Plants", "Optics", "Seeds", "Static Objects", "Storage Items",
+    "Supplies", "Suppressors", "Tacticals", "Tools", "Vests",
+    "Vehicle Parts", "Vehicles",
+)
+
+_TOOL_ORGANIZER_REGELN = tuple((kategorie, re.compile(muster, re.IGNORECASE)) for kategorie, muster in (
+    ("Ammo", r'^Ammo_'),
+    ("Magazines", r'^Mag_'),
+    ("Land Items", r'^Land_'),
+    ("Seeds", r'^Seeds?_'),
+    ("Flags", r'^Flag_'),
+    ("Infected", r'^Zmb'),
+    ("Armbands", r'Armband'),
+    ("Belts", r'Belt_'),
+    ("Pelts", r'Pelt'),
+    ("Suppressors", r'Suppressor'),
+    ("Optics", r'(ACOG|Kobra|PSO\b|EOTech|Holosight|Reflex|NVGoggles|Nightvision|Scope|Buris|LRSight|IronSight)'),
+    ("Attachments", r'(Handguard|Foregrip|Bipod|CarryHandle|OpticRail|MuzzleBrake|FlashHider|Choke_|'
+                    r'Compensator|Buttstock|Stock_|PistolGrip|Riser|Barrel_|Battery9V)'),
+    ("Firearms", r'\b(AK101|AK74|AKM|AKS74U|CZ527|CZ75|CR75|CR527|Deagle|FNX45|Glock19|IJ70|Izh18|'
+                r'Longhorn|M4A1|MP5K|Mosin|Repeater|SKS|Sporter22|SVAL|SVD|UMP45|VSS|Vikhr|Bizon|FAL|'
+                r'Blaze95|Winchester70|Tundra|ASVAL|Sawnoff|Colt1911|CZ61|B95|DMR|Aug|VSD|KAM|KA101|KA74)\b'),
+    ("Melee Items", r'(Axe|Hatchet|Machete|Knife|Crowbar|Sledgehammer|Pitchfork|Pickaxe|Sickle|'
+                    r'BaseballBat|Bat_|Cleaver|FireAxe|Hoe_)'),
+    ("Nades & Traps", r'(Grenade|BearTrap|Mine_|Claymore|TripFlare|Frag_)'),
+    ("Vehicles", r'(OffroadHatchback|CivilianSedan|Sedan_02|Hatchback_02|Truck_01|Bus_01|Vodnik|Vybor|Scooter)'),
+    ("Vehicle Parts", r'(Wheel|CarDoor|CarBattery|CarRadiator|SparkPlug|GlowPlug|CarSeat|Headlight|'
+                      r'TailLight|Muffler|Carburetor|Radiator)'),
+    ("Bags", r'(Backpack|Kotomka|Mochila|TaloonBag|CanvasBag|_Bag$|Bag_)'),
+    ("Storage Items", r'(Barrel|Crate_|Container|Chest_|Cabinet|Locker|GunSafe|Case_|TentSmall|'
+                      r'TentBig|CarTent|StorageShelf)'),
+    ("Gas Masks", r'GasMask'),
+    ("Gas Gear", r'(NBC|Hazmat|CBRN)'),
+    ("Masks", r'(Balaclava|HockeyMask|WolfMask|BearMask|RabbitMask|ClownMask|Bandana)'),
+    ("Ghillies", r'Ghillie'),
+    ("Clothing Improvised", r'Improvised'),
+    ("Helmets", r'(Helmet|Ssh68|Kolpak|MotoHelmet|PSH77)'),
+    ("Hats", r'(Ushanka|Beanie|CowboyHat|BoonieHat|PetrOldHat|HunterCap|BaseballCap|WoolHat|'
+            r'PanamaHat|WatchCap|Cap_|Hat_)'),
+    ("Gloves", r'(Gloves|Mitten)'),
+    ("Vests", r'(Vest_|PlateCarrier|ChestHolster|Vestpouch)'),
+    ("Feet", r'(Boots_|Shoes_|Sneakers|CombatBoots|WorkingBoots|HikingBoots|Sandals|RainBoots)'),
+    ("Tacticals", r'Tactical'),
+    ("Navigation Items", r'(Compass|GPS|Rangefinder|Map_)'),
+    ("Lights", r'(Flashlight|Headlamp|Chemlight|Lightstick|Lantern)'),
+    ("Static Objects", r'(StaticObj|Watchtower|Barricade|Fence_)'),
+    ("Plants", r'(Plant_|Mushroom|Bush_|Tree_|Garden)'),
+    ("Food", r'(Apple|Pear|Plum|Tomato|Potato|Pumpkin|Zucchini|Cucumber|BakedBeans|CannedFood|Pasta|'
+            r'Rice|Powdered|Canned|Fish_|Meat_|Steak|Sausage|Bacon|TunaCan|PeachesCan|SpaghettiCan|'
+            r'Water_|Cooking)'),
+    ("Medical Items", r'(Bandage|Splint|Morphine|Epinephrine|Tetracycline|Vitamin|Iodine|Charcoal|'
+                      r'SalineBag|BloodBag|Disinfectant|PainKiller|Adrenaline|SurgicalKit)'),
+    ("Animals", r'(Cow_|Wolf_|Bear_|Deer_|Goat_|Boar_|Rabbit_|Chicken_|Hen_)'),
+    ("Supplies", r'(Rope|Duct|Sewing|Fireplace|Matches|Lighter|Sharpening|WhetStone|Tarp|Wire_|'
+                r'Nail_|Stick_|WoodenPlank|Log_)'),
+    ("Tools", r'(Wrench|Screwdriver|Pliers|Shovel|Hammer_|Handsaw|WoodAxe|CanOpener|Radio_|Binocular)'),
+    ("Clothing", r'(Jacket|Shirt_|Coat_|Pants_|Jeans_|Sweater|Hoodie|TShirt|Dress_|Trousers|Suit_|Robe_)'),
+))
+
+
+def _tool_organizer_kategorie_von_classname(name: str) -> str:
+    for kategorie, muster in _TOOL_ORGANIZER_REGELN:
+        if muster.search(name):
+            return kategorie
+    return "Misc Items"
+
+
+_TOOL_TYPE_BLOCK_MUSTER = re.compile(
+    r'<type(?=[\s/>])[^>]*\bname=(["\'])([^"\']+)\1[^>]*(?:/>|>[\s\S]*?</type\s*>)')
+
+
+def _tool_organizer_bloecke_lesen(text: str) -> List[Dict[str, str]]:
+    """Extrahiert alle <type name="...">-Bloecke Byte-genau aus dem Originaltext.
+    Duplikate und eine leere Datei werden als Fehler behandelt, statt still
+    etwas zu verwerfen."""
+    bloecke = []
+    gesehen = set()
+    for m in _TOOL_TYPE_BLOCK_MUSTER.finditer(text):
+        name = m.group(2)
+        if name in gesehen:
+            raise ValueError(f'Doppelter Type-Name „{name}" in der Datei – bitte zuerst bereinigen.')
+        gesehen.add(name)
+        bloecke.append({"name": name, "block": m.group(0).strip()})
+    if not bloecke:
+        raise ValueError('Keine <type name="…">-Einträge in der Datei gefunden.')
+    return bloecke
+
+
+def _tool_organizer_erzeugen(text: str, optionen: Dict[str, Any]) -> Dict[str, Any]:
+    """Baut eine komplett neue, nach Kategorien gruppierte types.xml. Reine
+    Transformation, kein FTP-Zugriff."""
+    bloecke = _tool_organizer_bloecke_lesen(text)
+    gruppen: Dict[str, List[Dict[str, str]]] = {k: [] for k in _TOOL_ORGANIZER_KATEGORIEN}
+    unbekannt = []
+    for b in bloecke:
+        kategorie = _tool_organizer_kategorie_von_classname(b["name"])
+        gruppen[kategorie].append(b)
+        if kategorie == "Misc Items":
+            unbekannt.append(b["name"])
+    if optionen.get("alphabetisch", True):
+        for k in gruppen:
+            gruppen[k].sort(key=lambda b: b["name"].lower())
+    genutzt = [(k, gruppen[k]) for k in _TOOL_ORGANIZER_KATEGORIEN if gruppen[k]]
+    zeitstempel = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    zeilen = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+             "<!-- Organisiert vom Dashboard Types Organizer -->",
+             f"<!-- Erzeugt am {zeitstempel} UTC -->"]
+    if optionen.get("navigation", True):
+        zeilen.append("<!-- ===== SCHNELLE NAVIGATION =====")
+        for k, liste in genutzt:
+            zeilen.append(f"[{k}] ({len(liste)} Eintrag/Einträge)")
+        zeilen.append("=================================== -->")
+    zeilen.append("<types>")
+    for k, liste in genutzt:
+        if optionen.get("kategorie_header", True):
+            trenner = "=" * 50
+            zeilen.append(f"    <!-- {trenner} -->")
+            zeilen.append(f"    <!-- KATEGORIE: {k.upper()} ({len(liste)}) -->")
+            zeilen.append(f"    <!-- {trenner} -->")
+        for b in liste:
+            zeilen.append("    " + b["block"])
+    zeilen.append("</types>")
+    neu_text = "\n".join(zeilen) + "\n"
+    return {"text": neu_text, "gesamt": len(bloecke), "kategorien_genutzt": len(genutzt),
+           "kategorien": [{"name": k, "anzahl": len(v)} for k, v in genutzt],
+           "unbekannt": unbekannt[:200], "unbekannt_gesamt": len(unbekannt)}
+
+
+async def api_tools_typesorganizer_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.typesorganizer")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.typesorganizer", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"types_count": 0, "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+    if status != "ok":
+        return err("db/types.xml per FTP nicht lesbar.", 502)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return err("db/types.xml ist kein gültiges XML.")
+    return ok({"types_count": len(root.findall("type")),
+              "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()})
+
+
+async def api_tools_typesorganizer_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.typesorganizer")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.typesorganizer", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    quelle_lokal = str(data_in.get("source_xml") or "").strip()
+    if commit and quelle_lokal:
+        return err("Eine lokal eingefügte types.xml kann nur zur Vorschau genutzt werden, nicht hochgeladen.")
+    if not quelle_lokal and not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    optionen = {
+        "navigation": bool(data_in.get("navigation", True)),
+        "kategorie_header": bool(data_in.get("kategorie_header", True)),
+        "alphabetisch": bool(data_in.get("alphabetisch", True)),
+    }
+    loop = asyncio.get_running_loop()
+    if quelle_lokal:
+        text = quelle_lokal
+    else:
+        if commit:
+            fehler = _dash_rate_limited(request, "tools.typesorganizer", 5)
+            if fehler is not None:
+                return fehler
+        text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+        if status != "ok":
+            return err("db/types.xml per FTP nicht lesbar.", 502)
+        quell_hash = str(data_in.get("source_hash") or "")
+        if quell_hash and quell_hash != hashlib.sha256(text.encode("utf-8")).hexdigest():
+            return err("db/types.xml wurde inzwischen geändert – bitte neu laden und Vorschau erneut erzeugen.", 409)
+    try:
+        ET.fromstring(text)
+    except ET.ParseError:
+        return err("Das ist kein gültiges XML (types.xml).")
+    try:
+        ergebnis = _tool_organizer_erzeugen(text, optionen)
+    except ValueError as e:
+        return err(str(e))
+    if not await _tools_datei_schreiben_wenn(commit, conn, "db/types.xml", ergebnis["text"], loop):
+        return err("db/types.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Types Organizer gespeichert",
+                  f"{ergebnis['gesamt']} Type(s) neu sortiert · {ergebnis['kategorien_genutzt']} "
+                  f"Kategorie(n) · {ergebnis['unbekannt_gesamt']} unbekannt · {conn.name}")
+    return ok({"gesamt": ergebnis["gesamt"], "kategorien_genutzt": ergebnis["kategorien_genutzt"],
+              "kategorien": ergebnis["kategorien"], "unbekannt": ergebnis["unbekannt"],
+              "unbekannt_gesamt": ergebnis["unbekannt_gesamt"],
               "generated": [{"filename": "db/types.xml", "content": ergebnis["text"]}]})
 
 
@@ -24337,6 +24560,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/typesbooster", api_tools_typesbooster_post)
     r.add_get("/api/tools/horde/batch", api_tools_horde_batch_get)
     r.add_post("/api/tools/horde/batch", api_tools_horde_batch_post)
+    r.add_get("/api/tools/typesorganizer", api_tools_typesorganizer_get)
+    r.add_post("/api/tools/typesorganizer", api_tools_typesorganizer_post)
     r.add_get("/api/tools/spawnpoint", api_tools_spawnpoint_get)
     r.add_post("/api/tools/spawnpoint", api_tools_spawnpoint_post)
 
@@ -25120,6 +25345,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "6cccee27686cdfcd87ffadef967d80172a8543334bea5c27a38adc788ecc0758",
         "36a71171115841113f43ce0bfd45b581315fe8a4b55137f590dc7b48b96d3f77",
         "3d8885b770b0f573c02bc478d4373f2b30997872d264ebc06bd2bc0875ce5350",
+        "4607dee7f5b47377256b0ae35c3415cd21d40a226c4315d8e6a1a975640b9fc8",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
