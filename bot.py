@@ -760,6 +760,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.spawnpoint":                  {"label": "Spawn Point Generator", "gruppe": "Tools"},
     "tools.typesbooster":                {"label": "Types Booster", "gruppe": "Tools"},
     "tools.typesorganizer":              {"label": "Types Organizer", "gruppe": "Tools"},
+    "tools.randompresets":                {"label": "Random Presets Generator", "gruppe": "Tools"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
     "permissions.subcommands":           {"label": "Subcommand Permissions", "gruppe": "Permissions"},
@@ -10541,6 +10542,7 @@ _TOOL_LISTE = (
     ("spawnpoint", "📍", "Spawn Point Generator"),
     ("typesbooster", "📈", "Types Booster"),
     ("typesorganizer", "🗂️", "Types Organizer"),
+    ("randompresets", "🎲", "Random Presets Generator"),
 )
 
 
@@ -12189,6 +12191,208 @@ async def api_tools_typesorganizer_post(request: web.Request) -> web.Response:
               "kategorien": ergebnis["kategorien"], "unbekannt": ergebnis["unbekannt"],
               "unbekannt_gesamt": ergebnis["unbekannt_gesamt"],
               "generated": [{"filename": "db/types.xml", "content": ergebnis["text"]}]})
+
+
+# ── 11. Random Presets Generator ──────────────────────────────────────────
+# Bearbeitet cfgrandompresets.xml chirurgisch je Gruppe (wie Event-Vorlagen),
+# NICHT durch Neugenerierung der ganzen Datei. Nur die beiden echten,
+# vom Bohemia-Vanilla-Format belegten Gruppentypen "cargo" und "attachments"
+# werden unterstuetzt - ein "outfit"-Typ existiert nur auf der Referenzseite,
+# nicht im echten DayZ-Format, und wird deshalb bewusst nicht angeboten.
+_TOOL_RANDOMPRESETS_TYPEN = ("cargo", "attachments")
+
+
+def _tool_randompresets_lesen(root: Optional[ET.Element]) -> List[Dict[str, Any]]:
+    gruppen = []
+    if root is None:
+        return gruppen
+    for typ in _TOOL_RANDOMPRESETS_TYPEN:
+        for el in root.findall(typ):
+            name = el.get("name")
+            if not name:
+                continue
+            gruppen.append({
+                "typ": typ, "name": name, "chance": el.get("chance") or "0.1",
+                "items": [{"name": it.get("name"), "chance": it.get("chance") or "0.1"}
+                         for it in el.findall("item") if it.get("name")],
+            })
+    return gruppen
+
+
+def _tool_randompresets_definition_aus_payload(op: Dict[str, Any]) -> Dict[str, Any]:
+    name = str(op.get("name") or "").strip()
+    if not name:
+        raise ValueError("Gruppenname darf nicht leer sein.")
+    typ = str(op.get("typ") or "").strip()
+    if typ not in _TOOL_RANDOMPRESETS_TYPEN:
+        raise ValueError(f'Unbekannter Gruppentyp „{typ}".')
+    try:
+        chance = float(op.get("chance", 0.1))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f'Ungültige Chance in Gruppe „{name}".') from e
+    if not 0.0 <= chance <= 1.0:
+        raise ValueError(f'Die Chance in Gruppe „{name}" muss zwischen 0 und 1 liegen.')
+    items = []
+    for it in (op.get("items") or []):
+        it_name = str(it.get("name") or "").strip()
+        if not it_name:
+            continue
+        try:
+            it_chance = float(it.get("chance", 0.1))
+        except (TypeError, ValueError) as e:
+            raise ValueError(f'Ungültige Item-Chance in Gruppe „{name}".') from e
+        if not 0.0 <= it_chance <= 1.0:
+            raise ValueError(f'Item-Chance in Gruppe „{name}" muss zwischen 0 und 1 liegen.')
+        items.append({"name": it_name, "chance": it_chance})
+    if not items:
+        raise ValueError(f'Gruppe „{name}" braucht mindestens ein Item.')
+    return {"typ": typ, "name": name, "chance": chance, "items": items}
+
+
+def _tool_randompreset_block_bauen(typ: str, name: str, chance: float, items: List[Dict[str, Any]]) -> str:
+    zeilen = [f'    <{typ} chance="{chance:.2f}" name="{_tool_esc_xml(name)}">']
+    for it in items:
+        zeilen.append(f'        <item name="{_tool_esc_xml(it["name"])}" chance="{float(it["chance"]):.2f}" />')
+    zeilen.append(f'    </{typ}>')
+    return "\n".join(zeilen)
+
+
+def _tool_apply_randompresets_batch(text: str, ops: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Wendet eine Liste von Gruppen-Operationen (Loeschen/Anlegen/Aendern/
+    Umbenennen/Typwechsel) chirurgisch an - reine Transformation, kein
+    FTP-Zugriff. Nicht angefasste Gruppen, Kommentare und Reihenfolge bleiben
+    bytegenau erhalten."""
+    neu = text
+    erstellt = geaendert = geloescht = 0
+    for op in ops:
+        original_typ = op.get("original_typ") or op.get("typ")
+        original_name = op.get("original_name") or op.get("name")
+        if op.get("op") == "delete":
+            neu, gefunden = _tool_entferne_benannten_block(neu, original_typ, original_name)
+            if gefunden:
+                geloescht += 1
+            continue
+        typ, name = op["typ"], op["name"]
+        vorhanden_vorher = _tool_finde_benannten_block(neu, original_typ, original_name) is not None
+        if (original_typ != typ or original_name != name) and vorhanden_vorher:
+            neu, _ = _tool_entferne_benannten_block(neu, original_typ, original_name)
+            vorhanden_vorher = False
+        block = _tool_randompreset_block_bauen(typ, name, op["chance"], op["items"])
+        neu = _tool_benannten_block_ersetzen(neu, "randompresets", typ, name, block)
+        if vorhanden_vorher:
+            geaendert += 1
+        else:
+            erstellt += 1
+    return {"text": neu, "erstellt": erstellt, "geaendert": geaendert, "geloescht": geloescht}
+
+
+async def api_tools_randompresets_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.randompresets")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.randompresets", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"gruppen": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "cfgrandompresets.xml", loop)
+    if status != "ok":
+        return err("cfgrandompresets.xml per FTP nicht lesbar.", 502)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return err("cfgrandompresets.xml ist kein gültiges XML.")
+    classnames: List[str] = []
+    types_text, types_status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+    if types_status == "ok":
+        try:
+            types_root = ET.fromstring(types_text)
+            classnames = [t.get("name") for t in types_root.findall("type") if t.get("name")]
+        except ET.ParseError:
+            classnames = []
+    return ok({"gruppen": _tool_randompresets_lesen(root), "classnames": classnames,
+              "hash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "backup": text})
+
+
+async def api_tools_randompresets_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.randompresets")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.randompresets", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    quelle_lokal = str(data_in.get("source_xml") or "").strip()
+    if commit and quelle_lokal:
+        return err("Eine lokal eingefügte cfgrandompresets.xml kann nur zur Vorschau genutzt werden, "
+                  "nicht hochgeladen.")
+    if not quelle_lokal and not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    ops_in = data_in.get("ops") or []
+    if not ops_in:
+        return err("Keine Änderungen im Entwurf.")
+    ops = []
+    for o in ops_in:
+        art = str(o.get("op") or "").strip()
+        if art == "delete":
+            name = str(o.get("name") or "").strip()
+            typ = str(o.get("typ") or "").strip()
+            if not name or typ not in _TOOL_RANDOMPRESETS_TYPEN:
+                return err("Ungültige Angaben zum Löschen.")
+            ops.append({"op": "delete", "typ": typ, "name": name,
+                       "original_typ": str(o.get("original_typ") or typ),
+                       "original_name": str(o.get("original_name") or name)})
+            continue
+        if art != "upsert":
+            return err(f'Unbekannte Operation „{art}".')
+        try:
+            definition = _tool_randompresets_definition_aus_payload(o)
+        except ValueError as e:
+            return err(str(e))
+        definition["op"] = "upsert"
+        definition["original_typ"] = str(o.get("original_typ") or definition["typ"])
+        definition["original_name"] = str(o.get("original_name") or definition["name"]).strip()
+        ops.append(definition)
+    finale = [(o["typ"], o["name"]) for o in ops if o.get("op") == "upsert"]
+    if len(finale) != len(set(finale)):
+        return err("Zwei Gruppen im Entwurf haben denselben Typ und Namen.")
+    loop = asyncio.get_running_loop()
+    if quelle_lokal:
+        text = quelle_lokal
+    else:
+        if commit:
+            fehler = _dash_rate_limited(request, "tools.randompresets", 10)
+            if fehler is not None:
+                return fehler
+        text, status = await _tools_datei_lesen(conn, "cfgrandompresets.xml", loop)
+        if status != "ok":
+            return err("cfgrandompresets.xml per FTP nicht lesbar.", 502)
+        quell_hash = str(data_in.get("source_hash") or "")
+        if quell_hash and quell_hash != hashlib.sha256(text.encode("utf-8")).hexdigest():
+            return err("cfgrandompresets.xml wurde inzwischen geändert – bitte neu laden und "
+                      "Vorschau erneut erzeugen.", 409)
+    try:
+        ET.fromstring(text)
+    except ET.ParseError:
+        return err("Das ist kein gültiges XML (cfgrandompresets.xml).")
+    ergebnis = _tool_apply_randompresets_batch(text, ops)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "cfgrandompresets.xml", ergebnis["text"], loop):
+        return err("cfgrandompresets.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Random Presets gespeichert",
+                  f"{ergebnis['erstellt']} neu, {ergebnis['geaendert']} geändert, "
+                  f"{ergebnis['geloescht']} gelöscht · {conn.name}")
+    return ok({"erstellt": ergebnis["erstellt"], "geaendert": ergebnis["geaendert"],
+              "geloescht": ergebnis["geloescht"],
+              "generated": [{"filename": "cfgrandompresets.xml", "content": ergebnis["text"]}]})
 
 
 cmd_change_damage_settings.autocomplete("server")(_server_autocomplete)
@@ -24562,6 +24766,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/horde/batch", api_tools_horde_batch_post)
     r.add_get("/api/tools/typesorganizer", api_tools_typesorganizer_get)
     r.add_post("/api/tools/typesorganizer", api_tools_typesorganizer_post)
+    r.add_get("/api/tools/randompresets", api_tools_randompresets_get)
+    r.add_post("/api/tools/randompresets", api_tools_randompresets_post)
     r.add_get("/api/tools/spawnpoint", api_tools_spawnpoint_get)
     r.add_post("/api/tools/spawnpoint", api_tools_spawnpoint_post)
 
@@ -25228,6 +25434,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "02627c9d93c5d1d7a8a640158e828b48acac1f420619f7c7e33c714aebb7877f",
         "1b32821e705a7cd784d3a55f39812331d4d331930d0cff59934971c2d333e0c1",
         "13f516a00d633c30378a08ce78972670d8b55e1e47078b9d001268f03b488e6d",
+        "9012814c7e1e6addfb529dbd66cacd19e97fd58b9737c6e60a51c89c9ccb15a5",
     ),
     "app.js": (
         "60db1ecc03e138a333c3f04ab3f2a740b351835cf2bef6639f1d58d0be6f5900",
@@ -25346,6 +25553,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "36a71171115841113f43ce0bfd45b581315fe8a4b55137f590dc7b48b96d3f77",
         "3d8885b770b0f573c02bc478d4373f2b30997872d264ebc06bd2bc0875ce5350",
         "4607dee7f5b47377256b0ae35c3415cd21d40a226c4315d8e6a1a975640b9fc8",
+        "62366a8cb616bd0d2c138810f9fa826a2c167f6fa806f8f37ecac8df1c4b684f",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
