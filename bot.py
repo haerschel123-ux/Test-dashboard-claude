@@ -12064,12 +12064,18 @@ def _tool_organizer_bloecke_lesen(text: str) -> List[Dict[str, str]]:
     etwas zu verwerfen."""
     bloecke = []
     gesehen = set()
+    duplikate = []
     for m in _TOOL_TYPE_BLOCK_MUSTER.finditer(text):
         name = m.group(2)
         if name in gesehen:
-            raise ValueError(f'Doppelter Type-Name „{name}" in der Datei – bitte zuerst bereinigen.')
+            if name not in duplikate:
+                duplikate.append(name)
+            continue
         gesehen.add(name)
         bloecke.append({"name": name, "block": m.group(0).strip()})
+    if duplikate:
+        namen = ", ".join(f'„{n}"' for n in duplikate)
+        raise ValueError(f'Doppelte Type-Namen in der Datei – bitte zuerst bereinigen: {namen}')
     if not bloecke:
         raise ValueError('Keine <type name="…">-Einträge in der Datei gefunden.')
     return bloecke
@@ -25557,6 +25563,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "4607dee7f5b47377256b0ae35c3415cd21d40a226c4315d8e6a1a975640b9fc8",
         "62366a8cb616bd0d2c138810f9fa826a2c167f6fa806f8f37ecac8df1c4b684f",
         "6b8f968906cdd6980cd96176f95edd87ee6e75e452155adf87bf910cfcf30545",
+        "62220e3bec112daee98bbc9c46cb865eaae886dedef249da9d70334e310b9bed",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
