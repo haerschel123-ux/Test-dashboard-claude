@@ -761,6 +761,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.typesbooster":                {"label": "Types Booster", "gruppe": "Tools"},
     "tools.typesorganizer":              {"label": "Types Organizer", "gruppe": "Tools"},
     "tools.randompresets":                {"label": "Random Presets Generator", "gruppe": "Tools"},
+    "tools.dzejson":                      {"label": "DZE → JSON Converter", "gruppe": "Tools"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
     "permissions.subcommands":           {"label": "Subcommand Permissions", "gruppe": "Permissions"},
@@ -10543,6 +10544,7 @@ _TOOL_LISTE = (
     ("typesbooster", "📈", "Types Booster"),
     ("typesorganizer", "🗂️", "Types Organizer"),
     ("randompresets", "🎲", "Random Presets Generator"),
+    ("dzejson", "🧩", "DZE → JSON Converter"),
 )
 
 
@@ -25554,6 +25556,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "3d8885b770b0f573c02bc478d4373f2b30997872d264ebc06bd2bc0875ce5350",
         "4607dee7f5b47377256b0ae35c3415cd21d40a226c4315d8e6a1a975640b9fc8",
         "62366a8cb616bd0d2c138810f9fa826a2c167f6fa806f8f37ecac8df1c4b684f",
+        "6b8f968906cdd6980cd96176f95edd87ee6e75e452155adf87bf910cfcf30545",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
