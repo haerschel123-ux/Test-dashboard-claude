@@ -763,6 +763,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.typesorganizer":              {"label": "Types Organizer", "gruppe": "Tools"},
     "tools.randompresets":                {"label": "Random Presets Generator", "gruppe": "Tools"},
     "tools.dzejson":                      {"label": "DZE → JSON Converter", "gruppe": "Tools"},
+    "tools.messages":                     {"label": "Messages Generator", "gruppe": "Tools"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
     "permissions.subcommands":           {"label": "Subcommand Permissions", "gruppe": "Permissions"},
@@ -10547,6 +10548,7 @@ _TOOL_LISTE = (
     ("typesorganizer", "🗂️", "Types Organizer"),
     ("randompresets", "🎲", "Random Presets Generator"),
     ("dzejson", "🧩", "DZE → JSON Converter"),
+    ("messages", "🔔", "Messages Generator"),
 )
 
 
@@ -12420,6 +12422,182 @@ async def api_tools_randompresets_post(request: web.Request) -> web.Response:
     return ok({"erstellt": ergebnis["erstellt"], "geaendert": ergebnis["geaendert"],
               "geloescht": ergebnis["geloescht"],
               "generated": [{"filename": "cfgrandompresets.xml", "content": ergebnis["text"]}]})
+
+
+# ── 13. Messages Generator ────────────────────────────────────────────────
+# Bearbeitet db/messages.xml - das echte, von Bohemia dokumentierte Vanilla-
+# In-Game-Nachrichtensystem (siehe community.bistudio.com/wiki/DayZ:Server_
+# Messages), NICHT die Discord-Ankündigungen dieses Dashboards und NICHT
+# serverDZ.cfg. Da <message>-Bloecke keinen eindeutigen Schluessel (kein
+# "name"-Attribut) haben, ist eine chirurgische Teiländerung wie bei
+# Event-Vorlagen/Random Presets nicht möglich - die Datei wird bei jedem
+# Speichern komplett aus der aktuellen Liste neu erzeugt (wie Types
+# Organizer), das Frontend zeigt dazu eine Warnung.
+_TOOL_MESSAGES_MAX_TEXT = 160
+
+
+def _tool_messages_lesen(root: Optional[ET.Element]) -> List[Dict[str, Any]]:
+    eintraege = []
+    if root is None:
+        return eintraege
+    for el in root.findall("message"):
+        text_el = el.find("text")
+        text = (text_el.text or "").strip() if text_el is not None and text_el.text else ""
+
+        def _int_feld(tag: str) -> Optional[int]:
+            e = el.find(tag)
+            if e is None or not (e.text or "").strip():
+                return None
+            try:
+                return int(e.text.strip())
+            except ValueError:
+                return None
+
+        onconnect = el.find("onconnect") is not None or el.find("onConnect") is not None
+        shutdown_el = el.find("shutdown")
+        shutdown = bool(shutdown_el is not None and (shutdown_el.text or "").strip() == "1")
+        eintraege.append({"text": text, "onconnect": onconnect, "delay": _int_feld("delay"),
+                          "repeat": _int_feld("repeat"), "deadline": _int_feld("deadline"),
+                          "shutdown": shutdown})
+    return eintraege
+
+
+def _tool_messages_eintrag_aus_payload(op: Dict[str, Any], index: int) -> Dict[str, Any]:
+    nr = index + 1
+    text = str(op.get("text") or "").strip()
+    if not text:
+        raise ValueError(f'Nachricht {nr}: Text darf nicht leer sein.')
+    if len(text) > _TOOL_MESSAGES_MAX_TEXT:
+        raise ValueError(f'Nachricht {nr}: Text darf höchstens {_TOOL_MESSAGES_MAX_TEXT} Zeichen haben.')
+    onconnect = bool(op.get("onconnect"))
+    shutdown = bool(op.get("shutdown"))
+
+    def _int_oder_none(wert: Any, feld: str) -> Optional[int]:
+        if wert is None or wert == "":
+            return None
+        try:
+            n = int(wert)
+        except (TypeError, ValueError):
+            raise ValueError(f'Nachricht {nr}: „{feld}" muss eine ganze Zahl sein.')
+        if n < 0:
+            raise ValueError(f'Nachricht {nr}: „{feld}" darf nicht negativ sein.')
+        return n
+
+    delay = _int_oder_none(op.get("delay"), "delay") if onconnect else None
+    repeat = _int_oder_none(op.get("repeat"), "repeat")
+    deadline = _int_oder_none(op.get("deadline"), "deadline")
+    if repeat is not None and repeat <= 0:
+        raise ValueError(f'Nachricht {nr}: „repeat" muss größer 0 sein.')
+    if deadline is not None and deadline <= 0:
+        raise ValueError(f'Nachricht {nr}: „deadline" muss größer 0 sein.')
+    if shutdown and not deadline:
+        raise ValueError(f'Nachricht {nr}: „Server bei Ablauf stoppen" braucht einen Countdown (deadline).')
+    if not (onconnect or repeat or deadline):
+        raise ValueError(f'Nachricht {nr}: mindestens On Connect, Repeat oder Countdown auswählen.')
+    return {"text": text, "onconnect": onconnect, "delay": delay, "repeat": repeat,
+            "deadline": deadline, "shutdown": shutdown}
+
+
+def _tool_messages_xml_bauen(eintraege: List[Dict[str, Any]]) -> str:
+    zeilen = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', "<messages>"]
+    for e in eintraege:
+        zeilen.append("    <message>")
+        if e["onconnect"]:
+            zeilen.append("        <onconnect>1</onconnect>")
+        if e["delay"] is not None:
+            zeilen.append(f'        <delay>{e["delay"]}</delay>')
+        if e["repeat"] is not None:
+            zeilen.append(f'        <repeat>{e["repeat"]}</repeat>')
+        if e["deadline"] is not None:
+            zeilen.append(f'        <deadline>{e["deadline"]}</deadline>')
+        if e["shutdown"]:
+            zeilen.append("        <shutdown>1</shutdown>")
+        zeilen.append(f'        <text>{_tool_esc_xml(e["text"])}</text>')
+        zeilen.append("    </message>")
+    zeilen.append("</messages>")
+    return "\n".join(zeilen) + "\n"
+
+
+async def api_tools_messages_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.messages")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.messages", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"eintraege": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "db/messages.xml", loop)
+    if status == "missing":
+        return ok({"eintraege": [], "existiert_nicht": True, "hash": None})
+    if status != "ok":
+        return err("db/messages.xml per FTP nicht lesbar.", 502)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return err("db/messages.xml ist kein gültiges XML.")
+    return ok({"eintraege": _tool_messages_lesen(root),
+              "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()})
+
+
+async def api_tools_messages_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.messages")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.messages", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    quelle_lokal = str(data_in.get("source_xml") or "").strip()
+    if commit and quelle_lokal:
+        return err("Eine lokal eingefügte messages.xml kann nur zur Vorschau genutzt werden, "
+                  "nicht hochgeladen.")
+    if not quelle_lokal and not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    ops_in = data_in.get("eintraege")
+    if not isinstance(ops_in, list):
+        return err("Es fehlt das Feld „eintraege“ (Array).")
+    if len(ops_in) > 200:
+        return err("Zu viele Nachrichten in einem Entwurf (maximal 200).")
+    eintraege = []
+    for i, op in enumerate(ops_in):
+        try:
+            eintraege.append(_tool_messages_eintrag_aus_payload(op, i))
+        except ValueError as e:
+            return err(str(e))
+    loop = asyncio.get_running_loop()
+    if quelle_lokal:
+        pass
+    else:
+        if commit:
+            fehler = _dash_rate_limited(request, "tools.messages", 10)
+            if fehler is not None:
+                return fehler
+        text_alt, status = await _tools_datei_lesen(conn, "db/messages.xml", loop)
+        if status == "error":
+            return err("db/messages.xml per FTP nicht lesbar.", 502)
+        if status == "ok":
+            quell_hash = str(data_in.get("source_hash") or "")
+            if quell_hash and quell_hash != hashlib.sha256(text_alt.encode("utf-8")).hexdigest():
+                return err("db/messages.xml wurde inzwischen geändert – bitte neu laden und "
+                          "Vorschau erneut erzeugen.", 409)
+    neuer_text = _tool_messages_xml_bauen(eintraege)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "db/messages.xml", neuer_text, loop):
+        return err("db/messages.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        anzahl_shutdown = sum(1 for e in eintraege if e["shutdown"])
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Messages Generator gespeichert",
+                  f"{len(eintraege)} Nachricht(en), davon {anzahl_shutdown} mit Shutdown · {conn.name}")
+    return ok({"anzahl": len(eintraege),
+              "generated": [{"filename": "db/messages.xml", "content": neuer_text}]})
 
 
 cmd_change_damage_settings.autocomplete("server")(_server_autocomplete)
@@ -22310,9 +22488,6 @@ async def post_subcmd_permissions(request: web.Request) -> web.Response:
     denied = await _modul_pruefen("permissions.subcommands", request, conn)
     if denied is not None:
         return denied
-    denied = _dash_rate_limited(request, "permissions.subcommands", 5)
-    if denied is not None:
-        return denied
     data = await body(request)
     op = str(data.get("op") or "")
     target_type = str(data.get("target_type") or "")
@@ -22402,9 +22577,6 @@ async def api_dashboard_permissions(request: web.Request) -> web.Response:
 
 async def post_dashboard_permissions(request: web.Request) -> web.Response:
     conn, denied = _dash_perm_owner_only(request)
-    if denied is not None:
-        return denied
-    denied = _dash_rate_limited(request, "permissions.dashboard", 5)
     if denied is not None:
         return denied
     data = await body(request)
@@ -24791,6 +24963,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/typesbooster", api_tools_typesbooster_post)
     r.add_get("/api/tools/typesreducer", api_tools_typesreducer_get)
     r.add_post("/api/tools/typesreducer", api_tools_typesreducer_post)
+    r.add_get("/api/tools/messages", api_tools_messages_get)
+    r.add_post("/api/tools/messages", api_tools_messages_post)
     r.add_get("/api/tools/horde/batch", api_tools_horde_batch_get)
     r.add_post("/api/tools/horde/batch", api_tools_horde_batch_post)
     r.add_get("/api/tools/typesorganizer", api_tools_typesorganizer_get)
@@ -25586,6 +25760,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "6b8f968906cdd6980cd96176f95edd87ee6e75e452155adf87bf910cfcf30545",
         "62220e3bec112daee98bbc9c46cb865eaae886dedef249da9d70334e310b9bed",
         "b58d7c917458454abee72ede57fb847b4e04f73ece52625d9437613f4b0af574",
+        "03187d0f82bbcfbd035446c15fd052a899f91605d80fa77d923f1efaa05e4f33",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
