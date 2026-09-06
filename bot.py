@@ -759,6 +759,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.event":                       {"label": "Event-Vorlagen", "gruppe": "Tools"},
     "tools.spawnpoint":                  {"label": "Spawn Point Generator", "gruppe": "Tools"},
     "tools.typesbooster":                {"label": "Types Booster", "gruppe": "Tools"},
+    "tools.typesreducer":                 {"label": "Types Reducer", "gruppe": "Tools"},
     "tools.typesorganizer":              {"label": "Types Organizer", "gruppe": "Tools"},
     "tools.randompresets":                {"label": "Random Presets Generator", "gruppe": "Tools"},
     "tools.dzejson":                      {"label": "DZE → JSON Converter", "gruppe": "Tools"},
@@ -10542,6 +10543,7 @@ _TOOL_LISTE = (
     ("event",     "📅", "Event-Vorlagen"),
     ("spawnpoint", "📍", "Spawn Point Generator"),
     ("typesbooster", "📈", "Types Booster"),
+    ("typesreducer", "📉", "Types Reducer"),
     ("typesorganizer", "🗂️", "Types Organizer"),
     ("randompresets", "🎲", "Random Presets Generator"),
     ("dzejson", "🧩", "DZE → JSON Converter"),
@@ -11869,11 +11871,11 @@ def _tool_types_transform_anwenden(text: str, root: ET.Element, optionen: Dict[s
            "uebersprungen": uebersprungen, "aenderungen": aenderungen}
 
 
-async def api_tools_typesbooster_get(request: web.Request) -> web.Response:
-    conn, fehler = _session_conn(request, "tools.typesbooster")
+async def _api_tools_types_transform_get(request: web.Request, modul_key: str) -> web.Response:
+    conn, fehler = _session_conn(request, modul_key)
     if fehler is not None:
         return fehler
-    fehler = await _modul_pruefen("tools.typesbooster", request, conn)
+    fehler = await _modul_pruefen(modul_key, request, conn)
     if fehler is not None:
         return fehler
     fehler = await _dash_gate(request, conn, "tools", "view")
@@ -11894,11 +11896,23 @@ async def api_tools_typesbooster_get(request: web.Request) -> web.Response:
               "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()})
 
 
-async def api_tools_typesbooster_post(request: web.Request) -> web.Response:
-    conn, fehler = _session_conn(request, "tools.typesbooster")
+async def api_tools_typesbooster_get(request: web.Request) -> web.Response:
+    return await _api_tools_types_transform_get(request, "tools.typesbooster")
+
+
+async def api_tools_typesreducer_get(request: web.Request) -> web.Response:
+    return await _api_tools_types_transform_get(request, "tools.typesreducer")
+
+
+async def _api_tools_types_transform_post(request: web.Request, modul_key: str,
+                                          modus_rechnung: str) -> web.Response:
+    """Gemeinsamer Kern fuer Types Booster und Types Reducer - zwei getrennte
+    Tools (eigene Berechtigung, eigene Kachel, kein Umschalter im Frontend),
+    die intern dieselbe chirurgische Nominal-Transformation nutzen."""
+    conn, fehler = _session_conn(request, modul_key)
     if fehler is not None:
         return fehler
-    fehler = await _modul_pruefen("tools.typesbooster", request, conn)
+    fehler = await _modul_pruefen(modul_key, request, conn)
     if fehler is not None:
         return fehler
     fehler = await _dash_gate(request, conn, "tools", "edit")
@@ -11911,9 +11925,6 @@ async def api_tools_typesbooster_post(request: web.Request) -> web.Response:
         return err("Eine lokal eingefügte types.xml kann nur zur Vorschau genutzt werden, nicht hochgeladen.")
     if not quelle_lokal and not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
-    modus_rechnung = str(data_in.get("modus") or "boost")
-    if modus_rechnung not in ("boost", "reduce"):
-        return err("Unbekannter Modus.")
     optionen = {
         "modus": modus_rechnung, "auto_min": bool(data_in.get("auto_min", True)),
         "filter_mode": str(data_in.get("filter_mode") or "all"),
@@ -11946,7 +11957,7 @@ async def api_tools_typesbooster_post(request: web.Request) -> web.Response:
         text = quelle_lokal
     else:
         if commit:
-            fehler = _dash_rate_limited(request, "tools.typesbooster", 10)
+            fehler = _dash_rate_limited(request, modul_key, 10)
             if fehler is not None:
                 return fehler
         text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
@@ -11964,7 +11975,7 @@ async def api_tools_typesbooster_post(request: web.Request) -> web.Response:
         return err("db/types.xml konnte nicht gespeichert werden.", 502)
     if commit:
         if modus_rechnung == "reduce":
-            _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Types reduziert gespeichert",
+            _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Types Reducer gespeichert",
                       f"{optionen['reduction_percent']:.0f}% · {ergebnis['geaendert']} geändert · {conn.name}")
         else:
             _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Types Booster gespeichert",
@@ -11972,6 +11983,14 @@ async def api_tools_typesbooster_post(request: web.Request) -> web.Response:
     return ok({"geprueft": ergebnis["geprueft"], "geaendert": ergebnis["geaendert"],
               "uebersprungen": ergebnis["uebersprungen"], "aenderungen": ergebnis["aenderungen"][:200],
               "generated": [{"filename": "db/types.xml", "content": ergebnis["text"]}]})
+
+
+async def api_tools_typesbooster_post(request: web.Request) -> web.Response:
+    return await _api_tools_types_transform_post(request, "tools.typesbooster", "boost")
+
+
+async def api_tools_typesreducer_post(request: web.Request) -> web.Response:
+    return await _api_tools_types_transform_post(request, "tools.typesreducer", "reduce")
 
 
 # ── 10. Types Organizer ───────────────────────────────────────────────────
@@ -24770,6 +24789,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/event/batch", api_tools_event_batch_post)
     r.add_get("/api/tools/typesbooster", api_tools_typesbooster_get)
     r.add_post("/api/tools/typesbooster", api_tools_typesbooster_post)
+    r.add_get("/api/tools/typesreducer", api_tools_typesreducer_get)
+    r.add_post("/api/tools/typesreducer", api_tools_typesreducer_post)
     r.add_get("/api/tools/horde/batch", api_tools_horde_batch_get)
     r.add_post("/api/tools/horde/batch", api_tools_horde_batch_post)
     r.add_get("/api/tools/typesorganizer", api_tools_typesorganizer_get)
@@ -25564,6 +25585,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "62366a8cb616bd0d2c138810f9fa826a2c167f6fa806f8f37ecac8df1c4b684f",
         "6b8f968906cdd6980cd96176f95edd87ee6e75e452155adf87bf910cfcf30545",
         "62220e3bec112daee98bbc9c46cb865eaae886dedef249da9d70334e310b9bed",
+        "b58d7c917458454abee72ede57fb847b4e04f73ece52625d9437613f4b0af574",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
