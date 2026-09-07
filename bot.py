@@ -764,6 +764,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.randompresets":                {"label": "Random Presets Generator", "gruppe": "Tools"},
     "tools.dzejson":                      {"label": "DZE → JSON Converter", "gruppe": "Tools"},
     "tools.messages":                     {"label": "Messages Generator", "gruppe": "Tools"},
+    "tools.lootexclusion":                {"label": "Loot-Ausschlusszonen", "gruppe": "Tools"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
     "permissions.subcommands":           {"label": "Subcommand Permissions", "gruppe": "Permissions"},
@@ -10549,6 +10550,7 @@ _TOOL_LISTE = (
     ("randompresets", "🎲", "Random Presets Generator"),
     ("dzejson", "🧩", "DZE → JSON Converter"),
     ("messages", "🔔", "Messages Generator"),
+    ("lootexclusion", "🚫", "Loot-Ausschlusszonen"),
 )
 
 
@@ -10821,6 +10823,135 @@ async def api_tools_gaszone_post(request: web.Request) -> web.Response:
     generated = [{"filename": "cfgEffectArea.json (neue Zonen)",
                  "content": json.dumps(new_areas, indent=2, ensure_ascii=False)}]
     return ok({"areas": len(new_areas), "generated": generated})
+
+
+# ── 2b. Loot-Ausschlusszonen (entfernt <group>-Eintraege aus mapgrouppos.xml) ──
+# Eigenstaendiges System, unabhaengig von den Dashboard-Zonen und dem
+# Gas-Zonen-Builder: mapgrouppos.xml listet platzierte Kartenobjektgruppen
+# (Gebaeude, Container u.a.) mit ihrer Weltposition. Ein Eintrag innerhalb
+# einer hier gezeichneten Kreiszone wird aus der Datei entfernt, sein
+# Loot-Container spawnt dann dort nicht mehr. Y wird ignoriert (reine
+# X/Z-Kreisgeometrie), genau wie beim Referenz-Tool.
+_TOOL_LOOTZONE_GROUP_RE = re.compile(
+    r'[ \t]*<group\b[^>]*?\bpos="([-\d.eE ]+)"[^>]*/>[ \t]*\r?\n?')
+
+
+def _lootzone_gruppen(text: str) -> List[Dict[str, Any]]:
+    """Findet alle <group ... pos="x y z" .../>-Eintraege in mapgrouppos.xml,
+    mit Position im Rohtext (fuer chirurgisches Entfernen) und Welt-X/Z."""
+    treffer = []
+    for m in _TOOL_LOOTZONE_GROUP_RE.finditer(text):
+        teile = m.group(1).split()
+        if len(teile) < 3:
+            continue
+        try:
+            x, z = float(teile[0]), float(teile[2])
+        except ValueError:
+            continue
+        treffer.append({"start": m.start(), "end": m.end(), "x": x, "z": z})
+    return treffer
+
+
+def _lootzone_treffer(gruppen: List[Dict[str, Any]],
+                      zonen: List[Dict[str, Any]]) -> Tuple[Set[int], List[int]]:
+    """Welche Gruppen-Indizes liegen in mindestens einer Zone, und wie viele
+    je Zone (fuer die Vorschau)."""
+    entfernen: Set[int] = set()
+    je_zone = [0] * len(zonen)
+    for i, g in enumerate(gruppen):
+        for zi, z in enumerate(zonen):
+            dx = g["x"] - z["x"]
+            dz = g["z"] - z["z"]
+            if dx * dx + dz * dz <= z["radius"] * z["radius"]:
+                entfernen.add(i)
+                je_zone[zi] += 1
+    return entfernen, je_zone
+
+
+def _lootzone_entfernen(text: str, gruppen: List[Dict[str, Any]], indices: Set[int]) -> str:
+    """Entfernt die angegebenen Gruppen-Zeilen - alles andere bleibt Byte fuer
+    Byte erhalten, wie bei den anderen chirurgischen Tool-Edits."""
+    stuecke = []
+    letzte = 0
+    for i in sorted(indices):
+        g = gruppen[i]
+        stuecke.append(text[letzte:g["start"]])
+        letzte = g["end"]
+    stuecke.append(text[letzte:])
+    return "".join(stuecke)
+
+
+async def api_tools_lootexclusion_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.lootexclusion")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.lootexclusion", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"gruppen": 0, "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "mapgrouppos.xml", loop)
+    if status != "ok":
+        return ok({"gruppen": 0, "nicht_lesbar": True})
+    return ok({"gruppen": len(_lootzone_gruppen(text))})
+
+
+async def api_tools_lootexclusion_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.lootexclusion")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.lootexclusion", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.lootexclusion", 10)
+        if fehler is not None:
+            return fehler
+    zonen_in = data_in.get("zones") or []
+    if not isinstance(zonen_in, list) or not zonen_in:
+        return err("Bitte mindestens eine Zone angeben.")
+    zonen = []
+    for z in zonen_in:
+        try:
+            x, zz, radius = float(z["x"]), float(z["z"]), float(z["radius"])
+        except (TypeError, ValueError, KeyError):
+            return err("Ungültige Zonen-Position oder -Radius.")
+        if radius <= 0:
+            return err("Radius muss größer als 0 sein.")
+        name = str(z.get("name") or "").strip() or f"Zone {len(zonen) + 1}"
+        zonen.append({"name": name, "x": x, "z": zz, "radius": radius})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "mapgrouppos.xml", loop)
+    if status != "ok":
+        return err("mapgrouppos.xml nicht lesbar – bitte per /ftp_scan prüfen lassen.", 502)
+    gruppen = _lootzone_gruppen(text)
+    entfernen, je_zone = _lootzone_treffer(gruppen, zonen)
+    neu_text = _lootzone_entfernen(text, gruppen, entfernen)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "mapgrouppos.xml", neu_text, loop):
+        return err("mapgrouppos.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Loot-Ausschlusszonen angewendet",
+                  f"{len(entfernen)} Eintrag/Einträge entfernt, {len(zonen)} Zone(n) · {conn.name}")
+    zeilen = [f"{z['name']}: {je_zone[i]} Eintrag/Einträge entfernt "
+              f"(X:{z['x']:.0f} Z:{z['z']:.0f} R:{z['radius']:.0f})"
+              for i, z in enumerate(zonen)]
+    zeilen.append("")
+    zeilen.append(f"Gesamt: {len(entfernen)} von {len(gruppen)} Einträgen entfernt, "
+                 f"{len(gruppen) - len(entfernen)} bleiben übrig.")
+    generated = [{"filename": "mapgrouppos.xml (Zusammenfassung)", "content": "\n".join(zeilen)}]
+    return ok({"removed": len(entfernen), "total": len(gruppen), "per_zone": je_zone,
+              "generated": generated})
 
 
 # ── 3. Zombie-Horden Generator ────────────────────────────────────────────
@@ -24948,6 +25079,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/loadout", api_tools_loadout_post)
     r.add_get("/api/tools/gaszone", api_tools_gaszone_get)
     r.add_post("/api/tools/gaszone", api_tools_gaszone_post)
+    r.add_get("/api/tools/lootexclusion", api_tools_lootexclusion_get)
+    r.add_post("/api/tools/lootexclusion", api_tools_lootexclusion_post)
     r.add_get("/api/tools/horde", api_tools_horde_get)
     r.add_post("/api/tools/horde", api_tools_horde_post)
     r.add_get("/api/tools/heliloot", api_tools_heliloot_get)
@@ -25766,6 +25899,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "03187d0f82bbcfbd035446c15fd052a899f91605d80fa77d923f1efaa05e4f33",
         "bfe61261fc8787bbb831044695930f67cd3a5269c865a8288857537d30504819",
         "85ff8c88bbfd94e0a1df84ac05f02b0a7ce076ea379fa63fbdc25e04abfc2801",
+        "f32c5aae0f8ee7cd8dc040bcfbc92a10dccf5cd4088f374356c07e7a3addbbad",
+        "8cffaa536d838a0db8d989abad612cf737f37516129a30dc7f8d095f8a11ce7a",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
