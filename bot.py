@@ -10977,7 +10977,14 @@ async def api_tools_lootexclusion_get(request: web.Request) -> web.Response:
     text, status = await _tools_datei_lesen(conn, "mapgrouppos.xml", loop)
     if status != "ok":
         return ok({"gruppen": 0, "nicht_lesbar": True})
-    return ok({"gruppen": len(_lootzone_gruppen(text))})
+    gruppen = _lootzone_gruppen(text)
+    antwort = {"gruppen": len(gruppen)}
+    # Punkte nur auf Anfrage mitschicken (koennen zehntausende sein) - fuer
+    # die reine Anzeige beim Modal-Oeffnen reicht die Anzahl, die Punkte holt
+    # sich das Frontend erst per "Von Server importieren"-Knopf.
+    if request.query.get("points"):
+        antwort["points"] = [{"x": g["x"], "z": g["z"]} for g in gruppen]
+    return ok(antwort)
 
 
 async def api_tools_lootexclusion_post(request: web.Request) -> web.Response:
@@ -25986,6 +25993,9 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "8cffaa536d838a0db8d989abad612cf737f37516129a30dc7f8d095f8a11ce7a",
         "b99ddd5276ca5e7dbdc92d1b716f1feeba0455416b06c31149dc7b95e36cf144",
         "93a5ea9e69f2cd8f3c4e2da52c7565aff5472bfbb2adfebdfe915d08b9bada60",
+        "d477d80456277576142c987e95fafed0e7dc96cf3c5b79c8360db767e405cd04",
+        "cc3826e8d5d9e7c85a44461706f3a16e05e07f35297a741b352a9ef9c559310e",
+        "765a79a4a1187b79285a03348491979b7b280d2a8e9891cce047ec8c8f7d5fd0",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
