@@ -5085,12 +5085,13 @@ class DayZBot(discord.Client):
         cutoff = time.time() - 3600
         self._restart_announced = {k for k in self._restart_announced if k[1] > cutoff}
 
-    async def _restart_countdown_post(self, conn: ServerConnection, nxt: float, mins: int):
-        """Baut die Countdown-Ankuendigung (60/30/15/10/5/3 Min vorher) fuer
-        EINEN Zeitpunkt/Server und postet sie in den restart-Feed - gemeinsam
-        genutzt von /auto restart (_restart_scheduler_conn) und der
-        Auto-Aufgabe "Server neu starten" (_restart_task_countdown), damit
-        beide Systeme optisch identisch ankuendigen."""
+    def _restart_countdown_bauen(self, nxt: float, mins: int) -> Tuple[discord.Embed, discord.ui.View]:
+        """Baut NUR Embed+View der Countdown-Ankuendigung (60/30/15/10/5/3 Min
+        vorher) - reine Bausteine, kein Versand. Gemeinsam genutzt von
+        /auto restart (postet in den restart-Feed, siehe _restart_countdown_post)
+        und der Auto-Aufgabe "Server neu starten" (postet in DEREN eigenen
+        konfigurierten Channel, siehe _restart_task_countdown) - beide sollen
+        optisch identisch ankuendigen, aber an unterschiedliche Ziele."""
         dauer_de = _restart_dauer_text(mins, "de")
         dauer_en = _restart_dauer_text(mins, "en")
         titel_de = f"🔄 Noch {dauer_de} bis zum nächsten Neustart!"
@@ -5102,6 +5103,12 @@ class DayZBot(discord.Client):
         color = 0xE74C3C if mins <= 5 else (0xE67E22 if mins <= 15 else 0xF1C40F)
         e = discord.Embed(title=titel_de, description=text_de, color=color)
         view = _SimpleTranslateView(titel_de, titel_en, text_de, text_en, color)
+        return e, view
+
+    async def _restart_countdown_post(self, conn: ServerConnection, nxt: float, mins: int):
+        """Baut die Countdown-Ankuendigung und postet sie in den restart-Feed
+        (fuer /auto restart, siehe _restart_scheduler_conn)."""
+        e, view = self._restart_countdown_bauen(nxt, mins)
         await self._post_restart_feed(e, conn, view=view)
 
     async def _restart_scheduler_conn(self, conn: ServerConnection):
@@ -5164,9 +5171,16 @@ class DayZBot(discord.Client):
     async def _restart_task_countdown(self, conn: ServerConnection, task: Dict, jetzt: float):
         """Wie _restart_scheduler_conn, nur fuer die Auto-Aufgabe "Server neu
         starten" - eigener Zeitplan je Aufgabe (task["next_execution"]) statt
-        des EINEN /auto restart-Zeitplans."""
+        des EINEN /auto restart-Zeitplans, UND postet in den fuer DIESE
+        Aufgabe eingestellten Channel statt in den restart-Feed - sonst landet
+        die Ankuendigung in einem Channel, den Brigarde fuer diese Aufgabe nie
+        eingerichtet hat, waehrend die Fertig-Meldung im richtigen Channel
+        ankommt (genau das war der gemeldete Fehler: Countdown blieb unsichtbar,
+        obwohl die Ausfuehrung im konfigurierten Channel selbst postete)."""
         nxt = float(task.get("next_execution", 0))
         if nxt <= 0:
+            return
+        if task.get("channel_ignore") or not task.get("channel_id"):
             return
         sid = conn.service_id
         tid = int(task.get("id", 0))
@@ -5175,7 +5189,14 @@ class DayZBot(discord.Client):
             key = (sid, tid, int(nxt), mins)
             if (mins * 60 - 45) < remaining <= mins * 60 and key not in self._task_restart_announced:
                 self._task_restart_announced.add(key)
-                await self._restart_countdown_post(conn, nxt, mins)
+                ch = await self._resolve_channel(int(task["channel_id"]))
+                if ch is None:
+                    continue
+                e, view = self._restart_countdown_bauen(nxt, mins)
+                try:
+                    await ch.send(embed=e, view=view)
+                except Exception as ex:  # noqa: BLE001
+                    log.error(f"[AUTO-AUFGABEN] Countdown-Versand fehlgeschlagen: {ex}")
 
     async def _scheduled_tasks_conn(self, conn: ServerConnection):
         jetzt = time.time()

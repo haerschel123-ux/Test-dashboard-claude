@@ -45,24 +45,59 @@ def test_zwei_stunden_wuerden_als_stunden_erkannt():
     assert bot._restart_dauer_text(120, "en") == "2 hours"
 
 
+class _FakeChannel:
+    def __init__(self, sink):
+        self.sink = sink
+
+    async def send(self, embed=None, view=None):  # noqa: ARG002
+        self.sink.append(embed.title)
+
+
 def test_restart_task_countdown_feuert_nur_im_fenster():
+    """Postet in den fuer DIE AUFGABE konfigurierten Channel (channel_id),
+    nicht in den restart-Feed - genau das war der gemeldete Fehler: die
+    Ankuendigung landete im falschen Channel und blieb dort unsichtbar."""
     b = bot.DayZBot()
     calls = []
 
-    async def fake_post(embed, conn=None, view=None):  # noqa: ARG001
-        calls.append(embed.title)
+    async def fake_resolve(ch_id):  # noqa: ARG001
+        return _FakeChannel(calls)
 
-    b._post_restart_feed = fake_post
+    b._resolve_channel = fake_resolve
     conn = _FakeConn()
     jetzt = time.time()
 
     # 45 Minuten entfernt: trifft keines der 60/30/15/10/5/3-Fenster
-    ausserhalb = {"id": 1, "task": "restart_server", "next_execution": jetzt + 45 * 60}
+    ausserhalb = {"id": 1, "task": "restart_server", "channel_id": 123,
+                  "next_execution": jetzt + 45 * 60}
     asyncio.run(b._restart_task_countdown(conn, ausserhalb, jetzt))
     assert calls == []
 
     # 5 Minuten entfernt: muss genau einmal feuern, auch bei zweitem Aufruf
-    innerhalb = {"id": 2, "task": "restart_server", "next_execution": jetzt + 5 * 60 - 5}
+    innerhalb = {"id": 2, "task": "restart_server", "channel_id": 123,
+                 "next_execution": jetzt + 5 * 60 - 5}
     asyncio.run(b._restart_task_countdown(conn, innerhalb, jetzt))
     asyncio.run(b._restart_task_countdown(conn, innerhalb, jetzt))
     assert calls == ["🔄 Noch 5 Minuten bis zum nächsten Neustart!"]
+
+
+def test_restart_task_countdown_ohne_channel_bleibt_stumm():
+    b = bot.DayZBot()
+    aufgerufen = []
+
+    async def fake_resolve(ch_id):  # noqa: ARG001
+        aufgerufen.append(ch_id)
+        return _FakeChannel([])
+
+    b._resolve_channel = fake_resolve
+    conn = _FakeConn()
+    jetzt = time.time()
+
+    kein_channel = {"id": 3, "task": "restart_server", "next_execution": jetzt + 5 * 60 - 5}
+    asyncio.run(b._restart_task_countdown(conn, kein_channel, jetzt))
+    assert aufgerufen == []
+
+    ignoriert = {"id": 4, "task": "restart_server", "channel_id": 123, "channel_ignore": True,
+                "next_execution": jetzt + 5 * 60 - 5}
+    asyncio.run(b._restart_task_countdown(conn, ignoriert, jetzt))
+    assert aufgerufen == []
