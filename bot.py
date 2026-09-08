@@ -266,7 +266,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "status_update_interval_seconds: Aktualisierungs-Intervall des Auto-Status-Embeds",
         "  (/setup feeds status #channel).",
         "auto_restart_schedule: Wird über /auto restart im Discord gesetzt (Startzeit +",
-        "  Intervall in Stunden). Ankündigungen 15/5/1 Min vorher im /setup feeds restart Channel.",
+        "  Intervall in Stunden). Ankündigungen 60/30/15/10/5/3 Min vorher im /setup feeds restart Channel.",
         "economy_backup_keep: So viele tägliche economy.db-Backups werden aufbewahrt.",
         "delivery_cleanup_delay_seconds: FALLBACK-Delay. Nach einem Server-Neustart wartet",
         "  der Bot, bis der Server wieder ONLINE ist (A2S-Antwort), und entfernt die",
@@ -2533,6 +2533,15 @@ def _tx(sprache: str, de: str, en: str) -> str:
 def _dist(d: str, sprache: str = "de") -> str:
     return f"{d} m" if d != "?" else _tx(sprache, "Nahkampf", "Melee range")
 
+def _restart_dauer_text(mins: int, sprache: str) -> str:
+    """"1 Stunde"/"1 hour" bei vollen Stunden, sonst "X Minuten"/"X minutes" -
+    fuer die Neustart-Ankuendigungen (60/30/15/10/5/3 Minuten vorher)."""
+    if mins >= 60 and mins % 60 == 0:
+        h = mins // 60
+        return _tx(sprache, f"{h} Stunde" + ("" if h == 1 else "n"),
+                  f"{h} hour" + ("" if h == 1 else "s"))
+    return _tx(sprache, f"{mins} Minuten", f"{mins} minutes")
+
 _EMOTE_CAMEL_RE = re.compile(r'(?<=[a-z0-9])(?=[A-Z])')
 
 def _emote_label(roh: Optional[str]) -> str:
@@ -2841,6 +2850,32 @@ class _FeedTranslateView(discord.ui.View):
             return await interaction.response.send_message(_t(
                 interaction, "❌ Konnte nicht übersetzt werden.",
                 "❌ Could not translate this message."), ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class _SimpleTranslateView(discord.ui.View):
+    """Wie _FeedTranslateView, aber fuer einfache, rein statische Embeds ohne
+    Event-Rohdaten (z. B. Neustart-Ankuendigungen) - Titel/Beschreibung/Footer
+    liegen hier direkt als de/en-Paar vor, kein EmbedBuilder-Rebuild noetig."""
+
+    def __init__(self, titel_de: str, titel_en: str, text_de: str, text_en: str,
+                 color: int, footer_de: str = "", footer_en: str = ""):
+        super().__init__(timeout=86400)
+        self.titel = {"de": titel_de, "en": titel_en}
+        self.text = {"de": text_de, "en": text_en}
+        self.footer = {"de": footer_de, "en": footer_en}
+        self.color = color
+        knopf = discord.ui.Button(label="Translate / Übersetzen", emoji="🌐",
+                                  style=discord.ButtonStyle.secondary)
+        knopf.callback = self._translate
+        self.add_item(knopf)
+
+    async def _translate(self, interaction: discord.Interaction):
+        sprache = _sprache(interaction)
+        embed = discord.Embed(title=self.titel[sprache], description=self.text[sprache],
+                              color=self.color)
+        if self.footer.get(sprache):
+            embed.set_footer(text=self.footer[sprache])
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -5055,17 +5090,23 @@ class DayZBot(discord.Client):
                 self._restart_announced = übrig
             return
         remaining = nxt - time.time()
-        # Ankündigungen 15/5/1 Minuten vorher (45s-Fenster > 30s-Loop-Takt)
-        for mins in (15, 5, 1):
+        # Ankündigungen 60/30/15/10/5/3 Minuten vorher (45s-Fenster > 30s-Loop-Takt)
+        for mins in (60, 30, 15, 10, 5, 3):
             key = (sid, int(nxt), mins)
             if (mins * 60 - 45) < remaining <= mins * 60 and key not in self._restart_announced:
                 self._restart_announced.add(key)
-                e = discord.Embed(
-                    title=f"🔄 Server-Neustart in {mins} Minute{'n' if mins != 1 else ''}!",
-                    description=(f"Geplanter Neustart um <t:{int(nxt)}:t> Uhr – "
-                                 f"bitte sichere Position und Loot."),
-                    color=0xE67E22 if mins <= 5 else 0xF1C40F)
-                await self._post_restart_feed(e, conn)
+                dauer_de = _restart_dauer_text(mins, "de")
+                dauer_en = _restart_dauer_text(mins, "en")
+                titel_de = f"🔄 Noch {dauer_de} bis zum nächsten Neustart!"
+                titel_en = f"🔄 {dauer_en} until the next restart!"
+                text_de = (f"Geplanter Neustart um <t:{int(nxt)}:t> Uhr – "
+                          f"bitte sichere Position und Loot.")
+                text_en = (f"Scheduled restart at <t:{int(nxt)}:t> – "
+                          f"please secure your position and loot.")
+                color = 0xE74C3C if mins <= 5 else (0xE67E22 if mins <= 15 else 0xF1C40F)
+                e = discord.Embed(title=titel_de, description=text_de, color=color)
+                view = _SimpleTranslateView(titel_de, titel_en, text_de, text_en, color)
+                await self._post_restart_feed(e, conn, view=view)
         # Restart auslösen
         key0 = (sid, int(nxt), 0)
         if remaining <= 30 and key0 not in self._restart_announced:
@@ -5348,7 +5389,8 @@ class DayZBot(discord.Client):
         await self.wait_until_ready()
 
     async def _post_restart_feed(self, embed: discord.Embed,
-                                 conn: Optional[ServerConnection] = None):
+                                 conn: Optional[ServerConnection] = None,
+                                 view: Optional[discord.ui.View] = None):
         """Postet in den restart-Feed; ohne konfigurierten Channel → adminlog.
 
         Mit Verbindung nur in deren Guild – ein Neustart-Hinweis eines Servers
@@ -5360,7 +5402,7 @@ class DayZBot(discord.Client):
             gid = int(gid_str)
             _sid = conn.service_id if conn is not None else None
             lt = ("restart" if cfg.get_channel(gid, "restart", _sid) else "adminlog")
-            await _post_feed(gid, lt, embed, service_id=_sid)
+            await _post_feed(gid, lt, embed, service_id=_sid, view=view)
 
     async def _try_refresh_ftp_credentials(self, conn: ServerConnection) -> bool:
         """Selbstheilung bei FTP-Dauerausfall: Zugangsdaten fuer DIESEN Server
@@ -14786,7 +14828,8 @@ def _validate_bet(bet: int, conf: Dict) -> Optional[str]:
 async def _post_feed(guild_id: Optional[int], log_type: str, embed: discord.Embed,
                      content: Optional[str] = None, channel_id: Optional[int] = None,
                      service_id: Optional[str] = None,
-                     anhang: Optional[Tuple[bytes, str]] = None) -> Tuple[bool, str]:
+                     anhang: Optional[Tuple[bytes, str]] = None,
+                     view: Optional[discord.ui.View] = None) -> Tuple[bool, str]:
     """Postet ein Embed in den konfigurierten Feed-Channel (eine Guild oder alle).
     content: optionaler Nachrichtentext vor dem Embed (z. B. Rollen-Ping bei Zonen).
     channel_id: optionaler Ziel-Channel, der die Feed-Konfiguration überschreibt
@@ -14797,6 +14840,8 @@ async def _post_feed(guild_id: Optional[int], log_type: str, embed: discord.Embe
     Download-Feeds) – aus den rohen Bytes wird PRO Versand ein frisches
     discord.File gebaut, da ein einzelnes File-Objekt sich nicht mehrfach
     verschicken laesst (mehrere Guilds bei channel_id=None).
+    view: optionale discord.ui.View (z. B. Übersetzen-Button) – wird bei
+    mehreren Zielen (channel_id=None) an JEDEN Post gehängt.
 
     Rückgabe ``(erfolg, grund)`` – ``grund`` ist einer von "sent",
     "channel_not_found", "channel_not_configured", "discord_forbidden",
@@ -14813,10 +14858,10 @@ async def _post_feed(guild_id: Optional[int], log_type: str, embed: discord.Embe
                 if anhang is not None else None)
         try:
             if content:
-                await ch.send(content=content, embed=embed, file=datei,
+                await ch.send(content=content, embed=embed, file=datei, view=view,
                               allowed_mentions=discord.AllowedMentions(roles=True))
             else:
-                await ch.send(embed=embed, file=datei)
+                await ch.send(embed=embed, file=datei, view=view)
             return True, "sent"
         except discord.Forbidden as e:
             log.error(f"[FEED] {tag}: {e}")
@@ -25902,6 +25947,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "f32c5aae0f8ee7cd8dc040bcfbc92a10dccf5cd4088f374356c07e7a3addbbad",
         "8cffaa536d838a0db8d989abad612cf737f37516129a30dc7f8d095f8a11ce7a",
         "b99ddd5276ca5e7dbdc92d1b716f1feeba0455416b06c31149dc7b95e36cf144",
+        "93a5ea9e69f2cd8f3c4e2da52c7565aff5472bfbb2adfebdfe915d08b9bada60",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
