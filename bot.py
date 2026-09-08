@@ -3929,6 +3929,10 @@ class DayZBot(discord.Client):
         # Verbindung (ServerConnection.ftp_warned_ts / .online_since) – als
         # Bot-Attribut haetten sich die Kunden gegenseitig ueberschrieben.
         self._restart_announced: set = set()  # (restart_ts, minuten) bereits angekündigt
+        # Wie _restart_announced, aber fuer die Auto-Aufgabe "Server neu
+        # starten" (eigener Zeitplan pro Aufgabe statt EINEM /auto restart-
+        # Zeitplan) - Schluessel (service_id, task_id, next_execution, minuten).
+        self._task_restart_announced: set = set()
         # Zonen-Pings (/zone create): wiederholte Pings im Cooldown-Intervall
         # Schluessel jeweils MIT service_id – sonst greifen gleichnamige Zonen
         # bzw. gleichnamige Spieler zweier Kunden ineinander.
@@ -5081,6 +5085,25 @@ class DayZBot(discord.Client):
         cutoff = time.time() - 3600
         self._restart_announced = {k for k in self._restart_announced if k[1] > cutoff}
 
+    async def _restart_countdown_post(self, conn: ServerConnection, nxt: float, mins: int):
+        """Baut die Countdown-Ankuendigung (60/30/15/10/5/3 Min vorher) fuer
+        EINEN Zeitpunkt/Server und postet sie in den restart-Feed - gemeinsam
+        genutzt von /auto restart (_restart_scheduler_conn) und der
+        Auto-Aufgabe "Server neu starten" (_restart_task_countdown), damit
+        beide Systeme optisch identisch ankuendigen."""
+        dauer_de = _restart_dauer_text(mins, "de")
+        dauer_en = _restart_dauer_text(mins, "en")
+        titel_de = f"🔄 Noch {dauer_de} bis zum nächsten Neustart!"
+        titel_en = f"🔄 {dauer_en} until the next restart!"
+        text_de = (f"Geplanter Neustart um <t:{int(nxt)}:t> Uhr – "
+                  f"bitte sichere Position und Loot.")
+        text_en = (f"Scheduled restart at <t:{int(nxt)}:t> – "
+                  f"please secure your position and loot.")
+        color = 0xE74C3C if mins <= 5 else (0xE67E22 if mins <= 15 else 0xF1C40F)
+        e = discord.Embed(title=titel_de, description=text_de, color=color)
+        view = _SimpleTranslateView(titel_de, titel_en, text_de, text_en, color)
+        await self._post_restart_feed(e, conn, view=view)
+
     async def _restart_scheduler_conn(self, conn: ServerConnection):
         sid = conn.service_id
         nxt = self._next_scheduled_restart(conn)
@@ -5095,18 +5118,7 @@ class DayZBot(discord.Client):
             key = (sid, int(nxt), mins)
             if (mins * 60 - 45) < remaining <= mins * 60 and key not in self._restart_announced:
                 self._restart_announced.add(key)
-                dauer_de = _restart_dauer_text(mins, "de")
-                dauer_en = _restart_dauer_text(mins, "en")
-                titel_de = f"🔄 Noch {dauer_de} bis zum nächsten Neustart!"
-                titel_en = f"🔄 {dauer_en} until the next restart!"
-                text_de = (f"Geplanter Neustart um <t:{int(nxt)}:t> Uhr – "
-                          f"bitte sichere Position und Loot.")
-                text_en = (f"Scheduled restart at <t:{int(nxt)}:t> – "
-                          f"please secure your position and loot.")
-                color = 0xE74C3C if mins <= 5 else (0xE67E22 if mins <= 15 else 0xF1C40F)
-                e = discord.Embed(title=titel_de, description=text_de, color=color)
-                view = _SimpleTranslateView(titel_de, titel_en, text_de, text_en, color)
-                await self._post_restart_feed(e, conn, view=view)
+                await self._restart_countdown_post(conn, nxt, mins)
         # Restart auslösen
         key0 = (sid, int(nxt), 0)
         if remaining <= 30 and key0 not in self._restart_announced:
@@ -5145,10 +5157,33 @@ class DayZBot(discord.Client):
                 await self._scheduled_tasks_conn(conn)
             except Exception as e:  # noqa: BLE001 – ein Server darf die anderen nicht stoppen
                 log.error(f"[AUTO-AUFGABEN] {conn.name}: {e}")
+        # Alte Ankündigungs-Marker aufräumen (wie bei _restart_announced)
+        cutoff = time.time() - 3600
+        self._task_restart_announced = {k for k in self._task_restart_announced if k[2] > cutoff}
+
+    async def _restart_task_countdown(self, conn: ServerConnection, task: Dict, jetzt: float):
+        """Wie _restart_scheduler_conn, nur fuer die Auto-Aufgabe "Server neu
+        starten" - eigener Zeitplan je Aufgabe (task["next_execution"]) statt
+        des EINEN /auto restart-Zeitplans."""
+        nxt = float(task.get("next_execution", 0))
+        if nxt <= 0:
+            return
+        sid = conn.service_id
+        tid = int(task.get("id", 0))
+        remaining = nxt - jetzt
+        for mins in (60, 30, 15, 10, 5, 3):
+            key = (sid, tid, int(nxt), mins)
+            if (mins * 60 - 45) < remaining <= mins * 60 and key not in self._task_restart_announced:
+                self._task_restart_announced.add(key)
+                await self._restart_countdown_post(conn, nxt, mins)
 
     async def _scheduled_tasks_conn(self, conn: ServerConnection):
         jetzt = time.time()
-        faellig = [t for t in _scheduled_tasks(conn)
+        alle = _scheduled_tasks(conn)
+        for task in alle:
+            if isinstance(task, dict) and task.get("task") == "restart_server":
+                await self._restart_task_countdown(conn, task, jetzt)
+        faellig = [t for t in alle
                   if isinstance(t, dict) and float(t.get("next_execution", 0)) <= jetzt]
         if not faellig:
             return
@@ -6989,10 +7024,13 @@ auto_status.autocomplete("server")(_server_autocomplete)
 
 # ══════════════════════════════════════════════════════════════
 #  Auto-Aufgaben (Dashboard): mehrere unabhaengige geplante Aufgaben je
-#  Server – anders als der Neustart-Zeitplan aus /auto restart (EIN
-#  Zeitplan, 15/5/1-Minuten-Ankuendigungen) laufen diese hier lautlos ab
-#  und melden sich nur per Wahl-Channel, wenn sie tatsaechlich ausgefuehrt
-#  wurden. Bewusst getrennte Systeme, kein Ersatz fuereinander.
+#  Server – anders als der EINE Neustart-Zeitplan aus /auto restart hat hier
+#  jede Aufgabe ihren eigenen Zeitplan. Die meisten laufen lautlos ab und
+#  melden sich nur per Wahl-Channel, wenn sie tatsaechlich ausgefuehrt
+#  wurden - AUSSER "Server neu starten": die bekommt dieselben 60/30/15/
+#  10/5/3-Minuten-Countdown-Ankuendigungen in den restart-Feed wie /auto
+#  restart (siehe _restart_task_countdown), nur mit ihrem eigenen Zeitplan.
+#  Bewusst getrennte Systeme, kein Ersatz fuereinander.
 # ══════════════════════════════════════════════════════════════
 # Registrierte Aufgaben-Typen – weitere kommen spaeter dazu (die Ausfuehrung
 # je Typ steht in _scheduled_task_ausfuehren).
