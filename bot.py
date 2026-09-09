@@ -730,11 +730,16 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
 #  Bewusst NICHT als zusaetzliches Feld in FEED_TYPES: die Stufen aendert
 #  ausschliesslich Brigarde zur Laufzeit im Dashboard, FEED_TYPES bleibt
 #  Code-Konstante. Gespeichert wird die Abweichung vom Standard "premium" in
-#  cfg.config["module_tiers"] (und die Beta-Rolle in
-#  cfg.config["module_beta_roles"]) – beides global, gilt fuer alle Kunden
-#  gleichzeitig, kein Server-Override.
+#  cfg.config["module_tiers"] – global, gilt fuer alle Kunden gleichzeitig,
+#  kein Server-Override.
 # ══════════════════════════════════════════════════════════════
 MODULE_TIERS = ("public", "premium", "beta", "under_review")
+
+# Fest verdrahtete Beta-Rolle in Brigardes Haupt-Discord (Guild
+# 1534352039713439855) – frueher je Modul im Dashboard waehlbar, jetzt fuer
+# ALLE "beta"-Module dieselbe Rolle. _module_beta_role() gibt sie unabhaengig
+# vom Modul-Key zurueck, siehe _module_erlaubt/_sitzung_hat_beta_zugriff.
+BETA_ROLLE_ID = 1540339258852778015
 
 # Module ausserhalb der Feeds, die der Modul Manager ebenfalls stufen kann.
 # Schluessel mit Punkt ("auto_tasks.restart_schedule") sind Einzelfunktionen
@@ -19109,7 +19114,6 @@ async def api_modules(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     tiers = cfg.config.get("module_tiers") or {}
-    beta_roles = cfg.config.get("module_beta_roles") or {}
     out = []
     for k, v in _alle_module().items():
         eigener_eintrag = tiers.get(k) if tiers.get(k) in MODULE_TIERS else None
@@ -19121,28 +19125,8 @@ async def api_modules(request: web.Request) -> web.Response:
             # "folgt Kategorie"-Anzeige bei Einzelfunktionen im Dashboard).
             "tier": _module_tier(k),
             "eigene_stufe": eigener_eintrag,
-            "beta_role_id": str(beta_roles[k]) if beta_roles.get(k) else None,
         })
-    return ok({"modules": out,
-               "beta_guild_id": str(cfg.config.get("premium_role_guild_id") or "")})
-
-
-async def api_module_beta_roles(request: web.Request) -> web.Response:
-    """Rollen aus Brigardes Haupt-Discord (premium_role_guild_id) für die
-    Beta-Rollenauswahl – bewusst eine eigene Route statt guild_roles(), das
-    an die Guild des jeweils gewählten Kundenservers gebunden ist."""
-    denied = await _require_admin(request)
-    if denied is not None:
-        return denied
-    try:
-        gid = int(str(cfg.config.get("premium_role_guild_id") or "0") or 0)
-    except (TypeError, ValueError):
-        gid = 0
-    guild = bot.get_guild(gid) if (bot is not None and gid) else None
-    if guild is None:
-        return ok({"roles": []})
-    roles = [{"id": str(r.id), "name": r.name} for r in guild.roles if not r.is_default()]
-    return ok({"roles": roles})
+    return ok({"modules": out})
 
 
 async def post_module_tier(request: web.Request) -> web.Response:
@@ -19155,7 +19139,6 @@ async def post_module_tier(request: web.Request) -> web.Response:
     data = await body(request)
     tier = data.get("tier")
     tiers = cfg.config.setdefault("module_tiers", {})
-    beta_roles = cfg.config.setdefault("module_beta_roles", {})
     # "inherit" gibt es nur bei Einzelfunktionen (Punkt im Key) - dann
     # keinen eigenen Eintrag setzen, sondern einen vorhandenen entfernen,
     # damit die Kategorie-Stufe wieder greift.
@@ -19163,32 +19146,17 @@ async def post_module_tier(request: web.Request) -> web.Response:
         if _modul_elternteil(key) is None:
             return err("Kategorien können nicht auf „folgt Kategorie“ stehen.", 400)
         tiers.pop(key, None)
-        beta_roles.pop(key, None)
         cfg.save_config()
         _audit_add("dashboard", _audit_actor(_sess_get(request)),
                    "Modul-Stufe geändert", f"{key} → folgt Kategorie")
-        return ok({"key": key, "tier": _module_tier(key), "eigene_stufe": None,
-                   "beta_role_id": None})
+        return ok({"key": key, "tier": _module_tier(key), "eigene_stufe": None})
     if tier not in MODULE_TIERS:
         return err("Ungültige Stufe.", 400)
     tiers[key] = tier
-    if tier == "beta":
-        roh = data.get("beta_role_id")
-        try:
-            role_id = int(roh) if roh not in (None, "") else None
-        except (TypeError, ValueError):
-            return err("Ungültige Rollen-ID.", 400)
-        if role_id:
-            beta_roles[key] = role_id
-        else:
-            beta_roles.pop(key, None)
-    else:
-        beta_roles.pop(key, None)
     cfg.save_config()
     _audit_add("dashboard", _audit_actor(_sess_get(request)),
                "Modul-Stufe geändert", f"{key} → {tier}")
-    return ok({"key": key, "tier": tier,
-               "beta_role_id": str(beta_roles.get(key)) if beta_roles.get(key) else None})
+    return ok({"key": key, "tier": tier})
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -19347,16 +19315,11 @@ def _module_tier(key: str) -> str:
 
 
 def _module_beta_role(key: str) -> Optional[int]:
-    roles = cfg.config.get("module_beta_roles") or {}
-    try:
-        if roles.get(key):
-            return int(roles[key])
-        eltern = _modul_elternteil(key)
-        if eltern and roles.get(eltern):
-            return int(roles[eltern])
-    except (TypeError, ValueError):
-        return None
-    return None
+    """Fest verdrahtete Beta-Rolle (BETA_ROLLE_ID), unabhaengig vom Modul -
+    frueher je Modul im Dashboard waehlbar (cfg.config["module_beta_roles"]),
+    siehe BETA_ROLLE_ID. `key` bleibt Teil der Signatur, damit sich die
+    Aufrufer nicht aendern muessen."""
+    return BETA_ROLLE_ID
 
 
 async def _user_hat_rolle(guild_id: int, user_id: int, role_id: int) -> bool:
@@ -19378,21 +19341,12 @@ async def _user_hat_rolle(guild_id: int, user_id: int, role_id: int) -> bool:
 
 
 async def _sitzung_hat_beta_zugriff(sess: Optional[Dict[str, Any]]) -> bool:
-    """Traegt dieses Konto irgendeine der im Modul-Manager hinterlegten
-    Beta-Rollen im Betreiber-Discord? Fuer das Status-Abzeichen in der
-    Kopfzeile (app.js: applyDiscordUser) - unabhaengig von Premium, da Beta
-    ueber eine eigene Rolle laeuft (siehe _module_erlaubt)."""
+    """Traegt dieses Konto die fest verdrahtete Beta-Rolle (BETA_ROLLE_ID) im
+    Betreiber-Discord? Fuer das Status-Abzeichen in der Kopfzeile
+    (app.js: applyDiscordUser) - unabhaengig von Premium, da Beta ueber eine
+    eigene Rolle laeuft (siehe _module_erlaubt)."""
     uid = str(((sess or {}).get("discord") or {}).get("id") or "")
     if not uid:
-        return False
-    rollen = cfg.config.get("module_beta_roles") or {}
-    role_ids: set = set()
-    for wert in rollen.values():
-        try:
-            role_ids.add(int(wert))
-        except (TypeError, ValueError):
-            continue
-    if not role_ids:
         return False
     try:
         gid = int(str(cfg.config.get("premium_role_guild_id") or "0") or 0)
@@ -19400,10 +19354,7 @@ async def _sitzung_hat_beta_zugriff(sess: Optional[Dict[str, Any]]) -> bool:
         return False
     if not gid:
         return False
-    for role_id in role_ids:
-        if await _user_hat_rolle(gid, int(uid), role_id):
-            return True
-    return False
+    return await _user_hat_rolle(gid, int(uid), BETA_ROLLE_ID)
 
 
 async def _module_erlaubt(key: str, sess: Optional[Dict[str, Any]],
@@ -25112,7 +25063,6 @@ def build_app() -> web.Application:
     r.add_get("/api/admin/guilds", api_admin_guilds)
     r.add_get("/api/admin/backup", api_admin_backup)
     r.add_get("/api/modules", api_modules)
-    r.add_get("/api/modules/beta-roles", api_module_beta_roles)
     r.add_post("/api/modules/{key}", post_module_tier)
     r.add_get("/api/admin/servers", api_admin_servers)
     r.add_post("/api/admin/servers/{service_id}/guild", post_admin_server_guild)
@@ -26017,6 +25967,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "d477d80456277576142c987e95fafed0e7dc96cf3c5b79c8360db767e405cd04",
         "cc3826e8d5d9e7c85a44461706f3a16e05e07f35297a741b352a9ef9c559310e",
         "765a79a4a1187b79285a03348491979b7b280d2a8e9891cce047ec8c8f7d5fd0",
+        "0963c3f0a6eec5fee983d6d8d9e18b96647c86813ff624fef99cb28cadf5b36b",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
