@@ -741,6 +741,15 @@ MODULE_TIERS = ("public", "premium", "beta", "under_review")
 # vom Modul-Key zurueck, siehe _module_erlaubt/_sitzung_hat_beta_zugriff.
 BETA_ROLLE_ID = 1540339258852778015
 
+# Kunden-Stufe je Server (Serverliste, ServerConnection.data["kunden_stufe"]):
+# steuert, ob eine Freischaltung Premium-Zugang gibt, Beta-Zugang, beides
+# oder nur die reine Verbindung ohne beides ("public" - fuer Dashboard-Module
+# auf Stufe "public", die ohnehin fuer jeden offen sind). Getrennt von
+# MODULE_TIERS: dort steht, WELCHE Freigabe ein Modul GLOBAL braucht, hier,
+# WELCHE Freigabe(n) EIN Kunde bekommen hat. Siehe _sitzung_hat_premium,
+# _kunden_stufe, post_admin_server_status.
+KUNDEN_STUFEN = ("public", "premium", "premium_beta", "beta")
+
 # Module ausserhalb der Feeds, die der Modul Manager ebenfalls stufen kann.
 # Schluessel mit Punkt ("auto_tasks.restart_schedule") sind Einzelfunktionen
 # einer Kategorie und erben deren Stufe, wenn sie selbst keinen Eintrag in
@@ -3201,10 +3210,20 @@ class ServerConnection:
             # erst, wenn der Betreiber sie in der Serverliste zuordnet.
             "guild_id_requested": (str(self.data.get("guild_id_requested"))
                                    if self.data.get("guild_id_requested") else None),
+            "kunden_stufe": _kunden_stufe(self),
         }
         if with_token:
             out["token"] = self.token
         return out
+
+
+def _kunden_stufe(conn: Optional["ServerConnection"]) -> str:
+    """Welche Kunden-Stufe (KUNDEN_STUFEN) dieser Server hat - ohne eigenen
+    Eintrag "premium" (Altbestand: vor dieser Funktion bedeutete jede
+    Guild-Zuordnung automatisch Premium, das bleibt fuer bereits bestaetigte
+    Server ohne explizite Stufe unveraendert)."""
+    stufe = str((conn.data.get("kunden_stufe") if conn else None) or "premium")
+    return stufe if stufe in KUNDEN_STUFEN else "premium"
 
 
 class ConnectionRegistry:
@@ -3711,8 +3730,11 @@ async def _premium_check(interaction: discord.Interaction) -> bool:
         if not gesperrt:
             if interaction.guild_id is None:
                 return True                  # Direktnachricht: nichts zu sperren
-            # Freigeschaltet ist die Guild, sobald ihr MINDESTENS ein Server gehoert.
-            if connections.all_for_guild(interaction.guild_id):
+            # Freigeschaltet ist die Guild, sobald ihr MINDESTENS ein Server mit
+            # Premium-Stufe gehoert - ein rein "public"/"beta"-gestufter Server
+            # zaehlt hier nicht (siehe _kunden_stufe/_sitzung_hat_premium).
+            if any(_kunden_stufe(c) in ("premium", "premium_beta")
+                  for c in connections.all_for_guild(interaction.guild_id)):
                 return True
     except Exception:  # noqa: BLE001
         return True
@@ -4075,24 +4097,31 @@ class DayZBot(discord.Client):
             log.warning(f"[ECON] wipe_money_on_leave fehlgeschlagen für {member.id}: {e}")
 
     async def on_member_join(self, member: discord.Member):
-        """Automatisches Nachreichen der Premium-Badge-Rolle im Betreiber-
-        Discord: wurde einem Kunden Premium gegeben, WAEHREND er diesem
-        Discord noch gar nicht beigetreten war, konnte _premium_rolle ihn
-        damals nicht finden (discord.NotFound). Das hier holt es nach,
-        sobald er beitritt - die eigentliche Freischaltung im Kundenserver
-        war davon nie betroffen, nur die Badge-Rolle hier."""
+        """Automatisches Nachreichen der Premium-/Beta-Badge-Rolle im
+        Betreiber-Discord: wurde einem Kunden eine Rolle gegeben, WAEHREND er
+        diesem Discord noch gar nicht beigetreten war, konnte _premium_rolle/
+        _beta_rolle ihn damals nicht finden (discord.NotFound). Das hier holt
+        es nach, sobald er beitritt - die eigentliche Freischaltung im
+        Kundenserver war davon nie betroffen, nur die Badge-Rolle(n) hier."""
         try:
             gid = str(cfg.config.get("premium_role_guild_id") or "").strip()
             if not gid or int(gid) != member.guild.id:
                 return
-            if not _hat_noch_premium(member.id):
+            will_premium = _hat_noch_premium(member.id)
+            will_beta = _hat_noch_beta_stufe(member.id)
+            if not (will_premium or will_beta):
                 return
         except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
             log.debug(f"[PREMIUM] on_member_join: {e}")
             return
-        hinweis = await _premium_rolle(member.id, True)
-        if hinweis:
-            log.info(f"[PREMIUM] on_member_join {member}: {hinweis}")
+        if will_premium:
+            hinweis = await _premium_rolle(member.id, True)
+            if hinweis:
+                log.info(f"[PREMIUM] on_member_join {member}: {hinweis}")
+        if will_beta:
+            hinweis = await _beta_rolle(member.id, True)
+            if hinweis:
+                log.info(f"[BETA] on_member_join {member}: {hinweis}")
 
     async def on_member_ban(self, guild: discord.Guild, user: discord.abc.User):
         """Sofortiger Entzug der Freischaltung bei einem Bann im Betreiber-
@@ -19279,8 +19308,10 @@ def _sitzung_hat_premium(sess: Optional[Dict[str, Any]],
                          conn: Optional[ServerConnection]) -> bool:
     """Ist der Server DIESER Anmeldung freigeschaltet?
 
-    Freischaltung heisst: dem Nitrado-Server ist eine Discord-Guild zugeordnet –
-    dieselbe Bedingung, an der auch ``_premium_check`` die Slash-Befehle haengt.
+    Freischaltung heisst: dem Nitrado-Server ist eine Discord-Guild zugeordnet
+    UND die Kunden-Stufe (KUNDEN_STUFEN) ist "premium" oder "premium_beta" -
+    "public"/"beta" allein geben KEIN Dashboard-Premium, siehe _kunden_stufe.
+    Dieselbe Bedingung, an der auch ``_premium_check`` die Slash-Befehle haengt.
     Bewusst pro gewaehltem Server: wer zwei Server hat, von denen nur einer frei
     ist, soll beim anderen auch kein Dashboard bekommen.
 
@@ -19289,7 +19320,8 @@ def _sitzung_hat_premium(sess: Optional[Dict[str, Any]],
     """
     if (sess or {}).get("is_admin"):
         return True
-    return bool(conn is not None and conn.guild_id)
+    return bool(conn is not None and conn.guild_id
+               and _kunden_stufe(conn) in ("premium", "premium_beta"))
 
 
 def _modul_elternteil(key: str) -> Optional[str]:
@@ -19725,7 +19757,12 @@ async def api_admin_servers(request: web.Request) -> web.Response:
 
 
 async def post_admin_server_guild(request: web.Request) -> web.Response:
-    """Guild-ID einem Nitrado-Server zuordnen (der Premium-Schalter)."""
+    """Guild-ID einem Nitrado-Server zuordnen oder die Zuordnung entfernen -
+    der Stift-Dialog in der Serverliste. Aendert bewusst NUR die Guild-
+    Zuordnung, nicht die Kunden-Stufe (Premium/Beta) - die bleibt, wie sie
+    zuletzt gesetzt wurde (Default "premium" fuer Server ohne eigenen
+    Eintrag, siehe _kunden_stufe). Eine neue Stufe waehlen bzw. bestehende
+    hoch-/runterstufen geht ueber post_admin_server_status."""
     denied = await _require_admin(request)
     if denied is not None:
         return denied
@@ -19743,11 +19780,11 @@ async def post_admin_server_guild(request: web.Request) -> web.Response:
             return err(msg)
         result = await _guild_aufraeumen(alte_gid)
         # Erst NACH assign_guild pruefen – sonst zaehlt der gerade entzogene
-        # Server noch als Premium und die Rolle bliebe stehen.
-        if not _hat_noch_premium(besitzer):
-            hinweis = await _premium_rolle(besitzer, False)
-            if hinweis:
-                result["premium_rolle"] = hinweis
+        # Server noch mit und die Rolle(n) blieben stehen. Deckt Premium UND
+        # Beta ab, je nachdem, welche Stufe dieser Server zuletzt hatte.
+        hinweise = await _rollen_fuer_kunden_stufe(besitzer)
+        if hinweise:
+            result["premium_rolle"] = " ".join(hinweise)
         result["message"] = msg
         return ok(result)
     if not raw.isdigit() or not (17 <= len(raw) <= 20):
@@ -19772,28 +19809,82 @@ async def post_admin_server_guild(request: web.Request) -> web.Response:
         cfg.config["guild_ids"] = ids
         cfg.save_config()
     result = await _register_guild_commands(gid)
-    # Freischaltung heisst Premium – der Kunde bekommt die Premium-Rolle im
-    # Betreiber-Discord. Ein Fehlschlag steht als Hinweis in der Antwort, macht
-    # die Freischaltung selbst aber nicht rueckgaengig.
-    hinweis = await _premium_rolle(
-        _ziel.data.get("owner_discord_id") if _ziel is not None else None, True)
-    if hinweis:
-        result["premium_rolle"] = hinweis
     result["message"] = msg
     return ok(result)
 
 
-def _hat_noch_premium(owner_id: Any) -> bool:
-    """Hat dieses Discord-Konto noch einen ANDEREN freigeschalteten Server?
+async def post_admin_server_status(request: web.Request) -> web.Response:
+    """Bestaetigt eine Guild-Anfrage MIT Kunden-Stufe (Public/Premium/
+    Premium+Beta/Beta) oder aendert die Stufe eines bereits freigeschalteten
+    Servers (Upgrade/Downgrade) - Premium-/Beta-Rolle im Betreiber-Discord
+    werden dabei passend gesetzt bzw. entfernt. Getrennt von
+    post_admin_server_guild (Stift), das nur die Guild-Zuordnung aendert und
+    dabei bewusst die zuletzt gesetzte Stufe unangetastet laesst."""
+    denied = await _require_admin(request)
+    if denied is not None:
+        return denied
+    service_id = request.match_info["service_id"]
+    data = await body(request)
+    stufe = str(data.get("status") or "").strip()
+    if stufe not in KUNDEN_STUFEN:
+        return err("Ungültige Stufe.", 400)
+    raw = str(data.get("guild_id", "")).strip()
+    if not raw.isdigit() or not (17 <= len(raw) <= 20):
+        return err("Das sieht nicht nach einer Discord-Server-ID aus – sie besteht "
+                   "nur aus Ziffern (Rechtsklick auf den Server → Server-ID kopieren).")
+    gid = int(raw)
+    if gid in _PLACEHOLDER_GUILD_IDS:
+        return err("Das ist die Beispiel-ID aus der Anleitung, nicht die deines Servers.")
 
-    Verhindert, dass jemandem mit mehreren Servern die Premium-Rolle abgezogen
-    wird, nur weil einer davon entfaellt.
+    okay, msg = connections.assign_guild(service_id, gid)
+    if not okay:
+        return err(msg)
+    _ziel = connections.for_service(service_id)
+    if _ziel is None:
+        return err("Dieser Server ist nicht (mehr) verbunden.")
+    _ziel.data.pop("guild_id_requested", None)
+    _ziel.data["kunden_stufe"] = stufe
+    connections.save()
+
+    ids = _configured_guild_ids()
+    if gid not in ids:
+        ids.append(gid)
+        cfg.config["guild_ids"] = ids
+        cfg.save_config()
+    result = await _register_guild_commands(gid)
+
+    besitzer = _ziel.data.get("owner_discord_id")
+    hinweise = await _rollen_fuer_kunden_stufe(besitzer)
+    if hinweise:
+        result["premium_rolle"] = " ".join(hinweise)
+    result["message"] = msg
+    result["status"] = stufe
+    return ok(result)
+
+
+def _hat_noch_stufe(owner_id: Any, stufen: Tuple[str, ...]) -> bool:
+    """Hat dieses Discord-Konto noch einen ANDEREN freigeschalteten Server mit
+    einer dieser Kunden-Stufen? Verhindert, dass jemandem mit mehreren Servern
+    eine Rolle abgezogen wird, nur weil EINER davon entfaellt oder abgestuft
+    wird - siehe _hat_noch_premium/_hat_noch_beta_stufe.
     """
     uid = str(owner_id or "").strip()
     if not uid:
         return False
     return any(str(c.data.get("owner_discord_id") or "") == uid and c.guild_id
+               and _kunden_stufe(c) in stufen
                for c in connections.all())
+
+
+def _hat_noch_premium(owner_id: Any) -> bool:
+    """Hat dieses Discord-Konto noch einen ANDEREN freigeschalteten Server mit
+    Premium-Stufe (premium/premium_beta)?"""
+    return _hat_noch_stufe(owner_id, ("premium", "premium_beta"))
+
+
+def _hat_noch_beta_stufe(owner_id: Any) -> bool:
+    """Wie _hat_noch_premium, nur fuer die Beta-Stufe (beta/premium_beta)."""
+    return _hat_noch_stufe(owner_id, ("beta", "premium_beta"))
 
 
 async def _premium_wegen_discord_austritt_entziehen(owner_id: Any, quelle: str) -> None:
@@ -19844,8 +19935,12 @@ async def _betreiber_discord_gebannt(user_id: Any) -> bool:
     return True
 
 
-async def _premium_rolle(owner_id: Any, geben: bool) -> str:
-    """Die Premium-Rolle im Betreiber-Discord vergeben oder wieder abziehen.
+async def _rolle_zuweisen(owner_id: Any, role_id: Optional[int], geben: bool,
+                          was: str, log_tag: str) -> str:
+    """Gemeinsame Rollen-Vergabe/-Entzug im Betreiber-Discord - Grundlage fuer
+    _premium_rolle UND _beta_rolle (dieselbe Guild, andere Rolle). ``was``
+    steht am Anfang jeder Meldung ("Premium-Rolle"/"Beta-Rolle"), ``log_tag``
+    im Log ("PREMIUM"/"BETA").
 
     Gibt eine kurze Meldung fuer das Dashboard zurueck ("" = nichts zu tun).
     Scheitern ist NIE hart: eine Freischaltung darf nicht daran haengen, dass
@@ -19853,50 +19948,79 @@ async def _premium_rolle(owner_id: Any, geben: bool) -> str:
     """
     uid = str(owner_id or "").strip()
     gid = str(cfg.config.get("premium_role_guild_id") or "").strip()
-    rid = str(cfg.config.get("premium_role_id") or "").strip()
-    if not (uid and gid and rid):
+    if not (uid and gid and role_id):
         return ""
     if bot is None or getattr(bot, "user", None) is None:
-        return "Premium-Rolle: Bot ist nicht bei Discord angemeldet."
+        return f"{was}: Bot ist nicht bei Discord angemeldet."
     try:
         guild = bot.get_guild(int(gid))
     except (TypeError, ValueError):
-        return "Premium-Rolle: premium_role_guild_id ist keine gültige ID."
+        return f"{was}: premium_role_guild_id ist keine gültige ID."
     if guild is None:
-        return ("Premium-Rolle: Der Bot ist nicht in dem Discord-Server "
+        return (f"{was}: Der Bot ist nicht in dem Discord-Server "
                 f"{gid} – Rolle nicht vergeben.")
-    try:
-        rolle = guild.get_role(int(rid))
-    except (TypeError, ValueError):
-        return "Premium-Rolle: premium_role_id ist keine gültige ID."
+    rolle = guild.get_role(int(role_id))
     if rolle is None:
-        return f"Premium-Rolle: Rolle {rid} gibt es in „{guild.name}“ nicht."
+        return f"{was}: Rolle {role_id} gibt es in „{guild.name}“ nicht."
 
     try:
         member = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
     except discord.NotFound:
-        return f"Premium-Rolle: Der Kunde ist nicht in „{guild.name}“."
+        return f"{was}: Der Kunde ist nicht in „{guild.name}“."
     except discord.HTTPException as e:
-        return f"Premium-Rolle: Discord antwortete nicht ({e})."
+        return f"{was}: Discord antwortete nicht ({e})."
     except (TypeError, ValueError):
-        return "Premium-Rolle: Die gespeicherte Kunden-ID ist unbrauchbar."
+        return f"{was}: Die gespeicherte Kunden-ID ist unbrauchbar."
 
     hat = any(int(r.id) == rolle.id for r in getattr(member, "roles", []))
     if hat == geben:
         return ""                                  # schon im gewuenschten Zustand
     try:
         if geben:
-            await member.add_roles(rolle, reason="Premium freigeschaltet (Dashboard)")
-            log.info(f"[PREMIUM] {member} hat „{rolle.name}“ bekommen.")
+            await member.add_roles(rolle, reason=f"{was} freigeschaltet (Dashboard)")
+            log.info(f"[{log_tag}] {member} hat „{rolle.name}“ bekommen.")
             return f"„{rolle.name}“ an {member} vergeben."
-        await member.remove_roles(rolle, reason="Premium zurückgenommen (Dashboard)")
-        log.info(f"[PREMIUM] {member} hat „{rolle.name}“ verloren.")
+        await member.remove_roles(rolle, reason=f"{was} zurückgenommen (Dashboard)")
+        log.info(f"[{log_tag}] {member} hat „{rolle.name}“ verloren.")
         return f"„{rolle.name}“ bei {member} entfernt."
     except discord.Forbidden:
-        return (f"Premium-Rolle: Dem Bot fehlt das Recht „Rollen verwalten“, oder "
+        return (f"{was}: Dem Bot fehlt das Recht „Rollen verwalten“, oder "
                 f"„{rolle.name}“ steht über seiner eigenen Rolle.")
     except discord.HTTPException as e:
-        return f"Premium-Rolle: Discord lehnte die Änderung ab ({e})."
+        return f"{was}: Discord lehnte die Änderung ab ({e})."
+
+
+async def _premium_rolle(owner_id: Any, geben: bool) -> str:
+    """Die Premium-Rolle im Betreiber-Discord vergeben oder wieder abziehen."""
+    rid = str(cfg.config.get("premium_role_id") or "").strip()
+    try:
+        role_id = int(rid) if rid else None
+    except ValueError:
+        return "Premium-Rolle: premium_role_id ist keine gültige ID."
+    return await _rolle_zuweisen(owner_id, role_id, geben, "Premium-Rolle", "PREMIUM")
+
+
+async def _beta_rolle(owner_id: Any, geben: bool) -> str:
+    """Die fest verdrahtete Beta-Rolle (BETA_ROLLE_ID) im Betreiber-Discord
+    vergeben oder wieder abziehen - Gegenstueck zu _premium_rolle."""
+    return await _rolle_zuweisen(owner_id, BETA_ROLLE_ID, geben, "Beta-Rolle", "BETA")
+
+
+async def _rollen_fuer_kunden_stufe(owner_id: Any) -> List[str]:
+    """Setzt Premium-/Beta-Rolle passend zur aktuellen Kunden-Stufe ALLER
+    Server dieses Kontos (siehe _hat_noch_premium/_hat_noch_beta_stufe) - der
+    Aufrufer muss ServerConnection.data["kunden_stufe"] fuer den betroffenen
+    Server VORHER aktualisiert haben, sonst zaehlt hier noch der alte Wert."""
+    will_premium = _hat_noch_premium(owner_id)
+    will_beta = _hat_noch_beta_stufe(owner_id)
+    hinweise = []
+    h1 = await _premium_rolle(owner_id, will_premium)
+    if h1:
+        hinweise.append(h1)
+    h2 = await _beta_rolle(owner_id, will_beta)
+    if h2:
+        hinweise.append(h2)
+    return hinweise
 
 
 def _premium_preis_eur() -> float:
@@ -20255,12 +20379,12 @@ async def delete_admin_server(request: web.Request) -> web.Response:
 
     result = await _guild_aufraeumen(alte_gid)
 
-    # War das sein letzter freigeschalteter Server, geht die Premium-Rolle ab.
-    # Erst NACH connections.remove() – sonst zaehlt der Geloeschte noch mit.
-    if alte_gid and not _hat_noch_premium(besitzer):
-        hinweis = await _premium_rolle(besitzer, False)
-        if hinweis:
-            result["premium_rolle"] = hinweis
+    # War das sein letzter freigeschalteter Server, gehen Premium-/Beta-Rolle
+    # ab. Erst NACH connections.remove() – sonst zaehlt der Geloeschte noch mit.
+    if alte_gid:
+        hinweise = await _rollen_fuer_kunden_stufe(besitzer)
+        if hinweise:
+            result["premium_rolle"] = " ".join(hinweise)
 
     # bot.nitrado/bot.ftp/bot.shop hingen am Hauptserver – nach dem Schliessen
     # zeigten sie auf ein totes Objekt.
@@ -25066,6 +25190,7 @@ def build_app() -> web.Application:
     r.add_post("/api/modules/{key}", post_module_tier)
     r.add_get("/api/admin/servers", api_admin_servers)
     r.add_post("/api/admin/servers/{service_id}/guild", post_admin_server_guild)
+    r.add_post("/api/admin/servers/{service_id}/status", post_admin_server_status)
     r.add_delete("/api/admin/servers/{service_id}", delete_admin_server)
     r.add_get("/api/payment/info", api_payment_info)
     r.add_get("/api/payment/settings", api_get_payment_settings)
@@ -25968,6 +26093,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "cc3826e8d5d9e7c85a44461706f3a16e05e07f35297a741b352a9ef9c559310e",
         "765a79a4a1187b79285a03348491979b7b280d2a8e9891cce047ec8c8f7d5fd0",
         "0963c3f0a6eec5fee983d6d8d9e18b96647c86813ff624fef99cb28cadf5b36b",
+        "318d8579b0f2526dcc502971477672da2b8e887eebfe42226777557221d0b3fe",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
