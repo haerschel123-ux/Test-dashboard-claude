@@ -779,6 +779,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.dzejson":                      {"label": "DZE → JSON Converter", "gruppe": "Tools"},
     "tools.messages":                     {"label": "Messages Generator", "gruppe": "Tools"},
     "tools.lootexclusion":                {"label": "Loot-Ausschlusszonen", "gruppe": "Tools"},
+    "tools.custombuildmap":                {"label": "Custom Build Mapping", "gruppe": "Tools"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
     "discord_mgmt":                      {"label": "Discord Management (gesamt)", "gruppe": "Discord Management"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
@@ -9610,6 +9611,25 @@ def _json_schluessel_finden(daten: Any, schluessel: str,
     return None
 
 
+def _json_wert_finden(daten: Any, schluessel: str) -> Any:
+    """Sucht ``schluessel`` rekursiv in verschachtelten Dicts und gibt den
+    ERSTEN gefundenen Wert direkt zurueck (jeder Typ, auch Listen) - anders
+    als ``_json_schluessel_finden``, das Listen-/Dict-Werte bewusst ausspart
+    und nur den Fundort fuer skalare Einstellungen wie ``disableBaseDamage``
+    liefert. Fuer ``objectSpawnersArr`` (eine Liste) wird dieser Helfer
+    gebraucht."""
+    if not isinstance(daten, dict):
+        return None
+    if schluessel in daten:
+        return daten[schluessel]
+    for v in daten.values():
+        if isinstance(v, dict):
+            treffer = _json_wert_finden(v, schluessel)
+            if treffer is not None:
+                return treffer
+    return None
+
+
 def _json_unterobjekt(daten: Dict, pfad: str) -> Dict:
     """Folgt einem Punktpfad aus _json_schluessel_finden ("" = Wurzel)."""
     ziel = daten
@@ -10697,6 +10717,7 @@ _TOOL_LISTE = (
     ("dzejson", "🧩", "DZE → JSON Converter"),
     ("messages", "🔔", "Messages Generator"),
     ("lootexclusion", "🚫", "Loot-Ausschlusszonen"),
+    ("custombuildmap", "🗺️", "Custom Build Mapping"),
 )
 
 
@@ -11105,6 +11126,77 @@ async def api_tools_lootexclusion_post(request: web.Request) -> web.Response:
     generated = [{"filename": "mapgrouppos.xml (Zusammenfassung)", "content": "\n".join(zeilen)}]
     return ok({"removed": len(entfernen), "total": len(gruppen), "per_zone": je_zone,
               "generated": generated})
+
+
+# ── Custom Build Mapping ──────────────────────────────────────────────────
+# Zeigt, wo jedes vom DayZ Object Spawner server-seitig platzierte Custom-
+# Objekt liegt (Wracks, Deko-Szenen usw.) - NICHT spielerbaute Fundamente,
+# die liessen sich nur unzuverlaessig aus ADM-Logs oder dem propietaeren
+# storage_1.db rekonstruieren. Reines Anzeige-Tool, kein Schreibzugriff.
+async def _custom_build_dateien(conn: ServerConnection, loop) -> Tuple[List[str], str]:
+    """Liest ``objectSpawnersArr`` aus der cfggameplay.json - die Liste der
+    custom/*.json-Dateien, die der Object Spawner beim Serverstart laedt.
+
+    Rueckgabe (Dateinamen, Status). Status ist "ok", "kein_eintrag" (Datei
+    gelesen, aber kein objectSpawnersArr drin - viele Server nutzen den
+    Object Spawner einfach nicht) oder ein _tools_json_lesen-Fehlercode
+    ("missing"/"error"/"kaputt"/"kein_mission_ordner")."""
+    daten, status = await _tools_json_lesen(conn, "cfggameplay.json", loop)
+    if status != "ok":
+        return [], status
+    dateien = _json_wert_finden(daten, "objectSpawnersArr")
+    if not isinstance(dateien, list):
+        return [], "kein_eintrag"
+    return [str(d) for d in dateien if isinstance(d, str) and d.strip()], "ok"
+
+
+async def _custom_build_objekte(conn: ServerConnection, dateiname: str,
+                                loop) -> List[Dict[str, Any]]:
+    """Objekte einer einzelnen custom/*.json-Datei mit Position. Fehlerhafte
+    oder unerwartete Eintraege werden uebersprungen statt die ganze Antwort
+    scheitern zu lassen - wie beim Rest der Tools-Parser."""
+    daten, status = await _tools_json_lesen(conn, dateiname, loop)
+    if status != "ok" or not isinstance(daten, dict):
+        return []
+    objekte = daten.get("Objects")
+    if not isinstance(objekte, list):
+        return []
+    ausgabe: List[Dict[str, Any]] = []
+    for obj in objekte:
+        if not isinstance(obj, dict):
+            continue
+        pos = obj.get("pos")
+        if not isinstance(pos, list) or len(pos) < 3:
+            continue
+        try:
+            # pos = [x, y(Hoehe), z] - fuer die Karte zaehlen nur x und z,
+            # wie bei mapgrouppos.xml ueberall sonst im Dashboard.
+            x, z = float(pos[0]), float(pos[2])
+        except (TypeError, ValueError):
+            continue
+        ausgabe.append({"name": str(obj.get("name") or "?"), "x": x, "z": z})
+    return ausgabe
+
+
+async def api_tools_custombuildmap_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.custombuildmap")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.custombuildmap", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"files": [], "status": "kein_mission_ordner"})
+    loop = asyncio.get_running_loop()
+    dateien, status = await _custom_build_dateien(conn, loop)
+    ausgabe = []
+    for name in dateien:
+        objekte = await _custom_build_objekte(conn, name, loop)
+        ausgabe.append({"filename": name, "count": len(objekte), "points": objekte})
+    return ok({"files": ausgabe, "status": status})
 
 
 # ── 3. Zombie-Horden Generator ────────────────────────────────────────────
@@ -25449,6 +25541,7 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/gaszone", api_tools_gaszone_post)
     r.add_get("/api/tools/lootexclusion", api_tools_lootexclusion_get)
     r.add_post("/api/tools/lootexclusion", api_tools_lootexclusion_post)
+    r.add_get("/api/tools/custombuildmap", api_tools_custombuildmap_get)
     r.add_get("/api/tools/horde", api_tools_horde_get)
     r.add_post("/api/tools/horde", api_tools_horde_post)
     r.add_get("/api/tools/heliloot", api_tools_heliloot_get)
@@ -26278,6 +26371,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "0963c3f0a6eec5fee983d6d8d9e18b96647c86813ff624fef99cb28cadf5b36b",
         "318d8579b0f2526dcc502971477672da2b8e887eebfe42226777557221d0b3fe",
         "d807c8e5457ebf2ccd2abce2ca5b298169c20d2c92616cc2d30a8a84739c8ff5",
+        "7e3ffb2ce66fdc9b121a637f0f0ce633b0107edd0a482a31c345268f7138a143",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
@@ -26286,6 +26380,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "1fc83289875abfc221f402f523f1bbfc8725bea1d1d550f690e3a9f9e681bf43",
         "51e3f7410f2c57907075abe96b5cb5a44c3a35c327133810c46c82d0d73fdbf8",
         "ad3d41b110860daddbaccf68b9e6581b3f5805168b5220e0319f8e1356adb6ee",
+        "984982ae088d79c9d5f2114c836982a8bc0abf4e5a50f72bba2b52b518bd2fa2",
     ),
     "vendor/leaflet.css": (
         "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",
