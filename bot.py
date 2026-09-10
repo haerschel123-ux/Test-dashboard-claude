@@ -3081,7 +3081,7 @@ class ServerConnection:
         # geerbt wuerde sonst der Zeitplan des Betreibers auf fremden Servern
         # Neustarts ausloesen.
         "map_name", "auto_restart_schedule", "auto_restart_after_purchase",
-        "welcome_message", "leave_message",
+        "welcome_message", "leave_message", "reaction_roles",
         # Ban-/Whitelist-Feld auf dem Nitrado-Server: erbt ein Kunde hier die
         # Kategorie oder den Settings-Key eines anderen, liest und beschreibt
         # der Bot auf SEINEM Server das falsche Einstellungsfeld.
@@ -4148,6 +4148,33 @@ class DayZBot(discord.Client):
             log.debug(f"[PREMIUM] on_member_ban: {e}")
             return
         await _premium_wegen_discord_austritt_entziehen(user.id, "Bann")
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        """Reaction Roles (Dashboard → Discord Management): reagiert ein
+        Nutzer mit dem hinterlegten Emoji auf die hinterlegte Nachricht,
+        bekommt er die zugehoerige Rolle. "raw" statt der normalen Variante,
+        damit das auch bei Nachrichten funktioniert, die der Bot gerade nicht
+        im Cache hat (z. B. nach einem Neustart)."""
+        if not payload.guild_id or (self.user and payload.user_id == self.user.id):
+            return
+        try:
+            konten = connections.all_for_guild(payload.guild_id)
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[REACTION_ROLES] on_raw_reaction_add: {e}")
+            return
+        await _reaction_role_anwenden(self, payload, konten, vergeben=True)
+
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        """Spiegelbildlich zu on_raw_reaction_add: Reaktion entfernt -> Rolle
+        wieder weg."""
+        if not payload.guild_id or (self.user and payload.user_id == self.user.id):
+            return
+        try:
+            konten = connections.all_for_guild(payload.guild_id)
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[REACTION_ROLES] on_raw_reaction_remove: {e}")
+            return
+        await _reaction_role_anwenden(self, payload, konten, vergeben=False)
 
     async def on_ready(self):
         log.info(f"[BOT] ✅ Eingeloggt als {self.user} (ID: {self.user.id})")
@@ -22658,6 +22685,248 @@ async def post_discord_mgmt_leave(request: web.Request) -> web.Response:
 
 
 # ══════════════════════════════════════════════════════════════
+#  Discord Management: Reaction Roles
+# ══════════════════════════════════════════════════════════════
+_REACTION_ROLES_MAX = 50
+_DISCORD_MESSAGE_LINK_RE = re.compile(r"discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)")
+
+
+def _discord_message_link_parsen(link: str) -> Optional[Tuple[int, int, int]]:
+    """(guild_id, channel_id, message_id) aus einem Discord-Nachrichten-Link -
+    egal ob discord.com/canary.discord.com/ptb.discord.com/discordapp.com,
+    nur der Pfad zaehlt. None bei ungueltigem Link."""
+    m = _DISCORD_MESSAGE_LINK_RE.search(str(link or ""))
+    if not m:
+        return None
+    try:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    except ValueError:
+        return None
+
+
+def _reaction_roles(conn: ServerConnection) -> List[Dict[str, Any]]:
+    rr = conn.get("reaction_roles")
+    if not isinstance(rr, list):
+        rr = []
+        conn.set("reaction_roles", rr)
+    return rr
+
+
+def _ensure_reaction_role_ids(eintraege: List[Dict]) -> bool:
+    """Vergibt fortlaufende `id`-Felder an Eintraege ohne eins (analog
+    _ensure_faction_ids)."""
+    changed = False
+    next_id = 1 + max([int(e.get("id") or 0) for e in eintraege if isinstance(e, dict)] or [0])
+    for e in eintraege:
+        if isinstance(e, dict) and not e.get("id"):
+            e["id"] = next_id
+            next_id += 1
+            changed = True
+    return changed
+
+
+async def _reaction_role_nachricht_holen(conn: ServerConnection, link: str
+                                         ) -> Tuple[Optional[discord.Message], Optional[web.Response]]:
+    """Loest einen Discord-Nachrichten-Link zur echten Nachricht auf - prueft
+    dabei, dass Guild UND Channel wirklich zu DIESEM Kundenserver gehoeren
+    (sonst koennte ein Kunde mit einem fremden Link Rollen im Discord eines
+    anderen Kunden vergeben)."""
+    geparst = _discord_message_link_parsen(link)
+    if geparst is None:
+        return None, err("Das ist kein gültiger Discord-Nachrichten-Link.")
+    link_guild_id, channel_id, message_id = geparst
+    if not conn.guild_id:
+        return None, err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
+    if int(link_guild_id) != int(conn.guild_id):
+        return None, err("Dieser Link gehört nicht zu deinem Discord-Server.", 403)
+    fehler = _kanal_gehoert_guild(int(conn.guild_id), channel_id, "Nachrichten-Channel")
+    if fehler is not None:
+        return None, fehler
+    kanal = bot.get_channel(int(channel_id)) if bot else None
+    if kanal is None:
+        return None, err("Der Channel ist gerade nicht erreichbar.", 409)
+    try:
+        nachricht = await kanal.fetch_message(int(message_id))
+    except discord.NotFound:
+        return None, err("Diese Nachricht wurde nicht gefunden – falscher Link oder gelöscht?", 404)
+    except discord.Forbidden:
+        return None, err("Der Bot hat keine Rechte, diese Nachricht zu lesen.", 403)
+    except Exception as e:  # noqa: BLE001
+        return None, err(f"Nachricht konnte nicht geladen werden: {e}", 502)
+    return nachricht, None
+
+
+def _guild_emojis_payload(conn: ServerConnection) -> List[Dict[str, Any]]:
+    if not conn.guild_id or not bot:
+        return []
+    g = bot.get_guild(int(conn.guild_id))
+    if g is None:
+        return []
+    return [{"id": str(e.id), "name": e.name, "animated": bool(e.animated),
+             "emoji": str(e)} for e in g.emojis]
+
+
+def _reaction_role_payload(conn: ServerConnection, eintrag: Dict[str, Any]) -> Dict[str, Any]:
+    """Aufbereitete Ansicht fuer die Anzeige: Nachrichten-Link neu
+    zusammengesetzt (robuster als der roh eingegebene String - egal welche
+    Subdomain eingegeben wurde), plus Rollenname zum direkten Anzeigen."""
+    gid = conn.guild_id or "0"
+    channel_id = str(eintrag.get("channel_id") or "")
+    message_id = str(eintrag.get("message_id") or "")
+    rollenname = None
+    if bot and conn.guild_id:
+        g = bot.get_guild(int(conn.guild_id))
+        if g is not None:
+            try:
+                rolle = g.get_role(int(eintrag.get("role_id") or 0))
+            except (TypeError, ValueError):
+                rolle = None
+            if rolle is not None:
+                rollenname = rolle.name
+    return {
+        "id": eintrag.get("id"),
+        "message_link": f"https://discord.com/channels/{gid}/{channel_id}/{message_id}",
+        "emoji": eintrag.get("emoji"),
+        "role_id": str(eintrag.get("role_id") or ""),
+        "role_name": rollenname,
+    }
+
+
+async def _reaction_role_anwenden(client: "DayZBot", payload: "discord.RawReactionActionEvent",
+                                  konten: List[ServerConnection], vergeben: bool) -> None:
+    """Kern von on_raw_reaction_add/on_raw_reaction_remove: sucht in allen
+    Verbindungen dieser Guild einen Eintrag mit passender Nachricht+Emoji und
+    vergibt/entzieht die zugehoerige Rolle. Darf den Bot nie stoeren."""
+    emoji_str = str(payload.emoji)
+    for conn in konten:
+        eintrag = next((e for e in _reaction_roles(conn)
+                        if str(e.get("message_id")) == str(payload.message_id)
+                        and str(e.get("emoji")) == emoji_str), None)
+        if eintrag is None:
+            continue
+        try:
+            guild = client.get_guild(payload.guild_id)
+            if guild is None:
+                continue
+            rolle = guild.get_role(int(eintrag.get("role_id") or 0))
+            member = payload.member if vergeben else guild.get_member(payload.user_id)
+            if rolle is None or member is None:
+                continue
+            if vergeben:
+                await member.add_roles(rolle, reason="Reaction Role")
+            else:
+                await member.remove_roles(rolle, reason="Reaction Role entfernt")
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[REACTION_ROLES] {'add' if vergeben else 'remove'}_roles fehlgeschlagen "
+                     f"({conn.service_id}): {e}")
+
+
+async def get_reaction_roles(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "discord_mgmt")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("discord_mgmt", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "discord_mgmt", "view")
+    if fehler is not None:
+        return fehler
+    eintraege = _reaction_roles(conn)
+    return ok({
+        "entries": [_reaction_role_payload(conn, e) for e in eintraege],
+        "emojis": _guild_emojis_payload(conn),
+    })
+
+
+async def post_reaction_roles(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "discord_mgmt")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("discord_mgmt", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "discord_mgmt.reaction_roles", 5)
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+
+    link = str(data.get("message_link") or "").strip()
+    emoji_roh = str(data.get("emoji") or "").strip()
+    if not emoji_roh:
+        return err("Bitte ein Emoji auswählen.")
+    try:
+        role_id = int(data.get("role_id"))
+    except (TypeError, ValueError):
+        return err("Bitte eine Rolle auswählen.")
+
+    eintraege = _reaction_roles(conn)
+    if len(eintraege) >= _REACTION_ROLES_MAX:
+        return err(f"Höchstens {_REACTION_ROLES_MAX} Verknüpfungen je Server möglich.")
+
+    nachricht, fehler = await _reaction_role_nachricht_holen(conn, link)
+    if fehler is not None:
+        return fehler
+
+    g = bot.get_guild(int(conn.guild_id)) if bot and conn.guild_id else None
+    rolle = g.get_role(role_id) if g is not None else None
+    if rolle is None:
+        return err("Diese Rolle gibt es in deinem Discord-Server nicht.")
+
+    if any(str(e.get("message_id")) == str(nachricht.id) and str(e.get("emoji")) == emoji_roh
+          for e in eintraege):
+        return err("Für dieses Emoji ist auf dieser Nachricht schon eine Rolle hinterlegt.")
+
+    try:
+        await nachricht.add_reaction(emoji_roh)
+    except discord.HTTPException as e:
+        return err(f"Der Bot konnte nicht mit diesem Emoji reagieren: {e}", 502)
+
+    neu = {"id": None, "channel_id": str(nachricht.channel.id), "message_id": str(nachricht.id),
+          "emoji": emoji_roh, "role_id": str(role_id)}
+    eintraege.append(neu)
+    _ensure_reaction_role_ids(eintraege)
+    _conn_store(conn, "reaction_roles", eintraege)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Reaction Role hinzugefügt",
+              f"{emoji_roh} → {rolle.name} · {conn.name}")
+    return ok({"entries": [_reaction_role_payload(conn, e) for e in eintraege]})
+
+
+async def delete_reaction_role(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "discord_mgmt")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("discord_mgmt", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
+    if fehler is not None:
+        return fehler
+    try:
+        eintrag_id = int(request.match_info["id"])
+    except (TypeError, ValueError):
+        return err("Ungültige ID.")
+    eintraege = _reaction_roles(conn)
+    eintrag = next((e for e in eintraege if e.get("id") == eintrag_id), None)
+    if eintrag is None:
+        return err("Verknüpfung nicht gefunden.", 404)
+    eintraege.remove(eintrag)
+    _conn_store(conn, "reaction_roles", eintraege)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Reaction Role gelöscht",
+              f"{eintrag.get('emoji')} · {conn.name}")
+    try:
+        kanal = bot.get_channel(int(eintrag["channel_id"])) if bot else None
+        if kanal is not None:
+            nachricht = await kanal.fetch_message(int(eintrag["message_id"]))
+            await nachricht.remove_reaction(eintrag["emoji"], bot.user)
+    except Exception as e:  # noqa: BLE001 – Loeschen im Dashboard darf daran nie scheitern
+        log.debug(f"[REACTION_ROLES] Bot-Reaktion beim Löschen nicht entfernt: {e}")
+    return ok({"entries": [_reaction_role_payload(conn, e) for e in eintraege]})
+
+
+# ══════════════════════════════════════════════════════════════
 #  Auto-Aufgaben (Scheduled Tasks): mehrere geplante Aufgaben je Server
 # ══════════════════════════════════════════════════════════════
 def _scheduled_task_payload(t: Dict) -> Dict[str, Any]:
@@ -25499,6 +25768,9 @@ def build_app() -> web.Application:
     r.add_get("/api/discord-management", get_discord_mgmt)
     r.add_post("/api/discord-management/welcome", post_discord_mgmt_welcome)
     r.add_post("/api/discord-management/leave", post_discord_mgmt_leave)
+    r.add_get("/api/discord-management/reaction-roles", get_reaction_roles)
+    r.add_post("/api/discord-management/reaction-roles", post_reaction_roles)
+    r.add_delete("/api/discord-management/reaction-roles/{id}", delete_reaction_role)
     # ── Auto-Aufgaben (Scheduled Tasks) ──
     r.add_get("/api/scheduled-tasks", list_scheduled_tasks)
     r.add_post("/api/scheduled-tasks", create_scheduled_task)
@@ -26236,6 +26508,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "2a379262f78d05438c94e12d4658ba71018987190453b0656be560776f98d548",
         "a148b9252cec8bfc54d4ab4f4bb94841f5cdbd3f5e850508b0666ae9e99d7ea5",
         "12ca315de500b990c615bf11f0d15302e3396e9735d077678401d905b74e47af",
+        "f9d4254775eec5e0a32bbfb78c3b893f9639426b4535d8430cb0fef2adaf7c3c",
     ),
     "app.js": (
         "60db1ecc03e138a333c3f04ab3f2a740b351835cf2bef6639f1d58d0be6f5900",
@@ -26372,6 +26645,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "318d8579b0f2526dcc502971477672da2b8e887eebfe42226777557221d0b3fe",
         "d807c8e5457ebf2ccd2abce2ca5b298169c20d2c92616cc2d30a8a84739c8ff5",
         "7e3ffb2ce66fdc9b121a637f0f0ce633b0107edd0a482a31c345268f7138a143",
+        "cdf8ab6595d23303de45ff7680fa666132e7c48c0776852a41f8d391b4589d06",
     ),
     "map.js": (
         "f7c261a280532fbaaf046ad16e9fb480a6f9e98a7648c13f77d731da9409f98d",
