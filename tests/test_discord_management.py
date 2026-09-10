@@ -1,9 +1,9 @@
 """Tests fuer die Discord-Management-Embeds (Willkommen/Verlassen).
 
 Kein echter discord.Member/-Guild noetig: _welcome_leave_embed greift nur auf
-display_name, display_avatar.url, guild.name und guild.member_count zu - ein
-einfaches Duck-Typing-Stub reicht, ein echter Discord-Login ist im Test nicht
-moeglich (siehe CLAUDE.md).
+display_name, mention, display_avatar.url, guild.name und guild.member_count
+zu - ein einfaches Duck-Typing-Stub reicht, ein echter Discord-Login ist im
+Test nicht moeglich (siehe CLAUDE.md).
 
 Aufruf aus dem Repository-Wurzelverzeichnis:
 
@@ -33,8 +33,10 @@ class _StubGuild:
 
 
 class _StubMember:
-    def __init__(self, display_name, avatar_url="https://cdn.example/avatar.png"):
+    def __init__(self, display_name, user_id=555000111,
+                 avatar_url="https://cdn.example/avatar.png"):
         self.display_name = display_name
+        self.mention = f"<@{user_id}>"
         self.display_avatar = _StubAvatar(avatar_url)
 
     def __str__(self):
@@ -47,6 +49,10 @@ def test_willkommen_embed_de_mit_avatar():
     embed = bot._welcome_leave_embed(member, guild, "de", True, True)
     assert "Willkommen" in embed.title
     assert "Alex" in embed.title
+    # Titel bleibt reiner Text (Discord rendert dort keine Erwaehnungen) -
+    # die echte "<@id>"-Erwaehnung gehoert in die Beschreibung.
+    assert member.mention not in embed.title
+    assert member.mention in embed.description
     assert "#94" in embed.description
     assert "Test-Server" in embed.description
     assert embed.colour.value == 0x2ECC71
@@ -58,7 +64,8 @@ def test_willkommen_embed_en_ohne_avatar():
     guild = _StubGuild("Test-Server", 94)
     embed = bot._welcome_leave_embed(member, guild, "en", True, False)
     assert "Welcome" in embed.title
-    assert "member **#94**" in embed.description
+    assert member.mention in embed.description
+    assert "#94" in embed.description
     assert embed.thumbnail.url is None
 
 
@@ -67,6 +74,7 @@ def test_verlassen_embed_de():
     guild = _StubGuild("Test-Server", 93)
     embed = bot._welcome_leave_embed(member, guild, "de", False, True)
     assert "Auf Wiedersehen" in embed.title
+    assert member.mention in embed.description
     assert "verlassen" in embed.description
     assert "93" not in embed.description
     assert embed.colour.value == 0xE74C3C
@@ -77,4 +85,5 @@ def test_verlassen_embed_en():
     guild = _StubGuild("Test-Server", 93)
     embed = bot._welcome_leave_embed(member, guild, "en", False, True)
     assert "Goodbye" in embed.title
-    assert "has left" in embed.description
+    assert member.mention in embed.description
+    assert "left" in embed.description

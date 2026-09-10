@@ -22412,26 +22412,36 @@ def _welcome_leave_embed(member: discord.Member, guild: discord.Guild,
     """Baut die Embed-Box fuer Willkommen/Verlassen. Eine normale Discord-
     Embed-Box (Titel, Text mit Mitgliedernummer, Profilbild als Thumbnail,
     farbiger Rand) statt der Grafik-Karte des Referenz-Bots – dafuer gibt es
-    hier keinen Bild-Generierungsdienst."""
+    hier keinen Bild-Generierungsdienst.
+
+    Der Titel bleibt reiner Text mit dem Anzeigenamen – Discord rendert in
+    Embed-TITELN keine Erwaehnungen, ein "<@id>" wuerde dort nur als rohe
+    Zeichenkette erscheinen. Die BESCHREIBUNG dagegen benutzt ``member.mention``
+    (also die echte "<@id>"-Erwaehnung): dort stellt Discord sie als
+    anklickbare, hervorgehobene Erwaehnung dar – genau das farbig unterlegte
+    "@Name", das Brigarde vom Referenz-Bot kennt."""
     name = getattr(member, "display_name", None) or str(member)
+    erwaehnung = getattr(member, "mention", None) or f"@{name}"
     if ist_willkommen:
         anzahl = getattr(guild, "member_count", None)
         if sprache == "en":
             titel = f"🎉 Welcome {name}!"
-            beschreibung = (f"**{name}** is now member **#{anzahl}** of **{guild.name}**!"
-                            if anzahl else f"**{name}** just joined **{guild.name}**!")
+            beschreibung = (f"Welcome {erwaehnung}! You are member "
+                            f"**#{anzahl}** of **{guild.name}**!" if anzahl
+                            else f"Welcome {erwaehnung} to **{guild.name}**!")
         else:
             titel = f"🎉 Willkommen {name}!"
-            beschreibung = (f"**{name}** ist jetzt Mitglied **#{anzahl}** von **{guild.name}**!"
-                            if anzahl else f"**{name}** ist **{guild.name}** beigetreten!")
+            beschreibung = (f"Willkommen {erwaehnung}! Du bist jetzt Mitglied "
+                            f"**#{anzahl}** von **{guild.name}**!" if anzahl
+                            else f"Willkommen {erwaehnung} bei **{guild.name}**!")
         farbe = 0x2ECC71
     else:
         if sprache == "en":
             titel = f"👋 Goodbye {name}"
-            beschreibung = f"**{name}** has left **{guild.name}**."
+            beschreibung = f"User {erwaehnung} left **{guild.name}**."
         else:
             titel = f"👋 Auf Wiedersehen {name}"
-            beschreibung = f"**{name}** hat **{guild.name}** verlassen."
+            beschreibung = f"Nutzer {erwaehnung} hat **{guild.name}** verlassen."
         farbe = 0xE74C3C
     embed = discord.Embed(title=titel, description=beschreibung, colour=farbe)
     if mit_avatar:
