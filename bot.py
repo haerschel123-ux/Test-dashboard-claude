@@ -780,6 +780,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.messages":                     {"label": "Messages Generator", "gruppe": "Tools"},
     "tools.lootexclusion":                {"label": "Loot-Ausschlusszonen", "gruppe": "Tools"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
+    "discord_mgmt":                      {"label": "Discord Management (gesamt)", "gruppe": "Discord Management"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
     "permissions.subcommands":           {"label": "Subcommand Permissions", "gruppe": "Permissions"},
 }
@@ -3079,6 +3080,7 @@ class ServerConnection:
         # geerbt wuerde sonst der Zeitplan des Betreibers auf fremden Servern
         # Neustarts ausloesen.
         "map_name", "auto_restart_schedule", "auto_restart_after_purchase",
+        "welcome_message", "leave_message",
         # Ban-/Whitelist-Feld auf dem Nitrado-Server: erbt ein Kunde hier die
         # Kategorie oder den Settings-Key eines anderen, liest und beschreibt
         # der Bot auf SEINEM Server das falsche Einstellungsfeld.
@@ -4086,15 +4088,20 @@ class DayZBot(discord.Client):
             konten = connections.all_for_guild(member.guild.id)
         except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
             log.debug(f"[ECON] on_member_remove: {e}")
-            return
-        if not any(bool(_c.get("wipe_money_on_leave", False)) for _c in konten):
-            return
+            konten = []
+
+        if any(bool(_c.get("wipe_money_on_leave", False)) for _c in konten):
+            try:
+                db.wipe_balance(member.guild.id, member.id)
+                log.info(f"[ECON] Guthaben von {member} ({member.id}) auf "
+                         f"'{member.guild.name}' gelöscht (wipe_money_on_leave).")
+            except Exception as e:  # noqa: BLE001
+                log.warning(f"[ECON] wipe_money_on_leave fehlgeschlagen für {member.id}: {e}")
+
         try:
-            db.wipe_balance(member.guild.id, member.id)
-            log.info(f"[ECON] Guthaben von {member} ({member.id}) auf "
-                     f"'{member.guild.name}' gelöscht (wipe_money_on_leave).")
-        except Exception as e:  # noqa: BLE001
-            log.warning(f"[ECON] wipe_money_on_leave fehlgeschlagen für {member.id}: {e}")
+            await _welcome_leave_posten(member, konten, ist_willkommen=False)
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[DISCORD_MGMT] on_member_remove: {e}")
 
     async def on_member_join(self, member: discord.Member):
         """Automatisches Nachreichen der Premium-/Beta-Badge-Rolle im
@@ -4102,26 +4109,30 @@ class DayZBot(discord.Client):
         diesem Discord noch gar nicht beigetreten war, konnte _premium_rolle/
         _beta_rolle ihn damals nicht finden (discord.NotFound). Das hier holt
         es nach, sobald er beitritt - die eigentliche Freischaltung im
-        Kundenserver war davon nie betroffen, nur die Badge-Rolle(n) hier."""
+        Kundenserver war davon nie betroffen, nur die Badge-Rolle(n) hier.
+        Zusaetzlich: Willkommen-Nachricht (Dashboard → Discord Management) fuer
+        JEDE Guild, nicht nur das Betreiber-Discord."""
         try:
             gid = str(cfg.config.get("premium_role_guild_id") or "").strip()
-            if not gid or int(gid) != member.guild.id:
-                return
-            will_premium = _hat_noch_premium(member.id)
-            will_beta = _hat_noch_beta_stufe(member.id)
-            if not (will_premium or will_beta):
-                return
+            if gid and int(gid) == member.guild.id:
+                will_premium = _hat_noch_premium(member.id)
+                will_beta = _hat_noch_beta_stufe(member.id)
+                if will_premium:
+                    hinweis = await _premium_rolle(member.id, True)
+                    if hinweis:
+                        log.info(f"[PREMIUM] on_member_join {member}: {hinweis}")
+                if will_beta:
+                    hinweis = await _beta_rolle(member.id, True)
+                    if hinweis:
+                        log.info(f"[BETA] on_member_join {member}: {hinweis}")
         except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
             log.debug(f"[PREMIUM] on_member_join: {e}")
-            return
-        if will_premium:
-            hinweis = await _premium_rolle(member.id, True)
-            if hinweis:
-                log.info(f"[PREMIUM] on_member_join {member}: {hinweis}")
-        if will_beta:
-            hinweis = await _beta_rolle(member.id, True)
-            if hinweis:
-                log.info(f"[BETA] on_member_join {member}: {hinweis}")
+
+        try:
+            konten = connections.all_for_guild(member.guild.id)
+            await _welcome_leave_posten(member, konten, ist_willkommen=True)
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[DISCORD_MGMT] on_member_join: {e}")
 
     async def on_member_ban(self, guild: discord.Guild, user: discord.abc.User):
         """Sofortiger Entzug der Freischaltung bei einem Bann im Betreiber-
@@ -19450,6 +19461,7 @@ _DASH_PERM_CATS: Tuple[Tuple[str, str, str, Tuple[str, ...]], ...] = (
     ("diagnose", "Diagnose", "Diagnostics", ("view",)),
     ("zones", "Zones", "Zones", ("view", "create", "edit", "delete")),
     ("factions", "Factions", "Factions", ("view", "create", "edit", "delete")),
+    ("discord_mgmt", "Discord Management", "Discord Management", ("view", "edit")),
     ("autotasks", "Auto-Aufgaben", "Scheduled Tasks", ("view", "create", "edit", "delete")),
     ("shop", "Shop", "Shop", ("view", "create", "edit", "delete")),
     ("tools", "Tools", "Tools", ("view", "edit")),
@@ -22389,6 +22401,161 @@ async def delete_faction(request: web.Request) -> web.Response:
 
 
 # ══════════════════════════════════════════════════════════════
+#  Discord Management: Willkommen-/Verlassen-Nachrichten je Kundenserver
+# ══════════════════════════════════════════════════════════════
+_DISCORD_MGMT_SPRACHEN = ("de", "en")
+
+
+def _welcome_leave_embed(member: discord.Member, guild: discord.Guild,
+                         sprache: str, ist_willkommen: bool,
+                         mit_avatar: bool) -> discord.Embed:
+    """Baut die Embed-Box fuer Willkommen/Verlassen. Eine normale Discord-
+    Embed-Box (Titel, Text mit Mitgliedernummer, Profilbild als Thumbnail,
+    farbiger Rand) statt der Grafik-Karte des Referenz-Bots – dafuer gibt es
+    hier keinen Bild-Generierungsdienst."""
+    name = getattr(member, "display_name", None) or str(member)
+    if ist_willkommen:
+        anzahl = getattr(guild, "member_count", None)
+        if sprache == "en":
+            titel = f"🎉 Welcome {name}!"
+            beschreibung = (f"**{name}** is now member **#{anzahl}** of **{guild.name}**!"
+                            if anzahl else f"**{name}** just joined **{guild.name}**!")
+        else:
+            titel = f"🎉 Willkommen {name}!"
+            beschreibung = (f"**{name}** ist jetzt Mitglied **#{anzahl}** von **{guild.name}**!"
+                            if anzahl else f"**{name}** ist **{guild.name}** beigetreten!")
+        farbe = 0x2ECC71
+    else:
+        if sprache == "en":
+            titel = f"👋 Goodbye {name}"
+            beschreibung = f"**{name}** has left **{guild.name}**."
+        else:
+            titel = f"👋 Auf Wiedersehen {name}"
+            beschreibung = f"**{name}** hat **{guild.name}** verlassen."
+        farbe = 0xE74C3C
+    embed = discord.Embed(title=titel, description=beschreibung, colour=farbe)
+    if mit_avatar:
+        avatar = getattr(member, "display_avatar", None)
+        if avatar:
+            embed.set_thumbnail(url=avatar.url)
+    return embed
+
+
+async def _welcome_leave_posten(member: discord.Member, konn_liste: List["ServerConnection"],
+                                ist_willkommen: bool) -> None:
+    """Postet die Willkommen-/Verlassen-Nachricht in jeder Verbindung dieser
+    Guild, die sie aktiviert hat. Fehler (Channel geloescht, keine Rechte)
+    duerfen den Bot nie stoeren – dieselbe Vorsicht wie bei den anderen
+    Event-Handler-Bloecken (wipe_money_on_leave etc.)."""
+    schluessel = "welcome_message" if ist_willkommen else "leave_message"
+    for conn in konn_liste:
+        einstellung = conn.get(schluessel) or {}
+        if not isinstance(einstellung, dict) or not einstellung.get("enabled"):
+            continue
+        kanal_id = einstellung.get("channel_id")
+        if not kanal_id:
+            continue
+        try:
+            kanal = bot.get_channel(int(kanal_id)) if bot else None
+            if kanal is None:
+                continue
+            sprache = einstellung.get("language") \
+                if einstellung.get("language") in _DISCORD_MGMT_SPRACHEN else "en"
+            embed = _welcome_leave_embed(member, member.guild, sprache, ist_willkommen,
+                                         bool(einstellung.get("include_avatar", True)))
+            await kanal.send(embed=embed)
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stoeren
+            richtung = "welcome" if ist_willkommen else "leave"
+            log.debug(f"[DISCORD_MGMT] {richtung} posten fehlgeschlagen "
+                     f"({conn.service_id}): {e}")
+
+
+def _discord_mgmt_payload(conn: "ServerConnection") -> Dict[str, Any]:
+    def _eintrag(schluessel: str) -> Dict[str, Any]:
+        d = conn.get(schluessel) or {}
+        return {
+            "enabled": bool(d.get("enabled", False)),
+            "channel_id": str(d["channel_id"]) if d.get("channel_id") else None,
+            "language": d.get("language") if d.get("language") in _DISCORD_MGMT_SPRACHEN else "en",
+            "include_avatar": bool(d.get("include_avatar", True)),
+        }
+    return {"welcome_message": _eintrag("welcome_message"),
+            "leave_message": _eintrag("leave_message")}
+
+
+async def get_discord_mgmt(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request, "discord_mgmt")
+    if denied is not None:
+        return denied
+    denied = await _modul_pruefen("discord_mgmt", request, conn)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "discord_mgmt", "view")
+    if denied is not None:
+        return denied
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    payload = _discord_mgmt_payload(conn)
+    payload["channels"] = _guild_payload(gid, conn.service_id)["channels"] if gid else []
+    payload["kategorie_stufe"] = _module_tier("discord_mgmt")
+    return ok(payload)
+
+
+async def _set_discord_mgmt(request: web.Request, schluessel: str) -> web.Response:
+    conn, denied = _session_conn(request, "discord_mgmt")
+    if denied is not None:
+        return denied
+    denied = await _modul_pruefen("discord_mgmt", request, conn)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "discord_mgmt", "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, f"discord_mgmt.{schluessel}", 3)
+    if denied is not None:
+        return denied
+    data = await body(request)
+
+    enabled = bool(data.get("enabled", False))
+    sprache = str(data.get("language") or "en").strip().lower()
+    if sprache not in _DISCORD_MGMT_SPRACHEN:
+        return err("Unbekannte Sprache.")
+    include_avatar = bool(data.get("include_avatar", True))
+
+    kanal_id_roh = data.get("channel_id")
+    kanal_id: Optional[int] = None
+    if kanal_id_roh not in (None, "", "0"):
+        try:
+            kanal_id = int(kanal_id_roh)
+        except (TypeError, ValueError):
+            return err("Ungültige Channel-ID.")
+        if not conn.guild_id:
+            return err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
+        fehler = _kanal_gehoert_guild(int(conn.guild_id), kanal_id)
+        if fehler is not None:
+            return fehler
+    elif enabled:
+        return err("Bitte zuerst einen Channel wählen.")
+
+    _conn_store(conn, schluessel, {
+        "enabled": enabled,
+        "channel_id": str(kanal_id) if kanal_id else None,
+        "language": sprache,
+        "include_avatar": include_avatar,
+    })
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+              "Discord-Management aktualisiert", f"{schluessel} · {conn.name}")
+    return ok(_discord_mgmt_payload(conn))
+
+
+async def post_discord_mgmt_welcome(request: web.Request) -> web.Response:
+    return await _set_discord_mgmt(request, "welcome_message")
+
+
+async def post_discord_mgmt_leave(request: web.Request) -> web.Response:
+    return await _set_discord_mgmt(request, "leave_message")
+
+
+# ══════════════════════════════════════════════════════════════
 #  Auto-Aufgaben (Scheduled Tasks): mehrere geplante Aufgaben je Server
 # ══════════════════════════════════════════════════════════════
 def _scheduled_task_payload(t: Dict) -> Dict[str, Any]:
@@ -25225,6 +25392,11 @@ def build_app() -> web.Application:
     r.add_post("/api/factions", create_faction)
     r.add_put("/api/factions/{name}", update_faction)
     r.add_delete("/api/factions/{name}", delete_faction)
+
+    # ── Discord Management ──
+    r.add_get("/api/discord-management", get_discord_mgmt)
+    r.add_post("/api/discord-management/welcome", post_discord_mgmt_welcome)
+    r.add_post("/api/discord-management/leave", post_discord_mgmt_leave)
     # ── Auto-Aufgaben (Scheduled Tasks) ──
     r.add_get("/api/scheduled-tasks", list_scheduled_tasks)
     r.add_post("/api/scheduled-tasks", create_scheduled_task)
@@ -25925,6 +26097,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "2a2022df71837e0c345d43fbdc9a07f751488d839b1964e42fbfe4a8543b18a6",
         "d4b9366fc871538bd2de570fedc637801f6dd8054943789e862953f841284ae1",
         "98c473f8eae479d9e32c477769e317b53b5ef8ebb4493d0bcae6324db67514e3",
+        "763bc500eebafb4cfa32dc062e73a6281a2bb39dbd291776276c9cdd2c658e07",
     ),
     "styles.css": (
         "0dcb70fa1bee603d45b9b0dca4a0b8437f1b7ae65182c15d242f9eb625a3cfee",
