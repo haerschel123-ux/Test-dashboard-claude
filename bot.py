@@ -3082,6 +3082,7 @@ class ServerConnection:
         # Neustarts ausloesen.
         "map_name", "auto_restart_schedule", "auto_restart_after_purchase",
         "welcome_message", "leave_message", "reaction_roles",
+        "ticket_categories", "ticket_open",
         # Ban-/Whitelist-Feld auf dem Nitrado-Server: erbt ein Kunde hier die
         # Kategorie oder den Settings-Key eines anderen, liest und beschreibt
         # der Bot auf SEINEM Server das falsche Einstellungsfeld.
@@ -4003,6 +4004,19 @@ class DayZBot(discord.Client):
                          f"wiederhergestellt.")
         except Exception as e:
             log.error(f"[BOT] Persistente Whitelist-Views konnten nicht registriert werden: {e}")
+
+        # Ticket-Tool: Panel-Views je Server + Close/Claim-Views je noch
+        # offenem/uebernommenem Ticket wiederherstellen (archivierte Tickets
+        # brauchen keine aktive View mehr).
+        try:
+            for _c in connections.all():
+                if _c.service_id:
+                    self.add_view(TicketPanelView(_c.service_id))
+                    for _t_eintrag in _ticket_open(_c):
+                        if _t_eintrag.get("status") in ("open", "claimed") and _t_eintrag.get("id"):
+                            self.add_view(TicketChannelView(_c.service_id, int(_t_eintrag["id"])))
+        except Exception as e:
+            log.error(f"[BOT] Persistente Ticket-Views konnten nicht registriert werden: {e}")
 
         # /ping GLOBAL registrieren (einziger Befehl) - fuer Discords
         # "Unterstuetzt Befehle"-Symbol auf dem App-Profil (das erscheint nur
@@ -6629,6 +6643,11 @@ def _panel_view_registrieren(conn: "ServerConnection") -> None:
             bot.add_view(WhitelistPanelView(conn.service_id))
     except Exception as e:  # noqa: BLE001 – doppelte Anmeldung ist harmlos
         log.debug(f"[WL] Panel-View {conn.service_id}: {e}")
+    try:
+        if conn.service_id and bot is not None and getattr(bot, "user", None):
+            bot.add_view(TicketPanelView(conn.service_id))
+    except Exception as e:  # noqa: BLE001 – doppelte Anmeldung ist harmlos
+        log.debug(f"[TICKET_TOOL] Panel-View {conn.service_id}: {e}")
 
 
 
@@ -9142,6 +9161,253 @@ def _whitelist_conn(req: Dict[str, Any],
     return eigene[0] if len(eigene) == 1 else None
 
 
+_TICKET_CATEGORY_MAX = 20  # Discord erlaubt max. 25 Buttons je View - Puffer lassen
+
+
+class TicketPanelView(discord.ui.View):
+    """Persistentes Panel: EIN Knopf je Ticket-Kategorie (z. B. „Allgemeines
+    Ticket“, „Ban-Einspruch“) - Klick startet direkt die Ticket-Erstellung
+    fuer GENAU diese Kategorie, kein Zwischenschritt. custom_id traegt
+    Service-ID + Kategorie-ID, damit auch nach einem Bot-Neustart klar ist,
+    wofuer der Knopf steht (Vorbild: WhitelistPanelView weiter unten).
+    Aendert sich die Kategorienliste, muss das Panel neu gesendet werden
+    (`/send ticket panel`), damit die Knopf-Reihe aktualisiert wird."""
+
+    def __init__(self, service_id: Optional[str] = None):
+        super().__init__(timeout=None)
+        self.service_id = str(service_id or "")
+        conn = connections.for_service(self.service_id) if self.service_id else None
+        kategorien = _ticket_categories(conn) if conn is not None else []
+        for kategorie in kategorien[:_TICKET_CATEGORY_MAX]:
+            if not isinstance(kategorie, dict) or not kategorie.get("id"):
+                continue
+            label = str(kategorie.get("label") or f"Kategorie {kategorie['id']}")[:80]
+            knopf = discord.ui.Button(
+                label=label, emoji="🎫", style=discord.ButtonStyle.primary,
+                custom_id=f"ticket_open:{self.service_id}:{kategorie['id']}")
+            knopf.callback = self._erstellen_callback(int(kategorie["id"]))
+            self.add_item(knopf)
+
+    def _erstellen_callback(self, kategorie_id: int):
+        async def _callback(interaction: discord.Interaction):
+            conn = connections.for_service(self.service_id) if self.service_id else None
+            if conn is None or conn.guild_id is None or interaction.guild_id is None \
+                    or int(conn.guild_id) != int(interaction.guild_id):
+                return await interaction.response.send_message(_t(
+                    interaction, "❌ Für dieses Panel ist gerade kein Server zugeordnet.",
+                    "❌ No server is currently assigned to this panel."), ephemeral=True)
+            kategorie = next((k for k in _ticket_categories(conn)
+                              if int(k.get("id") or 0) == kategorie_id), None)
+            if kategorie is None:
+                return await interaction.response.send_message(_t(
+                    interaction, "❌ Diese Kategorie gibt es nicht mehr. Bitte einen Admin bitten, "
+                    "das Panel neu zu senden (`/send ticket panel`).",
+                    "❌ This category no longer exists. Please ask an admin to re-send the panel "
+                    "(`/send ticket panel`)."), ephemeral=True)
+            await _ticket_erstellen(interaction, conn, kategorie)
+        return _callback
+
+
+class TicketChannelView(discord.ui.View):
+    """Persistente Close/Claim-Buttons in einem Ticket-Kanal. custom_ids
+    tragen die Ticket-ID, damit sie einen Neustart ueberleben (Vorbild:
+    WhitelistApprovalView weiter unten)."""
+
+    def __init__(self, service_id: str, ticket_id: int):
+        super().__init__(timeout=None)
+        self.service_id = str(service_id)
+        self.ticket_id = int(ticket_id)
+        claim = discord.ui.Button(
+            label="Übernehmen", emoji="🙋", style=discord.ButtonStyle.secondary,
+            custom_id=f"ticket_claim:{self.service_id}:{self.ticket_id}")
+        close = discord.ui.Button(
+            label="Schließen", emoji="🔒", style=discord.ButtonStyle.danger,
+            custom_id=f"ticket_close:{self.service_id}:{self.ticket_id}")
+        claim.callback = self._claim
+        close.callback = self._close
+        self.add_item(claim)
+        self.add_item(close)
+
+    def _conn_und_ticket(self) -> Tuple[Optional[ServerConnection], Optional[Dict[str, Any]]]:
+        conn = connections.for_service(self.service_id) if self.service_id else None
+        if conn is None:
+            return None, None
+        ticket = next((t for t in _ticket_open(conn)
+                       if int(t.get("id") or 0) == self.ticket_id), None)
+        return conn, ticket
+
+    async def _claim(self, interaction: discord.Interaction):
+        conn, ticket = self._conn_und_ticket()
+        if conn is None or ticket is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
+                "❌ This ticket is no longer known."), ephemeral=True)
+        kategorie = next((k for k in _ticket_categories(conn)
+                          if int(k.get("id") or 0) == int(ticket.get("category_id") or 0)), None)
+        support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
+        member = interaction.user
+        if not isinstance(member, discord.Member) or \
+                not any(r.id in {sr.id for sr in support_rollen} for r in member.roles):
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Nur Support-Rollen dieser Kategorie können ein Ticket übernehmen.",
+                "❌ Only support roles of this category can claim a ticket."), ephemeral=True)
+        ticket["status"] = "claimed"
+        ticket["claimed_by"] = str(member.id)
+        _conn_store(conn, "ticket_open", _ticket_open(conn))
+        await interaction.response.send_message(_t(
+            interaction, f"🙋 {member.mention} hat dieses Ticket übernommen.",
+            f"🙋 {member.mention} has claimed this ticket."))
+
+    async def _close(self, interaction: discord.Interaction):
+        conn, ticket = self._conn_und_ticket()
+        if conn is None or ticket is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
+                "❌ This ticket is no longer known."), ephemeral=True)
+        kategorie = next((k for k in _ticket_categories(conn)
+                          if int(k.get("id") or 0) == int(ticket.get("category_id") or 0)), None)
+        support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
+        member = interaction.user
+        ist_ersteller = str(member.id) == str(ticket.get("user_id"))
+        ist_support = isinstance(member, discord.Member) and \
+            any(r.id in {sr.id for sr in support_rollen} for r in member.roles)
+        if not (ist_ersteller or ist_support):
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Nur der Ersteller oder eine Support-Rolle kann dieses Ticket schließen.",
+                "❌ Only the creator or a support role can close this ticket."), ephemeral=True)
+        if ticket.get("status") == "archived":
+            return await interaction.response.send_message(_t(
+                interaction, "ℹ️ Dieses Ticket ist bereits geschlossen.",
+                "ℹ️ This ticket is already closed."), ephemeral=True)
+        await interaction.response.defer()
+        kanal = interaction.channel
+        try:
+            nachrichten = [m async for m in kanal.history(limit=None, oldest_first=True)]
+        except Exception as e:  # noqa: BLE001
+            nachrichten = []
+            log.debug(f"[TICKET_TOOL] Verlauf konnte nicht gelesen werden: {e}")
+        transkript = _ticket_transkript_bauen(nachrichten)
+
+        ersteller = interaction.guild.get_member(int(ticket.get("user_id") or 0)) \
+            if interaction.guild else None
+        dm_gesendet = False
+        if ersteller is not None:
+            try:
+                await ersteller.send(
+                    content=_t(interaction,
+                              f"📄 Transkript deines Tickets „{kanal.name}“ auf {interaction.guild.name}.",
+                              f"📄 Transcript of your ticket „{kanal.name}“ on {interaction.guild.name}."),
+                    file=discord.File(io.BytesIO(transkript), filename=f"transkript-{kanal.name}.txt"))
+                dm_gesendet = True
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log.debug(f"[TICKET_TOOL] Transkript-DM fehlgeschlagen: {e}")
+        if not dm_gesendet:
+            await kanal.send(_t(
+                interaction,
+                "⚠️ Das Transkript konnte nicht per DM zugestellt werden "
+                "(DMs geschlossen oder Nutzer nicht mehr auf dem Server).",
+                "⚠️ The transcript could not be delivered by DM "
+                "(DMs closed or user no longer on the server)."))
+
+        try:
+            await kanal.set_permissions(discord.Object(id=int(ticket["user_id"])), overwrite=None)
+        except Exception as e:  # noqa: BLE001 – Archivieren darf daran nicht scheitern
+            log.debug(f"[TICKET_TOOL] Ersteller-Rechte beim Archivieren nicht entfernt: {e}")
+        try:
+            if not kanal.name.startswith("archiv-"):
+                await kanal.edit(name=f"archiv-{kanal.name}"[:100])
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"[TICKET_TOOL] Kanal beim Archivieren nicht umbenannt: {e}")
+
+        ticket["status"] = "archived"
+        _conn_store(conn, "ticket_open", _ticket_open(conn))
+        await interaction.followup.send(_t(
+            interaction, "🔒 Ticket archiviert – der Verlauf wurde als Transkript verschickt.",
+            "🔒 Ticket archived – the transcript has been sent."))
+
+
+async def _ticket_erstellen(interaction: discord.Interaction, conn: ServerConnection,
+                            kategorie: Dict[str, Any]) -> None:
+    """Legt fuer interaction.user einen privaten Ticket-Kanal an: nur
+    Ersteller + Support-Rollen der Kategorie + Bot sehen ihn."""
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Tickets können nur auf einem Discord-Server erstellt werden.",
+            "❌ Tickets can only be created on a Discord server."), ephemeral=True)
+
+    offene = [t for t in _ticket_open(conn)
+             if str(t.get("user_id")) == str(interaction.user.id) and t.get("status") != "archived"]
+    if offene:
+        bestehender = guild.get_channel(int(offene[0].get("channel_id") or 0))
+        hinweis = bestehender.mention if bestehender is not None else "#" + str(offene[0].get("channel_id"))
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Du hast bereits ein offenes Ticket: {hinweis}",
+            f"❌ You already have an open ticket: {hinweis}"), ephemeral=True)
+
+    support_rollen = _ticket_support_rollen(conn, kategorie)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                       read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                              manage_channels=True, read_message_history=True),
+    }
+    for rolle in support_rollen:
+        overwrites[rolle] = discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                         read_message_history=True)
+
+    await interaction.response.defer(ephemeral=True)
+    kanal_name = f"ticket-{interaction.user.name}"[:100]
+    try:
+        kanal = await guild.create_text_channel(
+            kanal_name, overwrites=overwrites, reason=f"Ticket Tool: {kategorie.get('label')}")
+    except discord.Forbidden:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Der Bot darf hier keinen Kanal erstellen (Berechtigung „Kanäle "
+            "verwalten“ fehlt).",
+            "❌ The bot isn't allowed to create a channel here (missing „Manage Channels“ "
+            "permission)."), ephemeral=True)
+    except discord.HTTPException as e:
+        return await interaction.followup.send(_t(
+            interaction, f"❌ Ticket-Kanal konnte nicht erstellt werden: {e}",
+            f"❌ Could not create the ticket channel: {e}"), ephemeral=True)
+
+    eintraege = _ticket_open(conn)
+    if len(eintraege) >= _TICKET_OPEN_MAX:
+        # Aelteste archivierte Eintraege zuerst raeumen, damit die Liste
+        # nicht unbegrenzt waechst - offene/uebernommene Tickets bleiben.
+        archiviert = [e for e in eintraege if e.get("status") == "archived"]
+        for e in archiviert[:max(1, len(eintraege) - _TICKET_OPEN_MAX + 1)]:
+            eintraege.remove(e)
+    neu = {"id": None, "channel_id": str(kanal.id), "user_id": str(interaction.user.id),
+          "category_id": kategorie.get("id"), "status": "open", "claimed_by": None,
+          "created_at": datetime.now(timezone.utc).isoformat()}
+    eintraege.append(neu)
+    _ensure_ticket_ids(eintraege)
+    _conn_store(conn, "ticket_open", eintraege)
+
+    erwaehnung = " ".join(r.mention for r in support_rollen) or _t(
+        interaction, "*(keine Support-Rolle hinterlegt)*", "*(no support role configured)*")
+    embed = discord.Embed(
+        title=_t(interaction, f"🎫 Ticket – {kategorie.get('label')}",
+                 f"🎫 Ticket – {kategorie.get('label')}"),
+        description=_t(
+            interaction,
+            f"Hallo {interaction.user.mention}! 🔔 Der Support wird sich in Kürze bei dir melden.",
+            f"Hello {interaction.user.mention}! 🔔 Support will be with you shortly."),
+        color=0x5865F2)
+    try:
+        await kanal.send(content=erwaehnung, embed=embed,
+                         view=TicketChannelView(conn.service_id, neu["id"]))
+    except discord.Forbidden as e:
+        log.debug(f"[TICKET_TOOL] Panel-Nachricht im neuen Ticket-Kanal fehlgeschlagen: {e}")
+
+    await interaction.followup.send(_t(
+        interaction, f"✅ Dein Ticket wurde erstellt: {kanal.mention}",
+        f"✅ Your ticket was created: {kanal.mention}"), ephemeral=True)
+
+
 class WhitelistPanelView(discord.ui.View):
     """Persistentes Panel mit dem Button, der das PSN-Eingabe-Modal öffnet.
 
@@ -9333,7 +9599,143 @@ async def send_whitelist_panel(interaction: discord.Interaction,
         ephemeral=True)
 
 
+send_ticket_group = app_commands.Group(
+    name="ticket", description=app_commands.locale_str("🎫 Ticket-Panel senden"), parent=send_group)
+
+
+@send_ticket_group.command(
+    name="panel",
+    description=app_commands.locale_str("🎫 Ticket-Panel in einen Channel senden (Admin)"))
+@app_commands.describe(
+    panel_channel="Channel, in dem das Ticket-Panel für die Spieler erscheint",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def send_ticket_panel(interaction: discord.Interaction,
+                            panel_channel: discord.TextChannel,
+                            server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "send_ticket_panel"):
+        return await _deny_subcmd(interaction)
+
+    _conn, _fehler = _conn_waehlen(interaction, server)
+    if _conn is None:
+        return await interaction.response.send_message(
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
+    if not _ticket_categories(_conn):
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Es ist noch keine Ticket-Kategorie eingerichtet. Im Dashboard unter "
+            "„Discord Management → Ticket Tool“ zuerst mindestens eine Kategorie anlegen.",
+            "❌ No ticket category is set up yet. Add at least one category in the dashboard "
+            "under „Discord Management → Ticket Tool“ first."), ephemeral=True)
+
+    panel_embed = discord.Embed(
+        title=_t(interaction, "🎫 Support-Ticket erstellen", "🎫 Create a support ticket"),
+        description=_t(
+            interaction,
+            "Klicke unten auf die passende Kategorie – es entsteht automatisch ein privater "
+            "Ticket-Kanal, den nur du und der zuständige Support sehen können.",
+            "Click the matching category below – a private ticket channel will be created "
+            "automatically that only you and the responsible support team can see."),
+        color=0x5865F2)
+    try:
+        await panel_channel.send(embed=panel_embed, view=TicketPanelView(_conn.service_id))
+    except discord.Forbidden:
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Ich darf in {panel_channel.mention} nicht schreiben. "
+            "Bitte Kanal-Rechte prüfen.",
+            f"❌ I'm not allowed to post in {panel_channel.mention}. "
+            "Please check the channel permissions."), ephemeral=True)
+
+    await interaction.response.send_message(_t(
+        interaction, f"✅ Ticket-Panel in {panel_channel.mention} gesendet.",
+        f"✅ Ticket panel sent to {panel_channel.mention}."), ephemeral=True)
+
+
 bot.tree.add_command(send_group)
+
+
+def _ticket_conn_und_eintrag(interaction: discord.Interaction, channel: discord.TextChannel
+                             ) -> Tuple[Optional[ServerConnection], Optional[Dict[str, Any]]]:
+    """Sucht unter allen Verbindungen DIESER Guild den Ticket-Eintrag zu
+    einem Kanal (analog _reaction_role_anwenden - eine Guild kann mehrere
+    Nitrado-Server verwalten, das Ticket kann zu jedem davon gehoeren)."""
+    for conn in _conns_of(interaction):
+        eintrag = _ticket_eintrag_von_channel(conn, channel.id)
+        if eintrag is not None:
+            return conn, eintrag
+    return None, None
+
+
+ticket_group = app_commands.Group(
+    name="ticket", description=app_commands.locale_str("🎫 Ticket-Kanal verwalten (Support)"))
+
+
+@ticket_group.command(
+    name="add", description=app_commands.locale_str("➕ Person zu einem Ticket hinzufügen (Support)"))
+@app_commands.describe(channel="Der Ticket-Kanal", member="Wer hinzugefügt werden soll")
+async def ticket_add_member(interaction: discord.Interaction,
+                            channel: discord.TextChannel, member: discord.Member):
+    conn, eintrag = _ticket_conn_und_eintrag(interaction, channel)
+    if conn is None or eintrag is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Das ist kein Ticket-Kanal.",
+            "❌ That is not a ticket channel."), ephemeral=True)
+    kategorie = next((k for k in _ticket_categories(conn)
+                      if int(k.get("id") or 0) == int(eintrag.get("category_id") or 0)), None)
+    support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
+    if not isinstance(interaction.user, discord.Member) or \
+            not any(r.id in {sr.id for sr in support_rollen} for r in interaction.user.roles):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Nur Support-Rollen dieser Kategorie dürfen Personen hinzufügen.",
+            "❌ Only support roles of this category can add people."), ephemeral=True)
+    try:
+        await channel.set_permissions(member, view_channel=True, send_messages=True,
+                                      read_message_history=True)
+    except discord.Forbidden:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Dem Bot fehlen die Rechte, um die Kanal-Berechtigungen zu ändern.",
+            "❌ The bot lacks permission to change the channel's permissions."), ephemeral=True)
+    await interaction.response.send_message(_t(
+        interaction, f"✅ {member.mention} wurde zu diesem Ticket hinzugefügt.",
+        f"✅ {member.mention} was added to this ticket."))
+
+
+@ticket_group.command(
+    name="remove", description=app_commands.locale_str("➖ Person aus einem Ticket entfernen (Support)"))
+@app_commands.describe(channel="Der Ticket-Kanal", member="Wer entfernt werden soll")
+async def ticket_remove_member(interaction: discord.Interaction,
+                               channel: discord.TextChannel, member: discord.Member):
+    conn, eintrag = _ticket_conn_und_eintrag(interaction, channel)
+    if conn is None or eintrag is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Das ist kein Ticket-Kanal.",
+            "❌ That is not a ticket channel."), ephemeral=True)
+    kategorie = next((k for k in _ticket_categories(conn)
+                      if int(k.get("id") or 0) == int(eintrag.get("category_id") or 0)), None)
+    support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
+    if not isinstance(interaction.user, discord.Member) or \
+            not any(r.id in {sr.id for sr in support_rollen} for r in interaction.user.roles):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Nur Support-Rollen dieser Kategorie dürfen Personen entfernen.",
+            "❌ Only support roles of this category can remove people."), ephemeral=True)
+    if str(member.id) == str(eintrag.get("user_id")):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Der Ticket-Ersteller kann nicht entfernt werden – dafür gibt es den "
+            "Schließen-Knopf im Ticket.",
+            "❌ The ticket creator can't be removed – use the close button in the ticket instead."),
+            ephemeral=True)
+    try:
+        await channel.set_permissions(member, overwrite=None)
+    except discord.Forbidden:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Dem Bot fehlen die Rechte, um die Kanal-Berechtigungen zu ändern.",
+            "❌ The bot lacks permission to change the channel's permissions."), ephemeral=True)
+    await interaction.response.send_message(_t(
+        interaction, f"✅ {member.mention} wurde aus diesem Ticket entfernt.",
+        f"✅ {member.mention} was removed from this ticket."))
+
+
+bot.tree.add_command(ticket_group)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -22821,6 +23223,108 @@ async def _reaction_role_anwenden(client: "DayZBot", payload: "discord.RawReacti
                      f"({conn.service_id}): {e}")
 
 
+_TICKET_OPEN_MAX = 200
+
+
+def _ticket_categories(conn: ServerConnection) -> List[Dict[str, Any]]:
+    kat = conn.get("ticket_categories")
+    if not isinstance(kat, list):
+        kat = []
+        conn.set("ticket_categories", kat)
+    return kat
+
+
+def _ensure_ticket_category_ids(eintraege: List[Dict]) -> bool:
+    """Vergibt fortlaufende `id`-Felder an Kategorien ohne eins (analog
+    _ensure_reaction_role_ids)."""
+    changed = False
+    next_id = 1 + max([int(e.get("id") or 0) for e in eintraege if isinstance(e, dict)] or [0])
+    for e in eintraege:
+        if isinstance(e, dict) and not e.get("id"):
+            e["id"] = next_id
+            next_id += 1
+            changed = True
+    return changed
+
+
+def _ticket_open(conn: ServerConnection) -> List[Dict[str, Any]]:
+    tk = conn.get("ticket_open")
+    if not isinstance(tk, list):
+        tk = []
+        conn.set("ticket_open", tk)
+    return tk
+
+
+def _ensure_ticket_ids(eintraege: List[Dict]) -> bool:
+    """Vergibt fortlaufende `id`-Felder an Ticket-Eintraege ohne eins."""
+    changed = False
+    next_id = 1 + max([int(e.get("id") or 0) for e in eintraege if isinstance(e, dict)] or [0])
+    for e in eintraege:
+        if isinstance(e, dict) and not e.get("id"):
+            e["id"] = next_id
+            next_id += 1
+            changed = True
+    return changed
+
+
+def _ticket_category_payload(conn: ServerConnection, eintrag: Dict[str, Any]) -> Dict[str, Any]:
+    """Aufbereitete Ansicht einer Ticket-Kategorie: Rollennamen aufgeloest,
+    damit das Dashboard sie ohne eigenen Nachschlag anzeigen kann."""
+    rollen_namen = []
+    g = bot.get_guild(int(conn.guild_id)) if bot and conn.guild_id else None
+    for rid in (eintrag.get("role_ids") or []):
+        try:
+            rolle = g.get_role(int(rid)) if g is not None else None
+        except (TypeError, ValueError):
+            rolle = None
+        rollen_namen.append({"id": str(rid), "name": rolle.name if rolle else None})
+    return {
+        "id": eintrag.get("id"),
+        "label": eintrag.get("label") or "",
+        "role_ids": [str(r) for r in (eintrag.get("role_ids") or [])],
+        "roles": rollen_namen,
+    }
+
+
+def _ticket_support_rollen(conn: ServerConnection, kategorie: Dict[str, Any]
+                           ) -> List["discord.Role"]:
+    """Die tatsaechlichen Rollen-Objekte einer Kategorie in DIESER Guild -
+    nicht mehr existierende Rollen-IDs werden dabei still uebersprungen."""
+    g = bot.get_guild(int(conn.guild_id)) if bot and conn.guild_id else None
+    if g is None:
+        return []
+    rollen = []
+    for rid in (kategorie.get("role_ids") or []):
+        try:
+            rolle = g.get_role(int(rid))
+        except (TypeError, ValueError):
+            rolle = None
+        if rolle is not None:
+            rollen.append(rolle)
+    return rollen
+
+
+def _ticket_eintrag_von_channel(conn: ServerConnection, channel_id: int
+                                ) -> Optional[Dict[str, Any]]:
+    return next((t for t in _ticket_open(conn)
+                if str(t.get("channel_id")) == str(channel_id)), None)
+
+
+def _ticket_transkript_bauen(nachrichten: List["discord.Message"]) -> bytes:
+    """Baut eine einfache Text-Transkription aus einer Liste von
+    Discord-Nachrichten (aelteste zuerst). Getrennt von der Discord-API
+    testbar, da sie nur einfache Objekte mit .created_at/.author/.content/
+    .attachments erwartet."""
+    zeilen = []
+    for m in nachrichten:
+        zeit = m.created_at.strftime("%Y-%m-%d %H:%M")
+        autor = getattr(m.author, "display_name", None) or getattr(m.author, "name", "?")
+        zeilen.append(f"[{zeit}] {autor}: {m.content}")
+        for anhang in (getattr(m, "attachments", None) or []):
+            zeilen.append(f"    📎 {anhang.url}")
+    return ("\n".join(zeilen) or "(keine Nachrichten)").encode("utf-8")
+
+
 async def get_reaction_roles(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request, "discord_mgmt")
     if fehler is not None:
@@ -22924,6 +23428,126 @@ async def delete_reaction_role(request: web.Request) -> web.Response:
     except Exception as e:  # noqa: BLE001 – Loeschen im Dashboard darf daran nie scheitern
         log.debug(f"[REACTION_ROLES] Bot-Reaktion beim Löschen nicht entfernt: {e}")
     return ok({"entries": [_reaction_role_payload(conn, e) for e in eintraege]})
+
+
+async def get_ticket_categories(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "discord_mgmt")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("discord_mgmt", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "discord_mgmt", "view")
+    if fehler is not None:
+        return fehler
+    kategorien = _ticket_categories(conn)
+    return ok({"categories": [_ticket_category_payload(conn, k) for k in kategorien]})
+
+
+async def post_ticket_categories(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "discord_mgmt")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("discord_mgmt", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "discord_mgmt.ticket_categories", 5)
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+
+    label = str(data.get("label") or "").strip()
+    if not label:
+        return err("Bitte einen Namen für die Kategorie angeben.")
+    if len(label) > 80:
+        return err("Der Name darf höchstens 80 Zeichen lang sein (erscheint als Knopf-Beschriftung).")
+    roh_role_ids = data.get("role_ids")
+    if not isinstance(roh_role_ids, list) or not roh_role_ids:
+        return err("Bitte mindestens eine Support-Rolle auswählen.")
+    if len(_ticket_categories(conn)) >= _TICKET_CATEGORY_MAX:
+        return err(f"Höchstens {_TICKET_CATEGORY_MAX} Kategorien je Server möglich "
+                  "(Discord erlaubt nur begrenzt viele Knöpfe in einem Panel).")
+
+    g = bot.get_guild(int(conn.guild_id)) if bot and conn.guild_id else None
+    role_ids: List[str] = []
+    for rid in roh_role_ids:
+        try:
+            rolle = g.get_role(int(rid)) if g is not None else None
+        except (TypeError, ValueError):
+            rolle = None
+        if rolle is None:
+            return err("Eine der ausgewählten Rollen gibt es in deinem Discord-Server nicht.")
+        role_ids.append(str(rid))
+
+    kategorien = _ticket_categories(conn)
+    neu = {"id": None, "label": label, "role_ids": role_ids}
+    kategorien.append(neu)
+    _ensure_ticket_category_ids(kategorien)
+    _conn_store(conn, "ticket_categories", kategorien)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Ticket-Kategorie hinzugefügt",
+              f"{label} · {conn.name}")
+    return ok({"categories": [_ticket_category_payload(conn, k) for k in kategorien]})
+
+
+async def delete_ticket_category(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "discord_mgmt")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("discord_mgmt", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
+    if fehler is not None:
+        return fehler
+    try:
+        eintrag_id = int(request.match_info["id"])
+    except (TypeError, ValueError):
+        return err("Ungültige ID.")
+    kategorien = _ticket_categories(conn)
+    eintrag = next((k for k in kategorien if k.get("id") == eintrag_id), None)
+    if eintrag is None:
+        return err("Kategorie nicht gefunden.", 404)
+    kategorien.remove(eintrag)
+    _conn_store(conn, "ticket_categories", kategorien)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Ticket-Kategorie gelöscht",
+              f"{eintrag.get('label')} · {conn.name}")
+    return ok({"categories": [_ticket_category_payload(conn, k) for k in kategorien]})
+
+
+async def get_ticket_open(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "discord_mgmt")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("discord_mgmt", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "discord_mgmt", "view")
+    if fehler is not None:
+        return fehler
+    g = bot.get_guild(int(conn.guild_id)) if bot and conn.guild_id else None
+    kategorien = {k.get("id"): k.get("label") for k in _ticket_categories(conn)}
+    ergebnis = []
+    for t in _ticket_open(conn):
+        mitglied = None
+        if g is not None:
+            try:
+                mitglied = g.get_member(int(t.get("user_id") or 0))
+            except (TypeError, ValueError):
+                mitglied = None
+        kanal = g.get_channel(int(t.get("channel_id") or 0)) if g is not None else None
+        ergebnis.append({
+            "id": t.get("id"),
+            "channel_id": str(t.get("channel_id") or ""),
+            "channel_name": kanal.name if kanal is not None else None,
+            "user_name": mitglied.display_name if mitglied is not None else None,
+            "category_label": kategorien.get(t.get("category_id")),
+            "status": t.get("status"),
+            "created_at": t.get("created_at"),
+        })
+    return ok({"tickets": ergebnis})
 
 
 # ══════════════════════════════════════════════════════════════
@@ -25771,6 +26395,10 @@ def build_app() -> web.Application:
     r.add_get("/api/discord-management/reaction-roles", get_reaction_roles)
     r.add_post("/api/discord-management/reaction-roles", post_reaction_roles)
     r.add_delete("/api/discord-management/reaction-roles/{id}", delete_reaction_role)
+    r.add_get("/api/discord-management/tickets/categories", get_ticket_categories)
+    r.add_post("/api/discord-management/tickets/categories", post_ticket_categories)
+    r.add_delete("/api/discord-management/tickets/categories/{id}", delete_ticket_category)
+    r.add_get("/api/discord-management/tickets/open", get_ticket_open)
     # ── Auto-Aufgaben (Scheduled Tasks) ──
     r.add_get("/api/scheduled-tasks", list_scheduled_tasks)
     r.add_post("/api/scheduled-tasks", create_scheduled_task)
@@ -26511,6 +27139,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "f9d4254775eec5e0a32bbfb78c3b893f9639426b4535d8430cb0fef2adaf7c3c",
     ),
     "app.js": (
+        "6fd643484c28d71142d13b628a467ef68fd9974d569c18d4db414bf7db102d58",
+        "0cc4758a91a7fa16a5dd95cd0057238e495cd49af65addda0134abdb2f1decc8",
         "9f6ec3db818579ea6ffabd99408a90463437f4ba5ebd4a992f224726cd897983",
         "60db1ecc03e138a333c3f04ab3f2a740b351835cf2bef6639f1d58d0be6f5900",
         "6f68a543ecadb6d3eeb89c4c6d97d79ec0841a1abc413df34ae02bf2fa491cf4",
