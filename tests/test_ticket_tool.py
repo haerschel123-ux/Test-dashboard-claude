@@ -24,6 +24,40 @@ if REPO not in sys.path:
 bot_mod = pytest.importorskip("bot", reason="bot.py-Abhaengigkeiten nicht installiert")
 
 
+def test_ticket_sprache_default_de():
+    conn = bot_mod.ServerConnection({"service_id": "9999", "guild_id": 111})
+    assert bot_mod._ticket_sprache(conn) == "de"
+    conn.data["ticket_language"] = "en"
+    assert bot_mod._ticket_sprache(conn) == "en"
+    assert bot_mod._ticket_sprache(None) == "de"
+
+
+def test_tt_waehlt_je_sprache():
+    assert bot_mod._tt("de", "Hallo", "Hello") == "Hallo"
+    assert bot_mod._tt("en", "Hallo", "Hello") == "Hello"
+    assert bot_mod._tt("fr", "Hallo", "Hello") == "Hallo"  # unbekannt -> de als Rueckfall
+
+
+def test_ticket_channel_view_buttons_nutzen_eingestellte_sprache():
+    bot_mod.connections.upsert("english-service")
+    bot_mod.connections.assign_guild("english-service", 222)
+    conn = bot_mod.connections.for_service("english-service")
+    conn.data["ticket_language"] = "en"
+    view = bot_mod.TicketChannelView("english-service", 1)
+    labels = [c.label for c in view.children]
+    assert labels == ["Claim", "Close"]
+
+
+def test_ticket_archived_view_buttons_nutzen_eingestellte_sprache():
+    bot_mod.connections.upsert("english-service")
+    bot_mod.connections.assign_guild("english-service", 222)
+    conn = bot_mod.connections.for_service("english-service")
+    conn.data["ticket_language"] = "en"
+    view = bot_mod.TicketArchivedView("english-service", 1)
+    labels = [c.label for c in view.children]
+    assert labels == ["Reopen", "Delete"]
+
+
 def test_ticket_categories_startet_leer_und_speichert_in_conn():
     conn = bot_mod.ServerConnection({"service_id": "9999", "guild_id": 111})
     assert bot_mod._ticket_categories(conn) == []
@@ -234,6 +268,152 @@ def test_ticket_remove_schuetzt_ersteller(monkeypatch):
         bot_mod.bot = original_bot
     assert not kanal.permission_calls, "Ersteller darf nicht entfernt werden"
     assert interaction.response.sent[0]["ephemeral"] is True
+
+
+class _StubGuild2:
+    def __init__(self, members):
+        self._members = {m.id: m for m in members}
+
+    def get_member(self, uid):
+        return self._members.get(uid)
+
+
+class _StubKanal:
+    def __init__(self, name):
+        self.name = name
+        self.set_permissions_calls = []
+        self.edit_calls = []
+        self.deleted = False
+
+    async def set_permissions(self, target, **kwargs):
+        self.set_permissions_calls.append((target, kwargs))
+
+    async def edit(self, name=None, **kwargs):
+        self.edit_calls.append(name)
+        self.name = name
+
+    async def delete(self, reason=None):
+        self.deleted = True
+
+
+class _StubFollowup:
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, content=None, view=None):
+        self.sent.append({"content": content, "view": view})
+
+
+class _StubResponse2:
+    def __init__(self):
+        self.sent = []
+        self.edited = []
+        self.deferred = False
+
+    async def send_message(self, content=None, view=None, ephemeral=False):
+        self.sent.append({"content": content, "view": view, "ephemeral": ephemeral})
+
+    async def edit_message(self, content=None, view=None):
+        self.edited.append({"content": content, "view": view})
+
+    async def defer(self):
+        self.deferred = True
+
+
+class _StubInteraction2:
+    def __init__(self, user, guild, channel):
+        self.user = user
+        self.guild = guild
+        self.channel = channel
+        self.locale = None
+        self.response = _StubResponse2()
+        self.followup = _StubFollowup()
+
+
+def _archived_setup(monkeypatch):
+    conn = bot_mod.connections.upsert("9999")
+    bot_mod.connections.assign_guild("9999", 111)
+    conn.data["ticket_categories"] = [{"id": 1, "label": "Kauf-Support", "role_ids": ["42"]}]
+    conn.data["ticket_open"] = [{"id": 1, "channel_id": "777", "user_id": "555",
+                                 "category_id": 1, "status": "archived", "claimed_by": None}]
+    rolle = type("R", (), {"id": 42, "name": "Support"})()
+    guild = type("G", (), {"get_role": lambda self, rid: rolle if rid == 42 else None})()
+    original_bot = bot_mod.bot
+    bot_mod.bot = type("C", (), {"get_guild": lambda self, gid: guild})()
+    monkeypatch.setattr(bot_mod.discord, "Member", _StubMember)
+    return conn, rolle, original_bot
+
+
+def test_ticket_reopen_erlaubt_fuer_support_rolle(monkeypatch):
+    conn, rolle, original_bot = _archived_setup(monkeypatch)
+    try:
+        view = bot_mod.TicketArchivedView("9999", 1)
+        ersteller = _StubMember(555)
+        guild = _StubGuild2([ersteller])
+        kanal = _StubKanal("archiv-ticket-spieler1")
+        interaction = _StubInteraction2(_StubMember(1, roles=[rolle]), guild, kanal)
+        asyncio.run(view._reopen(interaction))
+    finally:
+        bot_mod.bot = original_bot
+    assert conn.data["ticket_open"][0]["status"] == "open"
+    assert kanal.name == "ticket-spieler1"
+    assert kanal.set_permissions_calls
+    assert interaction.followup.sent
+
+
+def test_ticket_reopen_verweigert_ohne_support_rolle(monkeypatch):
+    conn, rolle, original_bot = _archived_setup(monkeypatch)
+    try:
+        view = bot_mod.TicketArchivedView("9999", 1)
+        kanal = _StubKanal("archiv-ticket-spieler1")
+        interaction = _StubInteraction2(_StubMember(1, roles=[]), _StubGuild2([]), kanal)
+        asyncio.run(view._reopen(interaction))
+    finally:
+        bot_mod.bot = original_bot
+    assert conn.data["ticket_open"][0]["status"] == "archived"
+    assert interaction.response.sent[0]["ephemeral"] is True
+
+
+def test_ticket_reopen_doppelklick_schutz(monkeypatch):
+    conn, rolle, original_bot = _archived_setup(monkeypatch)
+    conn.data["ticket_open"][0]["status"] = "open"  # schon offen
+    try:
+        view = bot_mod.TicketArchivedView("9999", 1)
+        kanal = _StubKanal("ticket-spieler1")
+        interaction = _StubInteraction2(_StubMember(1, roles=[rolle]), _StubGuild2([]), kanal)
+        asyncio.run(view._reopen(interaction))
+    finally:
+        bot_mod.bot = original_bot
+    assert not kanal.set_permissions_calls
+    assert interaction.response.sent[0]["ephemeral"] is True
+
+
+def test_ticket_delete_zeigt_bestaetigung(monkeypatch):
+    conn, rolle, original_bot = _archived_setup(monkeypatch)
+    try:
+        view = bot_mod.TicketArchivedView("9999", 1)
+        kanal = _StubKanal("archiv-ticket-spieler1")
+        interaction = _StubInteraction2(_StubMember(1, roles=[rolle]), _StubGuild2([]), kanal)
+        asyncio.run(view._delete(interaction))
+    finally:
+        bot_mod.bot = original_bot
+    assert not kanal.deleted, "Ohne Bestaetigung darf noch nicht geloescht werden"
+    assert interaction.response.sent[0]["ephemeral"] is True
+    assert isinstance(interaction.response.sent[0]["view"], bot_mod.TicketDeleteConfirmView)
+
+
+def test_ticket_delete_confirm_entfernt_eintrag_und_loescht_kanal(monkeypatch):
+    conn, rolle, original_bot = _archived_setup(monkeypatch)
+    try:
+        confirm_view = bot_mod.TicketDeleteConfirmView("9999", 1)
+        kanal = _StubKanal("archiv-ticket-spieler1")
+        interaction = _StubInteraction2(_StubMember(1, roles=[rolle]), _StubGuild2([]), kanal)
+        asyncio.run(confirm_view._bestaetigt(interaction))
+    finally:
+        bot_mod.bot = original_bot
+    assert conn.data["ticket_open"] == []
+    assert kanal.deleted
+    assert interaction.response.edited
 
 
 def test_ticket_category_payload_loest_rollennamen_auf():

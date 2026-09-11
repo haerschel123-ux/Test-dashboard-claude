@@ -3082,7 +3082,7 @@ class ServerConnection:
         # Neustarts ausloesen.
         "map_name", "auto_restart_schedule", "auto_restart_after_purchase",
         "welcome_message", "leave_message", "reaction_roles",
-        "ticket_categories", "ticket_open",
+        "ticket_categories", "ticket_open", "ticket_language",
         # Ban-/Whitelist-Feld auf dem Nitrado-Server: erbt ein Kunde hier die
         # Kategorie oder den Settings-Key eines anderen, liest und beschreibt
         # der Bot auf SEINEM Server das falsche Einstellungsfeld.
@@ -4006,15 +4006,19 @@ class DayZBot(discord.Client):
             log.error(f"[BOT] Persistente Whitelist-Views konnten nicht registriert werden: {e}")
 
         # Ticket-Tool: Panel-Views je Server + Close/Claim-Views je noch
-        # offenem/uebernommenem Ticket wiederherstellen (archivierte Tickets
-        # brauchen keine aktive View mehr).
+        # offenem/uebernommenem Ticket sowie Oeffnen/Loeschen-Views je
+        # archiviertem Ticket wiederherstellen.
         try:
             for _c in connections.all():
                 if _c.service_id:
                     self.add_view(TicketPanelView(_c.service_id))
                     for _t_eintrag in _ticket_open(_c):
-                        if _t_eintrag.get("status") in ("open", "claimed") and _t_eintrag.get("id"):
+                        if not _t_eintrag.get("id"):
+                            continue
+                        if _t_eintrag.get("status") in ("open", "claimed"):
                             self.add_view(TicketChannelView(_c.service_id, int(_t_eintrag["id"])))
+                        elif _t_eintrag.get("status") == "archived":
+                            self.add_view(TicketArchivedView(_c.service_id, int(_t_eintrag["id"])))
         except Exception as e:
             log.error(f"[BOT] Persistente Ticket-Views konnten nicht registriert werden: {e}")
 
@@ -9199,8 +9203,9 @@ class TicketPanelView(discord.ui.View):
             kategorie = next((k for k in _ticket_categories(conn)
                               if int(k.get("id") or 0) == kategorie_id), None)
             if kategorie is None:
-                return await interaction.response.send_message(_t(
-                    interaction, "❌ Diese Kategorie gibt es nicht mehr. Bitte einen Admin bitten, "
+                return await interaction.response.send_message(_tt(
+                    _ticket_sprache(conn),
+                    "❌ Diese Kategorie gibt es nicht mehr. Bitte einen Admin bitten, "
                     "das Panel neu zu senden (`/send ticket panel`).",
                     "❌ This category no longer exists. Please ask an admin to re-send the panel "
                     "(`/send ticket panel`)."), ephemeral=True)
@@ -9217,11 +9222,12 @@ class TicketChannelView(discord.ui.View):
         super().__init__(timeout=None)
         self.service_id = str(service_id)
         self.ticket_id = int(ticket_id)
+        sprache = _ticket_sprache(connections.for_service(self.service_id) if self.service_id else None)
         claim = discord.ui.Button(
-            label="Übernehmen", emoji="🙋", style=discord.ButtonStyle.secondary,
+            label=_tt(sprache, "Übernehmen", "Claim"), emoji="🙋", style=discord.ButtonStyle.secondary,
             custom_id=f"ticket_claim:{self.service_id}:{self.ticket_id}")
         close = discord.ui.Button(
-            label="Schließen", emoji="🔒", style=discord.ButtonStyle.danger,
+            label=_tt(sprache, "Schließen", "Close"), emoji="🔒", style=discord.ButtonStyle.danger,
             custom_id=f"ticket_close:{self.service_id}:{self.ticket_id}")
         claim.callback = self._claim
         close.callback = self._close
@@ -9242,20 +9248,21 @@ class TicketChannelView(discord.ui.View):
             return await interaction.response.send_message(_t(
                 interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
                 "❌ This ticket is no longer known."), ephemeral=True)
+        sprache = _ticket_sprache(conn)
         kategorie = next((k for k in _ticket_categories(conn)
                           if int(k.get("id") or 0) == int(ticket.get("category_id") or 0)), None)
         support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
         member = interaction.user
         if not isinstance(member, discord.Member) or \
                 not any(r.id in {sr.id for sr in support_rollen} for r in member.roles):
-            return await interaction.response.send_message(_t(
-                interaction, "❌ Nur Support-Rollen dieser Kategorie können ein Ticket übernehmen.",
+            return await interaction.response.send_message(_tt(
+                sprache, "❌ Nur Support-Rollen dieser Kategorie können ein Ticket übernehmen.",
                 "❌ Only support roles of this category can claim a ticket."), ephemeral=True)
         ticket["status"] = "claimed"
         ticket["claimed_by"] = str(member.id)
         _conn_store(conn, "ticket_open", _ticket_open(conn))
-        await interaction.response.send_message(_t(
-            interaction, f"🙋 {member.mention} hat dieses Ticket übernommen.",
+        await interaction.response.send_message(_tt(
+            sprache, f"🙋 {member.mention} hat dieses Ticket übernommen.",
             f"🙋 {member.mention} has claimed this ticket."))
 
     async def _close(self, interaction: discord.Interaction):
@@ -9264,6 +9271,7 @@ class TicketChannelView(discord.ui.View):
             return await interaction.response.send_message(_t(
                 interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
                 "❌ This ticket is no longer known."), ephemeral=True)
+        sprache = _ticket_sprache(conn)
         kategorie = next((k for k in _ticket_categories(conn)
                           if int(k.get("id") or 0) == int(ticket.get("category_id") or 0)), None)
         support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
@@ -9272,12 +9280,12 @@ class TicketChannelView(discord.ui.View):
         ist_support = isinstance(member, discord.Member) and \
             any(r.id in {sr.id for sr in support_rollen} for r in member.roles)
         if not (ist_ersteller or ist_support):
-            return await interaction.response.send_message(_t(
-                interaction, "❌ Nur der Ersteller oder eine Support-Rolle kann dieses Ticket schließen.",
+            return await interaction.response.send_message(_tt(
+                sprache, "❌ Nur der Ersteller oder eine Support-Rolle kann dieses Ticket schließen.",
                 "❌ Only the creator or a support role can close this ticket."), ephemeral=True)
         if ticket.get("status") == "archived":
-            return await interaction.response.send_message(_t(
-                interaction, "ℹ️ Dieses Ticket ist bereits geschlossen.",
+            return await interaction.response.send_message(_tt(
+                sprache, "ℹ️ Dieses Ticket ist bereits geschlossen.",
                 "ℹ️ This ticket is already closed."), ephemeral=True)
         await interaction.response.defer()
         kanal = interaction.channel
@@ -9294,20 +9302,13 @@ class TicketChannelView(discord.ui.View):
         if ersteller is not None:
             try:
                 await ersteller.send(
-                    content=_t(interaction,
+                    content=_tt(sprache,
                               f"📄 Transkript deines Tickets „{kanal.name}“ auf {interaction.guild.name}.",
                               f"📄 Transcript of your ticket „{kanal.name}“ on {interaction.guild.name}."),
                     file=discord.File(io.BytesIO(transkript), filename=f"transkript-{kanal.name}.txt"))
                 dm_gesendet = True
             except (discord.Forbidden, discord.HTTPException) as e:
                 log.debug(f"[TICKET_TOOL] Transkript-DM fehlgeschlagen: {e}")
-        if not dm_gesendet:
-            await kanal.send(_t(
-                interaction,
-                "⚠️ Das Transkript konnte nicht per DM zugestellt werden "
-                "(DMs geschlossen oder Nutzer nicht mehr auf dem Server).",
-                "⚠️ The transcript could not be delivered by DM "
-                "(DMs closed or user no longer on the server)."))
 
         try:
             await kanal.set_permissions(discord.Object(id=int(ticket["user_id"])), overwrite=None)
@@ -9321,9 +9322,150 @@ class TicketChannelView(discord.ui.View):
 
         ticket["status"] = "archived"
         _conn_store(conn, "ticket_open", _ticket_open(conn))
-        await interaction.followup.send(_t(
-            interaction, "🔒 Ticket archiviert – der Verlauf wurde als Transkript verschickt.",
-            "🔒 Ticket archived – the transcript has been sent."))
+        jetzt = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        transkript_zeile = _tt(sprache, "📄 Das Transkript wurde per DM verschickt.",
+                              "📄 The transcript was sent by DM.") if dm_gesendet else _tt(
+            sprache,
+            "⚠️ Das Transkript konnte nicht per DM zugestellt werden "
+            "(DMs geschlossen oder Nutzer nicht mehr auf dem Server).",
+            "⚠️ The transcript could not be delivered by DM "
+            "(DMs closed or user no longer on the server).")
+        embed = discord.Embed(
+            title=_tt(sprache, "🔒 Ticket geschlossen", "🔒 Ticket closed"),
+            description=_tt(sprache, f"Geschlossen von {member.mention} am {jetzt}.\n{transkript_zeile}",
+                            f"Closed by {member.mention} on {jetzt}.\n{transkript_zeile}"),
+            color=0x99AAB5)
+        await interaction.followup.send(embed=embed,
+                                        view=TicketArchivedView(self.service_id, self.ticket_id))
+
+
+class TicketDeleteConfirmView(discord.ui.View):
+    """Kurzlebige, NICHT-persistente Sicherheitsabfrage vor dem endgueltigen
+    Loeschen eines Ticket-Kanals - muss keinen Bot-Neustart ueberleben, ein
+    normaler Timeout reicht (Vorbild fuer nicht-persistente Views:
+    _FeedTranslateView, siehe Kommentar dort)."""
+
+    def __init__(self, service_id: str, ticket_id: int):
+        super().__init__(timeout=60)
+        self.service_id = service_id
+        self.ticket_id = ticket_id
+        sprache = _ticket_sprache(connections.for_service(service_id) if service_id else None)
+        knopf = discord.ui.Button(label=_tt(sprache, "Ja, endgültig löschen", "Yes, delete permanently"),
+                                  emoji="✅", style=discord.ButtonStyle.danger)
+        knopf.callback = self._bestaetigt
+        self.add_item(knopf)
+
+    async def _bestaetigt(self, interaction: discord.Interaction):
+        conn = connections.for_service(self.service_id) if self.service_id else None
+        ticket = next((t for t in _ticket_open(conn)
+                       if int(t.get("id") or 0) == self.ticket_id), None) if conn else None
+        if conn is None or ticket is None:
+            return await interaction.response.edit_message(content=_t(
+                interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
+                "❌ This ticket is no longer known."), view=None)
+        sprache = _ticket_sprache(conn)
+        eintraege = _ticket_open(conn)
+        eintraege.remove(ticket)
+        _conn_store(conn, "ticket_open", eintraege)
+        kanal = interaction.channel
+        await interaction.response.edit_message(content=_tt(
+            sprache, "🗑️ Ticket-Kanal wird gelöscht …", "🗑️ Deleting the ticket channel …"),
+            view=None)
+        try:
+            await kanal.delete(reason="Ticket Tool: endgültig gelöscht")
+        except (discord.Forbidden, discord.NotFound) as e:
+            log.debug(f"[TICKET_TOOL] Kanal beim Löschen nicht entfernt: {e}")
+
+
+class TicketArchivedView(discord.ui.View):
+    """Persistente Öffnen-/Löschen-Buttons fuer ein archiviertes Ticket.
+    Ersetzt die Übernehmen-/Schließen-Buttons von TicketChannelView, sobald
+    ein Ticket geschlossen wurde."""
+
+    def __init__(self, service_id: str, ticket_id: int):
+        super().__init__(timeout=None)
+        self.service_id = str(service_id)
+        self.ticket_id = int(ticket_id)
+        sprache = _ticket_sprache(connections.for_service(self.service_id) if self.service_id else None)
+        reopen = discord.ui.Button(
+            label=_tt(sprache, "Öffnen", "Reopen"), emoji="↩️", style=discord.ButtonStyle.secondary,
+            custom_id=f"ticket_reopen:{self.service_id}:{self.ticket_id}")
+        delete = discord.ui.Button(
+            label=_tt(sprache, "Löschen", "Delete"), emoji="🗑️", style=discord.ButtonStyle.danger,
+            custom_id=f"ticket_delete:{self.service_id}:{self.ticket_id}")
+        reopen.callback = self._reopen
+        delete.callback = self._delete
+        self.add_item(reopen)
+        self.add_item(delete)
+
+    def _conn_und_ticket(self) -> Tuple[Optional[ServerConnection], Optional[Dict[str, Any]]]:
+        conn = connections.for_service(self.service_id) if self.service_id else None
+        if conn is None:
+            return None, None
+        ticket = next((t for t in _ticket_open(conn)
+                       if int(t.get("id") or 0) == self.ticket_id), None)
+        return conn, ticket
+
+    def _support_pruefen(self, conn: ServerConnection, ticket: Dict[str, Any],
+                         member: Any) -> bool:
+        kategorie = next((k for k in _ticket_categories(conn)
+                          if int(k.get("id") or 0) == int(ticket.get("category_id") or 0)), None)
+        support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
+        return isinstance(member, discord.Member) and \
+            any(r.id in {sr.id for sr in support_rollen} for r in member.roles)
+
+    async def _reopen(self, interaction: discord.Interaction):
+        conn, ticket = self._conn_und_ticket()
+        if conn is None or ticket is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
+                "❌ This ticket is no longer known."), ephemeral=True)
+        sprache = _ticket_sprache(conn)
+        if not self._support_pruefen(conn, ticket, interaction.user):
+            return await interaction.response.send_message(_tt(
+                sprache, "❌ Nur Support-Rollen dieser Kategorie können ein Ticket öffnen.",
+                "❌ Only support roles of this category can reopen a ticket."), ephemeral=True)
+        if ticket.get("status") != "archived":
+            return await interaction.response.send_message(_tt(
+                sprache, "ℹ️ Dieses Ticket ist bereits offen.",
+                "ℹ️ This ticket is already open."), ephemeral=True)
+        await interaction.response.defer()
+        kanal = interaction.channel
+        guild = interaction.guild
+        ersteller = guild.get_member(int(ticket.get("user_id") or 0)) if guild else None
+        if ersteller is not None:
+            try:
+                await kanal.set_permissions(ersteller, view_channel=True, send_messages=True,
+                                            read_message_history=True)
+            except Exception as e:  # noqa: BLE001 – Öffnen darf daran nicht scheitern
+                log.debug(f"[TICKET_TOOL] Ersteller-Rechte beim Öffnen nicht wiederhergestellt: {e}")
+        try:
+            if kanal.name.startswith("archiv-"):
+                await kanal.edit(name=kanal.name[len("archiv-"):][:100])
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"[TICKET_TOOL] Kanal beim Öffnen nicht umbenannt: {e}")
+
+        ticket["status"] = "open"
+        _conn_store(conn, "ticket_open", _ticket_open(conn))
+        await interaction.followup.send(_tt(
+            sprache, "↩️ Ticket wieder geöffnet.", "↩️ Ticket reopened."),
+            view=TicketChannelView(self.service_id, self.ticket_id))
+
+    async def _delete(self, interaction: discord.Interaction):
+        conn, ticket = self._conn_und_ticket()
+        if conn is None or ticket is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
+                "❌ This ticket is no longer known."), ephemeral=True)
+        sprache = _ticket_sprache(conn)
+        if not self._support_pruefen(conn, ticket, interaction.user):
+            return await interaction.response.send_message(_tt(
+                sprache, "❌ Nur Support-Rollen dieser Kategorie können ein Ticket löschen.",
+                "❌ Only support roles of this category can delete a ticket."), ephemeral=True)
+        await interaction.response.send_message(_tt(
+            sprache, "⚠️ Der Kanal wird dabei unwiderruflich gelöscht. Sicher?",
+            "⚠️ This will permanently delete the channel. Are you sure?"),
+            view=TicketDeleteConfirmView(self.service_id, self.ticket_id), ephemeral=True)
 
 
 async def _ticket_erstellen(interaction: discord.Interaction, conn: ServerConnection,
@@ -9336,13 +9478,14 @@ async def _ticket_erstellen(interaction: discord.Interaction, conn: ServerConnec
             interaction, "❌ Tickets können nur auf einem Discord-Server erstellt werden.",
             "❌ Tickets can only be created on a Discord server."), ephemeral=True)
 
+    sprache = _ticket_sprache(conn)
     offene = [t for t in _ticket_open(conn)
              if str(t.get("user_id")) == str(interaction.user.id) and t.get("status") != "archived"]
     if offene:
         bestehender = guild.get_channel(int(offene[0].get("channel_id") or 0))
         hinweis = bestehender.mention if bestehender is not None else "#" + str(offene[0].get("channel_id"))
-        return await interaction.response.send_message(_t(
-            interaction, f"❌ Du hast bereits ein offenes Ticket: {hinweis}",
+        return await interaction.response.send_message(_tt(
+            sprache, f"❌ Du hast bereits ein offenes Ticket: {hinweis}",
             f"❌ You already have an open ticket: {hinweis}"), ephemeral=True)
 
     support_rollen = _ticket_support_rollen(conn, kategorie)
@@ -9363,14 +9506,14 @@ async def _ticket_erstellen(interaction: discord.Interaction, conn: ServerConnec
         kanal = await guild.create_text_channel(
             kanal_name, overwrites=overwrites, reason=f"Ticket Tool: {kategorie.get('label')}")
     except discord.Forbidden:
-        return await interaction.followup.send(_t(
-            interaction, "❌ Der Bot darf hier keinen Kanal erstellen (Berechtigung „Kanäle "
+        return await interaction.followup.send(_tt(
+            sprache, "❌ Der Bot darf hier keinen Kanal erstellen (Berechtigung „Kanäle "
             "verwalten“ fehlt).",
             "❌ The bot isn't allowed to create a channel here (missing „Manage Channels“ "
             "permission)."), ephemeral=True)
     except discord.HTTPException as e:
-        return await interaction.followup.send(_t(
-            interaction, f"❌ Ticket-Kanal konnte nicht erstellt werden: {e}",
+        return await interaction.followup.send(_tt(
+            sprache, f"❌ Ticket-Kanal konnte nicht erstellt werden: {e}",
             f"❌ Could not create the ticket channel: {e}"), ephemeral=True)
 
     eintraege = _ticket_open(conn)
@@ -9387,13 +9530,13 @@ async def _ticket_erstellen(interaction: discord.Interaction, conn: ServerConnec
     _ensure_ticket_ids(eintraege)
     _conn_store(conn, "ticket_open", eintraege)
 
-    erwaehnung = " ".join(r.mention for r in support_rollen) or _t(
-        interaction, "*(keine Support-Rolle hinterlegt)*", "*(no support role configured)*")
+    erwaehnung = " ".join(r.mention for r in support_rollen) or _tt(
+        sprache, "*(keine Support-Rolle hinterlegt)*", "*(no support role configured)*")
     embed = discord.Embed(
-        title=_t(interaction, f"🎫 Ticket – {kategorie.get('label')}",
+        title=_tt(sprache, f"🎫 Ticket – {kategorie.get('label')}",
                  f"🎫 Ticket – {kategorie.get('label')}"),
-        description=_t(
-            interaction,
+        description=_tt(
+            sprache,
             f"Hallo {interaction.user.mention}! 🔔 Der Support wird sich in Kürze bei dir melden.",
             f"Hello {interaction.user.mention}! 🔔 Support will be with you shortly."),
         color=0x5865F2)
@@ -9403,8 +9546,8 @@ async def _ticket_erstellen(interaction: discord.Interaction, conn: ServerConnec
     except discord.Forbidden as e:
         log.debug(f"[TICKET_TOOL] Panel-Nachricht im neuen Ticket-Kanal fehlgeschlagen: {e}")
 
-    await interaction.followup.send(_t(
-        interaction, f"✅ Dein Ticket wurde erstellt: {kanal.mention}",
+    await interaction.followup.send(_tt(
+        sprache, f"✅ Dein Ticket wurde erstellt: {kanal.mention}",
         f"✅ Your ticket was created: {kanal.mention}"), ephemeral=True)
 
 
@@ -9680,23 +9823,24 @@ async def ticket_add_member(interaction: discord.Interaction,
         return await interaction.response.send_message(_t(
             interaction, "❌ Das ist kein Ticket-Kanal.",
             "❌ That is not a ticket channel."), ephemeral=True)
+    sprache = _ticket_sprache(conn)
     kategorie = next((k for k in _ticket_categories(conn)
                       if int(k.get("id") or 0) == int(eintrag.get("category_id") or 0)), None)
     support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
     if not isinstance(interaction.user, discord.Member) or \
             not any(r.id in {sr.id for sr in support_rollen} for r in interaction.user.roles):
-        return await interaction.response.send_message(_t(
-            interaction, "❌ Nur Support-Rollen dieser Kategorie dürfen Personen hinzufügen.",
+        return await interaction.response.send_message(_tt(
+            sprache, "❌ Nur Support-Rollen dieser Kategorie dürfen Personen hinzufügen.",
             "❌ Only support roles of this category can add people."), ephemeral=True)
     try:
         await channel.set_permissions(member, view_channel=True, send_messages=True,
                                       read_message_history=True)
     except discord.Forbidden:
-        return await interaction.response.send_message(_t(
-            interaction, "❌ Dem Bot fehlen die Rechte, um die Kanal-Berechtigungen zu ändern.",
+        return await interaction.response.send_message(_tt(
+            sprache, "❌ Dem Bot fehlen die Rechte, um die Kanal-Berechtigungen zu ändern.",
             "❌ The bot lacks permission to change the channel's permissions."), ephemeral=True)
-    await interaction.response.send_message(_t(
-        interaction, f"✅ {member.mention} wurde zu diesem Ticket hinzugefügt.",
+    await interaction.response.send_message(_tt(
+        sprache, f"✅ {member.mention} wurde zu diesem Ticket hinzugefügt.",
         f"✅ {member.mention} was added to this ticket."))
 
 
@@ -9710,28 +9854,29 @@ async def ticket_remove_member(interaction: discord.Interaction,
         return await interaction.response.send_message(_t(
             interaction, "❌ Das ist kein Ticket-Kanal.",
             "❌ That is not a ticket channel."), ephemeral=True)
+    sprache = _ticket_sprache(conn)
     kategorie = next((k for k in _ticket_categories(conn)
                       if int(k.get("id") or 0) == int(eintrag.get("category_id") or 0)), None)
     support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
     if not isinstance(interaction.user, discord.Member) or \
             not any(r.id in {sr.id for sr in support_rollen} for r in interaction.user.roles):
-        return await interaction.response.send_message(_t(
-            interaction, "❌ Nur Support-Rollen dieser Kategorie dürfen Personen entfernen.",
+        return await interaction.response.send_message(_tt(
+            sprache, "❌ Nur Support-Rollen dieser Kategorie dürfen Personen entfernen.",
             "❌ Only support roles of this category can remove people."), ephemeral=True)
     if str(member.id) == str(eintrag.get("user_id")):
-        return await interaction.response.send_message(_t(
-            interaction, "❌ Der Ticket-Ersteller kann nicht entfernt werden – dafür gibt es den "
+        return await interaction.response.send_message(_tt(
+            sprache, "❌ Der Ticket-Ersteller kann nicht entfernt werden – dafür gibt es den "
             "Schließen-Knopf im Ticket.",
             "❌ The ticket creator can't be removed – use the close button in the ticket instead."),
             ephemeral=True)
     try:
         await channel.set_permissions(member, overwrite=None)
     except discord.Forbidden:
-        return await interaction.response.send_message(_t(
-            interaction, "❌ Dem Bot fehlen die Rechte, um die Kanal-Berechtigungen zu ändern.",
+        return await interaction.response.send_message(_tt(
+            sprache, "❌ Dem Bot fehlen die Rechte, um die Kanal-Berechtigungen zu ändern.",
             "❌ The bot lacks permission to change the channel's permissions."), ephemeral=True)
-    await interaction.response.send_message(_t(
-        interaction, f"✅ {member.mention} wurde aus diesem Ticket entfernt.",
+    await interaction.response.send_message(_tt(
+        sprache, f"✅ {member.mention} wurde aus diesem Ticket entfernt.",
         f"✅ {member.mention} was removed from this ticket."))
 
 
@@ -23234,6 +23379,24 @@ def _ticket_categories(conn: ServerConnection) -> List[Dict[str, Any]]:
     return kat
 
 
+def _ticket_sprache(conn: Optional[ServerConnection]) -> str:
+    """Die im Dashboard fest eingestellte Sprache fuer ALLE Ticket-Tool-Texte
+    (Buttons, Schliessen-/Oeffnen-Nachrichten usw.) - bewusst NICHT von der
+    Discord-Client-Sprache des jeweils klickenden Nutzers abgeleitet (siehe
+    _t/_sprache), damit ein Ticket-Kanal nicht je nach Klickendem zwischen
+    Deutsch und Englisch wechselt."""
+    if conn is None:
+        return "de"
+    return "en" if conn.get("ticket_language") == "en" else "de"
+
+
+def _tt(sprache: str, de: str, en: str) -> str:
+    """Wie _t(interaction, de, en), aber anhand einer festen Sprache statt
+    der Interaktion - fuer Ticket-Tool-Texte, die IMMER in der im Dashboard
+    eingestellten Sprache erscheinen sollen."""
+    return en if sprache == "en" else de
+
+
 def _ensure_ticket_category_ids(eintraege: List[Dict]) -> bool:
     """Vergibt fortlaufende `id`-Felder an Kategorien ohne eins (analog
     _ensure_reaction_role_ids)."""
@@ -23441,7 +23604,28 @@ async def get_ticket_categories(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     kategorien = _ticket_categories(conn)
-    return ok({"categories": [_ticket_category_payload(conn, k) for k in kategorien]})
+    return ok({"categories": [_ticket_category_payload(conn, k) for k in kategorien],
+              "language": _ticket_sprache(conn)})
+
+
+async def post_ticket_language(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "discord_mgmt")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("discord_mgmt", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    sprache = str(data.get("language") or "").strip().lower()
+    if sprache not in ("de", "en"):
+        return err("Bitte Deutsch oder Englisch auswählen.")
+    _conn_store(conn, "ticket_language", sprache)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Ticket-Tool-Sprache geändert",
+              f"{sprache} · {conn.name}")
+    return ok({"language": sprache})
 
 
 async def post_ticket_categories(request: web.Request) -> web.Response:
@@ -26398,6 +26582,7 @@ def build_app() -> web.Application:
     r.add_get("/api/discord-management/tickets/categories", get_ticket_categories)
     r.add_post("/api/discord-management/tickets/categories", post_ticket_categories)
     r.add_delete("/api/discord-management/tickets/categories/{id}", delete_ticket_category)
+    r.add_post("/api/discord-management/tickets/language", post_ticket_language)
     r.add_get("/api/discord-management/tickets/open", get_ticket_open)
     # ── Auto-Aufgaben (Scheduled Tasks) ──
     r.add_get("/api/scheduled-tasks", list_scheduled_tasks)
@@ -27139,6 +27324,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "f9d4254775eec5e0a32bbfb78c3b893f9639426b4535d8430cb0fef2adaf7c3c",
     ),
     "app.js": (
+        "bf08465dd83ed3a6b858f73892249131b676d049f3e84201b6c2fe56965012f6",
         "6fd643484c28d71142d13b628a467ef68fd9974d569c18d4db414bf7db102d58",
         "0cc4758a91a7fa16a5dd95cd0057238e495cd49af65addda0134abdb2f1decc8",
         "9f6ec3db818579ea6ffabd99408a90463437f4ba5ebd4a992f224726cd897983",
