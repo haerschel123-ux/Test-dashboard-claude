@@ -163,9 +163,7 @@ def test_jede_schrift_hat_gleich_viele_zeilen_je_zeichen():
             assert breiten.pop() >= spalten or zeichen == "#"
 
 
-def test_ausgewaehlte_objekte_stehen_im_item_katalog():
-    """Jeder vorgegebene Classname muss es wirklich geben - ein erfundener
-    Name erzeugt eine gueltige Datei, im Spiel erscheint aber nichts."""
+def _item_katalog():
     import base64
     import zlib
 
@@ -173,6 +171,45 @@ def test_ausgewaehlte_objekte_stehen_im_item_katalog():
 
     roh = zlib.decompress(base64.b64decode(
         embedded_assets._EMBEDDED_ASSETS["loadout-catalog.js"].replace("\n", "")))
-    katalog = roh.decode("utf8").lower()
+    return roh.decode("utf8").lower()
+
+
+def test_inventar_objekte_stehen_im_item_katalog():
+    """Die Inventar-Gegenstaende muessen es wirklich geben - ein erfundener
+    Classname erzeugt eine gueltige Datei, im Spiel erscheint aber nichts.
+
+    Statische Objekte (Container, Wracks, Militaer, Steine, Feuer) stehen
+    naturgemaess nicht im Loadout-Katalog; sie sind gegen echte Class-Dumps
+    des Spiels geprueft, siehe Kommentar an _SKY_OBJEKTE.
+    """
+    katalog = _item_katalog()
+    inventar = [c for _, c, _ in bot._SKY_OBJEKTE
+                if not c.startswith(("StaticObj_", "Land_", "BarrelHoles_"))
+                and c not in ("Bonfire", "Fireplace", "FireplaceIndoor")]
+    fehlend = [c for c in inventar if f'"{c.lower()}"' not in katalog]
+    assert fehlend == [], fehlend
+    assert len(inventar) >= 19
+
+
+def test_kein_classname_ist_ein_modellpfad():
+    """Die Vorlage bietet zwei Steine als "rock_apart1.p3d" an - das ist ein
+    Modellpfad, kein Classname, und der Object Spawner kann damit nichts
+    anfangen. So etwas darf nicht in die Auswahl geraten."""
     for _, classname, _ in bot._SKY_OBJEKTE:
-        assert f'"{classname.lower()}"' in katalog, classname
+        assert not classname.endswith(".p3d"), classname
+
+
+def test_alle_classnames_passieren_die_eingabepruefung():
+    """Die Auswahl muss durch dieselbe Pruefung kommen wie eine freie
+    Eingabe - sonst bietet das Dashboard etwas an, das der eigene Handler
+    anschliessend ablehnt."""
+    import re as _re
+    for _, classname, _ in bot._SKY_OBJEKTE:
+        assert _re.fullmatch(r"[A-Za-z0-9_]{1,64}", classname), classname
+
+
+def test_objektliste_ist_eindeutig():
+    namen = [c for _, c, _ in bot._SKY_OBJEKTE]
+    assert len(namen) == len(set(namen))
+    label = [l for _, _, l in bot._SKY_OBJEKTE]
+    assert len(label) == len(set(label))

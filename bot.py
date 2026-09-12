@@ -11949,26 +11949,71 @@ _SKY_GROESSEN: Dict[str, float] = {"small": 5.0, "medium": 10.0,
 _SKY_SCALES: Tuple[float, ...] = (0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5,
                                   0.75, 1.0, 1.5, 2.0, 3.0, 5.0)
 
-# Auswahl der Objekte. Bewusst nur Classnames, die im Item-Katalog des
-# Dashboards (loadout-catalog.js) tatsaechlich vorkommen - ein erfundener
-# Classname wuerde eine gueltige Datei erzeugen, im Spiel aber nichts
-# anzeigen. Alles Weitere traegt der Kunde als freien Classname ein.
+# Auswahl der Objekte. Die Labels stammen aus der Vorlage, die Classnames
+# NICHT: deren eigene Zuordnung (im Chunk assets/SkyMessenger-*.js) enthaelt
+# mehrere Namen, die es im Spiel nicht gibt. Jeder Eintrag hier ist gegen
+# echte Class-Dumps des Spiels geprueft (ravmustang/DayZ_SA_ClassName_Dump,
+# niboj/DayzXboxConfigTutorial) bzw. gegen den Item-Katalog des Dashboards.
+#
+# Korrigiert gegenueber der Vorlage:
+#   Land_Wreck_Volha        -> es gibt nur _Blue / _Grey / _Police
+#   Land_Wreck_PoliceCar    -> existiert nicht; der Polizeiwagen ist
+#                              Land_Wreck_Volha_Police
+#   StaticObj_Misc_CinderBlock -> nur die Mehrzahl ...CinderBlocks existiert
+#   Barrel_Black            -> existiert nicht; Faesser gibt es in vier
+#                              Farben, dazu die Feuertonnen BarrelHoles_*
+#   rock_apart1.p3d /       -> Modellpfade statt Classnames; die echten
+#   rock_apart2.p3d            Steine heissen StaticObj_Rubble_Rocks1/2
 _SKY_OBJEKTE: Tuple[Tuple[str, str, str], ...] = (
-    ("Rauch",      "M18SmokeGrenade_White",  "Rauchgranate weiß"),
-    ("Rauch",      "M18SmokeGrenade_Green",  "Rauchgranate grün"),
-    ("Rauch",      "M18SmokeGrenade_Red",    "Rauchgranate rot"),
-    ("Rauch",      "M18SmokeGrenade_Purple", "Rauchgranate violett"),
-    ("Rauch",      "M18SmokeGrenade_Yellow", "Rauchgranate gelb"),
-    ("Rauch",      "RDG2SmokeGrenade_White", "RDG-2 Rauch weiß"),
-    ("Rauch",      "RDG2SmokeGrenade_Black", "RDG-2 Rauch schwarz"),
-    ("Leuchten",   "Roadflare",              "Signalfackel"),
-    ("Leuchten",   "Flaregun",               "Signalpistole"),
-    ("Leuchten",   "Ammo_Flare",             "Leuchtmunition"),
-    ("Knicklicht", "Chemlight_White",        "Knicklicht weiß"),
-    ("Knicklicht", "Chemlight_Red",          "Knicklicht rot"),
-    ("Knicklicht", "Chemlight_Green",        "Knicklicht grün"),
-    ("Knicklicht", "Chemlight_Blue",         "Knicklicht blau"),
-    ("Knicklicht", "Chemlight_Yellow",       "Knicklicht gelb"),
+    ("Rauch",           "M18SmokeGrenade_White",          "Rauchgranate weiß"),
+    ("Rauch",           "M18SmokeGrenade_Green",          "Rauchgranate grün"),
+    ("Rauch",           "M18SmokeGrenade_Red",            "Rauchgranate rot"),
+    ("Rauch",           "M18SmokeGrenade_Purple",         "Rauchgranate violett"),
+    ("Rauch",           "M18SmokeGrenade_Yellow",         "Rauchgranate gelb"),
+    # Nicht in der Vorlage, aber im Item-Katalog belegt.
+    ("Rauch",           "RDG2SmokeGrenade_White",         "RDG-2 Rauch weiß"),
+    ("Rauch",           "RDG2SmokeGrenade_Black",         "RDG-2 Rauch schwarz"),
+    ("Leuchten",        "Roadflare",                      "Signalfackel"),
+    ("Leuchten",        "Flaregun",                       "Signalpistole"),
+    ("Leuchten",        "Ammo_Flare",                     "Leuchtmunition"),
+    ("Knicklicht",      "Chemlight_White",                "Knicklicht weiß"),
+    ("Knicklicht",      "Chemlight_Red",                  "Knicklicht rot"),
+    ("Knicklicht",      "Chemlight_Green",                "Knicklicht grün"),
+    ("Knicklicht",      "Chemlight_Blue",                 "Knicklicht blau"),
+    ("Knicklicht",      "Chemlight_Yellow",               "Knicklicht gelb"),
+    ("Container",       "StaticObj_Container_1D",         "Seecontainer blau"),
+    ("Container",       "Land_Container_1Aoh",            "Seecontainer gelb"),
+    ("Container",       "Land_Container_1Bo",             "Seecontainer rot"),
+    ("Container",       "Land_ContainerLocked_Red_DE",    "Verschlossener Container rot"),
+    ("Container",       "Land_ContainerLocked_Blue_DE",   "Verschlossener Container blau"),
+    ("Container",       "Land_ContainerLocked_Orange_DE", "Verschlossener Container orange"),
+    ("Fässer",          "Barrel_Blue",                    "Fass blau"),
+    ("Fässer",          "Barrel_Red",                     "Fass rot"),
+    ("Fässer",          "Barrel_Green",                   "Fass grün"),
+    ("Fässer",          "Barrel_Yellow",                  "Fass gelb"),
+    ("Fässer",          "BarrelHoles_Blue",               "Feuertonne blau"),
+    ("Fässer",          "BarrelHoles_Red",                "Feuertonne rot"),
+    ("Fässer",          "BarrelHoles_Green",              "Feuertonne grün"),
+    ("Fässer",          "BarrelHoles_Yellow",             "Feuertonne gelb"),
+    ("Militärobjekte",  "StaticObj_Misc_CinderBlocks",    "Schalsteine (Stapel)"),
+    ("Militärobjekte",  "StaticObj_Misc_BagFence_Round",  "Sandsäcke rund"),
+    ("Militärobjekte",  "StaticObj_Misc_BagFence_3m",     "Sandsackwall (3 m)"),
+    ("Militärobjekte",  "StaticObj_Misc_BagFence_Corner", "Sandsackecke"),
+    ("Militärobjekte",  "StaticObj_Misc_ConcreteBlock2",  "Betonsperre"),
+    ("Militärobjekte",  "StaticObj_Misc_ConcreteBlock1",  "Betonblock"),
+    ("Wracks",          "Land_Wreck_Volha_Blue",          "Wrack Volha blau"),
+    ("Wracks",          "Land_Wreck_Volha_Grey",          "Wrack Volha grau"),
+    ("Wracks",          "Land_Wreck_Volha_Police",        "Wrack Polizeiwagen"),
+    ("Wracks",          "Land_Wreck_S1023_Blue",          "Wrack Transporter"),
+    ("Wracks",          "StaticObj_Wreck_T72_Chassis",    "Panzerwrack (T-72)"),
+    # Saisonales Objekt (Walpurgisnacht); die Klasse gibt es laut den
+    # Spielskripten (bonfire.c), sie steht aber in keinem der aelteren
+    # Class-Dumps - bei Problemen zuerst hier nachsehen.
+    ("Feuer",           "Bonfire",                        "Lagerfeuer"),
+    ("Feuer",           "Fireplace",                      "Feuerstelle"),
+    ("Feuer",           "FireplaceIndoor",                "Feuerstelle drinnen"),
+    ("Steine",          "StaticObj_Rubble_Rocks1",        "Felsbrocken groß"),
+    ("Steine",          "StaticObj_Rubble_Rocks2",        "Felsbrocken klein"),
 )
 
 _SKY_MAX_ZEICHEN = 30
@@ -27996,6 +28041,10 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "e44e2a8692bbc2f2f0c8119f3f5a0c4be94e7fb2f2f979f37640ef1a395f2be0",
         "51a7554e26e369f04d8f403f6b178a4ff817879242214a8125978848b07728a7",
         "40829aef86ed1d80d42c552e6bf033030340297bf076f40e6eabf6fbb373fe67",
+        "ca6c70174bb3ca509ca436f4e461f1b22e2f82a6c051da65201bd53c778608fd",
+        "83067d288b29420fda2d18e2a074d4a3f32fdb71adf4b235293cbedc9d87eaca",
+        "af0f7d35397ab2f230b5ab18c4f1712678027afe0acd06f8d0d7f4eab7004a5f",
+        "91860774844dc07104443e0f0c017da01b188ba83cb78a5ef00cd08f6db6497b",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
