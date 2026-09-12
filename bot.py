@@ -780,6 +780,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.messages":                     {"label": "Messages Generator", "gruppe": "Tools"},
     "tools.lootexclusion":                {"label": "Loot-Ausschlusszonen", "gruppe": "Tools"},
     "tools.custombuildmap":                {"label": "Custom Build Mapping", "gruppe": "Tools"},
+    "tools.skymessage":                   {"label": "Sky Message Generator", "gruppe": "Tools"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
     "discord_mgmt":                      {"label": "Discord Management (gesamt)", "gruppe": "Discord Management"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
@@ -11292,6 +11293,7 @@ _TOOL_LISTE = (
     ("messages", "🔔", "Messages Generator"),
     ("lootexclusion", "🚫", "Loot-Ausschlusszonen"),
     ("custombuildmap", "🗺️", "Custom Build Mapping"),
+    ("skymessage", "☁️", "Sky Message Generator"),
 )
 
 
@@ -11771,6 +11773,528 @@ async def api_tools_custombuildmap_get(request: web.Request) -> web.Response:
         objekte = await _custom_build_objekte(conn, name, loop)
         ausgabe.append({"filename": name, "count": len(objekte), "points": objekte})
     return ok({"files": ausgabe, "status": status})
+
+
+# ── 2b. Sky Message Generator ─────────────────────────────────────────────
+#  Setzt einen kurzen Text in ein Raster aus DayZ-Objekten um, das senkrecht
+#  in der Luft steht ("Sky Writing"). Ergebnis ist eine Object-Spawner-Datei
+#  unter custom/ plus der zugehoerige Eintrag in objectSpawnersArr - ohne
+#  diesen Eintrag laedt der Server die Datei beim Start nicht.
+#
+#  Nachbau von doordiehub.com/SkyMessenger, mit bewusst korrigierten Fehlern
+#  der Vorlage (jeweils am Fundort kommentiert). Die Rasterschriften sind aus
+#  der Vorlage uebernommen; das Komma hat dort in allen drei Mustern ein
+#  leeres Raster, obwohl es als unterstuetzt angekuendigt wird.
+
+_SKY_FONT_COMPACT = {
+    " ": "000/000/000/000/000",
+    "!": "010/010/010/000/010",
+    "#": "0101/1111/0101/1111/0101",
+    ",": "000/000/000/010/100",
+    "-": "000/000/111/000/000",
+    ".": "000/000/000/000/010",
+    "/": "001/010/010/100/100",
+    "0": "111/101/101/101/111",
+    "1": "010/110/010/010/111",
+    "2": "111/001/111/100/111",
+    "3": "111/001/111/001/111",
+    "4": "101/101/111/001/001",
+    "5": "111/100/111/001/111",
+    "6": "111/100/111/101/111",
+    "7": "111/001/010/010/010",
+    "8": "111/101/111/101/111",
+    "9": "111/101/111/001/111",
+    "=": "000/111/000/111/000",
+    "A": "010/101/111/101/101",
+    "B": "110/101/110/101/110",
+    "C": "111/100/100/100/111",
+    "D": "110/101/101/101/110",
+    "E": "111/100/110/100/111",
+    "F": "111/100/110/100/100",
+    "G": "111/100/101/101/111",
+    "H": "101/101/111/101/101",
+    "I": "111/010/010/010/111",
+    "J": "111/001/001/101/111",
+    "K": "101/110/100/110/101",
+    "L": "100/100/100/100/111",
+    "M": "101/111/101/101/101",
+    "N": "101/111/111/111/101",
+    "O": "111/101/101/101/111",
+    "P": "110/101/110/100/100",
+    "Q": "111/101/101/111/001",
+    "R": "110/101/110/110/101",
+    "S": "111/100/111/001/111",
+    "T": "111/010/010/010/010",
+    "U": "101/101/101/101/111",
+    "V": "101/101/101/101/010",
+    "W": "101/101/101/111/101",
+    "X": "101/010/010/010/101",
+    "Y": "101/101/010/010/010",
+    "Z": "111/001/010/100/111",
+    "_": "000/000/000/000/111",
+}
+
+
+_SKY_FONT_STANDARD = {
+    " ": "00000/00000/00000/00000/00000/00000/00000",
+    "!": "00100/00100/00100/00100/00000/00100/00000",
+    "#": "01010/11111/01010/11111/01010/00000/00000",
+    ",": "00000/00000/00000/00000/00100/00100/01000",
+    "-": "00000/00000/00000/11111/00000/00000/00000",
+    ".": "00000/00000/00000/00000/00000/01100/01100",
+    "/": "00001/00010/00010/00100/01000/01000/10000",
+    "0": "01110/10001/10011/10101/11001/10001/01110",
+    "1": "00100/01100/00100/00100/00100/00100/11111",
+    "2": "01110/10001/00001/00010/00100/01000/11111",
+    "3": "01110/10001/00001/00110/00001/10001/01110",
+    "4": "00010/00110/01010/10010/11111/00010/00010",
+    "5": "11111/10000/11110/00001/00001/10001/01110",
+    "6": "01110/10001/10000/11110/10001/10001/01110",
+    "7": "11111/00001/00010/00100/00100/00100/00100",
+    "8": "01110/10001/10001/01110/10001/10001/01110",
+    "9": "01110/10001/10001/01111/00001/10001/01110",
+    "=": "00000/11111/00000/11111/00000/00000/00000",
+    "A": "00100/01010/10001/11111/10001/10001/10001",
+    "B": "11110/10001/10001/11110/10001/10001/11110",
+    "C": "01111/10000/10000/10000/10000/10000/01111",
+    "D": "11110/10001/10001/10001/10001/10001/11110",
+    "E": "11111/10000/10000/11110/10000/10000/11111",
+    "F": "11111/10000/10000/11110/10000/10000/10000",
+    "G": "01111/10000/10000/10111/10001/10001/01111",
+    "H": "10001/10001/10001/11111/10001/10001/10001",
+    "I": "11111/00100/00100/00100/00100/00100/11111",
+    "J": "11111/00001/00001/00001/00001/10001/01111",
+    "K": "10001/10010/10100/11000/10100/10010/10001",
+    "L": "10000/10000/10000/10000/10000/10000/11111",
+    "M": "10001/11011/10101/10001/10001/10001/10001",
+    "N": "10001/11001/10101/10011/10001/10001/10001",
+    "O": "01110/10001/10001/10001/10001/10001/01110",
+    "P": "11110/10001/10001/11110/10000/10000/10000",
+    "Q": "01110/10001/10001/10001/10101/10011/01111",
+    "R": "11110/10001/10001/11110/10100/10010/10001",
+    "S": "01111/10000/10000/01110/00001/00001/11110",
+    "T": "11111/00100/00100/00100/00100/00100/00100",
+    "U": "10001/10001/10001/10001/10001/10001/01110",
+    "V": "10001/10001/10001/10001/10001/01010/00100",
+    "W": "10001/10001/10001/10001/10101/11011/10001",
+    "X": "10001/01010/00100/00100/00100/01010/10001",
+    "Y": "10001/01010/00100/00100/00100/00100/00100",
+    "Z": "11111/00001/00010/00100/01000/10000/11111",
+    "_": "00000/00000/00000/00000/00000/11111/00000",
+}
+
+
+_SKY_FONT_DETAILED = {
+    " ": "000000000/000000000/000000000/000000000/000000000/000000000/000000000/000000000/000000000",
+    "!": "000111000/000111000/000111000/000111000/000111000/000000000/000000000/000111000/000111000",
+    "#": "001000100/001000100/111111111/001000100/001000100/111111111/001000100/001000100/000000000",
+    ",": "000000000/000000000/000000000/000000000/000000000/000000000/001110000/001110000/011000000",
+    "-": "000000000/000000000/000000000/000000000/111111111/000000000/000000000/000000000/000000000",
+    ".": "000000000/000000000/000000000/000000000/000000000/000000000/000000000/001110000/001110000",
+    "/": "000000010/000000100/000001000/000010000/000100000/001000000/010000000/100000000/000000000",
+    "0": "001111100/010000010/010000110/010001010/010010010/010100010/011000010/010000010/001111100",
+    "1": "000010000/000110000/000010000/000010000/000010000/000010000/000010000/000010000/011111110",
+    "2": "001111100/010000010/000000010/000000100/000001000/000010000/000100000/001000000/011111110",
+    "3": "001111100/010000010/000000010/000000010/000111100/000000010/000000010/010000010/001111100",
+    "4": "000000100/000001100/000010100/000100100/001000100/010000100/011111110/000000100/000000100",
+    "5": "011111110/010000000/010000000/011111100/000000010/000000010/000000010/010000010/001111100",
+    "6": "001111100/010000010/010000000/010000000/011111100/010000010/010000010/010000010/001111100",
+    "7": "011111110/000000010/000000100/000001000/000010000/000010000/000010000/000010000/000010000",
+    "8": "001111100/010000010/010000010/010000010/001111100/010000010/010000010/010000010/001111100",
+    "9": "001111100/010000010/010000010/010000010/001111110/000000010/000000010/010000010/001111100",
+    "=": "000000000/000000000/111111111/000000000/000000000/111111111/000000000/000000000/000000000",
+    "A": "000111000/001000100/010000010/010000010/011111110/010000010/010000010/010000010/010000010",
+    "B": "011111100/010000010/010000010/010000010/011111100/010000010/010000010/010000010/011111100",
+    "C": "001111100/010000010/010000000/010000000/010000000/010000000/010000000/010000010/001111100",
+    "D": "011111100/010000010/010000010/010000010/010000010/010000010/010000010/010000010/011111100",
+    "E": "011111110/010000000/010000000/010000000/011111100/010000000/010000000/010000000/011111110",
+    "F": "011111110/010000000/010000000/010000000/011111100/010000000/010000000/010000000/010000000",
+    "G": "001111100/010000010/010000000/010000000/010001110/010000010/010000010/010000010/001111100",
+    "H": "010000010/010000010/010000010/010000010/011111110/010000010/010000010/010000010/010000010",
+    "I": "011111110/000010000/000010000/000010000/000010000/000010000/000010000/000010000/011111110",
+    "J": "011111110/000000010/000000010/000000010/000000010/000000010/010000010/010000010/001111100",
+    "K": "010000010/010000100/010001000/010010000/011100000/010010000/010001000/010000100/010000010",
+    "L": "010000000/010000000/010000000/010000000/010000000/010000000/010000000/010000000/011111110",
+    "M": "010000010/011000110/010101010/010010010/010000010/010000010/010000010/010000010/010000010",
+    "N": "010000010/011000010/010100010/010010010/010001010/010000110/010000010/010000010/010000010",
+    "O": "001111100/010000010/010000010/010000010/010000010/010000010/010000010/010000010/001111100",
+    "P": "011111100/010000010/010000010/010000010/011111100/010000000/010000000/010000000/010000000",
+    "Q": "001111100/010000010/010000010/010000010/010000010/010010010/010001010/010000110/001111110",
+    "R": "011111100/010000010/010000010/010000010/011111100/010010000/010001000/010000100/010000010",
+    "S": "001111100/010000010/010000000/010000000/001111100/000000010/000000010/010000010/001111100",
+    "T": "011111110/000010000/000010000/000010000/000010000/000010000/000010000/000010000/000010000",
+    "U": "010000010/010000010/010000010/010000010/010000010/010000010/010000010/010000010/001111100",
+    "V": "010000010/010000010/010000010/010000010/010000010/010000010/001000100/000101000/000010000",
+    "W": "010000010/010000010/010000010/010000010/010010010/010101010/011000110/010000010/010000010",
+    "X": "010000010/001000100/000101000/000010000/000010000/000101000/001000100/010000010/010000010",
+    "Y": "010000010/001000100/000101000/000010000/000010000/000010000/000010000/000010000/000010000",
+    "Z": "011111110/000000010/000000100/000001000/000010000/000100000/001000000/010000000/011111110",
+    "_": "000000000/000000000/000000000/000000000/000000000/000000000/000000000/000000000/111111111",
+}
+
+# (Spalten, Zeilen, Schrift) je Muster. Die Spaltenzahl ist der Nennwert fuer
+# die Auswahl; die tatsaechliche Breite wird pro Glyphe gemessen, weil "#" im
+# Compact-Muster vier Spalten breit ist. Die Vorlage rechnet dort weiter mit
+# drei und setzt das Zeichen dadurch versetzt - hier korrigiert.
+_SKY_MUSTER: Dict[str, Tuple[int, int, Dict[str, str]]] = {
+    "compact":  (3, 5, _SKY_FONT_COMPACT),
+    "standard": (5, 7, _SKY_FONT_STANDARD),
+    "detailed": (9, 9, _SKY_FONT_DETAILED),
+}
+
+# Buchstabenhoehe in Metern je Groesse. Der Punktabstand ist Hoehe/Zeilenzahl.
+_SKY_GROESSEN: Dict[str, float] = {"small": 5.0, "medium": 10.0,
+                                   "large": 20.0, "huge": 40.0}
+
+_SKY_SCALES: Tuple[float, ...] = (0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5,
+                                  0.75, 1.0, 1.5, 2.0, 3.0, 5.0)
+
+# Auswahl der Objekte. Bewusst nur Classnames, die im Item-Katalog des
+# Dashboards (loadout-catalog.js) tatsaechlich vorkommen - ein erfundener
+# Classname wuerde eine gueltige Datei erzeugen, im Spiel aber nichts
+# anzeigen. Alles Weitere traegt der Kunde als freien Classname ein.
+_SKY_OBJEKTE: Tuple[Tuple[str, str, str], ...] = (
+    ("Rauch",      "M18SmokeGrenade_White",  "Rauchgranate weiß"),
+    ("Rauch",      "M18SmokeGrenade_Green",  "Rauchgranate grün"),
+    ("Rauch",      "M18SmokeGrenade_Red",    "Rauchgranate rot"),
+    ("Rauch",      "M18SmokeGrenade_Purple", "Rauchgranate violett"),
+    ("Rauch",      "M18SmokeGrenade_Yellow", "Rauchgranate gelb"),
+    ("Rauch",      "RDG2SmokeGrenade_White", "RDG-2 Rauch weiß"),
+    ("Rauch",      "RDG2SmokeGrenade_Black", "RDG-2 Rauch schwarz"),
+    ("Leuchten",   "Roadflare",              "Signalfackel"),
+    ("Leuchten",   "Flaregun",               "Signalpistole"),
+    ("Leuchten",   "Ammo_Flare",             "Leuchtmunition"),
+    ("Knicklicht", "Chemlight_White",        "Knicklicht weiß"),
+    ("Knicklicht", "Chemlight_Red",          "Knicklicht rot"),
+    ("Knicklicht", "Chemlight_Green",        "Knicklicht grün"),
+    ("Knicklicht", "Chemlight_Blue",         "Knicklicht blau"),
+    ("Knicklicht", "Chemlight_Yellow",       "Knicklicht gelb"),
+)
+
+_SKY_MAX_ZEICHEN = 30
+# Ab hier wird gewarnt: so viele Objekte an einer Stelle kosten spuerbar
+# Serverleistung. Kein hartes Limit - das entscheidet der Kunde selbst.
+_SKY_WARNUNG_AB = 400
+# Harte Obergrenze. 9x9-Raster mal 30 Zeichen sind rechnerisch schon ueber
+# 2000 Objekte; darueber hinaus ist die Datei fuer einen Konsolen-Server
+# nicht mehr sinnvoll nutzbar.
+_SKY_MAX_OBJEKTE = 2500
+
+# Erlaubt sind genau die Zeichen, fuer die es in allen drei Mustern eine
+# Glyphe gibt.
+_SKY_ERLAUBT = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ./!#-_=,")
+
+
+def _sky_text_saeubern(roh: str) -> Tuple[str, List[str]]:
+    """Wandelt die Eingabe in den tatsaechlich darstellbaren Text um.
+
+    Rueckgabe ``(text, entfernt)``. ``entfernt`` sind die weggefallenen
+    Zeichen in Eingabereihenfolge, ohne Wiederholungen - damit das Dashboard
+    sagen kann, WAS verschwunden ist. Die Vorlage entfernt solche Zeichen
+    kommentarlos; hier wird es gemeldet.
+
+    ``ß`` wird durch ``str.upper()`` zu ``SS`` und belegt damit zwei Stellen -
+    genau wie in der Vorlage.
+    """
+    text = []
+    entfernt: List[str] = []
+    for zeichen in (roh or "").upper():
+        if zeichen in _SKY_ERLAUBT:
+            text.append(zeichen)
+        elif zeichen not in entfernt:
+            entfernt.append(zeichen)
+    return "".join(text), entfernt
+
+
+def _sky_glyphen(text: str, muster: str) -> List[Tuple[int, List[str]]]:
+    """(Breite, Rasterzeilen) je Zeichen. Unbekannte Zeichen kommen hier nicht
+    mehr an, _sky_text_saeubern hat sie schon entfernt."""
+    schrift = _SKY_MUSTER[muster][2]
+    aus = []
+    for zeichen in text:
+        zeilen = schrift[zeichen].split("/")
+        aus.append((len(zeilen[0]), zeilen))
+    return aus
+
+
+def _sky_objekte_bauen(text: str, muster: str, groesse: str, start_x: float,
+                       start_z: float, hoehe: float, scale: float,
+                       yaw: float, pitch: float, roll: float, text_winkel: float,
+                       classname: str, wand: Optional[Tuple[float, float]]
+                       ) -> Tuple[List[Dict[str, Any]], float, int, int]:
+    """Baut die Objektliste. Rueckgabe ``(objekte, abstand, breite, zeilen)``.
+
+    ``wand`` ist ``(breite_m, hoehe_m)`` im Wandmodus, sonst ``None``; dann
+    ergibt sich der Punktabstand aus der Buchstabengroesse.
+    """
+    spalten_nenn, zeilen_zahl, _ = _SKY_MUSTER[muster]
+    glyphen = _sky_glyphen(text, muster)
+    # Gesamtbreite in Rasterzellen, mit einer Leerspalte zwischen den
+    # Zeichen. Die letzte Trennspalte zaehlt fuer die Zentrierung nicht mit.
+    breite = sum(b + 1 for b, _ in glyphen) - 1 if glyphen else 0
+
+    if wand is not None:
+        # Auto-Anpassung: das Raster soll in die angegebene Wand passen. Die
+        # eingestellte Buchstabengroesse ist dann ohne Wirkung.
+        abstand = min(wand[0] / breite if breite else wand[0],
+                      wand[1] / zeilen_zahl)
+    else:
+        abstand = _SKY_GROESSEN.get(groesse, 10.0) / zeilen_zahl
+
+    bogen = math.radians(text_winkel)
+    cos_w, sin_w = math.cos(bogen), math.sin(bogen)
+    mitte = (breite - 1) / 2.0
+    mitte_zeile = (zeilen_zahl - 1) / 2.0
+
+    objekte: List[Dict[str, Any]] = []
+    spalte_links = 0
+    for glyph_breite, zeilen in glyphen:
+        for r, zeile in enumerate(zeilen):
+            for c, zelle in enumerate(zeile):
+                if zelle != "1":
+                    continue
+                u = (spalte_links + c - mitte) * abstand
+                v = (mitte_zeile - r) * abstand
+                objekte.append({
+                    "name": classname,
+                    "pos": [_sky_rund(start_x + u * cos_w),
+                            _sky_rund(hoehe + v),
+                            _sky_rund(start_z + u * sin_w)],
+                    # Reihenfolge Yaw/Pitch/Roll wie im offiziellen
+                    # Object-Spawner-Format. Die Vorlage schreibt hier
+                    # [Pitch, Yaw, Roll] und dreht die Objekte damit falsch.
+                    "ypr": [_sky_rund(yaw), _sky_rund(pitch), _sky_rund(roll)],
+                    "scale": _sky_rund(scale),
+                    "enableCEPersistency": 0,
+                    "customString": "",
+                })
+        # Vorschub um die TATSAECHLICHE Glyphenbreite plus Trennspalte. Die
+        # Vorlage nimmt hier immer den Nennwert und setzt das vier Spalten
+        # breite "#" im Compact-Muster dadurch versetzt.
+        spalte_links += glyph_breite + 1
+    return objekte, abstand, breite, zeilen_zahl
+
+
+def _sky_dateiname(roh: str) -> str:
+    """Missionsrelativer Zielpfad im custom-Ordner, den der Object Spawner
+    ohnehin schon benutzt."""
+    basis = re.sub(r"[^a-z0-9_-]+", "_", (roh or "").lower()).strip("_")
+    return f"custom/skymessage_{basis or 'nachricht'}.json"
+
+
+def _sky_rund(wert: float) -> Any:
+    """Rundet auf vier Nachkommastellen und gibt ganze Zahlen als int zurueck.
+
+    Die Vorlage laeuft in JavaScript und schreibt dort ``7500`` statt
+    ``7500.0``; ohne diese Umwandlung unterscheiden sich sonst identische
+    Dateien in jeder Zeile.
+    """
+    gerundet = round(wert, 4)
+    return int(gerundet) if gerundet == int(gerundet) else gerundet
+
+
+def _sky_zahl(wert: Any, vorgabe: float) -> float:
+    try:
+        zahl = float(wert)
+    except (TypeError, ValueError):
+        return vorgabe
+    return vorgabe if math.isnan(zahl) or math.isinf(zahl) else zahl
+
+
+async def api_tools_skymessage_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.skymessage")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.skymessage", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    gruppen: Dict[str, List[Dict[str, str]]] = {}
+    for gruppe, classname, label in _SKY_OBJEKTE:
+        gruppen.setdefault(gruppe, []).append({"value": classname, "label": label})
+    antwort: Dict[str, Any] = {
+        "objekte": [{"gruppe": g, "eintraege": e} for g, e in gruppen.items()],
+        # Die Rasterschriften gehen mit an das Dashboard, damit die
+        # Live-Vorschau ohne Server-Anfrage zeichnen kann und die Tabellen
+        # nur an EINER Stelle gepflegt werden muessen.
+        "muster": [{"value": k, "label": f"{v[0]}×{v[1]}", "spalten": v[0],
+                    "zeilen": v[1], "schrift": v[2]} for k, v in _SKY_MUSTER.items()],
+        "groessen": [{"value": k, "meter": v} for k, v in _SKY_GROESSEN.items()],
+        "scales": list(_SKY_SCALES),
+        "max_zeichen": _SKY_MAX_ZEICHEN,
+        "warnung_ab": _SKY_WARNUNG_AB,
+        "max_objekte": _SKY_MAX_OBJEKTE,
+        "spawner": [],
+        "kein_mission_ordner": not _mission_dir_of(conn),
+    }
+    if not antwort["kein_mission_ordner"]:
+        loop = asyncio.get_running_loop()
+        dateien, status = await _custom_build_dateien(conn, loop)
+        antwort["spawner"] = dateien
+        antwort["spawner_status"] = status
+    return ok(antwort)
+
+
+async def api_tools_skymessage_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.skymessage")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.skymessage", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    commit = bool(data.get("commit"))
+    # Wie bei den anderen Tools: die Vorschau ist frei, erst das echte
+    # Hochladen wird begrenzt - sonst sperrt die Vorschau den Knopf, der
+    # unmittelbar danach gedrueckt wird.
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.skymessage", 10)
+        if fehler is not None:
+            return fehler
+
+    roh = str(data.get("text") or "")
+    if len(roh) > _SKY_MAX_ZEICHEN:
+        return err(f"Die Nachricht ist zu lang – höchstens {_SKY_MAX_ZEICHEN} "
+                   f"Zeichen (eingegeben: {len(roh)}).")
+    text, entfernt = _sky_text_saeubern(roh)
+    if not text.strip():
+        return err("Bitte eine Nachricht eingeben, die mindestens ein "
+                   "darstellbares Zeichen enthält (A–Z, 0–9, . / ! # - _ = ,).")
+
+    muster = str(data.get("muster") or "standard")
+    if muster not in _SKY_MUSTER:
+        return err("Unbekanntes Raster-Muster.")
+    groesse = str(data.get("groesse") or "medium")
+    if groesse not in _SKY_GROESSEN:
+        return err("Unbekannte Buchstabengröße.")
+
+    classname = str(data.get("classname") or "").strip()
+    if not classname:
+        return err("Bitte ein Objekt auswählen oder einen Classname eingeben.")
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,64}", classname):
+        return err("Der Classname darf nur Buchstaben, Ziffern und "
+                   "Unterstriche enthalten (höchstens 64 Zeichen).")
+
+    scale = _sky_zahl(data.get("scale"), 1.0)
+    if not 0.0 < scale <= 5.0:
+        return err("Die Objektgröße muss zwischen 0 und 5 liegen.")
+
+    wand: Optional[Tuple[float, float]] = None
+    if bool(data.get("wand")):
+        wand_breite = _sky_zahl(data.get("wand_breite"), 15.0)
+        wand_hoehe = _sky_zahl(data.get("wand_hoehe"), 8.0)
+        # Die Vorlage laesst hier auch 0 oder negative Werte durch und
+        # erzeugt dann unbrauchbare Koordinaten.
+        if not 5.0 <= wand_breite <= 200.0:
+            return err("Die Wandbreite muss zwischen 5 und 200 Metern liegen.")
+        if not 2.0 <= wand_hoehe <= 100.0:
+            return err("Die Wandhöhe muss zwischen 2 und 100 Metern liegen.")
+        wand = (wand_breite, wand_hoehe)
+
+    start_x = _sky_zahl(data.get("x"), 7500.0)
+    start_z = _sky_zahl(data.get("z"), 7500.0)
+    hoehe = _sky_zahl(data.get("hoehe"), 500.0)
+    # Wand-Y ersetzt die Flughoehe - aber nur im Wandmodus. Die Vorlage
+    # laesst das Feld auch bei ausgeschaltetem Wandmodus durchschlagen,
+    # obwohl es dort deaktiviert aussieht.
+    if wand is not None and str(data.get("wand_y") or "").strip() != "":
+        hoehe = _sky_zahl(data.get("wand_y"), hoehe)
+
+    text_winkel = _sky_zahl(data.get("text_winkel"), 0.0)
+    if not -180.0 <= text_winkel <= 180.0:
+        return err("Die Textdrehung muss zwischen -180° und 180° liegen.")
+
+    objekte, abstand, breite, zeilen = _sky_objekte_bauen(
+        text, muster, groesse, start_x, start_z, hoehe, scale,
+        _sky_zahl(data.get("yaw"), 0.0), _sky_zahl(data.get("pitch"), 0.0),
+        _sky_zahl(data.get("roll"), 0.0), text_winkel, classname, wand)
+
+    if not objekte:
+        return err("Diese Nachricht ergibt kein einziges Objekt – bitte "
+                   "anderen Text wählen.")
+    if len(objekte) > _SKY_MAX_OBJEKTE:
+        return err(f"Das wären {len(objekte)} Objekte – erlaubt sind höchstens "
+                   f"{_SKY_MAX_OBJEKTE}. Bitte ein kleineres Raster, eine "
+                   f"kürzere Nachricht oder eine kleinere Größe wählen.")
+
+    datei = str(data.get("datei") or "").strip() or _sky_dateiname(text)
+    if not re.fullmatch(r"custom/[A-Za-z0-9_.-]{1,80}\.json", datei):
+        return err("Der Dateiname muss im custom-Ordner liegen und auf .json "
+                   "enden, z. B. custom/skymessage_survive.json.")
+
+    inhalt = json.dumps({"Objects": objekte}, indent=2, ensure_ascii=False) + "\n"
+    dateien = [{"filename": datei, "content": inhalt}]
+
+    antwort: Dict[str, Any] = {
+        "generated": dateien, "objekte": len(objekte), "zeichen": len(text),
+        "text": text, "entfernt": entfernt, "abstand": round(abstand, 3),
+        "breite": breite, "zeilen": zeilen,
+        "warnung": len(objekte) >= _SKY_WARNUNG_AB,
+        "datei": datei,
+    }
+
+    if not _mission_dir_of(conn):
+        # Ohne Mission-Ordner kann nichts hochgeladen werden - erzeugen,
+        # kopieren und herunterladen geht trotzdem.
+        antwort["kein_mission_ordner"] = True
+        return ok(antwort)
+
+    loop = asyncio.get_running_loop()
+    vorhanden, lese_status = await _tools_datei_lesen(conn, datei, loop)
+    antwort["existiert"] = lese_status == "ok"
+    if lese_status == "ok":
+        antwort["bytes_vorher"] = len(vorhanden or "")
+
+    spawner, spawner_status = await _custom_build_dateien(conn, loop)
+    antwort["spawner_status"] = spawner_status
+    antwort["eingetragen"] = datei in spawner
+
+    if not commit:
+        return ok(antwort)
+
+    # Ab hier wird wirklich geschrieben.
+    if lese_status == "error":
+        return err("Die Zieldatei konnte nicht geprüft werden (FTP-Fehler) – "
+                   "nichts geändert.", 502)
+    if not await _tools_datei_schreiben(conn, datei, inhalt, loop):
+        return err("Die Datei konnte nicht per FTP gespeichert werden.", 502)
+    antwort["geschrieben"] = True
+
+    if not antwort["eingetragen"]:
+        gameplay, status = await _tools_json_lesen(conn, "cfggameplay.json", loop)
+        if status != "ok" or not isinstance(gameplay, dict):
+            return err(f"Die Datei `{datei}` wurde gespeichert, aber die "
+                       f"cfggameplay.json ist nicht lesbar – bitte den Eintrag "
+                       f"in objectSpawnersArr von Hand ergänzen.", 502)
+        liste = _json_wert_finden(gameplay, "objectSpawnersArr")
+        if not isinstance(liste, list):
+            # Kein objectSpawnersArr vorhanden: im selben Abschnitt anlegen,
+            # in dem der Object Spawner laut Bohemia erwartet wird.
+            ziel = gameplay.setdefault("WorldsData", {})
+            if not isinstance(ziel, dict):
+                return err(f"Die Datei `{datei}` wurde gespeichert, aber in der "
+                           f"cfggameplay.json gibt es keinen Abschnitt für "
+                           f"objectSpawnersArr – bitte von Hand ergänzen.", 502)
+            liste = []
+            ziel["objectSpawnersArr"] = liste
+        liste.append(datei)
+        if not await _tools_datei_schreiben(conn, "cfggameplay.json",
+                json.dumps(gameplay, indent=4, ensure_ascii=False) + "\n", loop):
+            return err(f"Die Datei `{datei}` wurde gespeichert, aber der Eintrag "
+                       f"in der cfggameplay.json ist fehlgeschlagen – bitte von "
+                       f"Hand ergänzen.", 502)
+        antwort["eingetragen"] = True
+        antwort["eintrag_ergaenzt"] = True
+
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+              "Tool: Sky Message hochgeladen",
+              f"{text} → {datei} ({len(objekte)} Objekte) · {conn.name}")
+    return ok(antwort)
 
 
 # ── 3. Zombie-Horden Generator ────────────────────────────────────────────
@@ -26627,6 +27151,8 @@ def build_app() -> web.Application:
     r.add_get("/api/tools/lootexclusion", api_tools_lootexclusion_get)
     r.add_post("/api/tools/lootexclusion", api_tools_lootexclusion_post)
     r.add_get("/api/tools/custombuildmap", api_tools_custombuildmap_get)
+    r.add_get("/api/tools/skymessage", api_tools_skymessage_get)
+    r.add_post("/api/tools/skymessage", api_tools_skymessage_post)
     r.add_get("/api/tools/horde", api_tools_horde_get)
     r.add_post("/api/tools/horde", api_tools_horde_post)
     r.add_get("/api/tools/heliloot", api_tools_heliloot_get)
@@ -27322,6 +27848,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "a148b9252cec8bfc54d4ab4f4bb94841f5cdbd3f5e850508b0666ae9e99d7ea5",
         "12ca315de500b990c615bf11f0d15302e3396e9735d077678401d905b74e47af",
         "f9d4254775eec5e0a32bbfb78c3b893f9639426b4535d8430cb0fef2adaf7c3c",
+        "6e720f80d26b4fb6dcd6eba50c1487cd5b71dc2553fc14269f3d5b2dde614f5b",
+        "261dd97a59d9e3ea643ee82071343704e974108bd9c671bca8b37022188907d9",
     ),
     "app.js": (
         "18baefd43bad0dea69057dcaa400f3b39d891e88af9db564e0b1911b9728ed4d",
@@ -27465,6 +27993,9 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "7e3ffb2ce66fdc9b121a637f0f0ce633b0107edd0a482a31c345268f7138a143",
         "cdf8ab6595d23303de45ff7680fa666132e7c48c0776852a41f8d391b4589d06",
         "9a8d056d0fc6b6d2ba9c1c5d0283b3a05b62bd075d9e091e4ec5fcc07cab86f0",
+        "e44e2a8692bbc2f2f0c8119f3f5a0c4be94e7fb2f2f979f37640ef1a395f2be0",
+        "51a7554e26e369f04d8f403f6b178a4ff817879242214a8125978848b07728a7",
+        "40829aef86ed1d80d42c552e6bf033030340297bf076f40e6eabf6fbb373fe67",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
