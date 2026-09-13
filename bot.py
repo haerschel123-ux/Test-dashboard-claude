@@ -781,6 +781,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.lootexclusion":                {"label": "Loot-Ausschlusszonen", "gruppe": "Tools"},
     "tools.custombuildmap":                {"label": "Custom Build Mapping", "gruppe": "Tools"},
     "tools.skymessage":                   {"label": "Sky Message Generator", "gruppe": "Tools"},
+    "tools.typesmanager":                 {"label": "Erweiterter Types Manager", "gruppe": "Tools"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
     "discord_mgmt":                      {"label": "Discord Management (gesamt)", "gruppe": "Discord Management"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
@@ -11294,6 +11295,7 @@ _TOOL_LISTE = (
     ("lootexclusion", "🚫", "Loot-Ausschlusszonen"),
     ("custombuildmap", "🗺️", "Custom Build Mapping"),
     ("skymessage", "☁️", "Sky Message Generator"),
+    ("typesmanager", "📦", "Erweiterter Types Manager"),
 )
 
 
@@ -13739,6 +13741,408 @@ async def api_tools_typesorganizer_post(request: web.Request) -> web.Response:
               "kategorien": ergebnis["kategorien"], "unbekannt": ergebnis["unbekannt"],
               "unbekannt_gesamt": ergebnis["unbekannt_gesamt"],
               "generated": [{"filename": "db/types.xml", "content": ergebnis["text"]}]})
+
+
+# ── 10b. Erweiterter Types Manager ────────────────────────────────────────
+#  Einzelbearbeitung der db/types.xml: eine durchsuchbare Liste aller Items,
+#  in der jeder Wert eines <type>-Blocks gezielt geaendert werden kann.
+#
+#  Abgrenzung zu den drei vorhandenen Types-Werkzeugen: Booster und Reducer
+#  aendern nominal/min in der Masse, der Organizer baut die ganze Datei um -
+#  keines bearbeitet ein einzelnes Item, und keines kann lifetime, restock,
+#  quantmin, quantmax, cost, Kategorie, usage, value oder die flags.
+#
+#  Vorlage war der Loot-Tab des Vorgaengerprojekts (Init_c-Manager). Dessen
+#  Speicherweg wird bewusst NICHT uebernommen: er hat die komplette XML neu
+#  serialisiert und dabei Kommentare und Formatierung des Kunden verloren.
+#  Hier wird wie im Rest der Tools chirurgisch nur der betroffene Block
+#  ersetzt.
+
+# Zahlenfelder: (Tag, Minimum, Maximum, Kurzerklaerung fuer das ℹ️ im
+# Dashboard). Die Grenzen sind bewusst weit - sie fangen Vertipper und
+# Vorzeichenfehler ab, ohne jemandem eine ungewoehnliche, aber gueltige
+# Einstellung zu verbieten.
+_TM_ZAHLENFELDER: Tuple[Tuple[str, int, int, str], ...] = (
+    ("nominal", 0, 10000,
+     "Zielanzahl: so viele Exemplare versucht der Server auf der Karte zu halten."),
+    ("min", 0, 10000,
+     "Mindestanzahl: sinkt der Bestand darunter, wird nachgeliefert. "
+     "Sollte nicht über nominal liegen."),
+    ("lifetime", 0, 3888000,
+     "Lebensdauer in Sekunden: so lange bleibt ein unberührtes Exemplar liegen, "
+     "bevor es verschwindet. 3888000 sind 45 Tage."),
+    ("restock", 0, 3888000,
+     "Nachschubsperre in Sekunden: so lange wartet der Server nach dem Aufbrauchen, "
+     "bevor er neu spawnt. 0 heißt sofort."),
+    ("quantmin", -1, 100,
+     "Mindest-Füllstand in Prozent, mit dem das Item spawnt (Munition, Getränke). "
+     "-1 schaltet die Vorgabe ab."),
+    ("quantmax", -1, 100,
+     "Höchst-Füllstand in Prozent, mit dem das Item spawnt. -1 schaltet die "
+     "Vorgabe ab."),
+    ("cost", 0, 100,
+     "Spawn-Priorität von 0 bis 100: höhere Werte werden bei der Verteilung "
+     "bevorzugt. Vorgabe ist 100."),
+)
+
+# Attribute des <flags>-Tags. Jedes ist 0 oder 1.
+_TM_FLAGS: Tuple[Tuple[str, str], ...] = (
+    ("count_in_cargo",
+     "Zählt Exemplare in Behältern (Kisten, Rucksäcke am Boden) zum Bestand."),
+    ("count_in_hoarder",
+     "Zählt Exemplare in Zelten und Verstecken zum Bestand."),
+    ("count_in_map",
+     "Zählt frei auf der Karte liegende Exemplare zum Bestand. Steht bei den "
+     "meisten Items auf 1."),
+    ("count_in_player",
+     "Zählt Exemplare im Inventar eingeloggter Spieler zum Bestand."),
+    ("crafted",
+     "Markiert das Item als hergestellt – es wird dann nicht über die "
+     "Loot-Ökonomie verteilt."),
+    ("deloot",
+     "Spawnt bei dynamischen Ereignissen (Heli-Crash, Polizeiauto) statt im "
+     "normalen Loot."),
+)
+
+_TM_ZAHLEN_INDEX: Dict[str, Tuple[int, int, str]] = {
+    tag: (mini, maxi, hinweis) for tag, mini, maxi, hinweis in _TM_ZAHLENFELDER}
+_TM_FLAG_NAMEN: Tuple[str, ...] = tuple(name for name, _ in _TM_FLAGS)
+
+# Listenfelder: mehrere <usage name="..."/> bzw. <value name="..."/> je Item.
+_TM_LISTENFELDER: Tuple[Tuple[str, str], ...] = (
+    ("usage",
+     "Fundorte: wo das Item überhaupt auftauchen darf (Military, Farm, …). "
+     "Ohne Eintrag spawnt es nirgends im normalen Loot."),
+    ("value",
+     "Loot-Stufe (Tier): in welchen Zonen der Karte das Item vorkommt. "
+     "Tier1 ist küstennah, höhere Stufen liegen im Landesinneren."),
+)
+
+
+def _tm_text(element: Optional[ET.Element]) -> Optional[str]:
+    if element is None or element.text is None:
+        return None
+    wert = element.text.strip()
+    return wert or None
+
+
+def _tm_type_lesen(el: ET.Element) -> Dict[str, Any]:
+    """Ein <type>-Element als flaches Dict fuers Dashboard."""
+    eintrag: Dict[str, Any] = {"name": el.get("name") or ""}
+    for tag, _, _, _ in _TM_ZAHLENFELDER:
+        roh = _tm_text(el.find(tag))
+        try:
+            eintrag[tag] = int(roh) if roh is not None else None
+        except ValueError:
+            # Kaputter Wert in der Kundendatei: als "nicht gesetzt" anzeigen,
+            # statt die ganze Liste scheitern zu lassen.
+            eintrag[tag] = None
+    cat = el.find("category")
+    eintrag["category"] = (cat.get("name") or "") if cat is not None else ""
+    for tag, _ in _TM_LISTENFELDER:
+        eintrag[tag] = [k.get("name") or "" for k in el.findall(tag) if k.get("name")]
+    flags_el = el.find("flags")
+    eintrag["flags"] = {
+        name: (1 if (flags_el is not None and flags_el.get(name) == "1") else 0)
+        for name in _TM_FLAG_NAMEN}
+    eintrag["hat_flags"] = flags_el is not None
+    return eintrag
+
+
+def _tm_einrueckung(block: str) -> str:
+    """Einrueckung der Kindzeilen eines <type>-Blocks, damit eingefuegte Tags
+    nicht aus der Formatierung des Kunden herausfallen."""
+    treffer = re.search(r"\n([ \t]+)<", block)
+    return treffer.group(1) if treffer else "        "
+
+
+def _tm_zahl_setzen(block: str, tag: str, wert: Optional[int]) -> str:
+    """Setzt, ergaenzt oder entfernt ein einfaches Wert-Tag im Block."""
+    vorhanden = re.search(r"[ \t]*<" + tag + r"\s*>[^<]*</" + tag + r"\s*>\n?", block)
+    if wert is None:
+        # Ausdruecklich geleert: Tag entfernen, damit der Server seine
+        # eigene Vorgabe benutzt.
+        return block[:vorhanden.start()] + block[vorhanden.end():] if vorhanden else block
+    if vorhanden:
+        return re.sub(r"(<" + tag + r"\s*>)[^<]*(</" + tag + r"\s*>)",
+                      lambda m: m.group(1) + str(wert) + m.group(2), block, count=1)
+    # Fehlendes Tag direkt hinter dem oeffnenden <type ...> anlegen.
+    einzug = _tm_einrueckung(block)
+    return re.sub(r"(<type\b[^>]*>)",
+                  lambda m: f"{m.group(1)}\n{einzug}<{tag}>{wert}</{tag}>", block, count=1)
+
+
+def _tm_kategorie_setzen(block: str, name: str) -> str:
+    vorhanden = re.search(r"[ \t]*<category\b[^>]*/?>(?:</category\s*>)?\n?", block)
+    if not name:
+        return block[:vorhanden.start()] + block[vorhanden.end():] if vorhanden else block
+    neu = f'<category name="{_tool_esc_xml(name)}"/>'
+    if vorhanden:
+        return re.sub(r"<category\b[^>]*/?>(?:</category\s*>)?", neu, block, count=1)
+    einzug = _tm_einrueckung(block)
+    return re.sub(r"(</type\s*>)", f"{einzug}{neu}\n" + r"\1", block, count=1)
+
+
+def _tm_liste_setzen(block: str, tag: str, namen: List[str]) -> str:
+    """Ersetzt ALLE <usage>- bzw. <value>-Tags des Blocks durch die neue Menge."""
+    muster = re.compile(r"[ \t]*<" + tag + r"\b[^>]*/?>(?:</" + tag + r"\s*>)?\n?")
+    treffer = list(muster.finditer(block))
+    einzug = _tm_einrueckung(block)
+    neue = "".join(f'{einzug}<{tag} name="{_tool_esc_xml(n)}"/>\n' for n in namen)
+    if treffer:
+        # An die Stelle des ersten alten Tags setzen, alle weiteren entfernen.
+        ergebnis = block[:treffer[0].start()] + neue
+        rest = block[treffer[0].end():]
+        for t in reversed(treffer[1:]):
+            versatz = t.start() - treffer[0].end()
+            rest = rest[:versatz] + rest[versatz + (t.end() - t.start()):]
+        return ergebnis + rest
+    if not namen:
+        return block
+    return re.sub(r"(</type\s*>)", neue + r"\1", block, count=1)
+
+
+def _tm_flags_setzen(block: str, flags: Dict[str, int]) -> str:
+    attribute = " ".join(f'{name}="{1 if flags.get(name) else 0}"'
+                         for name in _TM_FLAG_NAMEN)
+    neu = f"<flags {attribute}/>"
+    if re.search(r"<flags\b[^>]*/?>(?:</flags\s*>)?", block):
+        return re.sub(r"<flags\b[^>]*/?>(?:</flags\s*>)?", neu, block, count=1)
+    einzug = _tm_einrueckung(block)
+    return re.sub(r"(</type\s*>)", f"{einzug}{neu}\n" + r"\1", block, count=1)
+
+
+def _tm_block_anwenden(block: str, aenderung: Dict[str, Any]) -> str:
+    """Traegt eine Aenderung chirurgisch in einen <type>-Block ein. Alles, was
+    nicht ausdruecklich in ``aenderung`` steht, bleibt unangetastet."""
+    for tag, _, _, _ in _TM_ZAHLENFELDER:
+        if tag in aenderung:
+            block = _tm_zahl_setzen(block, tag, aenderung[tag])
+    if "category" in aenderung:
+        block = _tm_kategorie_setzen(block, str(aenderung["category"] or ""))
+    for tag, _ in _TM_LISTENFELDER:
+        if tag in aenderung:
+            block = _tm_liste_setzen(block, tag, list(aenderung[tag] or []))
+    if "flags" in aenderung:
+        block = _tm_flags_setzen(block, dict(aenderung["flags"] or {}))
+    return block
+
+
+def _tm_aenderung_pruefen(name: str, roh: Dict[str, Any],
+                          bekannt: Dict[str, set]) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Prueft eine einzelne Item-Aenderung. Rueckgabe (saubere Aenderung, Fehler).
+
+    Die Vorlage prueft ueberhaupt nicht und schreibt ungueltige Eingaben als 0
+    in die Kundendatei - hier wird stattdessen abgelehnt.
+    """
+    sauber: Dict[str, Any] = {}
+    for tag, mini, maxi, _ in _TM_ZAHLENFELDER:
+        if tag not in roh:
+            continue
+        wert = roh[tag]
+        if wert is None or wert == "":
+            sauber[tag] = None
+            continue
+        try:
+            zahl = int(wert)
+        except (TypeError, ValueError):
+            return {}, f"{name}: „{wert}“ ist keine ganze Zahl für {tag}."
+        if not mini <= zahl <= maxi:
+            return {}, (f"{name}: {tag} muss zwischen {mini} und {maxi} liegen "
+                        f"(eingegeben: {zahl}).")
+        sauber[tag] = zahl
+    if ("nominal" in sauber and "min" in sauber
+            and sauber["nominal"] is not None and sauber["min"] is not None
+            and sauber["min"] > sauber["nominal"]):
+        return {}, (f"{name}: min ({sauber['min']}) darf nicht über nominal "
+                    f"({sauber['nominal']}) liegen.")
+    if "category" in roh:
+        wert = str(roh["category"] or "").strip()
+        if wert and wert not in bekannt["category"]:
+            return {}, f"{name}: unbekannte Kategorie „{wert}“."
+        sauber["category"] = wert
+    for tag, _ in _TM_LISTENFELDER:
+        if tag not in roh:
+            continue
+        werte = [str(w).strip() for w in (roh[tag] or []) if str(w).strip()]
+        unbekannt = [w for w in werte if w not in bekannt[tag]]
+        if unbekannt:
+            return {}, f"{name}: unbekannte {tag}-Werte: {', '.join(unbekannt)}."
+        # Reihenfolge der Datei beibehalten, Doppelte entfernen.
+        sauber[tag] = list(dict.fromkeys(werte))
+    if "flags" in roh:
+        flags = roh["flags"] or {}
+        if not isinstance(flags, dict):
+            return {}, f"{name}: flags müssen ein Objekt sein."
+        unbekannt = [k for k in flags if k not in _TM_FLAG_NAMEN]
+        if unbekannt:
+            return {}, f"{name}: unbekannte flags: {', '.join(unbekannt)}."
+        sauber["flags"] = {k: (1 if flags.get(k) else 0) for k in _TM_FLAG_NAMEN}
+    return sauber, None
+
+
+def _tm_datei_lesen(root: ET.Element) -> Dict[str, Any]:
+    """Alle <type>-Eintraege plus die in DIESER Datei tatsaechlich benutzten
+    Kategorien, Fundorte und Stufen - so passt die Auswahl auch bei einem
+    Server mit Mods, statt einer fest verdrahteten Vanilla-Liste."""
+    eintraege = []
+    doppelt: List[str] = []
+    gesehen: set = set()
+    bekannt: Dict[str, set] = {"category": set(), "usage": set(), "value": set()}
+    for el in root.findall("type"):
+        name = el.get("name")
+        if not name:
+            continue
+        if name in gesehen:
+            # Die Vorlage nimmt hier still den letzten Block. Das ist ein
+            # stiller Datenverlust - hier wird der Name gemeldet und beim
+            # Schreiben ausgelassen.
+            if name not in doppelt:
+                doppelt.append(name)
+            continue
+        gesehen.add(name)
+        eintrag = _tm_type_lesen(el)
+        if eintrag["category"]:
+            bekannt["category"].add(eintrag["category"])
+        for tag, _ in _TM_LISTENFELDER:
+            bekannt[tag].update(eintrag[tag])
+        eintraege.append(eintrag)
+    return {"types": eintraege, "doppelt": doppelt,
+            "bekannt": {k: sorted(v) for k, v in bekannt.items()}}
+
+
+async def api_tools_typesmanager_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.typesmanager")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.typesmanager", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    felder = {
+        "zahlen": [{"tag": t, "min": mi, "max": ma, "hinweis": h}
+                   for t, mi, ma, h in _TM_ZAHLENFELDER],
+        "listen": [{"tag": t, "hinweis": h} for t, h in _TM_LISTENFELDER],
+        "flags": [{"name": n, "hinweis": h} for n, h in _TM_FLAGS],
+    }
+    if not _mission_dir_of(conn):
+        return ok({"types": [], "felder": felder, "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+    if status != "ok":
+        return ok({"types": [], "felder": felder, "status": status})
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        return err(f"db/types.xml ist kein gültiges XML: {e}", 409)
+    daten = _tm_datei_lesen(root)
+    daten["felder"] = felder
+    daten["status"] = "ok"
+    # Damit ein zweiter Bearbeiter die Datei nicht unbemerkt ueberschreibt.
+    daten["quelle_hash"] = hashlib.sha256((text or "").encode("utf8")).hexdigest()
+    return ok(daten)
+
+
+async def api_tools_typesmanager_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.typesmanager")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.typesmanager", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    commit = bool(data.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.typesmanager", 10)
+        if fehler is not None:
+            return fehler
+
+    aenderungen = data.get("aenderungen")
+    if not isinstance(aenderungen, dict) or not aenderungen:
+        return err("Keine Änderungen übergeben.")
+
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+    if status != "ok":
+        return err("db/types.xml konnte nicht gelesen werden – nichts geändert.", 502)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        return err(f"db/types.xml ist kein gültiges XML: {e}", 409)
+
+    hash_jetzt = hashlib.sha256((text or "").encode("utf8")).hexdigest()
+    if data.get("quelle_hash") and data["quelle_hash"] != hash_jetzt:
+        return err("Die db/types.xml auf dem Server hat sich inzwischen geändert. "
+                   "Bitte das Tool neu öffnen – sonst gehen fremde Änderungen "
+                   "verloren.", 409)
+
+    daten = _tm_datei_lesen(root)
+    bekannt = {k: set(v) for k, v in daten["bekannt"].items()}
+    vorhanden = {e["name"] for e in daten["types"]}
+    doppelt = set(daten["doppelt"])
+
+    neu = text
+    geschrieben: List[str] = []
+    nicht_gefunden: List[str] = []
+    for name, roh in aenderungen.items():
+        if not isinstance(roh, dict):
+            return err(f"{name}: ungültiges Änderungsformat.")
+        if name in doppelt:
+            return err(f"„{name}“ steht mehrfach in der db/types.xml. Bitte den "
+                       f"doppelten Eintrag erst von Hand entfernen – sonst wäre "
+                       f"nicht eindeutig, welcher geändert wird.", 409)
+        if name not in vorhanden:
+            nicht_gefunden.append(name)
+            continue
+        sauber, fehlertext = _tm_aenderung_pruefen(name, roh, bekannt)
+        if fehlertext:
+            return err(fehlertext)
+        if not sauber:
+            continue
+        found = _tool_finde_benannten_block(neu, "type", name)
+        if not found:
+            nicht_gefunden.append(name)
+            continue
+        neuer_block = _tm_block_anwenden(found["block"], sauber)
+        neu = neu[:found["start"]] + neuer_block + neu[found["end"]:]
+        geschrieben.append(name)
+
+    if nicht_gefunden:
+        return err("Diese Items stehen nicht in der db/types.xml: "
+                   + ", ".join(sorted(nicht_gefunden)), 409)
+    if not geschrieben:
+        return err("Keine der übergebenen Änderungen verändert etwas.")
+
+    try:
+        ET.fromstring(neu)
+    except ET.ParseError as e:
+        # Sicherheitsnetz: lieber gar nichts schreiben als eine kaputte
+        # types.xml auf dem Kundenserver.
+        return err(f"Die Änderung hätte ungültiges XML erzeugt ({e}) – "
+                   f"nichts geändert.", 500)
+
+    antwort: Dict[str, Any] = {
+        "generated": [{"filename": "db/types.xml", "content": neu}],
+        "geaendert": len(geschrieben), "namen": sorted(geschrieben),
+        "quelle_hash": hash_jetzt,
+    }
+    if not commit:
+        return ok(antwort)
+
+    if not await _tools_datei_schreiben(conn, "db/types.xml", neu, loop):
+        return err("db/types.xml konnte nicht per FTP gespeichert werden.", 502)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+              "Tool: Types Manager gespeichert",
+              f"{len(geschrieben)} Item(s) · {conn.name}")
+    antwort["geschrieben"] = True
+    return ok(antwort)
 
 
 # ── 11. Random Presets Generator ──────────────────────────────────────────
@@ -27198,6 +27602,8 @@ def build_app() -> web.Application:
     r.add_get("/api/tools/custombuildmap", api_tools_custombuildmap_get)
     r.add_get("/api/tools/skymessage", api_tools_skymessage_get)
     r.add_post("/api/tools/skymessage", api_tools_skymessage_post)
+    r.add_get("/api/tools/typesmanager", api_tools_typesmanager_get)
+    r.add_post("/api/tools/typesmanager", api_tools_typesmanager_post)
     r.add_get("/api/tools/horde", api_tools_horde_get)
     r.add_post("/api/tools/horde", api_tools_horde_post)
     r.add_get("/api/tools/heliloot", api_tools_heliloot_get)
@@ -27895,6 +28301,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "f9d4254775eec5e0a32bbfb78c3b893f9639426b4535d8430cb0fef2adaf7c3c",
         "6e720f80d26b4fb6dcd6eba50c1487cd5b71dc2553fc14269f3d5b2dde614f5b",
         "261dd97a59d9e3ea643ee82071343704e974108bd9c671bca8b37022188907d9",
+        "ae8cdec4c108661d0283f92ddcf6f6c4795932a92ab58397740e6044eb5ddb0c",
     ),
     "app.js": (
         "18baefd43bad0dea69057dcaa400f3b39d891e88af9db564e0b1911b9728ed4d",
@@ -28045,6 +28452,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "83067d288b29420fda2d18e2a074d4a3f32fdb71adf4b235293cbedc9d87eaca",
         "af0f7d35397ab2f230b5ab18c4f1712678027afe0acd06f8d0d7f4eab7004a5f",
         "91860774844dc07104443e0f0c017da01b188ba83cb78a5ef00cd08f6db6497b",
+        "bba874123b83903a6cc06822ef751019ac93e2f30d3ef645492a83c18be51b52",
+        "ce6546a4e29531057c67568ce42b1a62c867ccfe0e9fd5d42b9bf5968a9c184c",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
