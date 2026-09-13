@@ -20885,7 +20885,7 @@ async def api_audit(request: web.Request) -> web.Response:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Backup der Server-Dateien  (Dashboard → Optionen → Backup)
+#  Backup der Server-Dateien  (eigener Dashboard-Bereich „Backup")
 #
 #  Sichert ALLE Dateien des aktiven Mission-Ordners (db/, env/, custom/,
 #  storage_*/ und alles im Wurzelverzeichnis) als eine ZIP-Datei auf dem
@@ -28917,6 +28917,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "d4b9366fc871538bd2de570fedc637801f6dd8054943789e862953f841284ae1",
         "98c473f8eae479d9e32c477769e317b53b5ef8ebb4493d0bcae6324db67514e3",
         "763bc500eebafb4cfa32dc062e73a6281a2bb39dbd291776276c9cdd2c658e07",
+        "fe8ea19f77ec1994e9c96ec6a75492af6237b92ef2214ce3d1e97aa5a147c1d7",
     ),
     "styles.css": (
         "0dcb70fa1bee603d45b9b0dca4a0b8437f1b7ae65182c15d242f9eb625a3cfee",
@@ -29117,6 +29118,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "38bab0e1d1a3a3a1f66a7b877fb6953b02894b2fb07eec6d24dd32dbef37e259",
         "09f5e6310fcea9a314070dd9355714966fd8b532fdab4567d687e7af512883e3",
         "a80c97f528d8fb58dd65042a6bd0b39125fc30bee66fd7a31a42ac78fdf01660",
+        "43fa63170bc6f381f6c201457c6031495860861019bbd000ba354eb7e4e7a8c0",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",

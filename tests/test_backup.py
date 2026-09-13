@@ -1,4 +1,4 @@
-"""Tests fuer das Backup der Server-Dateien (Dashboard → Optionen → Backup).
+"""Tests fuer das Backup der Server-Dateien (eigener Dashboard-Bereich).
 
 Schwerpunkte: der rekursive Walk ueber den Mission-Ordner, dass sich der
 Backup-Ordner nicht selbst mitsichert, dass Binaerdateien byteweise heil
