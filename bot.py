@@ -39,6 +39,7 @@ import contextvars
 import copy
 import glob
 import zipfile
+import tempfile
 import base64
 import zlib
 import secrets
@@ -782,6 +783,8 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.custombuildmap":                {"label": "Custom Build Mapping", "gruppe": "Tools"},
     "tools.skymessage":                   {"label": "Sky Message Generator", "gruppe": "Tools"},
     "tools.typesmanager":                 {"label": "Erweiterter Types Manager", "gruppe": "Tools"},
+    "backup":                             {"label": "Backup der Server-Dateien",
+                                           "gruppe": "Verbindung"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
     "discord_mgmt":                      {"label": "Discord Management (gesamt)", "gruppe": "Discord Management"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
@@ -2303,6 +2306,137 @@ class FTPManager:
             log.error(f"[FTP] write_file({path}): {e}")
             return False
 
+    def write_file_bytes(self, path: str, data: bytes) -> bool:
+        """Wie write_file, aber fuer rohe Bytes.
+
+        write_file kodiert nach UTF-8 und wuerde jede Binaerdatei beschaedigen -
+        im Mission-Ordner liegen unter storage_*/ genau solche (Basen,
+        Inventare). Gleiches atomares Muster: erst .tmp, dann umbenennen.
+        """
+        tmp = path + ".tmp"
+        def op(ftp):
+            ftp.storbinary(f"STOR {tmp}", io.BytesIO(data))
+            try:
+                ftp.rename(tmp, path)
+            except ftplib.error_perm:
+                ftp.delete(path)
+                ftp.rename(tmp, path)
+            return True
+        try:
+            return bool(self._with_conn(op))
+        except Exception as e:  # noqa: BLE001
+            log.error(f"[FTP] write_file_bytes({path}): {e}")
+            return False
+
+    def mkdir(self, path: str) -> bool:
+        """Legt einen Ordner an. Dass er schon existiert, ist kein Fehler."""
+        def op(ftp):
+            try:
+                ftp.mkd(path)
+            except ftplib.error_perm as e:
+                # 550/521 = existiert bereits - fuer den Aufrufer dasselbe wie
+                # "angelegt".
+                if not str(e).lstrip().startswith(("550", "521")):
+                    raise
+            return True
+        try:
+            return bool(self._with_conn(op))
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"[FTP] mkdir({path}): {e}")
+            return False
+
+    def _eintraege_mit_typ(self, directory: str) -> Optional[List[Tuple[str, bool, int]]]:
+        """(Name, ist_ordner, groesse) je Eintrag - ueber MLSD.
+
+        Rueckgabe None, wenn der Server kein MLSD kann; dann muss der Aufrufer
+        auf die cwd-Probe ausweichen. Fuer eine Sicherung reicht die Heuristik
+        aus _find_mission_bfs ("kein Punkt im Namen = Ordner") nicht: eine
+        Datei ohne Endung wuerde als Ordner durchgehen und fehlen.
+        """
+        def op(ftp):
+            return list(ftp.mlsd(directory, facts=["type", "size"]))
+        try:
+            roh = self._with_conn(op)
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"[FTP] MLSD({directory}) nicht moeglich: {e}")
+            return None
+        aus: List[Tuple[str, bool, int]] = []
+        for name, fakten in roh:
+            typ = (fakten.get("type") or "").lower()
+            if typ in ("cdir", "pdir") or name in (".", ".."):
+                continue
+            try:
+                groesse = int(fakten.get("size") or 0)
+            except (TypeError, ValueError):
+                groesse = 0
+            aus.append((name, typ == "dir", groesse))
+        return aus
+
+    def _ist_ordner(self, path: str) -> bool:
+        """Rueckfall ohne MLSD: laesst sich hineinwechseln, ist es ein Ordner."""
+        def op(ftp):
+            vorher = ftp.pwd()
+            try:
+                ftp.cwd(path)
+                return True
+            finally:
+                try:
+                    ftp.cwd(vorher)
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            return bool(self._with_conn(op))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def walk(self, root: str, max_dateien: int = 3000,
+             max_bytes: int = 512 * 1024 * 1024,
+             ueberspringen: Optional[Set[str]] = None
+             ) -> Tuple[List[Tuple[str, int]], str]:
+        """Alle Dateien unterhalb von ``root``, rekursiv.
+
+        Rueckgabe ``(eintraege, status)`` mit ``eintraege`` als (Pfad relativ zu
+        ``root``, Groesse). Status ist "ok", "zu_viele_dateien", "zu_gross" oder
+        "leer". Bei gerissener Obergrenze wird ABGEBROCHEN statt still eine
+        unvollstaendige Liste zu liefern - eine halbe Sicherung ist schlimmer
+        als keine, weil sie beim Wiederherstellen Luecken hinterlaesst.
+
+        ``ueberspringen`` sind Ordnernamen (nicht Pfade), die nicht betreten
+        werden - damit sich der Backup-Ordner nicht selbst mitsichert.
+        """
+        ueberspringen = ueberspringen or set()
+        eintraege: List[Tuple[str, int]] = []
+        summe = 0
+        warteschlange: List[str] = [""]
+        while warteschlange:
+            rel_ordner = warteschlange.pop(0)
+            voll = f"{root.rstrip('/')}/{rel_ordner}".rstrip("/")
+            mit_typ = self._eintraege_mit_typ(voll)
+            if mit_typ is None:
+                # Kein MLSD: Namen holen und je Eintrag pruefen.
+                mit_typ = []
+                for pfad in self.list_dir(voll):
+                    name = pfad.rsplit("/", 1)[-1]
+                    if name in (".", ".."):
+                        continue
+                    mit_typ.append((name, self._ist_ordner(pfad), 0))
+            for name, ist_ordner, groesse in mit_typ:
+                rel = f"{rel_ordner}/{name}".lstrip("/")
+                if ist_ordner:
+                    if name in ueberspringen:
+                        continue
+                    warteschlange.append(rel)
+                    continue
+                eintraege.append((rel, groesse))
+                summe += groesse
+                if len(eintraege) > max_dateien:
+                    return [], "zu_viele_dateien"
+                if summe > max_bytes:
+                    return [], "zu_gross"
+        if not eintraege:
+            return [], "leer"
+        return eintraege, "ok"
+
     def delete_file(self, path: str) -> bool:
         """Löscht eine Datei; False wenn nicht vorhanden/kein Zugriff."""
         def op(ftp):
@@ -3085,6 +3219,10 @@ class ServerConnection:
         "map_name", "auto_restart_schedule", "auto_restart_after_purchase",
         "welcome_message", "leave_message", "reaction_roles",
         "ticket_categories", "ticket_open", "ticket_language",
+        # Die Sicherungen gehoeren genau einem Server; geerbt wuerde ein
+        # Kunde die Sicherungen eines fremden Servers sehen und
+        # zurueckspielen koennen.
+        "backups",
         # Ban-/Whitelist-Feld auf dem Nitrado-Server: erbt ein Kunde hier die
         # Kategorie oder den Settings-Key eines anderen, liest und beschreibt
         # der Bot auf SEINEM Server das falsche Einstellungsfeld.
@@ -20746,6 +20884,455 @@ async def api_audit(request: web.Request) -> web.Response:
     return ok({"entries": entries, "max": _AUDIT_MAX})
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  Backup der Server-Dateien  (Dashboard → Optionen → Backup)
+#
+#  Sichert ALLE Dateien des aktiven Mission-Ordners (db/, env/, custom/,
+#  storage_*/ und alles im Wurzelverzeichnis) als eine ZIP-Datei auf dem
+#  Nitrado-FTP DESSELBEN Kunden. Wiederherstellen setzt den Server auf genau
+#  diesen Stand zurueck und startet ihn neu.
+#
+#  Zwei Dinge, die hier bewusst so sind:
+#
+#  * Der Backup-Ordner liegt NEBEN dem Mission-Ordner, nicht darin. Laege er
+#    darin, wuerde jede neue Sicherung alle vorherigen mitsichern und die
+#    Groesse verdoppelte sich jedes Mal.
+#  * Wiederherstellen laeuft stoppen → zurueckspielen → starten. Schreibt man
+#    in den laufenden Server, ueberschreibt DayZ die Dateien beim naechsten
+#    eigenen Speichern einfach wieder - vor allem unter storage_*/.
+# ══════════════════════════════════════════════════════════════════════════
+_BACKUP_ORDNER_NAME = "dashboard_backups"
+_BACKUP_MAX = 10
+# Obergrenzen je Sicherung. Gerissen wird abgebrochen statt still eine halbe
+# Sicherung anzulegen - eine luckenhafte Sicherung ist schlimmer als keine,
+# weil sie beim Wiederherstellen Loecher hinterlaesst.
+_BACKUP_MAX_DATEIEN = 3000
+_BACKUP_MAX_BYTES = 512 * 1024 * 1024
+# So lange wird nach dem Stoppen auf den Server gewartet, bevor abgebrochen
+# wird.
+_BACKUP_STOP_TIMEOUT = 120
+_BACKUP_STOP_INTERVALL = 5
+
+# service_id -> Stand des laufenden Auftrags. Je Server hoechstens einer.
+_BACKUP_JOBS: Dict[str, Dict[str, Any]] = {}
+
+
+def _backup_ordner(conn: ServerConnection) -> Optional[str]:
+    """Zielordner der Sicherungen - NEBEN dem Mission-Ordner."""
+    mission = _mission_dir_of(conn)
+    if not mission:
+        return None
+    eltern = mission.rstrip("/").rsplit("/", 1)[0] or ""
+    return f"{eltern}/{_BACKUP_ORDNER_NAME}"
+
+
+def _backup_liste(conn: ServerConnection) -> List[Dict[str, Any]]:
+    roh = conn.get("backups")
+    return [e for e in roh if isinstance(e, dict)] if isinstance(roh, list) else []
+
+
+def _backup_liste_speichern(conn: ServerConnection, liste: List[Dict[str, Any]]) -> None:
+    conn.set("backups", liste)
+    connections.save()
+
+
+def _backup_eintrag(conn: ServerConnection, backup_id: str) -> Optional[Dict[str, Any]]:
+    for e in _backup_liste(conn):
+        if e.get("id") == backup_id:
+            return e
+    return None
+
+
+def _backup_name_pruefen(name: str) -> Tuple[str, Optional[str]]:
+    """Rueckgabe (sauberer Name, Fehler). Der Name landet nur in den Metadaten,
+    nie im Dateinamen - der bleibt die zufaellige ID."""
+    sauber = " ".join((name or "").split())
+    if not sauber:
+        return "", "Bitte einen Namen eingeben."
+    if len(sauber) > 60:
+        return "", "Der Name darf höchstens 60 Zeichen lang sein."
+    if any(ord(c) < 32 for c in sauber):
+        return "", "Der Name darf keine Steuerzeichen enthalten."
+    return sauber, None
+
+
+def _backup_zielpfad_pruefen(rel: str) -> bool:
+    """Darf dieser Pfad aus dem ZIP heraus geschrieben werden?
+
+    Ein manipuliertes oder von Hand ersetztes ZIP darf nicht ausserhalb des
+    Mission-Ordners landen - deshalb kein absoluter Pfad, kein ``..`` und kein
+    Windows-Laufwerk.
+    """
+    if not rel or rel.startswith("/") or rel.startswith("\\"):
+        return False
+    if ":" in rel.split("/", 1)[0]:
+        return False
+    return all(teil not in ("", ".", "..") for teil in rel.replace("\\", "/").split("/"))
+
+
+def _backup_aufraeumen(liste: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
+                                                             List[Dict[str, Any]]]:
+    """Behaelt die neuesten ``_BACKUP_MAX``. Rueckgabe (bleiben, weg).
+
+    Selbst benannte Sicherungen bleiben immer stehen - wer eine Sicherung
+    bewusst benannt hat, soll sie nicht durch Weiterarbeiten verlieren.
+    """
+    if len(liste) <= _BACKUP_MAX:
+        return liste, []
+    weg: List[Dict[str, Any]] = []
+    behalten: List[Dict[str, Any]] = []
+    # Aelteste zuerst wegwerfen, aber nur unbenannte.
+    ueberzaehlig = len(liste) - _BACKUP_MAX
+    for eintrag in sorted(liste, key=lambda e: str(e.get("erstellt") or "")):
+        if ueberzaehlig > 0 and not eintrag.get("umbenannt"):
+            weg.append(eintrag)
+            ueberzaehlig -= 1
+        else:
+            behalten.append(eintrag)
+    behalten.sort(key=lambda e: str(e.get("erstellt") or ""), reverse=True)
+    return behalten, weg
+
+
+def _backup_job(conn: ServerConnection) -> Optional[Dict[str, Any]]:
+    return _BACKUP_JOBS.get(str(conn.service_id))
+
+
+def _backup_job_laeuft(conn: ServerConnection) -> bool:
+    job = _backup_job(conn)
+    return bool(job and not job.get("fertig"))
+
+
+def _backup_job_setzen(conn: ServerConnection, **werte: Any) -> None:
+    job = _BACKUP_JOBS.setdefault(str(conn.service_id), {})
+    job.update(werte)
+
+
+async def _backup_erstellen_worker(conn: ServerConnection) -> None:
+    """Laedt alle Dateien des Mission-Ordners herunter, packt sie und legt das
+    ZIP im Backup-Ordner ab."""
+    loop = asyncio.get_running_loop()
+    mission = _mission_dir_of(conn)
+    ordner = _backup_ordner(conn)
+    tmp_pfad: Optional[str] = None
+    try:
+        _backup_job_setzen(conn, phase="auflisten", schritt=0, gesamt=0, datei="")
+        dateien, status = await loop.run_in_executor(
+            None, lambda: conn.ftp.walk(mission, _BACKUP_MAX_DATEIEN,
+                                        _BACKUP_MAX_BYTES, {_BACKUP_ORDNER_NAME}))
+        if status == "zu_viele_dateien":
+            raise RuntimeError(f"Der Mission-Ordner enthält mehr als "
+                               f"{_BACKUP_MAX_DATEIEN} Dateien – das ist zu viel "
+                               f"für eine Sicherung über FTP.")
+        if status == "zu_gross":
+            raise RuntimeError(f"Der Mission-Ordner ist größer als "
+                               f"{_BACKUP_MAX_BYTES // (1024 * 1024)} MB – das ist "
+                               f"zu viel für eine Sicherung über FTP.")
+        if status != "ok":
+            raise RuntimeError("Im Mission-Ordner wurde keine einzige Datei "
+                               "gefunden – stimmt der Pfad?")
+
+        _backup_job_setzen(conn, phase="herunterladen", gesamt=len(dateien))
+        fd, tmp_pfad = tempfile.mkstemp(prefix="dzbackup-", suffix=".zip")
+        os.close(fd)
+        gesamt_bytes = 0
+        with zipfile.ZipFile(tmp_pfad, "w", zipfile.ZIP_DEFLATED) as z:
+            for nr, (rel, _) in enumerate(dateien, 1):
+                _backup_job_setzen(conn, schritt=nr, datei=rel)
+                roh = await loop.run_in_executor(
+                    None, conn.ftp.read_file_bytes, f"{mission.rstrip('/')}/{rel}")
+                if roh is None:
+                    # Eine fehlende Datei macht die Sicherung unvollstaendig -
+                    # lieber abbrechen als spaeter beim Wiederherstellen eine
+                    # Luecke haben.
+                    raise RuntimeError(f"Die Datei „{rel}“ konnte nicht gelesen "
+                                       f"werden – Sicherung abgebrochen.")
+                z.writestr(rel, roh)
+                gesamt_bytes += len(roh)
+                await asyncio.sleep(0)
+
+        _backup_job_setzen(conn, phase="hochladen", datei="")
+        await loop.run_in_executor(None, conn.ftp.mkdir, ordner)
+        backup_id = uuid.uuid4().hex[:12]
+        ziel = f"{ordner}/{backup_id}.zip"
+        with open(tmp_pfad, "rb") as f:
+            inhalt = f.read()
+        if not await loop.run_in_executor(None, conn.ftp.write_file_bytes, ziel, inhalt):
+            raise RuntimeError("Die Sicherung konnte nicht auf den Server "
+                               "hochgeladen werden.")
+
+        eintrag = {
+            "id": backup_id,
+            # Bewusst nur der Zeitpunkt, ohne deutsches Wort darin: der Name
+            # ist gespeicherte Angabe, keine Oberflaeche - er wuerde im
+            # Englisch-Modus sonst halb uebersetzt dastehen.
+            "name": datetime.now().strftime("%d.%m.%Y %H:%M"),
+            "erstellt": datetime.now().isoformat(timespec="seconds"),
+            "dateien": len(dateien),
+            "bytes": gesamt_bytes,
+            "zip_bytes": len(inhalt),
+            "datei": f"{backup_id}.zip",
+            "karte": str(conn.get("map_name") or ""),
+            "mission": mission,
+            "umbenannt": False,
+        }
+        liste = [eintrag] + _backup_liste(conn)
+        liste, weg = _backup_aufraeumen(liste)
+        for alt in weg:
+            await loop.run_in_executor(None, conn.ftp.delete_file,
+                                       f"{ordner}/{alt.get('datei')}")
+        _backup_liste_speichern(conn, liste)
+        _backup_job_setzen(conn, fertig=True, phase="fertig",
+                          ergebnis=f"{len(dateien)} Dateien gesichert.")
+        _audit_add("dashboard", "-", "Backup erstellt",
+                  f"{len(dateien)} Dateien · {conn.name}")
+    except Exception as e:  # noqa: BLE001
+        log.error(f"[BACKUP] erstellen ({conn.service_id}): {e}")
+        _backup_job_setzen(conn, fertig=True, phase="fehler", fehler=str(e))
+    finally:
+        if tmp_pfad and os.path.exists(tmp_pfad):
+            try:
+                os.remove(tmp_pfad)
+            except OSError:
+                pass
+
+
+async def _backup_server_stoppen(conn: ServerConnection) -> Tuple[bool, str]:
+    """Stoppt den Server und wartet, bis er wirklich steht.
+
+    Wichtig fuer das Wiederherstellen: schreibt man in den laufenden Server,
+    ueberschreibt DayZ die Dateien beim naechsten eigenen Speichern wieder.
+    """
+    if conn.nitrado is None:
+        return False, "Für diesen Server ist kein Nitrado-Zugang hinterlegt."
+    ok_, meldung = await conn.nitrado.stop()
+    if not ok_:
+        return False, f"Der Server konnte nicht gestoppt werden: {meldung}"
+    gewartet = 0
+    while gewartet < _BACKUP_STOP_TIMEOUT:
+        await asyncio.sleep(_BACKUP_STOP_INTERVALL)
+        gewartet += _BACKUP_STOP_INTERVALL
+        infos = await conn.nitrado.get_info()
+        status = str(((infos or {}).get("status") or "")).lower()
+        if status and status not in ("started", "starting", "restarting", "stopping"):
+            return True, status
+    return False, (f"Der Server lief nach {_BACKUP_STOP_TIMEOUT}s immer noch – "
+                   f"es wurde nichts zurückgespielt.")
+
+
+async def _backup_wiederherstellen_worker(conn: ServerConnection,
+                                          eintrag: Dict[str, Any]) -> None:
+    loop = asyncio.get_running_loop()
+    mission = _mission_dir_of(conn)
+    ordner = _backup_ordner(conn)
+    try:
+        # 1. ZIP zuerst holen - fehlt es, wird der Server gar nicht erst
+        #    angefasst.
+        _backup_job_setzen(conn, phase="pruefen", schritt=0, gesamt=0, datei="")
+        roh = await loop.run_in_executor(
+            None, conn.ftp.read_file_bytes, f"{ordner}/{eintrag.get('datei')}")
+        if roh is None:
+            raise RuntimeError("Die Sicherungsdatei liegt nicht mehr auf dem "
+                               "Server – nichts geändert.")
+        try:
+            archiv = zipfile.ZipFile(io.BytesIO(roh))
+            namen = [n for n in archiv.namelist() if not n.endswith("/")]
+        except zipfile.BadZipFile:
+            raise RuntimeError("Die Sicherungsdatei ist beschädigt – "
+                               "nichts geändert.") from None
+        ungueltig = [n for n in namen if not _backup_zielpfad_pruefen(n)]
+        if ungueltig:
+            raise RuntimeError(f"Die Sicherung enthält unzulässige Pfade "
+                               f"({', '.join(ungueltig[:3])}) – nichts geändert.")
+        if not namen:
+            raise RuntimeError("Die Sicherung enthält keine Dateien – "
+                               "nichts geändert.")
+
+        # 2. Server stoppen - erst danach wird geschrieben.
+        _backup_job_setzen(conn, phase="stoppen", gesamt=len(namen))
+        gestoppt, meldung = await _backup_server_stoppen(conn)
+        if not gestoppt:
+            raise RuntimeError(meldung)
+
+        # 3. Zurueckspielen.
+        _backup_job_setzen(conn, phase="zurueckspielen")
+        ordner_angelegt: Set[str] = set()
+        for nr, name in enumerate(sorted(namen), 1):
+            _backup_job_setzen(conn, schritt=nr, datei=name)
+            unterordner = name.rsplit("/", 1)[0] if "/" in name else ""
+            if unterordner and unterordner not in ordner_angelegt:
+                # Jede Ebene einzeln - MKD legt keine Kette an.
+                teile = unterordner.split("/")
+                for tiefe in range(len(teile)):
+                    pfad = "/".join(teile[:tiefe + 1])
+                    if pfad in ordner_angelegt:
+                        continue
+                    await loop.run_in_executor(
+                        None, conn.ftp.mkdir, f"{mission.rstrip('/')}/{pfad}")
+                    ordner_angelegt.add(pfad)
+            if not await loop.run_in_executor(
+                    None, conn.ftp.write_file_bytes,
+                    f"{mission.rstrip('/')}/{name}", archiv.read(name)):
+                raise RuntimeError(f"Die Datei „{name}“ konnte nicht "
+                                   f"zurückgeschrieben werden. Der Server ist "
+                                   f"gestoppt – bitte von Hand prüfen.")
+            await asyncio.sleep(0)
+
+        # 4. Wieder starten.
+        _backup_job_setzen(conn, phase="starten", datei="")
+        start_ok, start_meldung = await conn.nitrado.restart()
+        _backup_job_setzen(conn, fertig=True, phase="fertig",
+                          ergebnis=(f"{len(namen)} Dateien zurückgespielt. "
+                                    + ("Der Server startet neu."
+                                       if start_ok
+                                       else f"ACHTUNG: Der Start ist "
+                                            f"fehlgeschlagen ({start_meldung}) – "
+                                            f"bitte von Hand starten.")))
+        _audit_add("dashboard", "-", "Backup wiederhergestellt",
+                  f"„{eintrag.get('name')}“ · {len(namen)} Dateien · {conn.name}")
+    except Exception as e:  # noqa: BLE001
+        log.error(f"[BACKUP] wiederherstellen ({conn.service_id}): {e}")
+        _backup_job_setzen(conn, fertig=True, phase="fehler", fehler=str(e))
+
+
+def _backup_job_antwort(conn: ServerConnection) -> Optional[Dict[str, Any]]:
+    job = _backup_job(conn)
+    if not job:
+        return None
+    return {k: job.get(k) for k in
+            ("art", "phase", "schritt", "gesamt", "datei", "fertig", "fehler",
+             "ergebnis")}
+
+
+async def _backup_vorbereiten(request: web.Request, aktion: str
+                              ) -> Tuple[Optional[ServerConnection], Optional[web.Response]]:
+    """Gemeinsamer Vertrag aller Backup-Endpunkte."""
+    conn, fehler = _session_conn(request, "backup")
+    if fehler is not None:
+        return None, fehler
+    fehler = await _modul_pruefen("backup", request, conn)
+    if fehler is not None:
+        return None, fehler
+    fehler = await _dash_gate(request, conn, "backup", aktion)
+    if fehler is not None:
+        return None, fehler
+    return conn, None
+
+
+async def api_backup_get(request: web.Request) -> web.Response:
+    conn, fehler = await _backup_vorbereiten(request, "view")
+    if fehler is not None:
+        return fehler
+    mission = _mission_dir_of(conn)
+    return ok({
+        "backups": _backup_liste(conn),
+        "mission": mission or "",
+        "karte": str(conn.get("map_name") or ""),
+        "kein_mission_ordner": not mission,
+        "kein_ftp": conn.ftp is None,
+        "kein_nitrado": conn.nitrado is None,
+        "max": _BACKUP_MAX,
+        "job": _backup_job_antwort(conn),
+    })
+
+
+async def api_backup_status(request: web.Request) -> web.Response:
+    conn, fehler = await _backup_vorbereiten(request, "view")
+    if fehler is not None:
+        return fehler
+    return ok({"job": _backup_job_antwort(conn), "backups": _backup_liste(conn)})
+
+
+async def api_backup_create(request: web.Request) -> web.Response:
+    conn, fehler = await _backup_vorbereiten(request, "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    if conn.ftp is None:
+        return err("Für diesen Server ist kein FTP-Zugang hinterlegt.", 409)
+    if _backup_job_laeuft(conn):
+        return err("Für diesen Server läuft bereits ein Backup-Vorgang.", 409)
+    fehler = _dash_rate_limited(request, "backup.create", 15)
+    if fehler is not None:
+        return fehler
+    _BACKUP_JOBS[str(conn.service_id)] = {
+        "art": "erstellen", "phase": "start", "schritt": 0, "gesamt": 0,
+        "datei": "", "fertig": False, "fehler": "", "ergebnis": ""}
+    asyncio.create_task(_backup_erstellen_worker(conn))
+    return ok({"gestartet": True})
+
+
+async def api_backup_rename(request: web.Request) -> web.Response:
+    conn, fehler = await _backup_vorbereiten(request, "edit")
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    eintrag = _backup_eintrag(conn, str(data.get("id") or ""))
+    if eintrag is None:
+        return err("Diese Sicherung gibt es nicht (mehr).", 404)
+    name, fehlertext = _backup_name_pruefen(str(data.get("name") or ""))
+    if fehlertext:
+        return err(fehlertext)
+    liste = _backup_liste(conn)
+    for e in liste:
+        if e.get("id") == eintrag["id"]:
+            e["name"] = name
+            # Ab jetzt vom automatischen Aufraeumen ausgenommen.
+            e["umbenannt"] = True
+    _backup_liste_speichern(conn, liste)
+    return ok({"name": name})
+
+
+async def api_backup_delete(request: web.Request) -> web.Response:
+    conn, fehler = await _backup_vorbereiten(request, "edit")
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    eintrag = _backup_eintrag(conn, str(data.get("id") or ""))
+    if eintrag is None:
+        return err("Diese Sicherung gibt es nicht (mehr).", 404)
+    if _backup_job_laeuft(conn):
+        return err("Für diesen Server läuft gerade ein Backup-Vorgang.", 409)
+    loop = asyncio.get_running_loop()
+    ordner = _backup_ordner(conn)
+    if ordner and conn.ftp is not None:
+        await loop.run_in_executor(None, conn.ftp.delete_file,
+                                   f"{ordner}/{eintrag.get('datei')}")
+    _backup_liste_speichern(
+        conn, [e for e in _backup_liste(conn) if e.get("id") != eintrag["id"]])
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Backup gelöscht",
+              f"„{eintrag.get('name')}“ · {conn.name}")
+    return ok({"geloescht": True})
+
+
+async def api_backup_restore(request: web.Request) -> web.Response:
+    conn, fehler = await _backup_vorbereiten(request, "edit")
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    eintrag = _backup_eintrag(conn, str(data.get("id") or ""))
+    if eintrag is None:
+        return err("Diese Sicherung gibt es nicht (mehr).", 404)
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    if conn.ftp is None:
+        return err("Für diesen Server ist kein FTP-Zugang hinterlegt.", 409)
+    if conn.nitrado is None:
+        return err("Für diesen Server ist kein Nitrado-Zugang hinterlegt – ohne "
+                   "ihn kann der Server zum Zurückspielen nicht gestoppt "
+                   "werden.", 409)
+    if _backup_job_laeuft(conn):
+        return err("Für diesen Server läuft bereits ein Backup-Vorgang.", 409)
+    fehler = _dash_rate_limited(request, "backup.restore", 15)
+    if fehler is not None:
+        return fehler
+    _BACKUP_JOBS[str(conn.service_id)] = {
+        "art": "wiederherstellen", "phase": "start", "schritt": 0, "gesamt": 0,
+        "datei": "", "fertig": False, "fehler": "", "ergebnis": ""}
+    asyncio.create_task(_backup_wiederherstellen_worker(conn, eintrag))
+    return ok({"gestartet": True})
+
+
 _BACKUP_VERZEICHNIS = "backups"
 
 
@@ -27665,6 +28252,12 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/skymessage", api_tools_skymessage_post)
     r.add_get("/api/tools/typesmanager", api_tools_typesmanager_get)
     r.add_post("/api/tools/typesmanager", api_tools_typesmanager_post)
+    r.add_get("/api/backup", api_backup_get)
+    r.add_get("/api/backup/status", api_backup_status)
+    r.add_post("/api/backup/create", api_backup_create)
+    r.add_post("/api/backup/rename", api_backup_rename)
+    r.add_post("/api/backup/delete", api_backup_delete)
+    r.add_post("/api/backup/restore", api_backup_restore)
     r.add_get("/api/tools/horde", api_tools_horde_get)
     r.add_post("/api/tools/horde", api_tools_horde_post)
     r.add_get("/api/tools/heliloot", api_tools_heliloot_get)
@@ -28364,6 +28957,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "261dd97a59d9e3ea643ee82071343704e974108bd9c671bca8b37022188907d9",
         "ae8cdec4c108661d0283f92ddcf6f6c4795932a92ab58397740e6044eb5ddb0c",
         "eee79844a84d4a488621c2e32ade028a06451b00cb56837b933562103a42afa2",
+        "f03188b82504bc4de8ffd8c554d287e2e16d7a2acca7762ce13b836357f97a8e",
     ),
     "app.js": (
         "18baefd43bad0dea69057dcaa400f3b39d891e88af9db564e0b1911b9728ed4d",
@@ -28521,6 +29115,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "cfd4d401b59c9ffe565c69c3d3fd56428c42d4ce4af14ac9ad2350a9a9a23163",
         "890a3c34cc122c278d2bfd637b67f2a8c630dd6ef10d944b6d0c7d4b074f9421",
         "38bab0e1d1a3a3a1f66a7b877fb6953b02894b2fb07eec6d24dd32dbef37e259",
+        "09f5e6310fcea9a314070dd9355714966fd8b532fdab4567d687e7af512883e3",
+        "a80c97f528d8fb58dd65042a6bd0b39125fc30bee66fd7a31a42ac78fdf01660",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
