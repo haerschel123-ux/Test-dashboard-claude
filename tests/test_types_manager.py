@@ -233,6 +233,74 @@ def test_doppelte_listenwerte_werden_entdoppelt():
     assert sauber["usage"] == ["Military", "Police"]
 
 
+# ── Auswahllisten aus der cfglimitsdefinition.xml ────────────────────────
+LIMITS = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<lists>
+    <categories>
+        <category name="tools"/>
+        <category name="containers"/>
+        <category name="lootdispatch"/>
+        <category name="weapons"/>
+    </categories>
+    <tags>
+        <tag name="floor"/>
+        <tag name="shelves"/>
+        <tag name="ground"/>
+    </tags>
+    <usageflags>
+        <usage name="Military"/>
+        <usage name="Police"/>
+        <usage name="Lunapark"/>
+    </usageflags>
+    <valueflags>
+        <value name="Tier1"/>
+        <value name="Unique"/>
+    </valueflags>
+</lists>
+'''
+
+
+def test_limits_werden_vollstaendig_gelesen():
+    """Die cfglimitsdefinition.xml ist die massgebliche Liste - auch Werte,
+    die in der types.xml noch gar nicht vorkommen (Lunapark, Unique,
+    lootdispatch), muessen zur Auswahl stehen."""
+    limits = bot._tm_limits_lesen(LIMITS)
+    assert limits["category"] == ["tools", "containers", "lootdispatch", "weapons"]
+    assert limits["usage"] == ["Military", "Police", "Lunapark"]
+    assert limits["value"] == ["Tier1", "Unique"]
+    assert limits["tag"] == ["floor", "shelves", "ground"]
+
+
+def test_limits_behalten_die_reihenfolge_der_datei():
+    """Nicht alphabetisch sortieren - die Reihenfolge der Datei ist die, die
+    der Serverbetreiber kennt."""
+    assert bot._tm_limits_lesen(LIMITS)["usage"][-1] == "Lunapark"
+
+
+def test_fehlende_limits_datei_kippt_nichts():
+    assert bot._tm_limits_lesen(None) == {}
+    assert bot._tm_limits_lesen("kein xml") == {}
+
+
+def test_leere_abschnitte_werden_uebersprungen():
+    ohne = '<?xml version="1.0"?><lists><categories/></lists>'
+    assert bot._tm_limits_lesen(ohne) == {}
+
+
+# ── tag als drittes Listenfeld ───────────────────────────────────────────
+def test_tag_wird_gelesen_und_geschrieben():
+    mit_tag = XML.replace('<value name="Tier4"/>',
+                          '<value name="Tier4"/>\n        <tag name="floor"/>')
+    assert bot._tm_type_lesen(_type(mit_tag, "AKM"))["tag"] == ["floor"]
+    neu = _anwenden(mit_tag, "AKM", {"tag": ["shelves", "ground"]})
+    assert [t.get("name") for t in _type(neu, "AKM").findall("tag")] == ["shelves", "ground"]
+
+
+def test_tag_kann_neu_angelegt_werden():
+    neu = _anwenden(XML, "AKM", {"tag": ["floor"]})
+    assert [t.get("name") for t in _type(neu, "AKM").findall("tag")] == ["floor"]
+
+
 def test_jedes_zahlenfeld_hat_eine_erklaerung():
     """Brigardes Vorgabe: jeder aenderbare Wert bekommt ein Info-Zeichen mit
     Erklaerung - die Texte kommen aus diesen Tabellen."""

@@ -13816,6 +13816,9 @@ _TM_LISTENFELDER: Tuple[Tuple[str, str], ...] = (
     ("value",
      "Loot-Stufe (Tier): in welchen Zonen der Karte das Item vorkommt. "
      "Tier1 ist küstennah, höhere Stufen liegen im Landesinneren."),
+    ("tag",
+     "Ablageort im Gebäude: floor (Boden), shelves (Regale) oder ground "
+     "(im Freien). Ohne Eintrag entscheidet der Server selbst."),
 )
 
 
@@ -13981,6 +13984,40 @@ def _tm_aenderung_pruefen(name: str, roh: Dict[str, Any],
     return sauber, None
 
 
+# In welchem Abschnitt der cfglimitsdefinition.xml die Auswahl je Feld steht.
+_TM_LIMITS_ABSCHNITTE: Tuple[Tuple[str, str, str], ...] = (
+    ("category", "categories", "category"),
+    ("usage", "usageflags", "usage"),
+    ("value", "valueflags", "value"),
+    ("tag", "tags", "tag"),
+)
+
+
+def _tm_limits_lesen(text: Optional[str]) -> Dict[str, List[str]]:
+    """Die erlaubten Kategorien, Fundorte, Stufen und Ablageorte aus der
+    cfglimitsdefinition.xml des Servers.
+
+    Das ist die massgebliche Liste - sie enthaelt auch Werte, die in der
+    types.xml noch gar nicht vorkommen (z. B. Lunapark oder Unique). Die
+    Auswahl nur aus der types.xml abzuleiten wuerde genau die verschlucken.
+    """
+    aus: Dict[str, List[str]] = {}
+    if not text:
+        return aus
+    try:
+        wurzel = ET.fromstring(text)
+    except ET.ParseError:
+        return aus
+    for feld, abschnitt, kind in _TM_LIMITS_ABSCHNITTE:
+        el = wurzel.find(abschnitt)
+        if el is None:
+            continue
+        namen = [k.get("name") for k in el.findall(kind) if k.get("name")]
+        if namen:
+            aus[feld] = namen
+    return aus
+
+
 def _tm_datei_lesen(root: ET.Element) -> Dict[str, Any]:
     """Alle <type>-Eintraege plus die in DIESER Datei tatsaechlich benutzten
     Kategorien, Fundorte und Stufen - so passt die Auswahl auch bei einem
@@ -13988,7 +14025,9 @@ def _tm_datei_lesen(root: ET.Element) -> Dict[str, Any]:
     eintraege = []
     doppelt: List[str] = []
     gesehen: set = set()
-    bekannt: Dict[str, set] = {"category": set(), "usage": set(), "value": set()}
+    bekannt: Dict[str, set] = {"category": set()}
+    for tag, _ in _TM_LISTENFELDER:
+        bekannt[tag] = set()
     for el in root.findall("type"):
         name = el.get("name")
         if not name:
@@ -14009,6 +14048,26 @@ def _tm_datei_lesen(root: ET.Element) -> Dict[str, Any]:
         eintraege.append(eintrag)
     return {"types": eintraege, "doppelt": doppelt,
             "bekannt": {k: sorted(v) for k, v in bekannt.items()}}
+
+
+async def _tm_auswahl(conn: ServerConnection, daten: Dict[str, Any],
+                      loop) -> Tuple[Dict[str, List[str]], bool]:
+    """Die Auswahllisten fuers Dashboard. Grundlage ist die
+    cfglimitsdefinition.xml des Servers; was die types.xml darueber hinaus
+    schon benutzt, wird ergaenzt, damit ein bestehender (etwa von einer Mod
+    gesetzter) Wert nicht aus der Auswahl faellt und beim Speichern als
+    unbekannt abgelehnt wuerde.
+
+    Rueckgabe (Auswahl, ob die cfglimitsdefinition.xml gelesen werden konnte).
+    """
+    text, status = await _tools_datei_lesen(conn, "cfglimitsdefinition.xml", loop)
+    limits = _tm_limits_lesen(text if status == "ok" else None)
+    auswahl: Dict[str, List[str]] = {}
+    for feld in ["category"] + [t for t, _ in _TM_LISTENFELDER]:
+        vorgabe = limits.get(feld, [])
+        zusatz = sorted(set(daten["bekannt"].get(feld, [])) - set(vorgabe))
+        auswahl[feld] = list(vorgabe) + zusatz
+    return auswahl, bool(limits)
 
 
 async def api_tools_typesmanager_get(request: web.Request) -> web.Response:
@@ -14038,6 +14097,7 @@ async def api_tools_typesmanager_get(request: web.Request) -> web.Response:
     except ET.ParseError as e:
         return err(f"db/types.xml ist kein gültiges XML: {e}", 409)
     daten = _tm_datei_lesen(root)
+    daten["bekannt"], daten["limits_gelesen"] = await _tm_auswahl(conn, daten, loop)
     daten["felder"] = felder
     daten["status"] = "ok"
     # Damit ein zweiter Bearbeiter die Datei nicht unbemerkt ueberschreibt.
@@ -14084,7 +14144,8 @@ async def api_tools_typesmanager_post(request: web.Request) -> web.Response:
                    "verloren.", 409)
 
     daten = _tm_datei_lesen(root)
-    bekannt = {k: set(v) for k, v in daten["bekannt"].items()}
+    auswahl, _ = await _tm_auswahl(conn, daten, loop)
+    bekannt = {k: set(v) for k, v in auswahl.items()}
     vorhanden = {e["name"] for e in daten["types"]}
     doppelt = set(daten["doppelt"])
 
@@ -28302,6 +28363,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "6e720f80d26b4fb6dcd6eba50c1487cd5b71dc2553fc14269f3d5b2dde614f5b",
         "261dd97a59d9e3ea643ee82071343704e974108bd9c671bca8b37022188907d9",
         "ae8cdec4c108661d0283f92ddcf6f6c4795932a92ab58397740e6044eb5ddb0c",
+        "eee79844a84d4a488621c2e32ade028a06451b00cb56837b933562103a42afa2",
     ),
     "app.js": (
         "18baefd43bad0dea69057dcaa400f3b39d891e88af9db564e0b1911b9728ed4d",
@@ -28454,6 +28516,9 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "91860774844dc07104443e0f0c017da01b188ba83cb78a5ef00cd08f6db6497b",
         "bba874123b83903a6cc06822ef751019ac93e2f30d3ef645492a83c18be51b52",
         "ce6546a4e29531057c67568ce42b1a62c867ccfe0e9fd5d42b9bf5968a9c184c",
+        "e7ff49fd98b58672988829fc96c52e6e67543105439d36d8ae837cfc7ff0d311",
+        "8a88c5efdc568adce3dff361122799c041acc17db1ec13f211771b0ab23f1452",
+        "cfd4d401b59c9ffe565c69c3d3fd56428c42d4ce4af14ac9ad2350a9a9a23163",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
