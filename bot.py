@@ -21102,16 +21102,16 @@ async def _backup_server_stoppen(conn: ServerConnection) -> Tuple[bool, str]:
     Wichtig fuer das Wiederherstellen: schreibt man in den laufenden Server,
     ueberschreibt DayZ die Dateien beim naechsten eigenen Speichern wieder.
     """
-    if conn.nitrado is None:
+    if conn.api is None:
         return False, "Für diesen Server ist kein Nitrado-Zugang hinterlegt."
-    ok_, meldung = await conn.nitrado.stop()
+    ok_, meldung = await conn.api.stop()
     if not ok_:
         return False, f"Der Server konnte nicht gestoppt werden: {meldung}"
     gewartet = 0
     while gewartet < _BACKUP_STOP_TIMEOUT:
         await asyncio.sleep(_BACKUP_STOP_INTERVALL)
         gewartet += _BACKUP_STOP_INTERVALL
-        infos = await conn.nitrado.get_info()
+        infos = await conn.api.get_info()
         status = str(((infos or {}).get("status") or "")).lower()
         if status and status not in ("started", "starting", "restarting", "stopping"):
             return True, status
@@ -21179,7 +21179,7 @@ async def _backup_wiederherstellen_worker(conn: ServerConnection,
 
         # 4. Wieder starten.
         _backup_job_setzen(conn, phase="starten", datei="")
-        start_ok, start_meldung = await conn.nitrado.restart()
+        start_ok, start_meldung = await conn.api.restart()
         _backup_job_setzen(conn, fertig=True, phase="fertig",
                           ergebnis=(f"{len(namen)} Dateien zurückgespielt. "
                                     + ("Der Server startet neu."
@@ -21229,7 +21229,7 @@ async def api_backup_get(request: web.Request) -> web.Response:
         "karte": str(conn.get("map_name") or ""),
         "kein_mission_ordner": not mission,
         "kein_ftp": conn.ftp is None,
-        "kein_nitrado": conn.nitrado is None,
+        "kein_nitrado": conn.api is None,
         "max": _BACKUP_MAX,
         "job": _backup_job_antwort(conn),
     })
@@ -21317,7 +21317,7 @@ async def api_backup_restore(request: web.Request) -> web.Response:
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     if conn.ftp is None:
         return err("Für diesen Server ist kein FTP-Zugang hinterlegt.", 409)
-    if conn.nitrado is None:
+    if conn.api is None:
         return err("Für diesen Server ist kein Nitrado-Zugang hinterlegt – ohne "
                    "ihn kann der Server zum Zurückspielen nicht gestoppt "
                    "werden.", 409)

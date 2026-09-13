@@ -161,7 +161,7 @@ class _FakeConn:
         self.data = {}
         self._werte = {"ftp_mission_dir": mission, "map_name": "ChernarusPlus"}
         self.ftp = _FakeFTP()
-        self.nitrado = None
+        self.api = None
 
     def get(self, key, default=None):
         return self._werte.get(key, default)
@@ -307,7 +307,7 @@ def _durchlauf(conn):
 
 def test_ganzer_durchlauf_stellt_alle_dateien_byteweise_wieder_her():
     conn = _FakeConn()
-    conn.nitrado = _FakeNitrado(conn.ftp)
+    conn.api = _FakeNitrado(conn.ftp)
     bot._BACKUP_STOP_INTERVALL = 0
     _durchlauf(conn)
     job = bot._backup_job(conn)
@@ -321,13 +321,13 @@ def test_beim_zurueckspielen_wird_erst_gestoppt_dann_geschrieben():
     """Schreibt man in den laufenden Server, ueberschreibt DayZ die Dateien
     beim naechsten eigenen Speichern wieder."""
     conn = _FakeConn()
-    conn.nitrado = _FakeNitrado(conn.ftp)
+    conn.api = _FakeNitrado(conn.ftp)
     bot._BACKUP_STOP_INTERVALL = 0
     _durchlauf(conn)
-    arten = [a for a, _ in conn.nitrado.aufrufe]
+    arten = [a for a, _ in conn.api.aufrufe]
     assert arten == ["stop", "restart"]
-    stop_bei = conn.nitrado.aufrufe[0][1]
-    restart_bei = conn.nitrado.aufrufe[1][1]
+    stop_bei = conn.api.aufrufe[0][1]
+    restart_bei = conn.api.aufrufe[1][1]
     # Beim Stoppen war erst die ZIP-Datei der Sicherung geschrieben.
     assert stop_bei == 1
     # Danach alle Dateien der Sicherung.
@@ -341,7 +341,7 @@ def test_ohne_erfolgreiches_stoppen_wird_nichts_geschrieben():
     import asyncio
 
     conn = _FakeConn()
-    conn.nitrado = _FakeNitrado(conn.ftp, stoppt=False)
+    conn.api = _FakeNitrado(conn.ftp, stoppt=False)
     bot._BACKUP_STOP_INTERVALL = 0
     bot._BACKUP_STOP_TIMEOUT = 0
     bot._BACKUP_JOBS[str(conn.service_id)] = {"art": "erstellen", "fertig": False}
@@ -353,14 +353,14 @@ def test_ohne_erfolgreiches_stoppen_wird_nichts_geschrieben():
     asyncio.run(bot._backup_wiederherstellen_worker(conn, eintrag))
     assert bot._backup_job(conn).get("fehler")
     assert conn.ftp.dateien == vorher
-    assert "restart" not in [a for a, _ in conn.nitrado.aufrufe]
+    assert "restart" not in [a for a, _ in conn.api.aufrufe]
     bot._BACKUP_STOP_TIMEOUT = 120
     bot._BACKUP_JOBS.clear()
 
 
 def test_sicherung_landet_nicht_im_mission_ordner():
     conn = _FakeConn()
-    conn.nitrado = _FakeNitrado(conn.ftp)
+    conn.api = _FakeNitrado(conn.ftp)
     bot._BACKUP_STOP_INTERVALL = 0
     import asyncio
     bot._BACKUP_JOBS[str(conn.service_id)] = {"art": "erstellen", "fertig": False}
