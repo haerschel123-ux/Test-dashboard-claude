@@ -783,6 +783,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.custombuildmap":                {"label": "Custom Build Mapping", "gruppe": "Tools"},
     "tools.skymessage":                   {"label": "Sky Message Generator", "gruppe": "Tools"},
     "tools.typesmanager":                 {"label": "Erweiterter Types Manager", "gruppe": "Tools"},
+    "tools.effectgenerator":              {"label": "Effekt-Generator", "gruppe": "Tools"},
     "backup":                             {"label": "Backup der Server-Dateien",
                                            "gruppe": "Verbindung"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
@@ -10561,6 +10562,66 @@ TOOL_GAS_PARTICLES = [
     ("graphics/particles/contaminated_area_gas_small", "Klein"),
 ]
 
+# ── Effekt-Generator: nur bestaetigte Namen (aus dem echten DayZ-Partikel-/
+# PPE-/Trigger-Katalog), keine unbestaetigten Presets einer fremden Webseite.
+TOOL_EFFECT_TRIGGERS = [
+    "BarbedwireTrigger", "ContaminatedTrigger", "CylinderTrigger", "EffectTrigger",
+    "ManTrigger", "SphereTrigger", "SpookyTrigger", "TrapTrigger", "Trigger",
+    "TriggerEffectmanager", "TriggerEvents",
+]
+
+TOOL_EFFECT_PARTICLES = [
+    "blood_bleeding_01", "blood_bleeding_02", "blood_surface_chunks", "blood_surface_drops",
+    "breath_vapour_heavy", "breath_vapour_light", "breath_vapour_medium",
+    "character_vomit_01", "character_vomit_puddle", "character_vomitblood_01",
+    "contaminated_area_gas_around", "contaminated_area_gas_around_tiny",
+    "contaminated_area_gas_bigass", "contaminated_area_gas_ground", "contaminated_area_gas_shell",
+    "cooking_baking_done", "cooking_baking_start", "cooking_boiling_done", "cooking_boiling_empty",
+    "cooking_boiling_start", "cooking_burning_done", "cooking_drying_done", "cooking_drying_start",
+    "digging_ground", "electro_shortc2", "env_fly_swarm_01",
+    "explosion_landmine_01", "explosion_m67_01", "explosion_m84_01", "explosion_rgd5_01",
+    "fire_bonfire", "fire_extinguish_wind", "fire_medium_barrel_01", "fire_medium_camp_01",
+    "fire_medium_house_01", "fire_medium_oven_01", "fire_small_barrel_01", "fire_small_camp_01",
+    "fire_small_flare_blue_01", "fire_small_flare_green_01", "fire_small_flare_red_01",
+    "fire_small_flare_yellow_01", "fire_small_house_01", "fire_small_oven_01",
+    "fire_small_roadflare_red_01", "fire_small_roadflare_red_02", "fire_small_roadflare_red_03",
+    "fire_small_roadflare_red_04", "fire_small_stove_01", "fire_small_torch_01",
+    "fire_small_torch_02", "fire_small_torch_03", "fire_small_torch_yellow_01",
+    "hatchback_coolant_overheated", "hatchback_coolant_overheating", "hatchback_engine_failing",
+    "hatchback_engine_failure", "hatchback_exhaust", "menu_engine_fire", "menu_evaporation",
+    "smoke_bonfire", "smoke_generic_wreck", "smoke_heli_wreck_01",
+    "smoke_m18_green_01", "smoke_m18_green_02", "smoke_m18_green_03",
+    "smoke_m18_purple_01", "smoke_m18_purple_02", "smoke_m18_purple_03",
+    "smoke_m18_red_01", "smoke_m18_red_02", "smoke_m18_red_03",
+    "smoke_m18_white_01", "smoke_m18_white_02", "smoke_m18_white_03",
+    "smoke_m18_yellow_01", "smoke_m18_yellow_02", "smoke_m18_yellow_03",
+    "smoke_m7a2_white_01", "smoke_m7a2_white_02", "smoke_m7a2_white_03",
+    "smoke_medium_barrel_01", "smoke_medium_camp_01", "smoke_medium_house_01",
+    "smoke_rdg2_black_01", "smoke_rdg2_black_02", "smoke_rdg2_black_03",
+    "smoke_rdg2_white_01", "smoke_rdg2_white_02", "smoke_rdg2_white_03",
+    "smoke_small_barrel_01", "smoke_small_camp_01", "smoke_small_generator_01", "smoke_small_house_01",
+    "smoking_barrel", "smoking_barrel_heavy", "smoking_barrel_small",
+    "smoking_barrel_steam", "smoking_barrel_steam_small",
+    "steam_medium_camp_2end", "steam_medium_house_2end", "toxic_cloud",
+]
+
+TOOL_EFFECT_PPE = [
+    "PPERequester_InventoryBlur", "PPERequester_ControllerDisconnectBlur",
+    "PPERequester_GlassesSportBlack", "PPERequester_GlassesSportBlue",
+    "PPERequester_GlassesSportGreen", "PPERequester_GlassesSportOrange",
+    "PPERequester_GlassesAviator", "PPERequester_GlassesDesignerBlack",
+    "PPERequester_TacticalGoggles", "PPERequester_MotoHelmetBlack", "PPERequester_WeldingMask",
+    "PPERequester_CameraNV", "PPERequester_CameraADS", "PPERequester_BloodLoss",
+    "PPERequester_DeathDarkening", "PPERequester_UnconEffects", "PPERequester_TunnelVisionEffects",
+    "PPERequester_BurlapSackEffects", "PPERequester_IntroChromAbb", "PPERequester_FeverEffects",
+    "PPERequester_FlashbangEffects", "PPERequester_ShockHitReaction", "PPERequester_HealthHitReaction",
+    "PPERequester_MenuEffects", "PPERequester_ControlsBlur", "PPERequester_ServerBrowserBlur",
+    "PPERequester_TutorialMenu", "PPERequester_ContaminatedAr",
+]
+
+TOOL_EFFECT_TYPES = ["SpookyArea", "EffectArea"]
+TOOL_EFFECT_PREFIX = "FX_"
+
 TOOL_HORDE_MOVEMENT = {
     "stationary": {"label": "Stehend (bleibt am Ort)", "smin": 0, "smax": 0, "dmin": 30, "dmax": 30},
     "patrol":     {"label": "Patrouille (läuft umher)", "smin": 2, "smax": 5, "dmin": 10, "dmax": 50},
@@ -11434,6 +11495,7 @@ _TOOL_LISTE = (
     ("custombuildmap", "🗺️", "Custom Build Mapping"),
     ("skymessage", "☁️", "Sky Message Generator"),
     ("typesmanager", "📦", "Erweiterter Types Manager"),
+    ("effectgenerator", "✨", "Effekt-Generator"),
 )
 
 
@@ -11601,8 +11663,8 @@ async def api_tools_gaszone_get(request: web.Request) -> web.Response:
         if not isinstance(a, dict):
             continue
         name = str(a.get("AreaName") or "")
-        if not name or name.startswith(ShopManager.AREA_PREFIX):
-            continue   # Shop-eigene Ausliefer-Einträge nicht als Gaszone anzeigen
+        if not name or name.startswith(ShopManager.AREA_PREFIX) or name.startswith(TOOL_EFFECT_PREFIX):
+            continue   # Shop-Ausliefer-Eintraege und Effekt-Generator-Bereiche hier nicht anzeigen
         d = a.get("Data") or {}
         pos = d.get("Pos") or [0, 0, 0]
         areas.append({
@@ -11645,6 +11707,9 @@ async def api_tools_gaszone_post(request: web.Request) -> web.Response:
     if name.startswith(ShopManager.AREA_PREFIX):
         return err(f"Der Name darf nicht mit „{ShopManager.AREA_PREFIX}“ beginnen "
                   f"(reserviert für den Shop).")
+    if name.startswith(TOOL_EFFECT_PREFIX):
+        return err(f"Der Name darf nicht mit „{TOOL_EFFECT_PREFIX}“ beginnen "
+                  f"(reserviert für den Effekt-Generator).")
     try:
         radius = float(data_in.get("radius", 150))
         pos_height = float(data_in.get("pos_height", 20))
@@ -11706,6 +11771,178 @@ async def api_tools_gaszone_post(request: web.Request) -> web.Response:
     generated = [{"filename": "cfgEffectArea.json (neue Zonen)",
                  "content": json.dumps(new_areas, indent=2, ensure_ascii=False)}]
     return ok({"areas": len(new_areas), "generated": generated})
+
+
+# ── 2a. Effekt-Generator (teilt sich cfgEffectArea.json mit Shop & Gaszonen) ──
+# Eigene sichtbare/PPE-Effektbereiche (SpookyArea/EffectArea) statt der
+# Kontaminationszonen des Gaszonen-Builders. Eigene Areas werden am Praefix
+# TOOL_EFFECT_PREFIX erkannt - beim Speichern werden NUR diese ersetzt, Shop-
+# Eintraege und Gaszonen bleiben unangetastet (gleiches Muster wie oben).
+async def api_tools_effectgenerator_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.effectgenerator")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.effectgenerator", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    antwort: Dict[str, Any] = {
+        "typen": TOOL_EFFECT_TYPES,
+        "trigger": TOOL_EFFECT_TRIGGERS,
+        "partikel": TOOL_EFFECT_PARTICLES,
+        "ppe": TOOL_EFFECT_PPE,
+        "areas": [],
+        "kein_mission_ordner": True,
+    }
+    if conn.shop is not None:
+        pfad = conn.shop.effect_area_path()
+        if pfad:
+            antwort["kein_mission_ordner"] = False
+            loop = asyncio.get_running_loop()
+            roh, status = await loop.run_in_executor(None, conn.ftp.read_file_ex, pfad)
+            if status == "error":
+                return err("cfgEffectArea.json per FTP nicht lesbar.", 502)
+            try:
+                data, areas_key = ShopManager._parse_effect_area(roh if status == "ok" else None)
+            except (ValueError, json.JSONDecodeError):
+                return err("cfgEffectArea.json ist kein gültiges JSON.", 502)
+            for a in data.get(areas_key) or []:
+                if not isinstance(a, dict):
+                    continue
+                name = str(a.get("AreaName") or "")
+                if not name.startswith(TOOL_EFFECT_PREFIX):
+                    continue   # Shop-/Gaszonen-Eintraege hier nicht anzeigen
+                d = a.get("Data") or {}
+                pd = a.get("PlayerData") or {}
+                pos = d.get("Pos") or [0, 0, 0]
+                antwort["areas"].append({
+                    "name": name, "typ": a.get("Type", "SpookyArea"),
+                    "trigger": a.get("TriggerType", "EffectTrigger"),
+                    "x": pos[0] if len(pos) > 0 else 0, "z": pos[2] if len(pos) > 2 else 0,
+                    "radius": d.get("Radius", 20), "pos_height": d.get("PosHeight", 10),
+                    "neg_height": d.get("NegHeight", 10),
+                    "inner_ring_count": d.get("InnerRingCount", 1),
+                    "inner_part": d.get("InnerPartDist", 15),
+                    "outer_ring": bool(d.get("OuterRingToggle", True)),
+                    "outer_part": d.get("OuterPartDist", 25),
+                    "outer_offset": d.get("OuterOffset", 0),
+                    "vertical_layers": d.get("VerticalLayers", 0),
+                    "vertical_offset": d.get("VerticalOffset", 0),
+                    "particle": d.get("ParticleName", TOOL_EFFECT_PARTICLES[0]),
+                    "around": pd.get("AroundPartName", ""),
+                    "tiny": pd.get("TinyPartName", ""),
+                    "ppe": pd.get("PPERequesterType", TOOL_EFFECT_PPE[0]),
+                })
+    return ok(antwort)
+
+
+async def api_tools_effectgenerator_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.effectgenerator")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.effectgenerator", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if conn.shop is None:
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    pfad = conn.shop.effect_area_path()
+    if not pfad:
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.effectgenerator", 10)
+        if fehler is not None:
+            return fehler
+
+    name = str(data_in.get("name") or "").strip()
+    if not name:
+        return err("Bitte einen Bereichsnamen angeben.")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", name):
+        return err("Der Name darf nur Buchstaben, Ziffern, „_“ und „-“ enthalten "
+                   "(höchstens 48 Zeichen).")
+    voller_name = name if name.startswith(TOOL_EFFECT_PREFIX) else f"{TOOL_EFFECT_PREFIX}{name}"
+
+    typ = str(data_in.get("typ") or TOOL_EFFECT_TYPES[0])
+    if typ not in TOOL_EFFECT_TYPES:
+        return err("Unbekannter Bereichstyp.")
+    trigger = str(data_in.get("trigger") or "EffectTrigger")
+    if trigger not in TOOL_EFFECT_TRIGGERS:
+        return err("Unbekannter Trigger-Typ.")
+    partikel = str(data_in.get("particle") or TOOL_EFFECT_PARTICLES[0])
+    if partikel not in TOOL_EFFECT_PARTICLES:
+        return err("Unbekannter Partikelname.")
+    around = str(data_in.get("around") or "")
+    if around and around not in TOOL_EFFECT_PARTICLES:
+        return err("Unbekannter Partikelname (Umgebung).")
+    tiny = str(data_in.get("tiny") or "")
+    if tiny and tiny not in TOOL_EFFECT_PARTICLES:
+        return err("Unbekannter Partikelname (Nahbereich).")
+    ppe = str(data_in.get("ppe") or TOOL_EFFECT_PPE[0])
+    if ppe not in TOOL_EFFECT_PPE:
+        return err("Unbekannter PPE-Effekt.")
+
+    try:
+        x = float(data_in.get("x", 0))
+        z = float(data_in.get("z", 0))
+        radius = float(data_in.get("radius", 20))
+        pos_height = float(data_in.get("pos_height", 10))
+        neg_height = float(data_in.get("neg_height", 10))
+        inner_ring_count = int(data_in.get("inner_ring_count", 1))
+        inner_part = float(data_in.get("inner_part", 15))
+        outer_part = float(data_in.get("outer_part", 25))
+        outer_offset = float(data_in.get("outer_offset", 0))
+        vertical_layers = int(data_in.get("vertical_layers", 0))
+        vertical_offset = float(data_in.get("vertical_offset", 0))
+    except (TypeError, ValueError):
+        return err("Ungültige Zahl in den Bereichs-Eigenschaften.")
+    if radius <= 0:
+        return err("Der Radius muss größer als 0 sein.")
+    outer_ring = bool(data_in.get("outer_ring", True))
+
+    neue_area = {
+        "AreaName": voller_name, "Type": typ, "TriggerType": trigger,
+        "Data": {
+            "Pos": [x, 0, z], "Radius": radius, "PosHeight": pos_height,
+            "NegHeight": neg_height, "InnerRingCount": inner_ring_count,
+            "InnerPartDist": inner_part, "OuterRingToggle": outer_ring,
+            "OuterPartDist": outer_part, "OuterOffset": outer_offset,
+            "VerticalLayers": vertical_layers, "VerticalOffset": vertical_offset,
+            "ParticleName": f"graphics/particles/{partikel}",
+        },
+        "PlayerData": {
+            "AroundPartName": f"graphics/particles/{around}" if around else "",
+            "TinyPartName": f"graphics/particles/{tiny}" if tiny else "",
+            "PPERequesterType": ppe,
+        },
+    }
+
+    async with conn.shop.lock:
+        loop = asyncio.get_running_loop()
+        roh, status = await loop.run_in_executor(None, conn.ftp.read_file_ex, pfad)
+        if status == "error":
+            return err("cfgEffectArea.json per FTP nicht lesbar.", 502)
+        try:
+            data, areas_key = ShopManager._parse_effect_area(roh if status == "ok" else None)
+        except (ValueError, json.JSONDecodeError):
+            return err("cfgEffectArea.json ist kein gültiges JSON.", 502)
+        bestehend = data.get(areas_key) or []
+        data[areas_key] = [a for a in bestehend
+                           if not (isinstance(a, dict) and a.get("AreaName") == voller_name)]
+        data[areas_key].append(neue_area)
+        if commit and not await conn.shop._write_json(pfad, data):
+            return err("cfgEffectArea.json konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Effekt-Generator gespeichert",
+                  f"{voller_name} · {conn.name}")
+    generated = [{"filename": "cfgEffectArea.json (neuer Bereich)",
+                 "content": json.dumps(neue_area, indent=2, ensure_ascii=False)}]
+    return ok({"generated": generated})
 
 
 # ── 2b. Loot-Ausschlusszonen (entfernt <group>-Eintraege aus mapgrouppos.xml) ──
@@ -28252,6 +28489,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/skymessage", api_tools_skymessage_post)
     r.add_get("/api/tools/typesmanager", api_tools_typesmanager_get)
     r.add_post("/api/tools/typesmanager", api_tools_typesmanager_post)
+    r.add_get("/api/tools/effectgenerator", api_tools_effectgenerator_get)
+    r.add_post("/api/tools/effectgenerator", api_tools_effectgenerator_post)
     r.add_get("/api/backup", api_backup_get)
     r.add_get("/api/backup/status", api_backup_status)
     r.add_post("/api/backup/create", api_backup_create)
@@ -29119,6 +29358,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "09f5e6310fcea9a314070dd9355714966fd8b532fdab4567d687e7af512883e3",
         "a80c97f528d8fb58dd65042a6bd0b39125fc30bee66fd7a31a42ac78fdf01660",
         "43fa63170bc6f381f6c201457c6031495860861019bbd000ba354eb7e4e7a8c0",
+        "30f531c8c6b740edf7211ac3c66f06d5ebf07d656c37cb0e3ba2b5d713979ecc",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
