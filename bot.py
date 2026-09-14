@@ -11711,11 +11711,14 @@ async def api_tools_gaszone_post(request: web.Request) -> web.Response:
         return err(f"Der Name darf nicht mit „{TOOL_EFFECT_PREFIX}“ beginnen "
                   f"(reserviert für den Effekt-Generator).")
     try:
-        radius = float(data_in.get("radius", 150))
-        pos_height = float(data_in.get("pos_height", 20))
-        neg_height = float(data_in.get("neg_height", 3))
-        inner_part = float(data_in.get("inner_part", 100))
-        outer_offset = float(data_in.get("outer_offset", 20))
+        # DayZ erwartet fuer diese Felder ganze Zahlen (ContaminatedAreaLoader
+        # lehnt z.B. "InnerPartDist": 15.0 mit "Expecting int" ab) - float()
+        # zuerst, damit "12.7" nicht crasht, dann auf int runden.
+        radius = round(float(data_in.get("radius", 150)))
+        pos_height = round(float(data_in.get("pos_height", 20)))
+        neg_height = round(float(data_in.get("neg_height", 3)))
+        inner_part = round(float(data_in.get("inner_part", 100)))
+        outer_offset = round(float(data_in.get("outer_offset", 20)))
     except (TypeError, ValueError):
         return err("Ungültige Zahl in den Zonen-Eigenschaften.")
     particle = str(data_in.get("particle") or TOOL_GAS_PARTICLES[0][0])
@@ -11888,17 +11891,21 @@ async def api_tools_effectgenerator_post(request: web.Request) -> web.Response:
         return err("Unbekannter PPE-Effekt.")
 
     try:
+        # Pos bleibt float (echte Weltkoordinaten), alle anderen Data-Felder
+        # erwartet DayZ als ganze Zahl - der ContaminatedAreaLoader lehnt z.B.
+        # "InnerPartDist": 15.0 mit "Expecting int" ab (Server-Crashloop,
+        # per RPT-Log bestaetigt). float() zuerst, damit "12.7" nicht crasht.
         x = float(data_in.get("x", 0))
         z = float(data_in.get("z", 0))
-        radius = float(data_in.get("radius", 20))
-        pos_height = float(data_in.get("pos_height", 10))
-        neg_height = float(data_in.get("neg_height", 10))
+        radius = round(float(data_in.get("radius", 20)))
+        pos_height = round(float(data_in.get("pos_height", 10)))
+        neg_height = round(float(data_in.get("neg_height", 10)))
         inner_ring_count = int(data_in.get("inner_ring_count", 1))
-        inner_part = float(data_in.get("inner_part", 15))
-        outer_part = float(data_in.get("outer_part", 25))
-        outer_offset = float(data_in.get("outer_offset", 0))
+        inner_part = round(float(data_in.get("inner_part", 15)))
+        outer_part = round(float(data_in.get("outer_part", 25)))
+        outer_offset = round(float(data_in.get("outer_offset", 0)))
         vertical_layers = int(data_in.get("vertical_layers", 0))
-        vertical_offset = float(data_in.get("vertical_offset", 0))
+        vertical_offset = round(float(data_in.get("vertical_offset", 0)))
     except (TypeError, ValueError):
         return err("Ungültige Zahl in den Bereichs-Eigenschaften.")
     if radius <= 0:
