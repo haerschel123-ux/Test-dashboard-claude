@@ -21716,6 +21716,49 @@ async def api_serverfiles_write(request: web.Request) -> web.Response:
     return ok({"gespeichert": True})
 
 
+def _serverfiles_zip_bauen(ftp: "FTPManager", mission: str,
+                           eintraege: List[Tuple[str, int]]) -> bytes:
+    """Laedt jede Datei per FTP und packt sie unter ihrem relativen Pfad in
+    ein ZIP - laeuft im Executor, da das je Datei einen FTP-Umlauf braucht."""
+    puffer = io.BytesIO()
+    with zipfile.ZipFile(puffer, "w", zipfile.ZIP_DEFLATED) as z:
+        for rel, _groesse in eintraege:
+            roh = ftp.read_file_bytes(f"{mission.rstrip('/')}/{rel}")
+            if roh is not None:
+                z.writestr(rel, roh)
+    return puffer.getvalue()
+
+
+async def api_serverfiles_zip(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
+    fehler = await _guild_admin_erforderlich(request, conn)
+    if fehler is not None:
+        return fehler
+    mission = _mission_dir_of(conn)
+    if not mission:
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    if conn.ftp is None:
+        return err("Für diesen Server ist kein FTP-Zugang hinterlegt.", 409)
+    fehler = _dash_rate_limited(request, "serverfiles.zip", 5)
+    if fehler is not None:
+        return fehler
+    loop = asyncio.get_running_loop()
+    eintraege, status = await loop.run_in_executor(
+        None, conn.ftp.walk, mission, _SERVERFILES_MAX_DATEIEN, _SERVERFILES_MAX_BYTES)
+    if status not in ("ok", "leer"):
+        return err("ZIP konnte nicht erstellt werden – zu viele oder zu große Dateien "
+                   "im Mission-Ordner.", 502)
+    zip_bytes = await loop.run_in_executor(
+        None, _serverfiles_zip_bauen, conn.ftp, mission, eintraege)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Server-Dateien als ZIP heruntergeladen",
+              f"{len(eintraege)} Datei(en) · {conn.name}")
+    dateiname = re.sub(r"[^A-Za-z0-9_-]+", "_", conn.name or "server") + "_dateien.zip"
+    return web.Response(body=zip_bytes, content_type="application/zip",
+                        headers={"Content-Disposition": f'attachment; filename="{dateiname}"'})
+
+
 _BACKUP_VERZEICHNIS = "backups"
 
 
@@ -28646,6 +28689,7 @@ def build_app() -> web.Application:
     r.add_get("/api/serverfiles", api_serverfiles_get)
     r.add_get("/api/serverfiles/read", api_serverfiles_read)
     r.add_post("/api/serverfiles/write", api_serverfiles_write)
+    r.add_get("/api/serverfiles/zip", api_serverfiles_zip)
     r.add_get("/api/tools/horde", api_tools_horde_get)
     r.add_post("/api/tools/horde", api_tools_horde_post)
     r.add_get("/api/tools/heliloot", api_tools_heliloot_get)
@@ -29516,6 +29560,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "79e13251f3cdbe32d26b77661253caf64be043a72a9ff2507f2b5e3ee76dd2da",
         "121011f99d7d10fba1ac8ccfb32bd480b1e6b2abb7f72847f8af899e2fd2c678",
         "ecbb9d00baa33258706110944655bc41a049dc7339c0a3a9b166f057338674e9",
+        "3518764b359fc788337047683c06ffad1b563c789af754db412faa4052e3740a",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
