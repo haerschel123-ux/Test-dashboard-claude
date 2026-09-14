@@ -21577,6 +21577,145 @@ async def api_backup_restore(request: web.Request) -> web.Response:
     return ok({"gestartet": True})
 
 
+# ── Server Dateien (roher Datei-Browser + Editor im Mission-Ordner) ──────
+# Bewusst OHNE Modul Manager/Dashboard-Permissions (_modul_pruefen/_dash_gate):
+# Zugriff haengt hier ausschliesslich an der Discord-Berechtigung
+# "Administrator" auf der verknuepften Guild - live ueber den Bot geprueft,
+# nicht an einer Freischaltung durch Brigarde und nicht am Server-Eigentuemer.
+# Anders als die strukturierten Tools validiert dieser Editor den Inhalt NICHT
+# - wer Administrator ist, kann jede Textdatei kaputt speichern. Das ist so
+# gewollt (siehe Auftrag), deshalb keine Warnung unterdruecken, sondern im
+# Frontend deutlich zeigen.
+_SERVERFILES_MAX_DATEIEN = 5000
+_SERVERFILES_MAX_BYTES = 512 * 1024 * 1024
+_SERVERFILES_MAX_EDIT_BYTES = 8 * 1024 * 1024   # groessere Dateien nur zum Download
+
+
+async def _guild_admin_erforderlich(request: web.Request,
+                                    conn: "ServerConnection") -> Optional[web.Response]:
+    """Nur Discord-Administratoren der verknuepften Guild duerfen hier ran.
+
+    Live geprueft (guild.fetch_member + guild_permissions.administrator), NICHT
+    aus einem beim Login gespeicherten Schnappschuss - eine nachtraeglich
+    entzogene Rolle wirkt so sofort statt erst nach erneuter Anmeldung.
+    """
+    if conn.guild_id is None:
+        return err("Diesem Server ist noch kein Discord-Server zugeordnet.", 409)
+    sess = _sess_get(request)
+    if not sess:
+        return err("Session abgelaufen – bitte neu anmelden.", 401)
+    if sess.get("is_admin"):
+        return None   # Bot-Betreiber darf immer
+    try:
+        user_id = int(str((sess.get("discord") or {}).get("id") or "0"))
+    except (TypeError, ValueError):
+        user_id = 0
+    if not user_id or bot is None or getattr(bot, "user", None) is None:
+        return err("Discord-Berechtigung konnte nicht geprüft werden.", 403)
+    guild = bot.get_guild(int(conn.guild_id))
+    if guild is None:
+        return err("Discord-Berechtigung konnte nicht geprüft werden – der Bot "
+                   "ist auf diesem Discord-Server nicht (mehr) Mitglied.", 403)
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except Exception:  # noqa: BLE001 – nicht Mitglied / nicht abrufbar
+            member = None
+    if member is None or not member.guild_permissions.administrator:
+        return err("Dafür brauchst du die Berechtigung „Administrator“ auf dem "
+                   "Discord-Server dieses Kunden.", 403)
+    return None
+
+
+def _serverfiles_pfad_pruefen(rel: str) -> bool:
+    """Wie _backup_zielpfad_pruefen - kein Ausbruch aus dem Mission-Ordner."""
+    return _backup_zielpfad_pruefen(rel)
+
+
+async def api_serverfiles_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
+    fehler = await _guild_admin_erforderlich(request, conn)
+    if fehler is not None:
+        return fehler
+    mission = _mission_dir_of(conn)
+    if not mission:
+        return ok({"dateien": [], "kein_mission_ordner": True})
+    if conn.ftp is None:
+        return err("Für diesen Server ist kein FTP-Zugang hinterlegt.", 409)
+    loop = asyncio.get_running_loop()
+    eintraege, status = await loop.run_in_executor(
+        None, conn.ftp.walk, mission, _SERVERFILES_MAX_DATEIEN, _SERVERFILES_MAX_BYTES)
+    if status not in ("ok", "leer"):
+        return err("Dateiliste konnte nicht vollständig geladen werden – "
+                   "zu viele oder zu große Dateien im Mission-Ordner.", 502)
+    return ok({"mission": mission, "kein_mission_ordner": False,
+              "dateien": [{"pfad": p, "bytes": b} for p, b in eintraege]})
+
+
+async def api_serverfiles_read(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
+    fehler = await _guild_admin_erforderlich(request, conn)
+    if fehler is not None:
+        return fehler
+    mission = _mission_dir_of(conn)
+    if not mission:
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    if conn.ftp is None:
+        return err("Für diesen Server ist kein FTP-Zugang hinterlegt.", 409)
+    rel = str(request.query.get("pfad") or "")
+    if not _serverfiles_pfad_pruefen(rel):
+        return err("Ungültiger Dateipfad.", 400)
+    voll = f"{mission.rstrip('/')}/{rel}"
+    loop = asyncio.get_running_loop()
+    roh = await loop.run_in_executor(None, conn.ftp.read_file_bytes, voll)
+    if roh is None:
+        return err("Datei nicht gefunden oder per FTP nicht lesbar.", 404)
+    if len(roh) > _SERVERFILES_MAX_EDIT_BYTES:
+        return ok({"pfad": rel, "bytes": len(roh), "zu_gross": True, "binaer": None})
+    try:
+        text = roh.decode("utf-8")
+        return ok({"pfad": rel, "bytes": len(roh), "binaer": False, "inhalt": text})
+    except UnicodeDecodeError:
+        return ok({"pfad": rel, "bytes": len(roh), "binaer": True,
+                  "inhalt_base64": base64.b64encode(roh).decode("ascii")})
+
+
+async def api_serverfiles_write(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request)
+    if fehler is not None:
+        return fehler
+    fehler = await _guild_admin_erforderlich(request, conn)
+    if fehler is not None:
+        return fehler
+    mission = _mission_dir_of(conn)
+    if not mission:
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    if conn.ftp is None:
+        return err("Für diesen Server ist kein FTP-Zugang hinterlegt.", 409)
+    data = await body(request)
+    rel = str(data.get("pfad") or "")
+    if not _serverfiles_pfad_pruefen(rel):
+        return err("Ungültiger Dateipfad.", 400)
+    inhalt = data.get("inhalt")
+    if not isinstance(inhalt, str):
+        return err("Kein Textinhalt übergeben.")
+    fehler = _dash_rate_limited(request, "serverfiles.write", 20)
+    if fehler is not None:
+        return fehler
+    voll = f"{mission.rstrip('/')}/{rel}"
+    loop = asyncio.get_running_loop()
+    if not await loop.run_in_executor(None, conn.ftp.write_file, voll, inhalt):
+        return err("Datei konnte nicht gespeichert werden.", 502)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Server-Datei gespeichert",
+              f"{rel} · {conn.name}")
+    return ok({"gespeichert": True})
+
+
 _BACKUP_VERZEICHNIS = "backups"
 
 
@@ -28504,6 +28643,9 @@ def build_app() -> web.Application:
     r.add_post("/api/backup/rename", api_backup_rename)
     r.add_post("/api/backup/delete", api_backup_delete)
     r.add_post("/api/backup/restore", api_backup_restore)
+    r.add_get("/api/serverfiles", api_serverfiles_get)
+    r.add_get("/api/serverfiles/read", api_serverfiles_read)
+    r.add_post("/api/serverfiles/write", api_serverfiles_write)
     r.add_get("/api/tools/horde", api_tools_horde_get)
     r.add_post("/api/tools/horde", api_tools_horde_post)
     r.add_get("/api/tools/heliloot", api_tools_heliloot_get)
@@ -29164,6 +29306,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "98c473f8eae479d9e32c477769e317b53b5ef8ebb4493d0bcae6324db67514e3",
         "763bc500eebafb4cfa32dc062e73a6281a2bb39dbd291776276c9cdd2c658e07",
         "fe8ea19f77ec1994e9c96ec6a75492af6237b92ef2214ce3d1e97aa5a147c1d7",
+        "152129e7f2a553f94e03a5c2b733c21172c083ae9f64582f86efc56b5b6c63fb",
     ),
     "styles.css": (
         "0dcb70fa1bee603d45b9b0dca4a0b8437f1b7ae65182c15d242f9eb625a3cfee",
@@ -29368,6 +29511,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "30f531c8c6b740edf7211ac3c66f06d5ebf07d656c37cb0e3ba2b5d713979ecc",
         "4c4b22eacc8262c2336daf7914c4e5e1e468288f5920c98dae1c102e297c509e",
         "8eefd49a3d82448d63a571a035942695da458bb1ba2f6c7f221eacc5e5428a61",
+        "6befca3c278fef6f4548a250fe82fb8e4582d7c2dc5cc84f39282a1ff068dee3",
+        "79e13251f3cdbe32d26b77661253caf64be043a72a9ff2507f2b5e3ee76dd2da",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
