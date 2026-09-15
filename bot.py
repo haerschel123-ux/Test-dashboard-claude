@@ -727,6 +727,21 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
     # sich unter einem neuen Gamertag - postet ueber diesen ganz normalen Feed.
     "alt_account":        {"label": "Alt-Account-Alarm",     "gruppe": "Bot",
                            "emoji": "🔎", "farbe": 0xF39C12},
+    # Verlassene Basen: periodischer Sammelbericht, kein einzelnes Log-Ereignis -
+    # postet ueber diesen Feed via _post_feed, siehe _abandoned_bases_digest.
+    "abandoned_bases":    {"label": "Verlassene Basen",      "gruppe": "Bau",
+                           "emoji": "🏚️", "farbe": 0xA16207},
+}
+
+# Kurztexte je Abandoned-Bases-Regel für die Digest-Zeilen - _tt() braucht
+# eine feste Sprache je Server, nicht die des jeweiligen Discord-Nutzers,
+# darum hier ein einfaches Dict statt _t()/_tt() (Sprache kommt vom Digest-
+# Aufrufer, der aktuell immer Deutsch sendet - siehe _abandoned_bases_digest_for).
+_ABANDONED_GRUND_TEXT = {
+    "builder_inactive": "Erbauer inaktiv",
+    "no_flag": "keine Flagge",
+    "flag_lowered": "Flagge gesenkt",
+    "no_activity": "keine Bauaktivität",
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -4477,6 +4492,8 @@ class DayZBot(discord.Client):
             self.scheduled_tasks_loop.start()
         if not announcement_scheduler.is_running():
             announcement_scheduler.start()
+        if not self.abandoned_bases_digest.is_running():
+            self.abandoned_bases_digest.start()
 
     async def init_nitrado(self, force: bool = False,
                            only: Optional[ServerConnection] = None):
@@ -5094,6 +5111,76 @@ class DayZBot(discord.Client):
     @betreiber_backup.before_loop
     async def _before_betreiber_backup(self):
         await self.wait_until_ready()
+
+    # ── Abandoned Bases: periodischer Sammelbericht ──
+    # Fester Grobtakt (1x/Stunde ueberpruefen); ob wirklich gepostet wird,
+    # entscheidet je Server dessen eigenes "report_every_hours" gegen die
+    # zuletzt gepostete Zeit (conn.data["abandoned_bases_last_digest_at"]).
+    @tasks.loop(hours=1)
+    async def abandoned_bases_digest(self):
+        for conn in connections.all():
+            try:
+                await self._abandoned_bases_digest_for(conn)
+            except Exception as e:  # noqa: BLE001 - ein Kunde darf nie alle anderen stoppen
+                log.error(f"[ABANDONED_BASES] Fehler bei {conn.service_id}: {e}")
+
+    @abandoned_bases_digest.before_loop
+    async def _before_abandoned_bases_digest(self):
+        await self.wait_until_ready()
+
+    async def _abandoned_bases_digest_for(self, conn: ServerConnection):
+        if conn.guild_id is None or not conn.get("abandoned_bases_enabled", False):
+            return
+        intervall_s = max(1, float(conn.get("abandoned_bases_report_every_hours", 24) or 24)) * 3600
+        zuletzt = float(conn.get("abandoned_bases_last_digest_at", 0) or 0)
+        if time.time() - zuletzt < intervall_s:
+            return
+        einstellungen = {
+            "min_parts": conn.get("abandoned_bases_min_parts", 10),
+            "repeat_after_days": conn.get("abandoned_bases_repeat_after_days", 7),
+            "builder_inactive_enabled": conn.get("abandoned_bases_builder_inactive_enabled", True),
+            "builder_inactive_days": conn.get("abandoned_bases_builder_inactive_days", 14),
+            "no_flag_enabled": conn.get("abandoned_bases_no_flag_enabled", True),
+            "no_flag_hours": conn.get("abandoned_bases_no_flag_hours", 48),
+            "flag_lowered_enabled": conn.get("abandoned_bases_flag_lowered_enabled", True),
+            "no_activity_enabled": conn.get("abandoned_bases_no_activity_enabled", True),
+            "no_activity_days": conn.get("abandoned_bases_no_activity_days", 21),
+        }
+        loop = asyncio.get_running_loop()
+        kandidaten = await loop.run_in_executor(
+            None, db.abandoned_bases_kandidaten, conn.service_id, einstellungen)
+        # "Zuletzt gepostet" IMMER fortschreiben, auch ohne Treffer - sonst
+        # wuerde ein Server ohne verlassene Basen jede Stunde neu geprueft.
+        _conn_store(conn, "abandoned_bases_last_digest_at", time.time())
+        if not kandidaten:
+            return
+        try:
+            farbe = int(str(conn.get("abandoned_bases_embed_color") or "A16207").lstrip("#"), 16)
+        except ValueError:
+            farbe = 0xA16207
+        map_name = _aktuelle_karte(conn)
+        zeilen = []
+        gemeldete_ids = []
+        for site in kandidaten[:20]:
+            gemeldete_ids.append(site["site_id"])
+            url = _izurvive_url(site["x"], site["z"], map_name)
+            gruende_text = ", ".join(_ABANDONED_GRUND_TEXT.get(g[0], g[0]) for g in site["gruende"])
+            zeilen.append(f"• [{site['x']:.0f} / {site['z']:.0f}]({url}) – {site['part_count']} Teile\n"
+                         f"  {gruende_text}")
+        rest = len(kandidaten) - 20
+        beschreibung = "\n".join(zeilen)
+        if rest > 0:
+            beschreibung += f"\n\n… und {rest} weitere Standorte."
+        embed = discord.Embed(
+            title="🏚️ Verlassene Basen – Bericht",
+            description=(f"{len(kandidaten)} Standort(e) benötigen eine Prüfung.\n\n{beschreibung}"),
+            color=farbe)
+        embed.set_footer(text="Meldungen sind Prüfhinweise und löschen keine Objekte.")
+        ok_gesendet, _ = await _post_feed(conn.guild_id, "abandoned_bases", embed,
+                                          service_id=conn.service_id)
+        if ok_gesendet:
+            await loop.run_in_executor(
+                None, db.abandoned_bases_als_gemeldet_markieren, conn.service_id, gemeldete_ids)
 
     # ── Auto-Status-Embed (eine Nachricht pro Guild, wird editiert) ──
     @tasks.loop(seconds=180)
@@ -6192,6 +6279,27 @@ class DayZBot(discord.Client):
             for gid_str in ([str(conn.guild_id)] if conn is not None else list(cfg.guilds)):
                 cfg.record_seen_player(int(gid_str), ev["player"],
                                        conn.service_id if conn is not None else None)
+            # Abandoned Bases: "Erbauer inaktiv seit"-Regel braucht die letzte
+            # Onlinezeit JEDES Accounts, nicht nur der mit Alt-Account-Toggel -
+            # deshalb unabhaengig von conn.get("abandoned_bases_enabled") gepflegt.
+            if conn is not None:
+                db.player_seen_now(conn.service_id, ev.get("player_id"))
+        # Abandoned Bases: Bau-/Flaggen-Ereignisse einsortieren, solange das
+        # Modul fuer DIESEN Server aktiv ist. Rein buchend, postet hier nichts -
+        # der Sammelbericht laeuft als eigener periodischer Task.
+        if nebenwirkungen and conn is not None and ev.get("type") == "basebuild" \
+                and conn.get("abandoned_bases_enabled", False):
+            xz = _ev_parse_pos(ev.get("position"))
+            if xz is not None:
+                radius = float(conn.get("abandoned_bases_cluster_radius_m", 60) or 60)
+                aktion = str(ev.get("aktion") or "").lower()
+                if aktion in ("raised", "lowered"):
+                    db.abandoned_bases_record_flag(conn.service_id, xz[0], xz[1],
+                                                   raised=(aktion == "raised"), radius_m=radius)
+                else:
+                    db.abandoned_bases_record_build(
+                        conn.service_id, xz[0], xz[1], ev.get("player_id"),
+                        ev.get("player"), aktion, radius_m=radius)
         # Alt Account Finder: NUR im normalen Event-Pfad (nebenwirkungen=True)
         # und NUR mit bekanntem Server - service_id ist Pflichtteil des
         # DB-Schluessels, ohne conn gaebe es keine sichere Zuordnung. Erkennt
@@ -14001,6 +14109,81 @@ async def api_tools_altaccountfinder_post(request: web.Request) -> web.Response:
     return ok({"enabled": bool(conn.get("alt_account_enabled", False))})
 
 
+def _abandoned_bases_payload(conn: ServerConnection) -> Dict[str, Any]:
+    return {
+        "enabled": bool(conn.get("abandoned_bases_enabled", False)),
+        "builder_inactive_enabled": bool(conn.get("abandoned_bases_builder_inactive_enabled", True)),
+        "builder_inactive_days": int(conn.get("abandoned_bases_builder_inactive_days", 14) or 14),
+        "no_flag_enabled": bool(conn.get("abandoned_bases_no_flag_enabled", True)),
+        "no_flag_hours": int(conn.get("abandoned_bases_no_flag_hours", 48) or 48),
+        "flag_lowered_enabled": bool(conn.get("abandoned_bases_flag_lowered_enabled", True)),
+        "no_activity_enabled": bool(conn.get("abandoned_bases_no_activity_enabled", True)),
+        "no_activity_days": int(conn.get("abandoned_bases_no_activity_days", 21) or 21),
+        "cluster_radius_m": int(conn.get("abandoned_bases_cluster_radius_m", 60) or 60),
+        "min_parts": int(conn.get("abandoned_bases_min_parts", 10) or 10),
+        "report_every_hours": int(conn.get("abandoned_bases_report_every_hours", 24) or 24),
+        "repeat_after_days": int(conn.get("abandoned_bases_repeat_after_days", 7) or 7),
+        "embed_color": str(conn.get("abandoned_bases_embed_color") or "A16207"),
+    }
+
+
+async def api_abandoned_bases_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "abandoned_bases")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("abandoned_bases", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "feeds", "view")
+    if fehler is not None:
+        return fehler
+    return ok(_abandoned_bases_payload(conn))
+
+
+_ABANDONED_INT_FELDER = {
+    "builder_inactive_days": (1, 365), "no_flag_hours": (1, 24 * 30), "no_activity_days": (1, 365),
+    "cluster_radius_m": (5, 1000), "min_parts": (1, 5000),
+    "report_every_hours": (1, 24 * 30), "repeat_after_days": (1, 365),
+}
+
+
+async def api_abandoned_bases_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "abandoned_bases")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("abandoned_bases", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "feeds", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "feeds.abandoned_bases", 10)
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    for schluessel in ("enabled", "builder_inactive_enabled", "no_flag_enabled",
+                      "flag_lowered_enabled", "no_activity_enabled"):
+        if schluessel in data:
+            _conn_store(conn, f"abandoned_bases_{schluessel}", bool(data[schluessel]))
+    for schluessel, (minimum, maximum) in _ABANDONED_INT_FELDER.items():
+        if schluessel in data:
+            try:
+                wert = int(data[schluessel])
+            except (TypeError, ValueError):
+                return err(f"„{schluessel}“ muss eine Zahl sein.")
+            _conn_store(conn, f"abandoned_bases_{schluessel}", max(minimum, min(maximum, wert)))
+    if "embed_color" in data:
+        farbe = str(data["embed_color"] or "").lstrip("#").strip()
+        try:
+            int(farbe, 16)
+        except ValueError:
+            return err("Ungültige Farbe (Hex-Code erwartet, z. B. A16207).")
+        _conn_store(conn, "abandoned_bases_embed_color", farbe.upper())
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Verlassene-Basen-Einstellungen geändert",
+              conn.name)
+    return ok(_abandoned_bases_payload(conn))
+
+
 # ── 9. Types Booster ──────────────────────────────────────────────────────
 def _tool_types_kategorien_lesen(root: Optional[ET.Element]) -> List[str]:
     """Eindeutige Kategorien aus db/types.xml, "" steht fuer "ohne Kategorie" -
@@ -16665,6 +16848,41 @@ class EconomyDB:
                 first_seen REAL NOT NULL,
                 last_seen  REAL NOT NULL,
                 PRIMARY KEY (service_id, account_id, gamertag))""")
+            # Abandoned Bases: Bauereignisse nah beieinander werden zu einem
+            # "Standort" zusammengefasst. site_id ist ein aus den gerundeten
+            # Cluster-Koordinaten gebildeter Text-Schluessel (siehe
+            # _abandoned_bases_site_id), service_id immer Teil des Schluessels.
+            c.execute("""CREATE TABLE IF NOT EXISTS base_sites (
+                service_id       TEXT NOT NULL DEFAULT '',
+                site_id          TEXT NOT NULL,
+                center_x         REAL NOT NULL,
+                center_z         REAL NOT NULL,
+                part_count       INTEGER NOT NULL DEFAULT 0,
+                first_activity_at REAL NOT NULL,
+                last_activity_at  REAL NOT NULL,
+                last_reported_at  REAL,
+                PRIMARY KEY (service_id, site_id))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS base_site_builders (
+                service_id   TEXT NOT NULL DEFAULT '',
+                site_id      TEXT NOT NULL,
+                account_id   TEXT NOT NULL,
+                gamertag     TEXT NOT NULL COLLATE NOCASE,
+                last_build_at REAL NOT NULL,
+                PRIMARY KEY (service_id, site_id, account_id))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS base_site_flags (
+                service_id      TEXT NOT NULL DEFAULT '',
+                site_id         TEXT NOT NULL,
+                last_raised_at  REAL,
+                last_lowered_at REAL,
+                PRIMARY KEY (service_id, site_id))""")
+            # Letzte bekannte Onlinezeit je DayZ-Account - unabhaengig vom Alt
+            # Account Finder gepflegt (der greift nur bei Gamertag-Wechsel),
+            # ausschliesslich fuer die "Erbauer inaktiv seit"-Regel gebraucht.
+            c.execute("""CREATE TABLE IF NOT EXISTS player_last_seen (
+                service_id TEXT NOT NULL DEFAULT '',
+                account_id TEXT NOT NULL,
+                last_seen  REAL NOT NULL,
+                PRIMARY KEY (service_id, account_id))""")
             self._migriere_serverspalten(c)
             c.commit()
 
@@ -17108,6 +17326,170 @@ class EconomyDB:
         return [{"account_id": r["account_id"], "gamertags": str(r["gamertags"]).split("||"),
                 "first_seen": r["first_seen"], "last_seen": r["last_seen"],
                 "anzahl": r["anzahl"]} for r in rows]
+
+    # ── Abandoned Bases ────────────────────────────────────────
+    _ABANDONED_BAU_AKTIONEN = {"placed", "built", "constructed", "attached",
+                              "packed", "folded", "deployed", "mounted"}
+    _ABANDONED_ABBAU_AKTIONEN = {"dismantled", "removed", "unmounted"}
+    # Zaehlt zusaetzlich als Bauaktivitaet (aktualisiert last_activity_at fuer
+    # die "keine Bauaktivitaet"-Regel), erzeugt aber KEIN neues Bauteil -
+    # sonst wuerde eine Reparatur den part_count kuenstlich aufblasen.
+    _ABANDONED_AKTIVITAET_ZUSATZ = {"repaired"}
+
+    def player_seen_now(self, service_id: str, account_id: str) -> None:
+        """Aktualisiert die letzte bekannte Onlinezeit EINES Accounts - fuer
+        die "Erbauer inaktiv seit"-Regel, unabhaengig vom Alt Account Finder."""
+        service_id = str(service_id or "")
+        account_id = str(account_id or "").strip()
+        if not account_id or account_id.lower() == "unbekannt":
+            return
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO player_last_seen (service_id, account_id, last_seen) VALUES (?,?,?) "
+                "ON CONFLICT(service_id, account_id) DO UPDATE SET last_seen=excluded.last_seen",
+                (service_id, account_id, now))
+            self._conn.commit()
+
+    def _abandoned_find_site(self, c: sqlite3.Connection, service_id: str,
+                             x: float, z: float, radius_m: float) -> Optional[str]:
+        """Naechstgelegener bestehender Standort innerhalb des Cluster-Radius,
+        oder None. Bewusst simpel (kein Zusammenfuehren zweier bestehender
+        Standorte) - reicht fuer die hier vorkommenden Basisgroessen."""
+        rows = c.execute(
+            "SELECT site_id, center_x, center_z FROM base_sites WHERE service_id=?",
+            (service_id,)).fetchall()
+        bester = None
+        beste_distanz = radius_m
+        for r in rows:
+            d = ((r["center_x"] - x) ** 2 + (r["center_z"] - z) ** 2) ** 0.5
+            if d <= beste_distanz:
+                bester = r["site_id"]
+                beste_distanz = d
+        return bester
+
+    def abandoned_bases_record_build(self, service_id: str, x: float, z: float,
+                                     account_id: str, gamertag: str, aktion: str,
+                                     radius_m: float) -> None:
+        """Ein Bau-Ereignis in den passenden Standort einsortieren (oder einen
+        neuen anlegen). part_count zaehlt nur objekterzeugende Aktionen -
+        Reparaturen wuerden ihn sonst kuenstlich aufblasen."""
+        service_id = str(service_id or "")
+        account_id = str(account_id or "").strip()
+        aktion = (aktion or "").lower()
+        alle_aktionen = (self._ABANDONED_BAU_AKTIONEN | self._ABANDONED_ABBAU_AKTIONEN
+                        | self._ABANDONED_AKTIVITAET_ZUSATZ)
+        if aktion not in alle_aktionen:
+            return
+        now = time.time()
+        with self._lock:
+            site_id = self._abandoned_find_site(self._conn, service_id, x, z, radius_m)
+            if site_id is None:
+                site_id = uuid.uuid4().hex[:12]
+                self._conn.execute(
+                    "INSERT INTO base_sites (service_id, site_id, center_x, center_z, "
+                    "part_count, first_activity_at, last_activity_at) VALUES (?,?,?,?,0,?,?)",
+                    (service_id, site_id, x, z, now, now))
+            zuwachs = 1 if aktion in self._ABANDONED_BAU_AKTIONEN else 0
+            self._conn.execute(
+                "UPDATE base_sites SET part_count=part_count+?, last_activity_at=? "
+                "WHERE service_id=? AND site_id=?",
+                (zuwachs, now, service_id, site_id))
+            if account_id and account_id.lower() != "unbekannt":
+                self._conn.execute(
+                    "INSERT INTO base_site_builders (service_id, site_id, account_id, gamertag, "
+                    "last_build_at) VALUES (?,?,?,?,?) ON CONFLICT(service_id, site_id, account_id) "
+                    "DO UPDATE SET gamertag=excluded.gamertag, last_build_at=excluded.last_build_at",
+                    (service_id, site_id, account_id, gamertag or account_id, now))
+            self._conn.commit()
+
+    def abandoned_bases_record_flag(self, service_id: str, x: float, z: float,
+                                    raised: bool, radius_m: float) -> None:
+        """Flaggen-Ereignis einem NAHEN, bereits bekannten Standort zuordnen -
+        eine Flagge ganz ohne Bauteile in der Naehe erzeugt keinen Standort."""
+        service_id = str(service_id or "")
+        now = time.time()
+        with self._lock:
+            site_id = self._abandoned_find_site(self._conn, service_id, x, z, radius_m)
+            if site_id is None:
+                return
+            feld = "last_raised_at" if raised else "last_lowered_at"
+            self._conn.execute(
+                f"INSERT INTO base_site_flags (service_id, site_id, {feld}) VALUES (?,?,?) "
+                f"ON CONFLICT(service_id, site_id) DO UPDATE SET {feld}=excluded.{feld}",
+                (service_id, site_id, now))
+            self._conn.commit()
+
+    def abandoned_bases_kandidaten(self, service_id: str, einstellungen: Dict[str, Any]
+                                   ) -> List[Dict[str, Any]]:
+        """Liefert alle Standorte, auf die mindestens eine aktivierte Regel
+        zutrifft und die nicht innerhalb der Wiederholungsfrist bereits
+        gemeldet wurden - sortiert nach laengster Inaktivitaet zuerst."""
+        service_id = str(service_id or "")
+        now = time.time()
+        min_parts = int(einstellungen.get("min_parts", 10))
+        repeat_after_s = float(einstellungen.get("repeat_after_days", 7)) * 86400
+        with self._lock:
+            sites = self._conn.execute(
+                "SELECT * FROM base_sites WHERE service_id=? AND part_count>=?",
+                (service_id, min_parts)).fetchall()
+            ergebnis: List[Dict[str, Any]] = []
+            for s in sites:
+                if s["last_reported_at"] and now - s["last_reported_at"] < repeat_after_s:
+                    continue
+                builder_rows = self._conn.execute(
+                    "SELECT account_id, gamertag, last_build_at FROM base_site_builders "
+                    "WHERE service_id=? AND site_id=?", (service_id, s["site_id"])).fetchall()
+                builders = [dict(r) for r in builder_rows]
+                letzte_online = 0.0
+                for b in builders:
+                    row = self._conn.execute(
+                        "SELECT last_seen FROM player_last_seen WHERE service_id=? AND account_id=?",
+                        (service_id, b["account_id"])).fetchone()
+                    b["last_seen"] = float(row["last_seen"]) if row else 0.0
+                    letzte_online = max(letzte_online, b["last_seen"])
+                flag_row = self._conn.execute(
+                    "SELECT last_raised_at, last_lowered_at FROM base_site_flags "
+                    "WHERE service_id=? AND site_id=?", (service_id, s["site_id"])).fetchone()
+
+                gruende = []
+                if einstellungen.get("builder_inactive_enabled", True) and builders:
+                    grenze_s = float(einstellungen.get("builder_inactive_days", 14)) * 86400
+                    if now - letzte_online >= grenze_s:
+                        gruende.append(("builder_inactive", now - letzte_online))
+                if einstellungen.get("no_flag_enabled", True) and flag_row is None:
+                    grenze_s = float(einstellungen.get("no_flag_hours", 48)) * 3600
+                    if now - s["first_activity_at"] >= grenze_s:
+                        gruende.append(("no_flag", now - s["first_activity_at"]))
+                if (einstellungen.get("flag_lowered_enabled", True) and flag_row is not None
+                        and flag_row["last_lowered_at"] and
+                        (not flag_row["last_raised_at"]
+                         or flag_row["last_raised_at"] < flag_row["last_lowered_at"])):
+                    gruende.append(("flag_lowered", now - flag_row["last_lowered_at"]))
+                if einstellungen.get("no_activity_enabled", True):
+                    grenze_s = float(einstellungen.get("no_activity_days", 21)) * 86400
+                    if now - s["last_activity_at"] >= grenze_s:
+                        gruende.append(("no_activity", now - s["last_activity_at"]))
+
+                if gruende:
+                    ergebnis.append({
+                        "site_id": s["site_id"], "x": s["center_x"], "z": s["center_z"],
+                        "part_count": s["part_count"], "builders": builders,
+                        "gruende": gruende,
+                        "inaktivitaet_sekunden": max(g[1] for g in gruende),
+                    })
+            ergebnis.sort(key=lambda e: e["inaktivitaet_sekunden"], reverse=True)
+            return ergebnis
+
+    def abandoned_bases_als_gemeldet_markieren(self, service_id: str, site_ids: List[str]) -> None:
+        if not site_ids:
+            return
+        now = time.time()
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE base_sites SET last_reported_at=? WHERE service_id=? AND site_id=?",
+                [(now, str(service_id or ""), sid) for sid in site_ids])
+            self._conn.commit()
 
     # ── Casino-Historie ───────────────────────────────────────
     def log_casino(self, guild_id: int, user_id: int, game: str,
@@ -30182,6 +30564,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/spawnpoint", api_tools_spawnpoint_post)
     r.add_get("/api/tools/altaccountfinder", api_tools_altaccountfinder_get)
     r.add_post("/api/tools/altaccountfinder", api_tools_altaccountfinder_post)
+    r.add_get("/api/feeds/abandoned-bases/settings", api_abandoned_bases_get)
+    r.add_post("/api/feeds/abandoned-bases/settings", api_abandoned_bases_post)
 
     # ── Karte / Events ──
     r.add_get("/api/map/meta", api_map_meta)
@@ -30862,6 +31246,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "53e4ad609bb4d57bb0f07e4c050cc88586bcccd3a9d5954af67a669b1a3d49da",
     ),
     "app.js": (
+        "fa03cf05e5cadcc50fb55f078eb3b5cb6ebd60e88e28b8193a1f6b888b8308db",
         "c2a36e8ca74fb9814ebfd5593a9f4aaff0fad6be3e66cd01679705673f21b820",
         "ae5d2c0724cc800275197cbd634aadb4875064b8f28f879d417b1da7f5d09edb",
         "18baefd43bad0dea69057dcaa400f3b39d891e88af9db564e0b1911b9728ed4d",
