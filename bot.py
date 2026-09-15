@@ -26843,6 +26843,60 @@ async def post_ticket_categories(request: web.Request) -> web.Response:
     return ok({"categories": [_ticket_category_payload(conn, k) for k in kategorien]})
 
 
+async def put_ticket_category(request: web.Request) -> web.Response:
+    """Bearbeitet Name und/oder Support-Rollen einer bestehenden Kategorie -
+    bisher liess sich eine Kategorie nur neu anlegen oder komplett loeschen,
+    Rollen nachtraeglich hinzuzufuegen/aendern ging nicht."""
+    conn, fehler = _session_conn(request, "discord_mgmt")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("discord_mgmt", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "discord_mgmt.ticket_categories", 5)
+    if fehler is not None:
+        return fehler
+    try:
+        eintrag_id = int(request.match_info["id"])
+    except (TypeError, ValueError):
+        return err("Ungültige ID.")
+    kategorien = _ticket_categories(conn)
+    eintrag = next((k for k in kategorien if k.get("id") == eintrag_id), None)
+    if eintrag is None:
+        return err("Kategorie nicht gefunden.", 404)
+    data = await body(request)
+
+    label = str(data.get("label") or "").strip()
+    if not label:
+        return err("Bitte einen Namen für die Kategorie angeben.")
+    if len(label) > 80:
+        return err("Der Name darf höchstens 80 Zeichen lang sein (erscheint als Knopf-Beschriftung).")
+    roh_role_ids = data.get("role_ids")
+    if not isinstance(roh_role_ids, list) or not roh_role_ids:
+        return err("Bitte mindestens eine Support-Rolle auswählen.")
+
+    g = bot.get_guild(int(conn.guild_id)) if bot and conn.guild_id else None
+    role_ids: List[str] = []
+    for rid in roh_role_ids:
+        try:
+            rolle = g.get_role(int(rid)) if g is not None else None
+        except (TypeError, ValueError):
+            rolle = None
+        if rolle is None:
+            return err("Eine der ausgewählten Rollen gibt es in deinem Discord-Server nicht.")
+        role_ids.append(str(rid))
+
+    eintrag["label"] = label
+    eintrag["role_ids"] = role_ids
+    _conn_store(conn, "ticket_categories", kategorien)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Ticket-Kategorie geändert",
+              f"{label} · {conn.name}")
+    return ok({"categories": [_ticket_category_payload(conn, k) for k in kategorien]})
+
+
 async def delete_ticket_category(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request, "discord_mgmt")
     if fehler is not None:
@@ -26899,6 +26953,89 @@ async def get_ticket_open(request: web.Request) -> web.Response:
             "created_at": t.get("created_at"),
         })
     return ok({"tickets": ergebnis})
+
+
+async def post_ticket_close(request: web.Request) -> web.Response:
+    """Schliesst UND loescht ein Ticket direkt vom Dashboard aus - fuer den
+    Fall, dass im Kanal selbst niemand mehr auf Schliessen/Loeschen klicken
+    kann oder soll. Baut vorher noch das Transkript und schickt es wie beim
+    normalen Schliessen per DM an den Ersteller sowie (falls eingerichtet)
+    in den Transkript-Channel, bevor der Kanal endgueltig geloescht wird."""
+    conn, fehler = _session_conn(request, "discord_mgmt")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("discord_mgmt", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "discord_mgmt", "delete")
+    if fehler is not None:
+        return fehler
+    try:
+        ticket_id = int(request.match_info["id"])
+    except (TypeError, ValueError):
+        return err("Ungültige Ticket-ID.")
+    eintraege = _ticket_open(conn)
+    ticket = next((t for t in eintraege if int(t.get("id") or 0) == ticket_id), None)
+    if ticket is None:
+        return err("Ticket nicht gefunden.", 404)
+    sprache = _ticket_sprache(conn)
+    g = bot.get_guild(int(conn.guild_id)) if bot and conn.guild_id else None
+    kanal = g.get_channel(int(ticket.get("channel_id") or 0)) if g is not None else None
+    schliesser = "Dashboard (" + _audit_actor(_sess_get(request)) + ")"
+
+    if kanal is not None:
+        try:
+            nachrichten = [m async for m in kanal.history(limit=None, oldest_first=True)]
+        except Exception as e:  # noqa: BLE001
+            nachrichten = []
+            log.debug(f"[TICKET_TOOL] Verlauf konnte beim Dashboard-Schliessen nicht gelesen werden: {e}")
+        transkript = _ticket_transkript_bauen(nachrichten)
+
+        ersteller = g.get_member(int(ticket.get("user_id") or 0)) if g else None
+        if ersteller is not None:
+            try:
+                await ersteller.send(
+                    content=_tt(sprache,
+                              f"📄 Transkript deines Tickets „{kanal.name}“ auf {g.name}.",
+                              f"📄 Transcript of your ticket „{kanal.name}“ on {g.name}."),
+                    file=discord.File(io.BytesIO(transkript), filename=f"transkript-{kanal.name}.txt"))
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log.debug(f"[TICKET_TOOL] Transkript-DM beim Dashboard-Schliessen fehlgeschlagen: {e}")
+
+        protokoll_kanal_id = _ticket_transkript_kanal(conn)
+        protokoll_kanal = g.get_channel(protokoll_kanal_id) if protokoll_kanal_id else None
+        if isinstance(protokoll_kanal, discord.TextChannel):
+            kategorie = next((k for k in _ticket_categories(conn)
+                              if int(k.get("id") or 0) == int(ticket.get("category_id") or 0)), None)
+            protokoll_embed = discord.Embed(
+                title=_tt(sprache, f"Ticket #{ticket.get('id')} geschlossen",
+                         f"Ticket #{ticket.get('id')} closed"),
+                color=0x99AAB5)
+            protokoll_embed.add_field(name=_tt(sprache, "Typ", "Type"),
+                                      value=(kategorie or {}).get("label") or "–", inline=True)
+            protokoll_embed.add_field(
+                name=_tt(sprache, "Erstellt von", "Opened by"),
+                value=ersteller.mention if ersteller else f"<@{ticket.get('user_id')}>", inline=True)
+            protokoll_embed.add_field(name=_tt(sprache, "Geschlossen von", "Closed by"),
+                                      value=schliesser, inline=True)
+            protokoll_embed.timestamp = datetime.now(timezone.utc)
+            try:
+                await protokoll_kanal.send(
+                    embed=protokoll_embed,
+                    file=discord.File(io.BytesIO(transkript), filename=f"ticket-{ticket.get('id')}.txt"))
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log.debug(f"[TICKET_TOOL] Transkript-Post beim Dashboard-Schliessen fehlgeschlagen: {e}")
+
+        try:
+            await kanal.delete(reason=f"Ticket Tool: vom Dashboard geschlossen von {schliesser}")
+        except (discord.Forbidden, discord.NotFound) as e:
+            log.debug(f"[TICKET_TOOL] Kanal beim Dashboard-Schliessen nicht gelöscht: {e}")
+
+    eintraege.remove(ticket)
+    _conn_store(conn, "ticket_open", eintraege)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Ticket geschlossen und gelöscht",
+              f"#{ticket_id} · {conn.name}")
+    return ok({"closed": True})
 
 
 # ══════════════════════════════════════════════════════════════
@@ -29949,10 +30086,12 @@ def build_app() -> web.Application:
     r.add_delete("/api/discord-management/reaction-roles/{id}", delete_reaction_role)
     r.add_get("/api/discord-management/tickets/categories", get_ticket_categories)
     r.add_post("/api/discord-management/tickets/categories", post_ticket_categories)
+    r.add_put("/api/discord-management/tickets/categories/{id}", put_ticket_category)
     r.add_delete("/api/discord-management/tickets/categories/{id}", delete_ticket_category)
     r.add_post("/api/discord-management/tickets/language", post_ticket_language)
     r.add_post("/api/discord-management/tickets/transcript-channel", post_ticket_transcript_channel)
     r.add_get("/api/discord-management/tickets/open", get_ticket_open)
+    r.add_post("/api/discord-management/tickets/open/{id}/close", post_ticket_close)
     # ── Auto-Aufgaben (Scheduled Tasks) ──
     r.add_get("/api/scheduled-tasks", list_scheduled_tasks)
     r.add_post("/api/scheduled-tasks", create_scheduled_task)
@@ -30723,6 +30862,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "53e4ad609bb4d57bb0f07e4c050cc88586bcccd3a9d5954af67a669b1a3d49da",
     ),
     "app.js": (
+        "c2a36e8ca74fb9814ebfd5593a9f4aaff0fad6be3e66cd01679705673f21b820",
         "ae5d2c0724cc800275197cbd634aadb4875064b8f28f879d417b1da7f5d09edb",
         "18baefd43bad0dea69057dcaa400f3b39d891e88af9db564e0b1911b9728ed4d",
         "bf08465dd83ed3a6b858f73892249131b676d049f3e84201b6c2fe56965012f6",
