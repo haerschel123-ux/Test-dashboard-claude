@@ -3072,7 +3072,9 @@ class ServerConnection:
         self.ftp: Optional[FTPManager] = None
         self.parser: Optional[DayZLogParser] = None
         self.shop: Optional[Any] = None
+        self.rentals: Optional[Any] = None
         self._catalog: Optional[Any] = None
+        self._rentals_catalog: Optional[Any] = None
         # Lief die FTP-Auto-Erkennung fuer DIESEN Server schon?
         self.discovered: bool = False
         # FTP-Warnzustand je Server (sonst verschluckt ein Kunde die Warnung
@@ -3139,6 +3141,10 @@ class ServerConnection:
         # blockieren. Lazy erzeugt, weil beim __init__ noch kein Event-Loop
         # laufen muss.
         self._hydrate_lock: Optional[asyncio.Lock] = None
+        # Serialisiert Rental-Schreibzugriffe auf db/events.xml/cfgeventspawns.xml
+        # (Kauf vs. Ablauf-Bereinigung) - lazy aus demselben Grund wie
+        # _hydrate_lock: beim __init__ laeuft noch kein Event-Loop.
+        self._events_lock: Optional[asyncio.Lock] = None
         # Diagnose: Lesezustand getrennt von "FTP-Objekt existiert".
         self.last_read_versuch_ts: float = 0.0
         self.last_read_erfolg_ts: float = 0.0
@@ -3150,6 +3156,12 @@ class ServerConnection:
         if self._hydrate_lock is None:
             self._hydrate_lock = asyncio.Lock()
         return self._hydrate_lock
+
+    @property
+    def events_lock(self) -> asyncio.Lock:
+        if self._events_lock is None:
+            self._events_lock = asyncio.Lock()
+        return self._events_lock
 
     def online_zustand_zuruecksetzen(self, grund: str) -> None:
         """Roster UND alle zugehoerigen Hydrierungs-Felder gemeinsam leeren.
@@ -3292,6 +3304,19 @@ class ServerConnection:
                                         path=str(self.data.get("shop_items_file") or ""))
             self._catalog.load()
         return self._catalog
+
+    @property
+    def rentals_catalog(self) -> "RentalCatalog":
+        """Eigener Miet-Katalog dieses Servers (beim ersten Zugriff geladen).
+
+        Bewusst KEIN gemeinsamer Code mit ``ShopCatalog``: dessen ``load()``/
+        ``rebuild_index()`` verwerfen jeden Eintrag ohne ``classname``/
+        ``classnames`` - ein Rental-Eintrag hat beides nicht.
+        """
+        if self._rentals_catalog is None:
+            self._rentals_catalog = RentalCatalog(self.service_id)
+            self._rentals_catalog.load()
+        return self._rentals_catalog
 
     def masked_token(self) -> str:
         """Token fuer die Anzeige: nur die letzten vier Zeichen bleiben lesbar."""
@@ -4454,6 +4479,8 @@ class DayZBot(discord.Client):
         for verbindung in ziele:
             if verbindung.shop is None and verbindung.ftp is not None:
                 verbindung.shop = ShopManager(self, verbindung)
+            if verbindung.rentals is None and verbindung.ftp is not None:
+                verbindung.rentals = RentalManager(self, verbindung)
         if only is None or only is primary:
             self.shop = primary.shop
 
@@ -4803,6 +4830,11 @@ class DayZBot(discord.Client):
                 # bis der Server per A2S wieder online ist (Mission-Load fertig),
                 # und werden dann sofort entfernt
                 conn.shop.spawn_cleanup(delayed=restart_detected)
+
+            if conn.rentals and (restart_detected or conn.rentals.cleanup_retry_needed):
+                # Miet-Ablauf-Zaehler weiterschalten / abgelaufene Mieten entfernen -
+                # gleiches Task-Muster wie beim Shop-Cleanup direkt darueber.
+                conn.rentals.spawn_cleanup(delayed=restart_detected)
 
             if restart_detected:
                 # Server-Neustart wirft alle Spieler → offene Spielzeit-Sitzungen
@@ -10837,6 +10869,25 @@ async def _tools_datei_lesen(conn: ServerConnection, dateiname: str,
     return await loop.run_in_executor(None, conn.ftp.read_file_ex, pfad)
 
 
+def _tool_datei_lesen_sync(conn: ServerConnection, dateiname: str) -> Tuple[Optional[str], str]:
+    """Wie _tools_datei_lesen, aber KOMPLETT synchron (Pfad-Aufloesung
+    eingeschlossen) - fuer den Aufruf ueber run_in_executor aus dem
+    10-Sekunden-Poll-Takt (siehe RentalManager.on_restart_detected). Ohne das
+    wuerde _mission_datei_pfad's list_dir-Aufruf bei Dateien ohne "/" im Namen
+    (z.B. cfgeventspawns.xml) den Event-Loop fuer ALLE Server blockieren."""
+    pfad = _mission_datei_pfad(conn, dateiname)
+    if not pfad or conn.ftp is None:
+        return None, "kein_mission_ordner"
+    return conn.ftp.read_file_ex(pfad)
+
+
+def _tool_datei_schreiben_sync(conn: ServerConnection, dateiname: str, inhalt: str) -> bool:
+    pfad = _mission_datei_pfad(conn, dateiname)
+    if not pfad or conn.ftp is None:
+        return False
+    return conn.ftp.write_file(pfad, inhalt)
+
+
 async def _tools_json_lesen(conn: ServerConnection, dateiname: str,
                             loop) -> Tuple[Optional[Any], str]:
     inhalt, status = await _tools_datei_lesen(conn, dateiname, loop)
@@ -11151,6 +11202,110 @@ def _tool_write_event_zones(text: str, name: str, zones: List[Dict[str, Any]]) -
                   f'x="{_tool_fmt_zahl(z["x"])}" y="{_tool_fmt_zahl(z.get("y", 0))}" '
                   f'z="{_tool_fmt_zahl(z["z"])}"/>' + nl)
     block = re.sub(r'([ \t]*)</event\s*>$', lambda m: lines + m.group(1) + "</event>", block)
+    return text[:found["start"]] + block + text[found["end"]:]
+
+
+# ── Shop-Rentals: eigene, schlanke Event-Helfer ──────────────────────────
+# Bewusst KEINE Erweiterung von _tool_upsert_eventspawns/_tool_write_event_zones:
+# beide bauen ihre <pos>/<zone>-Zeilen aus festen, eigenen Feldern und werden
+# von Event-Vorlagen/Vehicle-Builder/Zombie-Horden wiederverwendet - ein Umbau
+# dort haette y/group (bzw. rohen Zonen-Text) beim naechsten Speichern in
+# diesen Tools stillschweigend wieder entfernt. Rentals bekommen deshalb eigene
+# Schreibfunktionen; Loeschen laeuft weiterhin ueber die vorhandenen generischen
+# _tool_delete_event/_tool_delete_eventspawns (entfernen den ganzen Block).
+_RENTAL_EVENT_PREFIX = "RENT_"
+_RENTAL_MAX_EVENT_XML = 1000
+
+
+def _tool_rental_event_name() -> str:
+    return f"{_RENTAL_EVENT_PREFIX}{uuid.uuid4().hex[:10]}"
+
+
+def _tool_rental_xml_validieren(roh: str, erwartetes_tag: str) -> Tuple[Optional[str], Optional[str]]:
+    """Prüft einen vom Admin eingegebenen XML-Ausschnitt (Event- oder
+    Zonen-Vorlage): muss genau EIN Element mit dem erwarteten Tag sein, ohne
+    DTD/Kommentar/Processing-Instruction/CDATA (schützt vor XXE und kaputten
+    Dateien - gleiche Regel wie beim Referenz-Dashboard, an dem sich dieses
+    Formular orientiert). Gibt (bereinigter_text, None) oder (None,
+    fehlermeldung) zurück."""
+    text = (roh or "").strip()
+    if not text:
+        return None, "Darf nicht leer sein."
+    if len(text) > _RENTAL_MAX_EVENT_XML:
+        return None, f"Höchstens {_RENTAL_MAX_EVENT_XML} Zeichen erlaubt."
+    for muster in ("<!--", "<![CDATA[", "<!DOCTYPE", "<?"):
+        if muster in text:
+            return None, "Keine Kommentare, CDATA, DTD oder Processing Instructions erlaubt."
+    if not text.startswith(f"<{erwartetes_tag}"):
+        return None, f'Muss mit "<{erwartetes_tag}" beginnen.'
+    try:
+        el = ET.fromstring(text)
+    except ET.ParseError as e:
+        return None, f"Kein gültiges XML: {e}"
+    if el.tag != erwartetes_tag:
+        return None, f'Das Wurzel-Element muss "{erwartetes_tag}" heißen.'
+    return text, None
+
+
+def _tool_rental_event_umbenennen(event_xml: str, neuer_name: str) -> str:
+    """Schreibt den name="..."-Wert des Wurzel-<event> auf die neu erzeugte
+    Instanz-ID um - VOR dem Einfügen, sonst findet _tool_finde_benannten_block
+    den Block beim Ablauf unter dem alten Vorlagen-Namen nicht mehr wieder
+    (und mehrere Käufe derselben Vorlage würden sich gegenseitig überschreiben)."""
+    return re.sub(r'(<event\b[^>]*\bname=)(["\'])[^"\']*\2',
+                  lambda m: m.group(1) + m.group(2) + neuer_name + m.group(2),
+                  event_xml, count=1)
+
+
+def _tool_rental_event_einfuegen(text: str, name: str, event_xml: str) -> str:
+    """Fügt die (bereits umbenannte) Event-Vorlage in db/events.xml ein. Wirft
+    ValueError, wenn kein </events> gefunden wird (falsche Datei) - vom
+    Aufrufer abzufangen."""
+    return _tool_benannten_block_ersetzen(text, "events", "event", name, event_xml)
+
+
+def _tool_rental_pos_schreiben(text: str, name: str, x: float, z: float,
+                               y: Optional[float] = None, a: Optional[float] = None,
+                               gruppe: Optional[str] = None,
+                               zone_xml: Optional[str] = None) -> str:
+    """Schreibt genau EINE <pos>-Zeile (+ optional eine rohe <zone>-Zeile aus
+    der Vorlage) in den <event name="...">-Block von cfgeventspawns.xml.
+    y/gruppe/zone_xml nur, wenn gesetzt - _tool_fmt_zahl(0) liefert "0", ein
+    unbedingtes Mitschreiben würde also y="0" auf Positionen erzeugen, die das
+    nie hatten. `a` wird immer geschrieben (Default 0) - in allen echten
+    cfgeventspawns.xml-Beispielen, die für dieses Projekt geprüft wurden, war
+    "a" nie weggelassen."""
+    text, found, block = _tool_ensure_spawn_event_block(text, name)
+    nl = _tool_eol(text)
+    teile = [f'x="{_tool_fmt_zahl(x)}"']
+    if y is not None:
+        teile.append(f'y="{_tool_fmt_zahl(y)}"')
+    teile.append(f'z="{_tool_fmt_zahl(z)}"')
+    teile.append(f'a="{_tool_fmt_zahl(a if a is not None else 0)}"')
+    if gruppe:
+        teile.append(f'group="{_tool_esc_xml(gruppe)}"')
+    zeile = f'        <pos {" ".join(teile)}/>' + nl
+    if zone_xml:
+        zeile += "        " + zone_xml.strip() + nl
+    block = re.sub(r'([ \t]*)</event\s*>$', lambda m: zeile + m.group(1) + "</event>", block)
+    return text[:found["start"]] + block + text[found["end"]:]
+
+
+def _tool_rental_lifetime_kuerzen(text: str, name: str, sekunden: int = 30) -> str:
+    """Stufe 1 des zweistufigen Ablaufs: <lifetime> in db/events.xml auf einen
+    kurzen Wert setzen und flags deletable="1" erzwingen, statt den Block
+    sofort zu löschen - DayZs eigene Aufräum-Logik soll das bereits gespawnte
+    Objekt in dieser Zeit als abgelaufen einstufen und entfernen. Wirft
+    ValueError, wenn der Event-Block nicht (mehr) existiert."""
+    found = _tool_finde_benannten_block(text, "event", name)
+    if not found:
+        raise ValueError(f'Event "{name}" nicht in events.xml gefunden.')
+    block = found["block"]
+    block = re.sub(r'(<lifetime\s*>)[^<]*(</lifetime\s*>)',
+                   lambda m: f"{m.group(1)}{sekunden}{m.group(2)}", block, count=1)
+    if re.search(r'<flags\b', block):
+        block = re.sub(r'(<flags\b[^>]*\bdeletable=)(["\'])[^"\']*\2',
+                       lambda m: f'{m.group(1)}{m.group(2)}1{m.group(2)}', block, count=1)
     return text[:found["start"]] + block + text[found["end"]:]
 
 
@@ -12734,7 +12889,11 @@ def _tool_events_liste(root: Optional[ET.Element], nur_zombies: bool = False,
         return namen
     for ev in root.findall("event"):
         name = ev.get("name")
-        if not name:
+        if not name or name.startswith(_RENTAL_EVENT_PREFIX):
+            # Miet-Events gehoeren dem Rental-System (eigene Ablauf-Logik ueber
+            # Neustarts) - hier auftauchend liesse sie ein Admin versehentlich
+            # im Event-Vorlagen-/Fahrzeug-Builder-Tool bearbeiten oder loeschen,
+            # ohne dass die zugehoerige Miet-Zeile in der DB davon erfaehrt.
             continue
         kinder = ev.findall("./children/child")
         typen = [c.get("type", "") for c in kinder]
@@ -16242,6 +16401,29 @@ class EconomyDB:
                 status       TEXT DEFAULT 'pending',
                 created_at   REAL,
                 delivered_at REAL)""")
+            # Miet-Items (Shop-Rentals): eigener Neustart-Ablauf-Zähler je Kauf.
+            # event_name ist die eindeutige Instanz-ID des Events/der Position
+            # in db/events.xml + cfgeventspawns.xml (nicht der Katalog-Name der
+            # Vorlage - mehrere Käufe derselben Vorlage brauchen eigene IDs).
+            # status: 'active' (läuft) -> 'expiring' (Stufe 1: lifetime gekürzt,
+            # wartet auf den nächsten Neustart) -> 'removed' (Stufe 2: Event +
+            # Position gelöscht). pos_group NICHT "group" - SQL-Schlüsselwort.
+            c.execute("""CREATE TABLE IF NOT EXISTS rentals (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id         TEXT NOT NULL DEFAULT '',
+                guild_id           INTEGER NOT NULL,
+                user_id            INTEGER NOT NULL,
+                user_name          TEXT,
+                item_name          TEXT,
+                event_name         TEXT NOT NULL UNIQUE,
+                x REAL, y REAL, z REAL, a REAL,
+                pos_group          TEXT,
+                restarts_total     INTEGER NOT NULL,
+                restarts_remaining INTEGER NOT NULL,
+                status             TEXT DEFAULT 'active',
+                expires_at         REAL,
+                created_at         REAL,
+                removed_at         REAL)""")
             c.execute("""CREATE TABLE IF NOT EXISTS casino_history (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 guild_id   INTEGER,
@@ -16628,6 +16810,64 @@ class EconomyDB:
             self._conn.executemany(
                 "UPDATE purchases SET status='delivered', delivered_at=? WHERE id=?",
                 [(now, i) for i in ids])
+            self._conn.commit()
+
+    # ── Shop-Rentals ────────────────────────────────────────────
+    def create_rental(self, service_id: str, guild_id: int, user_id: int,
+                      user_name: str, item_name: str, event_name: str,
+                      x: float, y: Optional[float], z: float, a: Optional[float],
+                      pos_group: Optional[str], restarts: int,
+                      expires_at: Optional[float]) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO rentals
+                   (service_id, guild_id, user_id, user_name, item_name, event_name,
+                    x, y, z, a, pos_group, restarts_total, restarts_remaining,
+                    status, expires_at, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?)""",
+                (str(service_id or ""), guild_id, user_id, user_name, item_name,
+                 event_name, x, y, z, a, pos_group, restarts, restarts,
+                 expires_at, time.time()))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def active_rentals(self, guild_id: int, service_id: str) -> List[sqlite3.Row]:
+        """Aktive/ablaufende Mieten EINES Servers - wie pending_purchases immer
+        nach guild_id UND service_id gefiltert, ohne Rückfall auf einen
+        leeren service_id-Altbestand (den gibt es bei einer neuen Tabelle
+        nicht, ein solcher Rückfall würde nur ein Leck zwischen Kunden öffnen)."""
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT * FROM rentals WHERE status IN ('active','expiring') "
+                "AND guild_id=? AND service_id=? ORDER BY id",
+                (int(guild_id), str(service_id or ""))).fetchall())
+
+    def rental_decrement(self, rental_id: int, restarts_remaining: int):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE rentals SET restarts_remaining=? WHERE id=?",
+                (restarts_remaining, rental_id))
+            self._conn.commit()
+
+    def rental_set_expiring(self, rental_id: int):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE rentals SET status='expiring', restarts_remaining=0 WHERE id=?",
+                (rental_id,))
+            self._conn.commit()
+
+    def rental_set_removed(self, rental_id: int):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE rentals SET status='removed', removed_at=? WHERE id=?",
+                (time.time(), rental_id))
+            self._conn.commit()
+
+    def rental_delete(self, rental_id: int):
+        """Nur für den Kauf-Rollback (Schreibvorgang fehlgeschlagen) - die
+        Zeile darf dann nie entstanden sein, nicht nur 'removed' markiert."""
+        with self._lock:
+            self._conn.execute("DELETE FROM rentals WHERE id=?", (rental_id,))
             self._conn.commit()
 
     # ── Casino-Historie ───────────────────────────────────────
@@ -17511,6 +17751,193 @@ class ShopManager:
             embed.set_footer(text=f"Purchase #{r['id']}")
             await _post_feed(int(r["guild_id"]), "shop_log", embed,
                              service_id=self.conn.service_id)
+
+
+class RentalManager:
+    """Verwaltet den Neustart-Ablauf gemieteter Events (siehe RentalCatalog)
+    für EINEN Server. Analog zu ShopManager (Task-Muster, cleanup_retry_needed),
+    aber gegen db/events.xml + cfgeventspawns.xml statt cfgEffectArea.json,
+    und mit einem echten Neustart-ZÄHLER je Miete statt einer einmaligen
+    Auslieferung.
+
+    Zweistufige Entfernung bei Ablauf, weil ein geloeschtes Event nur
+    verhindert, dass DayZ das Objekt NACHspawnt - das bereits stehende
+    Fahrzeug wird dadurch nicht zwangslaeufig entfernt:
+      Stufe 1 ('expiring'): <lifetime> kurz setzen + deletable="1" erzwingen,
+               damit DayZs eigene Aufraeum-Logik das Objekt als abgelaufen
+               einstuft, WARTET einen weiteren Neustart ab.
+      Stufe 2 ('removed'):  Event- und Positions-Block ganz entfernen.
+    Muss vor dem produktiven Einsatz an einem echten Server verifiziert
+    werden (siehe Plan „Offenes Risiko") - ob Stufe 1 das Objekt wirklich
+    entfernt, ist eine DayZ-Engine-Frage, kein Code-Fakt.
+    """
+
+    LIFETIME_KURZ_SEKUNDEN = 30
+
+    def __init__(self, bot_ref: "DayZBot", conn: "ServerConnection"):
+        self.bot = bot_ref
+        self.conn = conn
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self.cleanup_retry_needed = False
+
+    def spawn_cleanup(self, delayed: bool = False):
+        """Startet on_restart_detected als Task – nie fire-and-forget, gleiches
+        Schutzmuster wie ShopManager.spawn_cleanup gegen doppeltes Anstoßen."""
+        if self._cleanup_task and not self._cleanup_task.done():
+            return
+        self._cleanup_task = asyncio.create_task(self._cleanup_safe(delayed))
+
+    async def _cleanup_safe(self, delayed: bool = False):
+        try:
+            await self.on_restart_detected(delayed)
+        except Exception as e:
+            log.error(f"[RENTAL] Ablauf-Bereinigung fehlgeschlagen: {e}")
+            self.cleanup_retry_needed = True
+
+    async def _wait_for_server_online(self) -> bool:
+        """Wie ShopManager._wait_for_server_online: db/events.xml wird beim
+        Mission-Init gelesen, ein zu frühes Schreiben wirkt erst den
+        übernächsten Neustart."""
+        ip = str(self.conn.get("server_ip") or "").split(":")[0].strip()
+        qport = int(self.conn.get("query_port", 0) or 0)
+        if not ip or not qport:
+            return False
+        max_wait = max(60, int(self.conn.get("delivery_online_wait_max_seconds", 2700) or 2700))
+        deadline = time.time() + max_wait
+        loop = asyncio.get_running_loop()
+        while time.time() < deadline:
+            info = await loop.run_in_executor(None, a2s_query, ip, qport)
+            if info:
+                return True
+            await asyncio.sleep(20)
+        return False
+
+    async def on_restart_detected(self, delayed: bool = False):
+        """Vom Log-Poller nach einem erkannten Server-Neustart aufgerufen.
+        Zählt jede aktive Miete einen Neustart herunter und treibt die
+        zweistufige Entfernung abgelaufener Mieten voran."""
+        self.cleanup_retry_needed = False
+        rows = db.active_rentals(self.conn.guild_id or 0, self.conn.service_id)
+        if not rows:
+            return
+        if delayed:
+            await self._wait_for_server_online()
+        if self.conn.ftp is None or not _mission_dir_of(self.conn):
+            self.cleanup_retry_needed = True
+            return
+
+        loop = asyncio.get_running_loop()
+        ev_text, ev_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, self.conn, "db/events.xml")
+        sp_text, sp_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, self.conn, "cfgeventspawns.xml")
+        if ev_status != "ok" or sp_status != "ok":
+            log.error("[RENTAL] events.xml/cfgeventspawns.xml nicht lesbar – "
+                      "Ablauf-Bereinigung wird beim nächsten Poll erneut versucht.")
+            self.cleanup_retry_needed = True
+            return
+
+        neu_ev, neu_sp = ev_text, sp_text
+        datei_aenderung_noetig = False
+        # Erst ALLE Text-Transformationen im Speicher berechnen und sammeln,
+        # welche DB-Uebergaenge von einem Schreiberfolg abhaengen - committet
+        # wird an der DB erst NACH bestaetigtem Schreiberfolg, sonst laufen
+        # Zaehler und Datei auseinander (siehe Plan „Hook in die
+        # Neustart-Erkennung" - genau dieser Fehler wurde per Test gefunden:
+        # ein fehlgeschlagener Schreibvorgang darf den Status nicht trotzdem
+        # auf 'expiring'/'removed' setzen).
+        ausstehend: List[Tuple[str, int, Optional[int]]] = []
+        jetzt = time.time()
+        for r in rows:
+            rid = int(r["id"])
+            name = str(r["event_name"])
+            uebrig = int(r["restarts_remaining"]) - 1
+            zu_alt = bool(r["expires_at"]) and jetzt > float(r["expires_at"])
+            try:
+                if r["status"] == "expiring":
+                    # Stufe 2: ein weiterer Neustart seit Stufe 1 ist vergangen.
+                    neu_ev, _ = _tool_delete_event(neu_ev, name)
+                    neu_sp, _ = _tool_delete_eventspawns(neu_sp, name)
+                    ausstehend.append(("removed", rid, None))
+                    datei_aenderung_noetig = True
+                elif uebrig <= 0 or zu_alt:
+                    # Stufe 1: Lifetime kuerzen + deletable erzwingen, Status
+                    # 'expiring' - Stufe 2 folgt beim naechsten Neustart.
+                    neu_ev = _tool_rental_lifetime_kuerzen(
+                        neu_ev, name, self.LIFETIME_KURZ_SEKUNDEN)
+                    ausstehend.append(("expiring", rid, None))
+                    datei_aenderung_noetig = True
+                else:
+                    ausstehend.append(("decrement", rid, uebrig))
+            except ValueError:
+                # Block schon nicht mehr vorhanden (z.B. von Hand gelöscht) -
+                # unabhängig vom Schreibergebnis dieses Zyklus als entfernt
+                # verbuchen, für diese Zeile gibt es ohnehin nichts zu schreiben.
+                db.rental_set_removed(rid)
+
+        if not datei_aenderung_noetig:
+            # Nur Zaehler-Updates, keine Datei-Aenderung noetig - kein
+            # Schreibrisiko, direkt committen.
+            for _, rid, wert in ausstehend:
+                db.rental_decrement(rid, wert)
+            return
+
+        ok_ev = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, self.conn, "db/events.xml", neu_ev)
+        ok_sp = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, self.conn, "cfgeventspawns.xml", neu_sp)
+        if not (ok_ev and ok_sp):
+            log.error("[RENTAL] events.xml/cfgeventspawns.xml konnten nicht gespeichert "
+                      "werden – automatischer neuer Versuch beim nächsten Poll-Zyklus.")
+            self.cleanup_retry_needed = True
+            return   # NICHTS in der DB ändern - der nächste Versuch wiederholt alles
+
+        for aktion, rid, wert in ausstehend:
+            if aktion == "decrement":
+                db.rental_decrement(rid, wert)
+            elif aktion == "expiring":
+                db.rental_set_expiring(rid)
+            else:
+                db.rental_set_removed(rid)
+                zeile = next((r for r in rows if int(r["id"]) == rid), None)
+                if zeile is not None:
+                    await self._melde_ablauf(zeile)
+
+    async def check_orphans(self) -> Dict[str, Any]:
+        """Diagnose für /shop check: findet RENT_-Events in den Dateien ohne
+        aktive DB-Zeile (z.B. weil ein Admin einen Block trotz des Filters in
+        _tool_events_liste doch von Hand über die API gelöscht hat). Meldet
+        nur, räumt NICHT automatisch auf - anders als ShopManager.sweep_orphans
+        lässt sich ein Fahrzeug-Event nicht gefahrlos aus dem Nichts
+        rekonstruieren, dafür fehlen die Positionsdaten außerhalb der DB."""
+        report: Dict[str, Any] = {"active": 0, "orphaned_events": 0, "status": "ok"}
+        rows = db.active_rentals(self.conn.guild_id or 0, self.conn.service_id)
+        report["active"] = len(rows)
+        valid = {str(r["event_name"]) for r in rows}
+        loop = asyncio.get_running_loop()
+        ev_text, ev_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, self.conn, "db/events.xml")
+        if ev_status != "ok":
+            report["status"] = ev_status
+            return report
+        try:
+            root = ET.fromstring(ev_text)
+        except ET.ParseError:
+            report["status"] = "kaputt"
+            return report
+        gefunden = {ev.get("name") for ev in root.findall("event")
+                   if str(ev.get("name") or "").startswith(_RENTAL_EVENT_PREFIX)}
+        report["orphaned_events"] = len(gefunden - valid)
+        return report
+
+    async def _melde_ablauf(self, row: sqlite3.Row):
+        embed = discord.Embed(
+            title="🚗 Miete abgelaufen",
+            description=f"**{row['item_name']}** von <@{row['user_id']}> wurde entfernt.",
+            color=0xE67E22)
+        embed.set_footer(text=f"Miete #{row['id']}")
+        await _post_feed(int(row["guild_id"]), "shop_log", embed,
+                         service_id=str(row["service_id"] or self.conn.service_id))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -18691,6 +19118,85 @@ async def cmd_blackjack(interaction: discord.Interaction, bet: app_commands.Rang
 
 
 # ══════════════════════════════════════════════════════════════
+#  SHOP-RENTALS – Miet-Katalog (Vorlagen für /shop buy rental)
+# ══════════════════════════════════════════════════════════════
+class RentalCatalog:
+    """Miet-Katalog **eines** Nitrado-Servers, eigene Datei
+    ``shop_rentals_<service_id>.json``.
+
+    Bewusst KEINE gemeinsame Basis mit ``ShopCatalog``: dessen ``load()``
+    verwirft jeden Eintrag ohne ``classname``/``classnames`` - ein
+    Rental-Eintrag hat statt eines Classnamens ein rohes ``event_xml``, würde
+    also beim Laden über ``ShopCatalog`` sofort wieder verschwinden.
+    """
+
+    def __init__(self, service_id: str = ""):
+        self.service_id = str(service_id or "")
+        self.items: List[Dict] = []
+        self._by_key: Dict[str, Dict] = {}
+        # (suchtext, label, value, enabled) – wie ShopCatalog._ac_index, für
+        # das Autocomplete von /shop buy rental.
+        self._ac_index: List[Tuple[str, str, str, bool]] = []
+
+    @property
+    def path(self) -> str:
+        if self.service_id:
+            return f"shop_rentals_{self.service_id}.json"
+        return "shop_rentals.json"
+
+    def load(self):
+        items: Optional[List[Dict]] = None
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                cand = data.get("items") if isinstance(data, dict) else data
+                if isinstance(cand, list):
+                    items = cand
+            except Exception as e:  # noqa: BLE001
+                log.error(f"[RENTAL] {self.path} unlesbar ({e}).")
+        self.items = [it for it in (items or []) if isinstance(it, dict) and it.get("name")]
+        self.rebuild_index()
+
+    def rebuild_index(self):
+        self._by_key.clear()
+        self._ac_index = []
+        for it in self.items:
+            name = str(it.get("name") or "")
+            if not name:
+                continue
+            self._by_key[name.lower()] = it
+            enabled = bool(it.get("enabled", True))
+            flag = "" if enabled else "🚫 "
+            preis = int(it.get("price_per_restart", 0))
+            label = f"{flag}{name} – {preis:,}/Neustart ({it.get('category', 'Misc')})"
+            self._ac_index.append((name.lower(), label[:100], name[:100], enabled))
+
+    def find(self, key: str) -> Optional[Dict]:
+        return self._by_key.get(str(key or "").strip().lower())
+
+    def save(self) -> bool:
+        data: Dict[str, Any] = {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            pass
+        data["items"] = self.items
+        data["_updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.rebuild_index()
+            return True
+        except Exception as e:
+            log.error(f"[RENTAL] Konnte {self.path} nicht speichern: {e}")
+            return False
+
+
+# ══════════════════════════════════════════════════════════════
 #  SHOP-COMMANDS – /shop list|pending|cleanup|setprice und /buy
 # ══════════════════════════════════════════════════════════════
 class ShopCatalog:
@@ -19245,6 +19751,18 @@ async def shop_check(interaction: discord.Interaction, server: Optional[str] = N
                 "beim nächsten (manuellen/geplanten) Server-Neustart.",
                 "`auto_restart_after_purchase` is **off** – items only spawn "
                 "at the next (manual/scheduled) server restart."), inline=False)
+    if _conn.rentals:
+        rentals_rep = await _conn.rentals.check_orphans()
+        if rentals_rep.get("status") == "ok":
+            verwaist = rentals_rep.get("orphaned_events", 0)
+            embed.add_field(name="🚗 Rentals", value=_t(
+                interaction,
+                f"{rentals_rep.get('active', 0)} aktiv" +
+                (f" · ⚠️ {verwaist} verwaist (Event ohne DB-Eintrag)" if verwaist else ""),
+                f"{rentals_rep.get('active', 0)} active" +
+                (f" · ⚠️ {verwaist} orphaned (event without DB row)" if verwaist else "")),
+                inline=False)
+
     last = rep.get("last_restart_at") or 0
     embed.set_footer(text=_t(
         interaction,
@@ -19289,6 +19807,293 @@ shop_pending.autocomplete("server")(_server_autocomplete)
 shop_cleanup.autocomplete("server")(_server_autocomplete)
 shop_check.autocomplete("server")(_server_autocomplete)
 shop_enable.autocomplete("server")(_server_autocomplete)
+
+
+# ══════════════════════════════════════════════════════════════
+#  SHOP-RENTALS – /shop rentals, /shop buy rental
+#  /shop list kann kein Unterkommando "rental" bekommen: "list" ist selbst
+#  bereits ein Unterkommando von shop_group, Discord erlaubt keine Mischung
+#  aus Unterkommando und Untergruppe unter demselben Namen. Deshalb ein
+#  eigenständiges "/shop rentals". "buy" existiert unter shop_group dagegen
+#  noch nicht (das bestehende /buy ist ein SEPARATES Top-Level-Kommando) und
+#  kann als neue Untergruppe angelegt werden.
+# ══════════════════════════════════════════════════════════════
+async def _rental_buy_autocomplete(interaction: discord.Interaction,
+                                   current: str) -> List[app_commands.Choice[str]]:
+    conns = _ac_conns(interaction)
+    if not conns:
+        return []
+    mehrere = len(conns) > 1
+    cur = current.strip().lower()
+    out: List[app_commands.Choice] = []
+    gesehen = set()
+    for c in conns:
+        cat = c.rentals_catalog
+        for search, label, value, enabled in cat._ac_index:
+            if not enabled:
+                continue
+            if cur and cur not in search:
+                continue
+            if value in gesehen:
+                continue
+            gesehen.add(value)
+            out.append(app_commands.Choice(
+                name=f"{label} – {c.name}"[:100] if mehrere else label, value=value))
+            if len(out) >= 25:
+                return out
+    return out
+
+
+@shop_group.command(name="rentals", description="🚗 Show the rental catalog (vehicles etc. available to rent)")
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_rentals_cmd(interaction: discord.Interaction, server: Optional[str] = None):
+    _conn, _fehler = _conn_waehlen(interaction, server)
+    if _conn is None:
+        return await interaction.response.send_message(
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
+    items = [it for it in _conn.rentals_catalog.items if it.get("enabled", True)]
+    if not items:
+        return await interaction.response.send_message(_t(
+            interaction, "🚗 Aktuell sind keine Miet-Items verfügbar.",
+            "🚗 No rental items are currently available."), ephemeral=True)
+    lines = []
+    for it in sorted(items, key=lambda i: str(i.get("name", ""))):
+        preis = _fmt_money(int(it.get("price_per_restart", 0)))
+        mn, mx = int(it.get("min_restarts", 1)), int(it.get("max_restarts", 1))
+        lines.append(f"**{it['name']}** — {preis}/{_t(interaction, 'Neustart', 'restart')} · "
+                     f"{mn}–{mx} {_t(interaction, 'Neustarts', 'restarts')} · "
+                     f"{it.get('category', 'Vehicle')}")
+    embed = discord.Embed(
+        title=_t(interaction, "🚗 Miet-Katalog", "🚗 Rental Catalog"),
+        description="\n".join(lines), color=0x5865F2)
+    embed.set_footer(text=_t(
+        interaction, "Mieten mit /shop buy rental <item> <restarts> <x> <z>",
+        "Rent with /shop buy rental <item> <restarts> <x> <z>"))
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+shop_rentals_cmd.autocomplete("server")(_server_autocomplete)
+
+
+shop_buy_group = app_commands.Group(name="buy", description="Buy something from the shop",
+                                    parent=shop_group)
+
+
+@shop_buy_group.command(name="rental",
+                        description="🚗 Rent a vehicle/object – spawns at your coordinates for N restarts")
+@app_commands.describe(
+    item="Rental item name (pick from the autocomplete list)",
+    restarts="How many server restarts the rental lasts",
+    x="iZurvive X coordinate (East – the FIRST number on iZurvive)",
+    z="iZurvive Y coordinate (North – the SECOND number on iZurvive)",
+    y="Height / altitude (OPTIONAL)",
+    a="Rotation in degrees (OPTIONAL)",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_buy_rental(interaction: discord.Interaction, item: str,
+                          restarts: app_commands.Range[int, 1], x: float, z: float,
+                          y: Optional[float] = None, a: Optional[float] = None,
+                          server: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    gid, uid = interaction.guild_id, interaction.user.id
+
+    # ── 1. Server EINMAL auflösen – Katalog, Lieferung und Ablauf müssen
+    #       zwingend derselbe Server sein (gleicher Grund wie bei /buy).
+    _conn, _fehler = _conn_waehlen(interaction, server)
+    if _conn is None:
+        return await interaction.response.send_message(
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
+    katalog = _conn.rentals_catalog
+    it = katalog.find(item)
+    if not it or not it.get("enabled", True):
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Miet-Item `{item}` ist nicht verfügbar. `/shop rentals` zeigt den Katalog.",
+            f"❌ Rental item `{item}` is not available. Use `/shop rentals` to see the catalog."),
+            ephemeral=True)
+
+    # ── 1b. Rollen-Beschränkung zuerst (leer = alle dürfen) ───
+    noetig = _rollen_aus_daten(it.get("role_ids"))
+    if noetig and not (isinstance(interaction.user, discord.Member)
+                       and _member_has_role_ids(interaction.user, noetig)):
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Du hast nicht die erforderliche Rolle, um **{it['name']}** zu mieten.\n"
+            "Benötigt wird: " + ", ".join(f"<@&{r}>" for r in noetig),
+            f"❌ You don't have the required role to rent **{it['name']}**.\n"
+            "Required: " + ", ".join(f"<@&{r}>" for r in noetig)),
+            ephemeral=True)
+
+    min_r, max_r = int(it.get("min_restarts", 1)), int(it.get("max_restarts", 1))
+    if not (min_r <= restarts <= max_r):
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ **{it['name']}** kann für {min_r}–{max_r} Neustarts gemietet werden.",
+            f"❌ **{it['name']}** can be rented for {min_r}-{max_r} restarts."), ephemeral=True)
+
+    # ── 2. Koordinaten validieren (iZurvive: x=Ost, z=Nord) ───
+    if not (0.0 <= x <= 20000.0 and 0.0 <= z <= 20000.0):
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Koordinaten außerhalb der Map. Gib die beiden iZurvive-Zahlen als "
+            "`x` (Ost) und `z` (Nord) an, z. B. `x: 4640` `z: 10350`.",
+            "❌ Coordinates out of range. Enter the two iZurvive numbers as "
+            "`x` (East) and `z` (North), e.g. `x: 4640` `z: 10350`."), ephemeral=True)
+
+    # ── 3. Preis prüfen (Vorprüfung, Abbuchung erst nach FTP-Erfolg) ──
+    total = int(it.get("price_per_restart", 0)) * int(restarts)
+    wallet, _bank = db.get_balance(gid, uid)
+    if wallet < total:
+        return await interaction.response.send_message(
+            embed=_insufficient_embed(total, wallet), ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    if _conn.api is None or _conn.ftp is None:
+        return await interaction.followup.send(_t(
+            interaction,
+            "❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn kann nichts "
+            "ausgeliefert werden.\nBitte wende dich an den Bot-Betreiber.",
+            "❌ This server is missing FTP access – without it nothing "
+            "can be delivered.\nPlease contact the bot operator."), ephemeral=True)
+    if not _conn.rentals or not _mission_dir_of(_conn):
+        return await interaction.followup.send(_t(
+            interaction,
+            "❌ Rental-System startet noch oder es ist kein Mission-Ordner bekannt – "
+            "bitte gleich noch einmal versuchen.",
+            "❌ Rental system is still starting up or no mission folder is known – "
+            "try again in a moment."), ephemeral=True)
+
+    # ── 4. Event + Position schreiben (unter dem Rentals-Lock) ───────
+    event_name = _tool_rental_event_name()
+    loop = asyncio.get_running_loop()
+    async with _conn.events_lock:
+        ev_text, ev_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, _conn, "db/events.xml")
+        sp_text, sp_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, _conn, "cfgeventspawns.xml")
+        if ev_status != "ok" or sp_status != "ok":
+            return await interaction.followup.send(_t(
+                interaction, "❌ db/events.xml oder cfgeventspawns.xml sind per FTP nicht lesbar.",
+                "❌ db/events.xml or cfgeventspawns.xml could not be read via FTP."),
+                ephemeral=True)
+        try:
+            renamed = _tool_rental_event_umbenennen(str(it.get("event_xml") or ""), event_name)
+            neu_ev = _tool_rental_event_einfuegen(ev_text, event_name, renamed)
+        except ValueError as e:
+            return await interaction.followup.send(f"❌ {e}", ephemeral=True)
+        pos_group = str(it.get("event_group") or "").strip() or None
+        neu_sp = _tool_rental_pos_schreiben(
+            sp_text, event_name, x, z, y=y, a=a, gruppe=pos_group,
+            zone_xml=(str(it.get("event_zone") or "") or None))
+
+        ok_ev = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, _conn, "db/events.xml", neu_ev)
+        if not ok_ev:
+            return await interaction.followup.send(_t(
+                interaction, "❌ db/events.xml konnte nicht gespeichert werden – "
+                "nichts wurde abgebucht.",
+                "❌ db/events.xml could not be saved – nothing was charged."), ephemeral=True)
+        ok_sp = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, _conn, "cfgeventspawns.xml", neu_sp)
+        if not ok_sp:
+            # Event wurde geschrieben, Position nicht – Event zurückrollen,
+            # sonst bleibt ein Event ohne Position übrig.
+            neu_ev_rollback, _ = _tool_delete_event(neu_ev, event_name)
+            await loop.run_in_executor(
+                None, _tool_datei_schreiben_sync, _conn, "db/events.xml", neu_ev_rollback)
+            return await interaction.followup.send(_t(
+                interaction, "❌ cfgeventspawns.xml konnte nicht gespeichert werden – "
+                "nichts wurde abgebucht.",
+                "❌ cfgeventspawns.xml could not be saved – nothing was charged."),
+                ephemeral=True)
+
+    # ── 5. ... dann Geld abbuchen (atomar). Bei Fehlschlag: Rollback ──
+    if not db.try_spend_wallet(gid, uid, total):
+        rollback_ok = False
+        async with _conn.events_lock:
+            ev2, ev2_status = await loop.run_in_executor(
+                None, _tool_datei_lesen_sync, _conn, "db/events.xml")
+            sp2, sp2_status = await loop.run_in_executor(
+                None, _tool_datei_lesen_sync, _conn, "cfgeventspawns.xml")
+            if ev2_status == "ok" and sp2_status == "ok":
+                ev3, _ = _tool_delete_event(ev2, event_name)
+                sp3, _ = _tool_delete_eventspawns(sp2, event_name)
+                rollback_ok = (
+                    await loop.run_in_executor(
+                        None, _tool_datei_schreiben_sync, _conn, "db/events.xml", ev3)
+                    and await loop.run_in_executor(
+                        None, _tool_datei_schreiben_sync, _conn, "cfgeventspawns.xml", sp3))
+        if not rollback_ok:
+            log.error(f"[RENTAL] Rollback fehlgeschlagen – verwaistes Event: {event_name}")
+            warn = discord.Embed(
+                title="⚠️ Orphaned rental event",
+                description=(f"A cancelled rental purchase could not be rolled back "
+                             f"(`{event_name}`). It needs manual removal via the "
+                             f"Event-Vorlagen tool - `/shop check` also flags it."),
+                color=0xE67E22)
+            await _post_feed(gid, "shop_log", warn, service_id=_conn.service_id)
+        wallet, _bank = db.get_balance(gid, uid)
+        return await interaction.followup.send(
+            embed=_insufficient_embed(total, wallet), ephemeral=True)
+
+    # ── 6. Miete als aktiv speichern ───────────────────────────
+    # expires_at ist nur eine grobe Rückfall-Sicherung (siehe
+    # RentalManager.on_restart_detected) - falls der Server sehr lange ohne
+    # erkannten Neustart durchläuft, verhindert sie einen unbegrenzten Ablauf.
+    expires_at = time.time() + max(1, int(restarts)) * 6 * 3600
+    rental_id = db.create_rental(
+        _conn.service_id, gid, uid, str(interaction.user), it["name"], event_name,
+        x, y, z, a, pos_group, int(restarts), expires_at)
+
+    # ── 7. Auto-Restart oder Hinweis auf nächsten Neustart ────
+    if _conn.get("auto_restart_after_purchase", False) and _conn.shop:
+        _conn.shop.schedule_auto_restart()
+        cooldown = int(_conn.get("restart_cooldown_seconds", 300) or 300)
+        delivery_info = _t(
+            interaction,
+            f"🔄 Ein Server-Neustart wurde geplant – deine Miete spawnt in "
+            f"etwa **{max(5, cooldown)} Sekunden** (plus Startzeit).",
+            f"🔄 A server restart has been scheduled – your rental will spawn "
+            f"in about **{max(5, cooldown)} seconds** (plus boot time).")
+    else:
+        delivery_info = _t(interaction,
+                           "⏳ Deine Miete spawnt beim **nächsten geplanten Server-Neustart**.",
+                           "⏳ Your rental will spawn at the **next scheduled server restart**.")
+
+    # ── 8. Bestätigung an den Käufer ───────────────────────────
+    map_name = _conn.get("map_name", "ChernarusPlus")
+    loc_url  = _izurvive_url(x, z, map_name)
+    near     = _nearest_location(x, z, map_name)
+    near_txt = _t(interaction, f"\n*(Nahe {near})*", f"\n*(Near {near})*") if near else ""
+    wallet, _bank = db.get_balance(gid, uid)
+
+    embed = discord.Embed(
+        title=_t(interaction, "🚗 Miete erfolgreich", "🚗 Rental successful"),
+        description=_t(
+            interaction,
+            f"Du hast **{it['name']}** für **{restarts} Neustart(s)** für "
+            f"**{_fmt_money(total)}** gemietet.",
+            f"You rented **{it['name']}** for **{restarts} restart(s)** for "
+            f"**{_fmt_money(total)}**."),
+        color=0x2ECC71)
+    embed.add_field(name=_t(interaction, "📍 Spawn-Ort", "📍 Spawn location"),
+                    value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=False)
+    embed.add_field(name=_t(interaction, "🚚 Lieferung", "🚚 Delivery"), value=delivery_info, inline=False)
+    embed.add_field(name="👛 Wallet", value=_fmt_money(wallet), inline=True)
+    embed.set_footer(text=f"Miete #{rental_id}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # ── 9. In den shop_log-Feed posten ─────────────────────────
+    feed = discord.Embed(
+        title="🚗 RENTAL PURCHASE",
+        description=f"{interaction.user.mention} rented **{it['name']}** for **{restarts} restart(s)**",
+        color=0x3498DB)
+    feed.add_field(name="Price", value=_fmt_money(total), inline=True)
+    feed.add_field(name="Location", value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=True)
+    feed.set_footer(text=(f"Miete #{rental_id} · {event_name}")[:100])
+    await _post_feed(gid, "shop_log", feed, service_id=_conn.service_id)
+
+shop_buy_rental.autocomplete("item")(_rental_buy_autocomplete)
+shop_buy_rental.autocomplete("server")(_server_autocomplete)
+
 
 bot.tree.add_command(shop_group)
 
@@ -26787,6 +27592,207 @@ async def delete_item(request: web.Request) -> web.Response:
     return ok({"removed": str(it.get("name")), "saved": saved})
 
 
+# ── Shop-Rentals: Dashboard-Verwaltung des Miet-Katalogs ─────────────────
+_RENTAL_MAX_RESTARTS_KAPPE = 500   # verhindert Preis-Überlauf (price_per_restart * restarts)
+
+
+def _rental_item_view(it: dict) -> dict:
+    return {
+        "name": str(it.get("name") or "?"),
+        "price_per_restart": int(it.get("price_per_restart", 0)),
+        "event_xml": str(it.get("event_xml") or ""),
+        "event_zone": str(it.get("event_zone") or ""),
+        "category": str(it.get("category", "Vehicle")),
+        "event_group": str(it.get("event_group") or ""),
+        "enabled": bool(it.get("enabled", True)),
+        "min_restarts": int(it.get("min_restarts", 1)),
+        "max_restarts": int(it.get("max_restarts", 1)),
+        "role_ids": [str(r) for r in _rollen_aus_daten(it.get("role_ids"))],
+    }
+
+
+def _rental_restarts_klemmen(data: dict, vorgabe_min: int = 1,
+                             vorgabe_max: int = 1) -> Tuple[int, int]:
+    try:
+        mn = int(data.get("min_restarts", vorgabe_min))
+    except (TypeError, ValueError):
+        mn = vorgabe_min
+    mn = max(1, mn)
+    try:
+        mx = int(data.get("max_restarts", vorgabe_max))
+    except (TypeError, ValueError):
+        mx = vorgabe_max
+    mx = max(mn, min(mx, _RENTAL_MAX_RESTARTS_KAPPE))
+    return mn, mx
+
+
+async def api_shop_rentals_list(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "shop.catalog_admin")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("shop.catalog_admin", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "shop", "view")
+    if fehler is not None:
+        return fehler
+    items = [_rental_item_view(it) for it in conn.rentals_catalog.items]
+    return ok({"items": items, "server": conn.name, "service_id": conn.service_id})
+
+
+async def api_shop_rentals_create(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "shop.catalog_admin")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("shop.catalog_admin", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "shop", "create")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "shop.rental", 5)
+    if fehler is not None:
+        return fehler
+    katalog = conn.rentals_catalog
+    data = await body(request)
+    name = str(data.get("name") or "").strip()
+    if not name:
+        return err("Bitte einen Namen angeben.")
+    if katalog.find(name):
+        return err(f"'{name}' existiert bereits im Miet-Katalog.")
+    event_xml, xml_fehler = _tool_rental_xml_validieren(data.get("event_xml"), "event")
+    if xml_fehler:
+        return err(f"Event XML: {xml_fehler}")
+    event_zone = ""
+    if str(data.get("event_zone") or "").strip():
+        event_zone, zone_fehler = _tool_rental_xml_validieren(data.get("event_zone"), "zone")
+        if zone_fehler:
+            return err(f"Event zone: {zone_fehler}")
+    try:
+        price = max(0, int(data.get("price_per_restart", 0)))
+    except (TypeError, ValueError):
+        return err("Preis pro Neustart muss eine Zahl sein.")
+    min_restarts, max_restarts = _rental_restarts_klemmen(data)
+    it = {
+        "name": name[:100],
+        "price_per_restart": price,
+        "event_xml": event_xml,
+        "event_zone": event_zone,
+        "category": str(data.get("category") or "Vehicle").strip()[:60],
+        "event_group": str(data.get("event_group") or "").strip()[:100],
+        "enabled": bool(data.get("enabled", True)),
+        "min_restarts": min_restarts,
+        "max_restarts": max_restarts,
+    }
+    rollen = _rollen_aus_daten(data.get("role_ids"))
+    if rollen:
+        it["role_ids"] = rollen
+    katalog.items.append(it)
+    saved = katalog.save()
+    return ok({"item": _rental_item_view(it), "saved": saved})
+
+
+async def api_shop_rentals_update(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "shop.catalog_admin")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("shop.catalog_admin", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "shop", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "shop.rental", 5)
+    if fehler is not None:
+        return fehler
+    katalog = conn.rentals_catalog
+    it = katalog.find(request.match_info["name"])
+    if not it:
+        return err("Rental-Item nicht gefunden.", 404)
+    data = await body(request)
+    if "name" in data:
+        new_name = str(data["name"]).strip()
+        if new_name and new_name.lower() != str(it.get("name", "")).lower():
+            if katalog.find(new_name):
+                return err(f"'{new_name}' existiert bereits.")
+            it["name"] = new_name[:100]
+    if "price_per_restart" in data:
+        try:
+            it["price_per_restart"] = max(0, int(data["price_per_restart"]))
+        except (TypeError, ValueError):
+            return err("Preis pro Neustart muss eine Zahl sein.")
+    if "event_xml" in data:
+        event_xml, xml_fehler = _tool_rental_xml_validieren(data.get("event_xml"), "event")
+        if xml_fehler:
+            return err(f"Event XML: {xml_fehler}")
+        it["event_xml"] = event_xml
+    if "event_zone" in data:
+        roh = str(data.get("event_zone") or "").strip()
+        if not roh:
+            it["event_zone"] = ""
+        else:
+            event_zone, zone_fehler = _tool_rental_xml_validieren(roh, "zone")
+            if zone_fehler:
+                return err(f"Event zone: {zone_fehler}")
+            it["event_zone"] = event_zone
+    if "category" in data and str(data["category"]).strip():
+        it["category"] = str(data["category"]).strip()[:60]
+    if "event_group" in data:
+        it["event_group"] = str(data.get("event_group") or "").strip()[:100]
+    if "enabled" in data:
+        it["enabled"] = bool(data["enabled"])
+    if "min_restarts" in data or "max_restarts" in data:
+        it["min_restarts"], it["max_restarts"] = _rental_restarts_klemmen(
+            data, it.get("min_restarts", 1), it.get("max_restarts", 1))
+    if "role_ids" in data:
+        rollen = _rollen_aus_daten(data.get("role_ids"))
+        if rollen:
+            it["role_ids"] = rollen
+        else:
+            it.pop("role_ids", None)
+    saved = katalog.save()
+    return ok({"item": _rental_item_view(it), "saved": saved})
+
+
+async def api_shop_rentals_delete(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "shop.catalog_admin")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("shop.catalog_admin", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "shop", "delete")
+    if fehler is not None:
+        return fehler
+    katalog = conn.rentals_catalog
+    it = katalog.find(request.match_info["name"])
+    if not it:
+        return err("Rental-Item nicht gefunden.", 404)
+    data = await body(request)
+    aktiv_von_diesem = [r for r in db.active_rentals(conn.guild_id or 0, conn.service_id)
+                        if str(r["item_name"]) == str(it.get("name"))]
+    if aktiv_von_diesem and not bool(data.get("confirm")):
+        # Bewusst VOR dem Rate-Limit: dieser Zwischenstand aendert nichts und
+        # ist Teil desselben Loeschvorgangs wie der bestaetigte zweite Klick
+        # direkt danach - siehe _dash_rate_limited-Doku ("ein sowieso
+        # abgelehnter Versuch (403/409 etc.) darf keinen Cooldown verbrauchen").
+        # Saesse der Rate-Limit-Check davor, wuerde der zweite Klick
+        # ("trotzdem loeschen") oft schon an der eigenen ersten Abfrage
+        # scheitern, bevor 5s vergangen sind.
+        return err(f"{len(aktiv_von_diesem)} laufende Miete(n) nutzen dieses Item noch – "
+                  f"zum Löschen trotzdem 'confirm': true mitschicken. Bereits gespawnte "
+                  f"Mieten laufen unabhängig davon normal weiter/ab.", 409)
+    fehler = _dash_rate_limited(request, "shop.rental", 5)
+    if fehler is not None:
+        return fehler
+    try:
+        katalog.items.remove(it)
+    except ValueError:
+        pass
+    saved = katalog.save()
+    return ok({"removed": str(it.get("name")), "saved": saved})
+
+
 async def api_shop_reset(request: web.Request) -> web.Response:
     """Kompletten Shop-Katalog DIESES Servers leeren - unwiderruflich.
 
@@ -28660,6 +29666,10 @@ def build_app() -> web.Application:
     r.add_put("/api/shop/items/{name}", update_item)
     r.add_delete("/api/shop/items/{name}", delete_item)
     r.add_post("/api/shop/categories", add_category)
+    r.add_get("/api/shop/rentals", api_shop_rentals_list)
+    r.add_post("/api/shop/rentals", api_shop_rentals_create)
+    r.add_put("/api/shop/rentals/{name}", api_shop_rentals_update)
+    r.add_delete("/api/shop/rentals/{name}", api_shop_rentals_delete)
     r.add_post("/api/shop/upload-types", api_shop_upload_types)
     r.add_get("/api/shop/export", api_shop_export)
     r.add_post("/api/shop/import", api_shop_import)
@@ -29561,6 +30571,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "121011f99d7d10fba1ac8ccfb32bd480b1e6b2abb7f72847f8af899e2fd2c678",
         "ecbb9d00baa33258706110944655bc41a049dc7339c0a3a9b166f057338674e9",
         "3518764b359fc788337047683c06ffad1b563c789af754db412faa4052e3740a",
+        "6ff65cd6eb5627e474da1348c5ef2b93690f7a4be8611d29ac89392d35d12722",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
