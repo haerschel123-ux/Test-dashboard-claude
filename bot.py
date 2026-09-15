@@ -723,6 +723,10 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
                            "emoji": "📄", "farbe": 0x95A5A6},
     "rpt_download":       {"label": "RPT-Log Download",      "gruppe": "Bot",
                            "emoji": "📄", "farbe": 0x7F8C8D},
+    # Alt Account Finder (Tools-Kachel): dieselbe DayZ-Account-ID verbindet
+    # sich unter einem neuen Gamertag - postet ueber diesen ganz normalen Feed.
+    "alt_account":        {"label": "Alt-Account-Alarm",     "gruppe": "Bot",
+                           "emoji": "🔎", "farbe": 0xF39C12},
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -784,6 +788,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.skymessage":                   {"label": "Sky Message Generator", "gruppe": "Tools"},
     "tools.typesmanager":                 {"label": "Erweiterter Types Manager", "gruppe": "Tools"},
     "tools.effectgenerator":              {"label": "Effekt-Generator", "gruppe": "Tools"},
+    "tools.altaccountfinder":             {"label": "Alt Account Finder", "gruppe": "Tools"},
     "backup":                             {"label": "Backup der Server-Dateien",
                                            "gruppe": "Verbindung"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
@@ -6160,6 +6165,25 @@ class DayZBot(discord.Client):
             for gid_str in ([str(conn.guild_id)] if conn is not None else list(cfg.guilds)):
                 cfg.record_seen_player(int(gid_str), ev["player"],
                                        conn.service_id if conn is not None else None)
+        # Alt Account Finder: NUR im normalen Event-Pfad (nebenwirkungen=True)
+        # und NUR mit bekanntem Server - service_id ist Pflichtteil des
+        # DB-Schluessels, ohne conn gaebe es keine sichere Zuordnung. Erkennt
+        # dieselbe Account-ID unter einem neuen Gamertag (Vigil "Gamertag
+        # change") und postet dann in den Feed "alt_account".
+        if (nebenwirkungen and conn is not None and ev.get("type") == "connect"
+                and ev.get("player") and conn.get("alt_account_enabled", False)):
+            vorheriger_name = db.alt_account_seen(conn.service_id, ev.get("player_id"), ev["player"])
+            if vorheriger_name:
+                alarm = discord.Embed(
+                    title="🔎 Alt Account erkannt",
+                    description=(f"Neue Identität: **{ev['player']}**\n"
+                                f"Vorher bekannt als: **{vorheriger_name}**\n"
+                                f"DayZ-Account-ID: `{ev.get('player_id')}`\n"
+                                f"Server: {conn.name}"),
+                    color=0xF39C12)
+                alarm.set_footer(text="Account-ID mit anderem Gamertag wiedererkannt. "
+                                      "Bitte manuell prüfen.")
+                await _post_feed(conn.guild_id, "alt_account", alarm, service_id=conn.service_id)
         # Rückfallkette statt einem einzelnen Schlüssel: erst die feine
         # Zuordnung (Zombie Death statt "Umwelttod"), dann die grobe
         # Sammelkategorie (macht EVENT_TO_LOG wieder nutzbar – vorher toter
@@ -11651,6 +11675,7 @@ _TOOL_LISTE = (
     ("skymessage", "☁️", "Sky Message Generator"),
     ("typesmanager", "📦", "Erweiterter Types Manager"),
     ("effectgenerator", "✨", "Effekt-Generator"),
+    ("altaccountfinder", "🔎", "Alt Account Finder"),
 )
 
 
@@ -13831,6 +13856,48 @@ async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
     # Kunde nur ein <fresh>-Fragment herunter, das server-seitig ungueltig ist.
     generated = [{"filename": "cfgplayerspawnpoints.xml", "content": neu}]
     return ok({"total": total, "generated": generated})
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Alt Account Finder: Tool-Kachel, agiert zur Laufzeit als Feed
+#  ("alt_account", siehe FEED_TYPES) - der eigentliche Kanal wird also ganz
+#  normal auf der Feeds-Seite gewaehlt, hier nur der Ein/Aus-Schalter und die
+#  Anzeige der bereits erkannten Mehrfach-Zuordnungen dieses Servers.
+# ──────────────────────────────────────────────────────────────────────────
+async def api_tools_altaccountfinder_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.altaccountfinder")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.altaccountfinder", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    mehrfach = db.alt_account_mehrfach(conn.service_id)
+    return ok({
+        "enabled": bool(conn.get("alt_account_enabled", False)),
+        "mehrfach": mehrfach,
+    })
+
+
+async def api_tools_altaccountfinder_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.altaccountfinder")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.altaccountfinder", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.altaccountfinder", 10)
+    if fehler is not None:
+        return fehler
+    data_in = await body(request)
+    if "enabled" in data_in:
+        _conn_store(conn, "alt_account_enabled", bool(data_in["enabled"]))
+    return ok({"enabled": bool(conn.get("alt_account_enabled", False))})
 
 
 # ── 9. Types Booster ──────────────────────────────────────────────────────
@@ -16485,6 +16552,18 @@ class EconomyDB:
                 last_seen_ts    REAL NOT NULL,
                 credited_blocks INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (service_id, ingame_name))""")
+            # Alt Account Finder: welche Gamertags wurden je Server unter
+            # welcher DayZ-Account-ID gesehen. service_id IMMER Teil des
+            # Schluessels - derselbe Account auf zwei Kundendiensten darf nie
+            # zusammengefuehrt werden. "Unbekannt"/leere IDs werden von den
+            # Aufrufern schon vorher verworfen, landen also nie hier.
+            c.execute("""CREATE TABLE IF NOT EXISTS alt_account_names (
+                service_id TEXT NOT NULL DEFAULT '',
+                account_id TEXT NOT NULL,
+                gamertag   TEXT NOT NULL COLLATE NOCASE,
+                first_seen REAL NOT NULL,
+                last_seen  REAL NOT NULL,
+                PRIMARY KEY (service_id, account_id, gamertag))""")
             self._migriere_serverspalten(c)
             c.commit()
 
@@ -16869,6 +16948,65 @@ class EconomyDB:
         with self._lock:
             self._conn.execute("DELETE FROM rentals WHERE id=?", (rental_id,))
             self._conn.commit()
+
+    # ── Alt Account Finder ─────────────────────────────────────
+    def alt_account_seen(self, service_id: str, account_id: str,
+                         gamertag: str) -> Optional[str]:
+        """Verarbeitet EINE Connect-Zeile (service_id + Account-ID + Gamertag)
+        atomar und meldet, ob ein Alt-Account-Alarm ausgeloest werden soll.
+
+        Rueckgabe:
+          - None: erster gesehener Name dieses Accounts, oder der Name ist
+            unter dieser Account-ID bereits bekannt (kein Alarm).
+          - sonst: der zuletzt bekannte ANDERE Gamertag derselben Account-ID -
+            der Aufrufer postet damit genau einmal je neu beobachteten Namen
+            einen Alarm (spaetere Connects mit demselben Namen sind dann schon
+            bekannt und liefern beim naechsten Aufruf wieder None).
+
+        service_id ist immer Teil des Schluessels - zwei Kundendienste mit
+        zufaellig derselben Account-ID werden nie zusammengefuehrt.
+        """
+        service_id = str(service_id or "")
+        account_id = str(account_id or "").strip()
+        gamertag = (gamertag or "").strip()
+        if not account_id or not gamertag or account_id.lower() == "unbekannt":
+            return None
+        now = time.time()
+        with self._lock:
+            vorhanden = self._conn.execute(
+                "SELECT gamertag FROM alt_account_names WHERE service_id=? AND account_id=?",
+                (service_id, account_id)).fetchall()
+            bekannte_namen = {str(r["gamertag"]).lower() for r in vorhanden}
+            if gamertag.lower() in bekannte_namen:
+                self._conn.execute(
+                    "UPDATE alt_account_names SET last_seen=? WHERE service_id=? AND "
+                    "account_id=? AND gamertag=? COLLATE NOCASE",
+                    (now, service_id, account_id, gamertag))
+                self._conn.commit()
+                return None
+            self._conn.execute(
+                "INSERT INTO alt_account_names (service_id, account_id, gamertag, "
+                "first_seen, last_seen) VALUES (?,?,?,?,?)",
+                (service_id, account_id, gamertag, now, now))
+            self._conn.commit()
+            if not vorhanden:
+                return None   # erster jemals gesehene Name dieser Account-ID
+            return str(vorhanden[0]["gamertag"])
+
+    def alt_account_mehrfach(self, service_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """Accounts EINES Servers mit mehr als einem beobachteten Gamertag,
+        zuletzt gesehen zuerst - fuer die Dashboard-Anzeige "bekannte
+        Zuordnungen"."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT account_id, group_concat(gamertag, '||') AS gamertags, "
+                "MIN(first_seen) AS first_seen, MAX(last_seen) AS last_seen, "
+                "COUNT(*) AS anzahl FROM alt_account_names WHERE service_id=? "
+                "GROUP BY account_id HAVING anzahl > 1 ORDER BY last_seen DESC LIMIT ?",
+                (str(service_id or ""), limit)).fetchall()
+        return [{"account_id": r["account_id"], "gamertags": str(r["gamertags"]).split("||"),
+                "first_seen": r["first_seen"], "last_seen": r["last_seen"],
+                "anzahl": r["anzahl"]} for r in rows]
 
     # ── Casino-Historie ───────────────────────────────────────
     def log_casino(self, guild_id: int, user_id: int, game: str,
@@ -29725,6 +29863,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/randompresets", api_tools_randompresets_post)
     r.add_get("/api/tools/spawnpoint", api_tools_spawnpoint_get)
     r.add_post("/api/tools/spawnpoint", api_tools_spawnpoint_post)
+    r.add_get("/api/tools/altaccountfinder", api_tools_altaccountfinder_get)
+    r.add_post("/api/tools/altaccountfinder", api_tools_altaccountfinder_post)
 
     # ── Karte / Events ──
     r.add_get("/api/map/meta", api_map_meta)
@@ -30572,6 +30712,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "ecbb9d00baa33258706110944655bc41a049dc7339c0a3a9b166f057338674e9",
         "3518764b359fc788337047683c06ffad1b563c789af754db412faa4052e3740a",
         "6ff65cd6eb5627e474da1348c5ef2b93690f7a4be8611d29ac89392d35d12722",
+        "b0dbcdbeac9c8f476b5b597d72e4885f37f33767f4ba18a549b7b1dc580f998b",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
