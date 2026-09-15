@@ -1435,8 +1435,22 @@ class ConfigManager:
 
     @staticmethod
     def _kanal_aus(wert: Any) -> Optional[int]:
-        """Kanal-ID aus einem Feed-Eintrag – egal ob Zahl oder Einstellungs-Dict."""
+        """Kanal-ID aus einem Feed-Eintrag – egal ob Zahl oder Einstellungs-Dict.
+
+        Ein per Schalter deaktivierter Feed (``enabled: false``) liefert
+        bewusst ``None``, obwohl ein Channel gesetzt ist: diese Funktion wird
+        NUR von einzelnen Direkt-Abfragen genutzt (Status-Embed, Zonen-Ping,
+        Whitelist-Anfragen, Link-Meldungen), die selbst keine Rückfallkette
+        haben - dort ist "nichts posten" exakt das gewuenschte Verhalten.
+        Die beiden Rückfallketten (``_dispatch``, ``_post_feed``) pruefen
+        ``enabled`` stattdessen selbst ueber ``feed_settings()``, weil ein
+        deaktivierter Feed dort NICHT auf den naechsten Kandidaten (z. B.
+        "catch_all") ausweichen darf - sonst tauchen abgeschaltete Kills im
+        "Alles Übrige"-Feed wieder auf.
+        """
         if isinstance(wert, dict):
+            if wert.get("enabled") is False:
+                return None
             wert = wert.get("channel_id")
         if wert in (None, "", 0, "0"):
             return None
@@ -1448,24 +1462,37 @@ class ConfigManager:
     # Vorgabewerte eines Feeds, solange der Kunde nichts anderes gesetzt hat.
     def feed_settings(self, guild_id: int, feed_key: str,
                       service_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Alle Einstellungen eines Feeds oder None, wenn er nicht gesetzt ist."""
+        """Alle Einstellungen eines Feeds oder None, wenn kein Channel gesetzt
+        ist. Anders als ``get_channel``/``_kanal_aus`` bleibt ein Ergebnis auch
+        bei ``enabled: false`` bestehen (nur ohne Channel gibt es None) - die
+        Rückfallketten in ``_dispatch``/``_post_feed`` muessen einen
+        deaktivierten Feed von einem gar nicht konfigurierten unterscheiden
+        koennen, um beim ersten Fall NICHT auf den naechsten Kandidaten
+        auszuweichen."""
         roh = self.server_feeds(guild_id, service_id).get(feed_key) if service_id else None
         if roh is None:
             if service_id and self._guild_hat_mehrere_server(guild_id):
                 return None
             roh = (self.guilds.get(str(guild_id)) or {}).get(feed_key)
-        kanal = self._kanal_aus(roh)
+        if not isinstance(roh, dict):
+            kanal_roh = roh
+            roh = {}
+        else:
+            kanal_roh = roh.get("channel_id")
+        try:
+            kanal = int(kanal_roh) if kanal_roh not in (None, "", 0, "0") else None
+        except (TypeError, ValueError):
+            kanal = None
         if not kanal:
             return None
         meta = FEED_TYPES.get(feed_key) or {}
-        if not isinstance(roh, dict):
-            roh = {}
         return {
             "channel_id": kanal,
             "colour": roh.get("colour", meta.get("farbe", 0x5865F2)),
             "location": bool(roh.get("location", True)),
             "footer_ts": bool(roh.get("footer_ts", False)),
             "note": str(roh.get("note") or ""),
+            "enabled": bool(roh.get("enabled", True)),
         }
 
     def set_channel(self, guild_id: int, log_type: str, channel_id: int,
@@ -6237,6 +6264,14 @@ class DayZBot(discord.Client):
                 self._dispatch_merken(conn, ev, "kein Feed/Channel gesetzt",
                                      kandidaten=kandidaten, guild=gid_str)
                 continue
+            if not feed.get("enabled", True):
+                # Bewusst KEIN Ausweichen auf den naechsten Kandidaten (z. B.
+                # "catch_all") - ein abgeschalteter Feed soll wirklich nichts
+                # mehr posten, nicht anderswo wieder auftauchen.
+                self._dispatch_merken(conn, ev, "Feed deaktiviert",
+                                     kandidaten=kandidaten, guild=gid_str,
+                                     feed=treffer_schluessel)
+                continue
             ch_id = feed["channel_id"]
             send_embed = _feed_anwenden(embed.copy(), feed)
             reward_line = rewards.get(int(gid_str))
@@ -6477,6 +6512,7 @@ _SUBCMD_DEFS: Tuple[Tuple[str, str, str, str, str], ...] = (
     ("whitelist_approve", "Bans & Whitelist", "Bans & Whitelist", "Whitelist-Anfrage annehmen (Panel-Button)", "Approve whitelist request (panel button)"),
     ("whitelist_reject", "Bans & Whitelist", "Bans & Whitelist", "Whitelist-Anfrage ablehnen (Panel-Button)", "Reject whitelist request (panel button)"),
     ("send_whitelist_panel", "Bans & Whitelist", "Bans & Whitelist", "/send whitelist panel – Sendet das Whitelist-Panel", "/send whitelist panel – Sends the whitelist panel"),
+    ("send_ticket_panel", "Discord Management", "Discord Management", "/send ticket panel – Sendet das Ticket-Panel (zusätzlich zu Administrator)", "/send ticket panel – Sends the ticket panel (in addition to Administrator)"),
     ("hackban", "Bans & Whitelist", "Bans & Whitelist", "/hackban – Bannt per Discord User-ID", "/hackban – Bans by Discord user ID"),
     ("admin_position", "Diagnose", "Diagnostics", "/admin_position – Letzte Spieler-Positionen", "/admin_position – Last known player positions"),
     ("spieler_suche", "Diagnose", "Diagnostics", "/spieler_suche – Sucht einen Spieler in den Logs", "/spieler_suche – Searches for a player in the logs"),
@@ -9952,7 +9988,11 @@ send_ticket_group = app_commands.Group(
 async def send_ticket_panel(interaction: discord.Interaction,
                             panel_channel: discord.TextChannel,
                             server: Optional[str] = None):
-    if not _subcmd_allowed(interaction, "send_ticket_panel"):
+    # Standardmaessig fuer jede Rolle mit Discord-Administrator erlaubt (wie
+    # die eigene Befehlsbeschreibung "(Admin)" verspricht) - zusaetzlich ueber
+    # die Permissions-Seite auf einzelne Rollen/Personen erweiterbar, ohne
+    # Administrator dafuer auszuschalten.
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "send_ticket_panel")):
         return await _deny_subcmd(interaction)
 
     _conn, _fehler = _conn_waehlen(interaction, server)
@@ -17458,17 +17498,26 @@ async def _post_feed(guild_id: Optional[int], log_type: str, embed: discord.Embe
     letzter_grund = "channel_not_configured"
     erfolg_gesamt = False
     for gid in gids:
-        ch_id = None
+        feed = None
         treffer = log_type
         for kand in kandidaten:
-            ch_id = cfg.get_channel(int(gid), kand, service_id)
-            if ch_id:
+            feed = cfg.feed_settings(int(gid), kand, service_id)
+            if feed:
                 treffer = kand
                 break
-        if not ch_id:
+        if not feed:
+            continue
+        if not feed.get("enabled", True):
+            # Wie in _dispatch: ein deaktivierter Feed weicht nicht auf den
+            # naechsten Kandidaten aus, er postet fuer diese Guild einfach
+            # nicht - zaehlt aber als gefundenes Ziel, sonst wuerde ein reiner
+            # "channel_not_configured"-Rueckgabewert faelschlich einen
+            # Konfigurationsfehler statt einer bewussten Abschaltung melden.
+            irgendein_ziel = True
+            letzter_grund = "feed_disabled"
             continue
         irgendein_ziel = True
-        ok_gid, grund = await _send(ch_id, f"{treffer} → Guild {gid}")
+        ok_gid, grund = await _send(feed["channel_id"], f"{treffer} → Guild {gid}")
         erfolg_gesamt = erfolg_gesamt or ok_gid
         letzter_grund = grund
     if not irgendein_ziel:
@@ -25043,6 +25092,7 @@ def _guild_payload(gid: int, service_id: Optional[str] = None) -> dict:
             "location": s["location"],
             "footer_ts": s["footer_ts"],
             "note": s["note"],
+            "enabled": s["enabled"],
         })
     return {
         "id": str(gid),
@@ -25145,6 +25195,21 @@ async def set_feed(request: web.Request) -> web.Response:
     if log_type in FEED_TYPES and not await _module_erlaubt(log_type, _sess_get(request), conn):
         return err("Dieses Feature ist für deinen Server aktuell nicht freigeschaltet.", 403)
     data = await body(request)
+    # Reiner Ein/Aus-Schalter, ohne die restlichen Einstellungen anzufassen -
+    # anders als beim Loeschen (channel_id explizit leer) fehlt "channel_id"
+    # hier komplett im Aufruf. Braucht einen bereits eingerichteten Channel,
+    # sonst gaebe es nichts zum An-/Abschalten.
+    if "channel_id" not in data and "enabled" in data:
+        vorhanden = cfg.feed_settings(int(gid), log_type, conn.service_id)
+        if not vorhanden:
+            return err("Für diesen Feed ist noch kein Channel eingerichtet.", 409)
+        vorhanden["enabled"] = bool(data["enabled"])
+        cfg.server_feeds(int(gid), conn.service_id, anlegen=True)[log_type] = vorhanden
+        cfg.save_guilds()
+        _audit_add("dashboard", _audit_actor(_sess_get(request)),
+                   "Feed " + ("aktiviert" if vorhanden["enabled"] else "pausiert"),
+                   f"{log_type} · {conn.name}")
+        return ok({"log_type": log_type, "enabled": vorhanden["enabled"]})
     channel_id = data.get("channel_id")
     if channel_id in (None, "", "0"):
         eigen = cfg.server_feeds(int(gid), conn.service_id, anlegen=True)
@@ -25178,6 +25243,11 @@ async def set_feed(request: web.Request) -> web.Response:
         except (TypeError, ValueError):
             return err("Ungültige Farbe.")
 
+    # "enabled" bleibt beim Bearbeiten (Farbe/Channel/Notiz aendern) erhalten,
+    # wenn der Aufruf es nicht explizit mitschickt - sonst wuerde jedes
+    # Speichern im Einstellungsdialog einen zuvor pausierten Feed wieder
+    # stillschweigend einschalten.
+    bisher = cfg.feed_settings(int(gid), log_type, conn.service_id)
     eintrag = {
         "channel_id": kanal,
         "colour": farbe,
@@ -25186,6 +25256,7 @@ async def set_feed(request: web.Request) -> web.Response:
         # Die Notiz ist reiner Text fuer den Betreiber und wird im Frontend
         # ueber createTextNode ausgegeben – hier nur die Laenge begrenzen.
         "note": str(data.get("note") or "")[:200],
+        "enabled": bool(data.get("enabled", bisher["enabled"] if bisher else True)),
     }
     cfg.server_feeds(int(gid), conn.service_id, anlegen=True)[log_type] = eintrag
     cfg.save_guilds()
@@ -30713,6 +30784,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "3518764b359fc788337047683c06ffad1b563c789af754db412faa4052e3740a",
         "6ff65cd6eb5627e474da1348c5ef2b93690f7a4be8611d29ac89392d35d12722",
         "b0dbcdbeac9c8f476b5b597d72e4885f37f33767f4ba18a549b7b1dc580f998b",
+        "3cf30da6a897009147f22bdc8f3cde893e36cbda293a4ef237e61bb611b78eda",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
