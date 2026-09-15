@@ -6513,6 +6513,7 @@ _SUBCMD_DEFS: Tuple[Tuple[str, str, str, str, str], ...] = (
     ("whitelist_reject", "Bans & Whitelist", "Bans & Whitelist", "Whitelist-Anfrage ablehnen (Panel-Button)", "Reject whitelist request (panel button)"),
     ("send_whitelist_panel", "Bans & Whitelist", "Bans & Whitelist", "/send whitelist panel – Sendet das Whitelist-Panel", "/send whitelist panel – Sends the whitelist panel"),
     ("send_ticket_panel", "Discord Management", "Discord Management", "/send ticket panel – Sendet das Ticket-Panel (zusätzlich zu Administrator)", "/send ticket panel – Sends the ticket panel (in addition to Administrator)"),
+    ("ticket_clear_stale", "Discord Management", "Discord Management", "/ticket clear_stale – Räumt verwaiste Ticket-Sperren auf (zusätzlich zu Administrator)", "/ticket clear_stale – Clears stale ticket locks (in addition to Administrator)"),
     ("hackban", "Bans & Whitelist", "Bans & Whitelist", "/hackban – Bannt per Discord User-ID", "/hackban – Bans by Discord user ID"),
     ("admin_position", "Diagnose", "Diagnostics", "/admin_position – Letzte Spieler-Positionen", "/admin_position – Last known player positions"),
     ("spieler_suche", "Diagnose", "Diagnostics", "/spieler_suche – Sucht einen Spieler in den Logs", "/spieler_suche – Searches for a player in the logs"),
@@ -9739,10 +9740,16 @@ async def _ticket_erstellen(interaction: discord.Interaction, conn: ServerConnec
              if str(t.get("user_id")) == str(interaction.user.id) and t.get("status") != "archived"]
     if offene:
         bestehender = guild.get_channel(int(offene[0].get("channel_id") or 0))
-        hinweis = bestehender.mention if bestehender is not None else "#" + str(offene[0].get("channel_id"))
-        return await interaction.response.send_message(_tt(
-            sprache, f"❌ Du hast bereits ein offenes Ticket: {hinweis}",
-            f"❌ You already have an open ticket: {hinweis}"), ephemeral=True)
+        if bestehender is None:
+            # Der Kanal wurde ausserhalb des Ticket Tools geloescht (z. B. von
+            # Hand) - der Eintrag bliebe sonst fuer immer "offen" haengen und
+            # der Ersteller koennte nie wieder ein Ticket eroeffnen.
+            offene[0]["status"] = "archived"
+            _conn_store(conn, "ticket_open", _ticket_open(conn))
+        else:
+            return await interaction.response.send_message(_tt(
+                sprache, f"❌ Du hast bereits ein offenes Ticket: {bestehender.mention}",
+                f"❌ You already have an open ticket: {bestehender.mention}"), ephemeral=True)
 
     support_rollen = _ticket_support_rollen(conn, kategorie)
     overwrites = {
@@ -10138,6 +10145,37 @@ async def ticket_remove_member(interaction: discord.Interaction,
     await interaction.response.send_message(_tt(
         sprache, f"✅ {member.mention} wurde aus diesem Ticket entfernt.",
         f"✅ {member.mention} was removed from this ticket."))
+
+
+@ticket_group.command(
+    name="clear_stale", description=app_commands.locale_str(
+        "🧹 Verwaiste Ticket-Sperren aufräumen, deren Kanal gelöscht wurde (Admin)"))
+async def ticket_clear_stale(interaction: discord.Interaction):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "ticket_clear_stale")):
+        return await _deny_subcmd(interaction)
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Das geht nur auf einem Discord-Server.",
+            "❌ This only works on a Discord server."), ephemeral=True)
+    geraeumt = 0
+    for conn in _conns_of(interaction):
+        eintraege = _ticket_open(conn)
+        geaendert = False
+        for t in eintraege:
+            if t.get("status") == "archived":
+                continue
+            if guild.get_channel(int(t.get("channel_id") or 0)) is None:
+                t["status"] = "archived"
+                geaendert = True
+                geraeumt += 1
+        if geaendert:
+            _conn_store(conn, "ticket_open", eintraege)
+    await interaction.response.send_message(_t(
+        interaction, f"🧹 {geraeumt} verwaiste Ticket-Sperre(n) aufgeräumt "
+        "(Kanal existierte nicht mehr) – Betroffene können jetzt wieder ein Ticket öffnen.",
+        f"🧹 Cleared {geraeumt} stale ticket lock(s) whose channel no longer existed – "
+        "affected users can open a new ticket again."), ephemeral=True)
 
 
 bot.tree.add_command(ticket_group)
