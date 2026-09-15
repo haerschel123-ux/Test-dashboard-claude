@@ -9571,6 +9571,29 @@ class TicketChannelView(discord.ui.View):
         await interaction.followup.send(embed=embed,
                                         view=TicketArchivedView(self.service_id, self.ticket_id))
 
+        protokoll_kanal_id = _ticket_transkript_kanal(conn)
+        if protokoll_kanal_id and interaction.guild:
+            protokoll_kanal = interaction.guild.get_channel(protokoll_kanal_id)
+            if isinstance(protokoll_kanal, discord.TextChannel):
+                protokoll_embed = discord.Embed(
+                    title=_tt(sprache, f"Ticket #{ticket.get('id')} geschlossen",
+                             f"Ticket #{ticket.get('id')} closed"),
+                    color=0x99AAB5)
+                protokoll_embed.add_field(name=_tt(sprache, "Typ", "Type"),
+                                          value=(kategorie or {}).get("label") or "–", inline=True)
+                protokoll_embed.add_field(
+                    name=_tt(sprache, "Erstellt von", "Opened by"),
+                    value=ersteller.mention if ersteller else f"<@{ticket.get('user_id')}>", inline=True)
+                protokoll_embed.add_field(name=_tt(sprache, "Geschlossen von", "Closed by"),
+                                          value=member.mention, inline=True)
+                protokoll_embed.timestamp = datetime.now(timezone.utc)
+                try:
+                    await protokoll_kanal.send(
+                        embed=protokoll_embed,
+                        file=discord.File(io.BytesIO(transkript), filename=f"ticket-{ticket.get('id')}.txt"))
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    log.debug(f"[TICKET_TOOL] Transkript-Post in Log-Channel fehlgeschlagen: {e}")
+
 
 class TicketDeleteConfirmView(discord.ui.View):
     """Kurzlebige, NICHT-persistente Sicherheitsabfrage vor dem endgueltigen
@@ -26440,6 +26463,20 @@ def _ticket_categories(conn: ServerConnection) -> List[Dict[str, Any]]:
     return kat
 
 
+def _ticket_transkript_kanal(conn: Optional[ServerConnection]) -> Optional[int]:
+    """Der im Dashboard hinterlegte Channel, in den beim Schliessen eines
+    Tickets zusaetzlich zur DM ein Transkript-Embed samt Anhang gepostet
+    wird - None, wenn nichts eingerichtet ist (dann passiert nur die DM,
+    wie bisher)."""
+    if conn is None:
+        return None
+    try:
+        wert = int(conn.get("ticket_transcript_channel") or 0)
+    except (TypeError, ValueError):
+        return None
+    return wert or None
+
+
 def _ticket_sprache(conn: Optional[ServerConnection]) -> str:
     """Die im Dashboard fest eingestellte Sprache fuer ALLE Ticket-Tool-Texte
     (Buttons, Schliessen-/Oeffnen-Nachrichten usw.) - bewusst NICHT von der
@@ -26666,7 +26703,8 @@ async def get_ticket_categories(request: web.Request) -> web.Response:
         return fehler
     kategorien = _ticket_categories(conn)
     return ok({"categories": [_ticket_category_payload(conn, k) for k in kategorien],
-              "language": _ticket_sprache(conn)})
+              "language": _ticket_sprache(conn),
+              "transcript_channel_id": str(_ticket_transkript_kanal(conn) or "") or None})
 
 
 async def post_ticket_language(request: web.Request) -> web.Response:
@@ -26687,6 +26725,36 @@ async def post_ticket_language(request: web.Request) -> web.Response:
     _audit_add("dashboard", _audit_actor(_sess_get(request)), "Ticket-Tool-Sprache geändert",
               f"{sprache} · {conn.name}")
     return ok({"language": sprache})
+
+
+async def post_ticket_transcript_channel(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "discord_mgmt")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("discord_mgmt", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    roh = data.get("channel_id")
+    if roh in (None, "", "0", 0):
+        _conn_store(conn, "ticket_transcript_channel", None)
+        _audit_add("dashboard", _audit_actor(_sess_get(request)),
+                  "Ticket-Transkript-Channel entfernt", conn.name)
+        return ok({"transcript_channel_id": None})
+    g = bot.get_guild(int(conn.guild_id)) if bot and conn.guild_id else None
+    try:
+        kanal = g.get_channel(int(roh)) if g is not None else None
+    except (TypeError, ValueError):
+        kanal = None
+    if not isinstance(kanal, discord.TextChannel):
+        return err("Diesen Text-Channel gibt es in deinem Discord-Server nicht.")
+    _conn_store(conn, "ticket_transcript_channel", int(roh))
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+              "Ticket-Transkript-Channel geändert", f"#{kanal.name} · {conn.name}")
+    return ok({"transcript_channel_id": str(kanal.id)})
 
 
 async def post_ticket_categories(request: web.Request) -> web.Response:
@@ -29845,6 +29913,7 @@ def build_app() -> web.Application:
     r.add_post("/api/discord-management/tickets/categories", post_ticket_categories)
     r.add_delete("/api/discord-management/tickets/categories/{id}", delete_ticket_category)
     r.add_post("/api/discord-management/tickets/language", post_ticket_language)
+    r.add_post("/api/discord-management/tickets/transcript-channel", post_ticket_transcript_channel)
     r.add_get("/api/discord-management/tickets/open", get_ticket_open)
     # ── Auto-Aufgaben (Scheduled Tasks) ──
     r.add_get("/api/scheduled-tasks", list_scheduled_tasks)
@@ -30616,6 +30685,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "53e4ad609bb4d57bb0f07e4c050cc88586bcccd3a9d5954af67a669b1a3d49da",
     ),
     "app.js": (
+        "ae5d2c0724cc800275197cbd634aadb4875064b8f28f879d417b1da7f5d09edb",
         "18baefd43bad0dea69057dcaa400f3b39d891e88af9db564e0b1911b9728ed4d",
         "bf08465dd83ed3a6b858f73892249131b676d049f3e84201b6c2fe56965012f6",
         "6fd643484c28d71142d13b628a467ef68fd9974d569c18d4db414bf7db102d58",
