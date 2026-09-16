@@ -38,6 +38,24 @@ class _StubFTP:
         return self.inhalt
 
 
+class _StubNitradoAPI:
+    def __init__(self, inhalt=b"ADM-Dateiinhalt-per-API" * 20):
+        self.inhalt = inhalt
+        self.angefragte_pfade = []
+
+    async def download_file(self, pfad):
+        self.angefragte_pfade.append(pfad)
+        return self.inhalt
+
+
+class _VergiftetesFTP:
+    """Wuerde bei einem Aufruf beweisen, dass faelschlich der FTP-Pfad
+    genommen wurde, obwohl die Verbindung ueber die Nitrado-API liest."""
+
+    def read_file_bytes(self, pfad):
+        raise AssertionError("FTP haette hier NICHT aufgerufen werden duerfen (Server liest via API)")
+
+
 class _StubChannel:
     def __init__(self, id_):
         self.id = id_
@@ -70,6 +88,28 @@ def conn_mit_feeds(monkeypatch):
     bot_mod.cfg.set_channel(111, "adm_download", 9001, service_id="logdl-service")
     bot_mod.cfg.set_channel(111, "rpt_download", 9002, service_id="logdl-service")
     return conn, kanal_adm, kanal_rpt
+
+
+@pytest.fixture
+def conn_mit_feeds_via_api(monkeypatch):
+    """Wie conn_mit_feeds, aber fuer einen Server, der Logs ueber die
+    Nitrado-API liest statt per FTP - der Standardfall (log_lesen_via_api
+    ist per Vorgabe True, sobald conn.api gesetzt ist)."""
+    bot_mod.connections.upsert("logdl-service-api")
+    bot_mod.connections.assign_guild("logdl-service-api", 333)
+    conn = bot_mod.connections.for_service("logdl-service-api")
+    conn.api = _StubNitradoAPI()
+    conn.ftp = _VergiftetesFTP()
+
+    kanal_adm = _StubChannel(9101)
+    kanaele = {9101: kanal_adm}
+
+    async def fake_resolve_channel(ch_id):
+        return kanaele.get(int(ch_id))
+    monkeypatch.setattr(bot_mod.bot, "_resolve_channel", fake_resolve_channel)
+
+    bot_mod.cfg.set_channel(333, "adm_download", 9101, service_id="logdl-service-api")
+    return conn, kanal_adm
 
 
 def test_post_log_download_sendet_adm_datei_mit_anhang(conn_mit_feeds):
@@ -143,3 +183,55 @@ def test_post_log_download_disabled_feed_postet_nicht(conn_mit_feeds):
     _run(bot_mod.bot._post_log_download(
         conn, "adm_download", "/games/x/config/DayZServer_alt.ADM", _StubLoop()))
     assert kanal_adm.gesendet == []
+
+
+# ── Regression: Server, die ueber die Nitrado-API statt per FTP lesen ─────
+# (log_lesen_via_api ist per Vorgabe True, sobald conn.api gesetzt ist -
+# das betrifft neue Verbindungen standardmaessig). _post_log_download rief
+# bisher IMMER conn.ftp.read_file_bytes auf, auch wenn der Server ueber die
+# API liest - dort schlug das leise fehl ("Datei leer/nicht lesbar"), ohne
+# Ausnahme und ohne dass irgendwo sichtbar wurde, warum. Betraf nur diese
+# zwei Feeds, weil jeder andere Codepfad (_log_dateien, _log_lesen_ab_offset,
+# _log_dateigroesse) schon immer zwischen FTP und API unterschied.
+def test_post_log_download_liest_ueber_nitrado_api_wenn_konfiguriert(conn_mit_feeds_via_api):
+    conn, kanal_adm = conn_mit_feeds_via_api
+    _run(bot_mod.bot._post_log_download(
+        conn, "adm_download",
+        "/games/ni11769331_2/noftp/dayzps/config/DayZServer_alt.ADM", _StubLoop()))
+    assert len(kanal_adm.gesendet) == 1
+    assert conn.api.angefragte_pfade == [
+        "/games/ni11769331_2/noftp/dayzps/config/DayZServer_alt.ADM"]
+    assert conn.dispatch_verlauf[-1]["ergebnis"] == "gepostet"
+
+
+def test_post_log_download_ueber_api_ueberlebt_leere_antwort(conn_mit_feeds_via_api):
+    conn, kanal_adm = conn_mit_feeds_via_api
+    conn.api.inhalt = None
+    _run(bot_mod.bot._post_log_download(
+        conn, "adm_download", "/games/x/noftp/config/DayZServer_leer.ADM", _StubLoop()))
+    assert kanal_adm.gesendet == []
+    assert conn.dispatch_verlauf[-1]["ergebnis"] == "Datei leer oder nicht lesbar (API)"
+
+
+def test_post_log_download_respektiert_expliziten_ftp_vorzug(monkeypatch):
+    """log_lesen_via_api kann pro Server auf False gesetzt werden (manueller
+    Rueckfall auf FTP) - dann muss weiterhin FTP genutzt werden, obwohl
+    conn.api gesetzt ist."""
+    bot_mod.connections.upsert("logdl-service-ftp-vorzug")
+    bot_mod.connections.assign_guild("logdl-service-ftp-vorzug", 444)
+    conn = bot_mod.connections.for_service("logdl-service-ftp-vorzug")
+    conn.data["log_lesen_via_api"] = False
+    conn.api = _StubNitradoAPI()
+    conn.ftp = _StubFTP()
+    kanal = _StubChannel(9201)
+
+    async def fake_resolve_channel(ch_id):
+        return kanal if int(ch_id) == 9201 else None
+    monkeypatch.setattr(bot_mod.bot, "_resolve_channel", fake_resolve_channel)
+    bot_mod.cfg.set_channel(444, "adm_download", 9201, service_id="logdl-service-ftp-vorzug")
+
+    _run(bot_mod.bot._post_log_download(
+        conn, "adm_download", "/dayzps/config/DayZServer_alt.ADM", _StubLoop()))
+    assert len(kanal.gesendet) == 1
+    assert conn.ftp.gelesene_pfade == ["/dayzps/config/DayZServer_alt.ADM"]
+    assert conn.api.angefragte_pfade == []

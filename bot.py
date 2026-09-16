@@ -6092,10 +6092,21 @@ class DayZBot(discord.Client):
 
     async def _post_log_download(self, conn: ServerConnection, feed_key: str,
                                  pfad: str, loop) -> None:
-        """Laedt eine gerade abgeschlossene .ADM/.RPT-Datei per FTP und postet
-        sie als Anhang in den fuer ``feed_key`` konfigurierten Feed-Channel
-        dieses Servers – NUR wenn Brigarde/der Kunde diesen Feed ueberhaupt
-        eingerichtet hat (sonst waere jeder Download unnoetiger FTP-Traffic).
+        """Laedt eine gerade abgeschlossene .ADM/.RPT-Datei per FTP ODER
+        Nitrado-API und postet sie als Anhang in den fuer ``feed_key``
+        konfigurierten Feed-Channel dieses Servers – NUR wenn Brigarde/der
+        Kunde diesen Feed ueberhaupt eingerichtet hat (sonst waere jeder
+        Download unnoetiger Traffic).
+
+        Liest ueber dieselbe Weiche wie der Rest des Polls (siehe
+        _log_lesen_via_api/_log_dateien/_log_lesen_ab_offset) - vorher rief
+        diese Funktion IMMER conn.ftp.read_file_bytes auf, auch bei Servern,
+        die (per Default!) ueber die Nitrado-API lesen. Dort war conn.ftp
+        entweder ungenutzt/nicht mehr gepflegt oder pfad im API-Pfadformat
+        (".../noftp/...") - ein FTP-Aufruf damit schlug leise fehl, ohne
+        Ausnahme, nur mit "Datei leer/nicht lesbar". Betraf ausschliesslich
+        diese beiden Download-Feeds, weil alle anderen Codepfade schon immer
+        ueber die Weiche liefen.
 
         Eine Zugabe wie ``_pruefe_neustart`` – ein Fehler hier (zu gross,
         FTP-Hakler, Kanal ohne Rechte) darf den Poll-Zyklus NIE kippen."""
@@ -6106,10 +6117,15 @@ class DayZBot(discord.Client):
             self._dispatch_merken(conn, ev, "kein Feed/Channel gesetzt", datei=dateiname)
             return
         try:
-            data = await loop.run_in_executor(None, conn.ftp.read_file_bytes, pfad)
+            if _log_lesen_via_api(conn):
+                data = await conn.api.download_file(pfad)
+            else:
+                data = await loop.run_in_executor(None, conn.ftp.read_file_bytes, pfad)
             if not data:
-                log.debug(f"[POLL] {conn.name}: {feed_key} – {dateiname} leer/nicht lesbar, kein Download-Post.")
-                self._dispatch_merken(conn, ev, "Datei leer oder nicht lesbar (FTP)", datei=dateiname)
+                quelle = "API" if _log_lesen_via_api(conn) else "FTP"
+                log.debug(f"[POLL] {conn.name}: {feed_key} – {dateiname} leer/nicht lesbar ({quelle}), "
+                         f"kein Download-Post.")
+                self._dispatch_merken(conn, ev, f"Datei leer oder nicht lesbar ({quelle})", datei=dateiname)
                 return
             meta = FEED_TYPES[feed_key]
             embed = discord.Embed(
