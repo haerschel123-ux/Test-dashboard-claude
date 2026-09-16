@@ -6099,14 +6099,17 @@ class DayZBot(discord.Client):
 
         Eine Zugabe wie ``_pruefe_neustart`` – ein Fehler hier (zu gross,
         FTP-Hakler, Kanal ohne Rechte) darf den Poll-Zyklus NIE kippen."""
+        dateiname = pfad.split("/")[-1]
+        ev = {"type": feed_key}
         ch_id = cfg.get_channel(conn.guild_id, feed_key, conn.service_id) if conn.guild_id else None
         if not ch_id:
+            self._dispatch_merken(conn, ev, "kein Feed/Channel gesetzt", datei=dateiname)
             return
-        dateiname = pfad.split("/")[-1]
         try:
             data = await loop.run_in_executor(None, conn.ftp.read_file_bytes, pfad)
             if not data:
                 log.debug(f"[POLL] {conn.name}: {feed_key} – {dateiname} leer/nicht lesbar, kein Download-Post.")
+                self._dispatch_merken(conn, ev, "Datei leer oder nicht lesbar (FTP)", datei=dateiname)
                 return
             meta = FEED_TYPES[feed_key]
             embed = discord.Embed(
@@ -6118,8 +6121,13 @@ class DayZBot(discord.Client):
                                          anhang=(data, dateiname))
             if not ok:
                 log.warning(f"[POLL] {conn.name}: {feed_key} fuer {dateiname} nicht gesendet ({grund}).")
+                self._dispatch_merken(conn, ev, f"nicht gesendet ({grund})",
+                                      datei=dateiname, bytes=len(data))
+            else:
+                self._dispatch_merken(conn, ev, "gepostet", datei=dateiname, bytes=len(data))
         except Exception as e:  # noqa: BLE001 – Zugabe, darf den Poll nie kippen
             log.warning(f"[POLL] {conn.name}: {feed_key} fuer {dateiname} fehlgeschlagen: {e}")
+            self._dispatch_merken(conn, ev, f"Ausnahme: {e}", datei=dateiname)
 
     async def _check_ftp_health(self, conn: Optional[ServerConnection] = None):
         """Warnt im Adminlog-Feed, wenn das FTP-Polling dauerhaft fehlschlägt
