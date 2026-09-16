@@ -727,7 +727,36 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
     # postet ueber diesen Feed via _post_feed, siehe _abandoned_bases_digest.
     "abandoned_bases":    {"label": "Verlassene Basen",      "gruppe": "Bau",
                            "emoji": "🏚️", "farbe": 0xA16207},
+    # CE-Dynamic-Events (Heli-Crash, Convoy, Checkpoint, Abandoned Train,
+    # Vehicle) - erkannt ueber den periodischen "[CE][DE] DynamicEvent Types"-
+    # Zaehler-Dump im RPT-Log, siehe _lese_ce_events. Ein Feed-Kanal, fuenf
+    # unabhaengige Sub-Schalter (ce_events_<key>_enabled je Server).
+    "ce_events":          {"label": "CE-Events",             "gruppe": "Bot",
+                           "emoji": "🚁", "farbe": 0x2E86C1},
 }
+
+# Zuordnung der tatsaechlichen DayZ-CE-Event-Typnamen (wie sie im RPT-
+# Zaehler-Dump stehen) zu den Sub-Schaltern des ce_events-Feeds. Anhand einer
+# echten RPT-Datei verifiziert - "Contaminated Zone"/"Loot Container" kommen
+# in DayZ als solche gar nicht vor und wurden bewusst weggelassen. Alle
+# "Vehicle*"-Typen (VehicleBoat, VehicleCivilianSedan, ...) fallen zusammen
+# unter EINEN Schalter, das Embed nennt aber den konkreten Typnamen.
+_CE_EVENT_TYP_ZU_SCHALTER: Dict[str, str] = {
+    "StaticHeliCrash":       "helicopter_crash",
+    "StaticMilitaryConvoy":  "convoy",
+    "StaticPoliceSituation": "checkpoint",
+    "StaticTrain":           "abandoned_train",
+}
+_CE_EVENT_SCHALTER_LABEL: Dict[str, Tuple[str, str]] = {
+    # schalter_key -> (emoji, Anzeigename)
+    "helicopter_crash": ("🚁", "Helicopter Crash"),
+    "convoy":            ("🚙", "Convoy"),
+    "checkpoint":         ("🚓", "Police Checkpoint"),
+    "abandoned_train":    ("🚂", "Abandoned Train"),
+    "vehicle_event":      ("🚗", "Vehicle Event"),
+}
+_CE_EVENT_ZEILE_RE = re.compile(
+    r"^\s*(?:\d+:\d+:\d+\.\d+\s+)?([A-Za-z_][A-Za-z0-9_ ]*?)\s+\((\d+)\)\s*$")
 
 # Kurztexte je Abandoned-Bases-Regel für die Digest-Zeilen - _tt() braucht
 # eine feste Sprache je Server, nicht die des jeweiligen Discord-Nutzers,
@@ -3131,6 +3160,11 @@ class ServerConnection:
         # Die Abfrage kostet eine eigene FTP-Runde und muss deshalb nicht in
         # jedem 10s-Zyklus laufen – siehe _pruefe_neustart.
         self.rpt_geprueft_ts: float = 0.0
+        # Letzter bekannter Zaehlerstand je CE-Event-Typ (reiner Arbeitsspeicher,
+        # NICHT persistiert - nach einem Bot-Neustart soll der naechste Dump
+        # ohnehin nur als neue Baseline gelten statt "alles neu aufgetaucht"
+        # zu melden). Siehe _lese_ce_events/_ce_events_zeilen_auswerten.
+        self.ce_event_counts: Dict[str, int] = {}
         # Grund, aus dem der Poll-Zyklus diesen Server gerade uebergeht
         # (None = laeuft normal). Nur bei einer AENDERUNG geloggt (siehe
         # _poll_zustand_melden) – sonst waere das Terminal bei einem
@@ -3837,6 +3871,42 @@ async def _log_lesen_ab_offset(conn: "ServerConnection", path: str,
         return raw.decode("utf-8", errors="replace"), offset + len(raw)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, conn.ftp.read_from_offset, path, offset)
+
+
+def _ce_events_zeilen_auswerten(zeilen: List[str], counts: Dict[str, int]
+                                ) -> List[Tuple[str, str, int]]:
+    """Reine Funktion (kein I/O) fuer den CE-Events-Zaehler-Diff: DayZ schreibt
+    alle 5 Sekunden ALLE 56 Event-Typen mit ihrem aktuellen Zaehlerstand neu
+    ins RPT-Log (``  StaticHeliCrash (3)``), nie eine einzelne "Event ist da"-
+    Zeile. Ein neues Event erkennt man nur daran, dass die Zahl zwischen zwei
+    Dumps steigt. ``counts`` wird IN-PLACE aktualisiert (letzter bekannter
+    Stand je Typ) - beim ersten je gesehenen Typ wird nur der Stand gemerkt,
+    NICHTS gemeldet (sonst waere nach jedem Bot-/Cursor-Neustart der komplette
+    Bestand faelschlich "neu aufgetaucht").
+
+    Gibt eine Liste ``(typ_name, schalter_key, neuer_stand)`` zurueck, EIN
+    Eintrag pro Zaehler-Schritt (steigt der Stand um mehr als 1 zwischen zwei
+    Dumps, z.B. zwei Heli-Crashes kurz hintereinander, entsprechend oft)."""
+    ergebnisse: List[Tuple[str, str, int]] = []
+    for zeile in zeilen:
+        treffer = _CE_EVENT_ZEILE_RE.match(zeile)
+        if not treffer:
+            continue
+        typ_name, stand_text = treffer.group(1), treffer.group(2)
+        if typ_name in _CE_EVENT_TYP_ZU_SCHALTER:
+            schalter = _CE_EVENT_TYP_ZU_SCHALTER[typ_name]
+        elif typ_name.startswith("Vehicle"):
+            schalter = "vehicle_event"
+        else:
+            continue
+        neuer_stand = int(stand_text)
+        alter_stand = counts.get(typ_name)
+        counts[typ_name] = neuer_stand
+        if alter_stand is None:
+            continue  # erster gesehener Dump fuer diesen Typ - nur merken
+        for schritt in range(alter_stand + 1, neuer_stand + 1):
+            ergebnisse.append((typ_name, schalter, schritt))
+    return ergebnisse
 
 
 async def _poll_zustand_melden(conn: ServerConnection, grund: Optional[str]) -> None:
@@ -4686,6 +4756,7 @@ class DayZBot(discord.Client):
         try:
             loop = asyncio.get_running_loop()
             await self._pruefe_neustart(conn, log_dir, loop)
+            await self._lese_ce_events(conn, log_dir, loop)
             adm_files = await _log_dateien(conn, log_dir, ".adm")
             if not adm_files:
                 # Ein GESPEICHERTER, aber falscher Pfad heilte sich frueher nie:
@@ -6022,6 +6093,61 @@ class DayZBot(discord.Client):
             log.info(f"[HYDRATE] {conn.name}: kein vollständiger PlayerList-Block in {latest} – "
                      f"Online-Namen kommen erst mit dem nächsten Block des Servers.")
         return False
+
+    async def _lese_ce_events(self, conn: ServerConnection, log_dir: str, loop):
+        """Liest neue Zeilen der aktuellen RPT-Datei (ab gespeichertem Offset,
+        wie beim ADM-Cursor) und wertet den periodischen
+        ``[CE][DE] DynamicEvent Types (56):``-Zaehler-Dump aus (siehe
+        _ce_events_zeilen_auswerten). Die RPT-Datei wird sonst im ganzen Bot
+        NIE inhaltlich gelesen (nur ihr Dateiname fuer die Neustart-Erkennung,
+        siehe _pruefe_neustart) - das hier ist der einzige Ort, der tatsaechlich
+        RPT-Text parst, deshalb ein eigener Cursor statt Mitbenutzung des
+        ADM-Zustands."""
+        if conn.guild_id is None:
+            return
+        try:
+            rpt = await _log_dateien(conn, log_dir, ".rpt")
+        except Exception as e:  # noqa: BLE001 – darf den Poll nie kippen
+            log.debug(f"[POLL] CE-Events-RPT-Liste ({conn.name}): {e}")
+            return
+        if not rpt:
+            return
+        aktuelle_datei = rpt[-1]
+        state = conn.log_state.get("ce_events")
+        if state is None or state.get("file") != aktuelle_datei:
+            # Erststart oder Rotation: Cursor ans aktuelle Ende setzen, alte
+            # Zaehlerstaende verwerfen - sonst wuerde ein nach dem Neustart
+            # (auf 0) zurueckgesetzter DayZ-Zaehler faelschlich als "Rueckgang"
+            # gewertet und beim naechsten echten Anstieg u.U. falsch gemeldet.
+            size_now = await _log_dateigroesse(conn, aktuelle_datei)
+            if size_now is None:
+                return
+            conn.log_state["ce_events"] = {"file": aktuelle_datei, "offset": int(size_now)}
+            conn.ce_event_counts = {}
+            connections.save()
+            return
+        text, neuer_offset = await _log_lesen_ab_offset(conn, aktuelle_datei, state.get("offset", 0))
+        if text is None:
+            return  # Lesefehler - naechster Zyklus versucht es erneut
+        state["offset"] = neuer_offset
+        connections.save()
+        if not text:
+            return
+        postings = _ce_events_zeilen_auswerten(text.splitlines(), conn.ce_event_counts)
+        for typ_name, schalter, neuer_stand in postings:
+            schluessel = f"ce_events_{schalter}_enabled"
+            if not conn.get(schluessel, True):
+                continue
+            emoji, label = _CE_EVENT_SCHALTER_LABEL[schalter]
+            if schalter == "vehicle_event":
+                beschreibung = f"**{typ_name}** ist aufgetaucht (jetzt {neuer_stand} aktiv)"
+            else:
+                beschreibung = f"ist aufgetaucht (jetzt {neuer_stand} aktiv)"
+            embed = discord.Embed(title=f"{emoji} {label}", description=beschreibung,
+                                  color=FEED_TYPES["ce_events"]["farbe"])
+            ok, grund = await _post_feed(conn.guild_id, "ce_events", embed, service_id=conn.service_id)
+            if not ok:
+                log.debug(f"[POLL] {conn.name}: ce_events fuer {typ_name} nicht gesendet ({grund}).")
 
     async def _pruefe_neustart(self, conn: ServerConnection, log_dir: str, loop):
         """Neue .RPT-Datei erkannt = der Gameserver wurde neu gestartet.
@@ -14151,6 +14277,52 @@ async def api_abandoned_bases_post(request: web.Request) -> web.Response:
     _audit_add("dashboard", _audit_actor(_sess_get(request)), "Verlassene-Basen-Einstellungen geändert",
               conn.name)
     return ok(_abandoned_bases_payload(conn))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  CE-Dynamic-Events-Feed: ein Feed-Kanal ("ce_events", siehe FEED_TYPES),
+#  fuenf unabhaengige Sub-Schalter je Server. Erkennung selbst laeuft im
+#  Poll-Zyklus (_lese_ce_events/_ce_events_zeilen_auswerten), hier nur die
+#  Ein/Aus-Schalter-Verwaltung - 1:1 dasselbe Muster wie Verlassene Basen.
+# ──────────────────────────────────────────────────────────────────────────
+def _ce_events_payload(conn: ServerConnection) -> Dict[str, Any]:
+    return {schalter: bool(conn.get(f"ce_events_{schalter}_enabled", True))
+            for schalter in _CE_EVENT_SCHALTER_LABEL}
+
+
+async def api_ce_events_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "ce_events")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("ce_events", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "feeds", "view")
+    if fehler is not None:
+        return fehler
+    return ok(_ce_events_payload(conn))
+
+
+async def api_ce_events_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "ce_events")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("ce_events", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "feeds", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "feeds.ce_events", 10)
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    for schalter in _CE_EVENT_SCHALTER_LABEL:
+        if schalter in data:
+            _conn_store(conn, f"ce_events_{schalter}_enabled", bool(data[schalter]))
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "CE-Events-Einstellungen geändert",
+              conn.name)
+    return ok(_ce_events_payload(conn))
 
 
 # ── 9. Types Booster ──────────────────────────────────────────────────────
@@ -30534,6 +30706,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/altaccountfinder", api_tools_altaccountfinder_post)
     r.add_get("/api/feeds/abandoned-bases/settings", api_abandoned_bases_get)
     r.add_post("/api/feeds/abandoned-bases/settings", api_abandoned_bases_post)
+    r.add_get("/api/feeds/ce-events/settings", api_ce_events_get)
+    r.add_post("/api/feeds/ce-events/settings", api_ce_events_post)
 
     # ── Karte / Events ──
     r.add_get("/api/map/meta", api_map_meta)
@@ -31386,6 +31560,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "6ff65cd6eb5627e474da1348c5ef2b93690f7a4be8611d29ac89392d35d12722",
         "b0dbcdbeac9c8f476b5b597d72e4885f37f33767f4ba18a549b7b1dc580f998b",
         "3cf30da6a897009147f22bdc8f3cde893e36cbda293a4ef237e61bb611b78eda",
+        "f23b31b77382784facdaddf0da34a85dce10f105b23e9cd8098613b5f6d9bd9e",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
