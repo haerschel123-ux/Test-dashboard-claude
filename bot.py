@@ -691,21 +691,17 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
     # Rückfall-Feeds: garantieren, dass nichts mehr unbemerkt verschwindet.
     # catch_all fängt jedes ERKANNTE Ereignis auf, für das kein eigener Feed
     # gesetzt ist (Rückfallkette in _dispatch: fein → grob → catch_all).
-    # unparsed sammelt Roh-Log-Zeilen, die an KEINEM Muster hängen blieben –
-    # gedrosselt und entdoppelt gepostet (siehe _unparsed_posten), damit eine
-    # rauschige ADM-Datei die Feeds nicht flutet. Ungefiltert und vollständig
-    # stehen dieselben Zeilen auf der Diagnose-Seite im Dashboard.
-    "catch_all":          {"label": "Alles Übrige",        "gruppe": "Sonstiges",
-                           "emoji": "🧺", "farbe": 0x5D6D7E},
-    "unparsed":           {"label": "Unerkannte Log-Zeilen", "gruppe": "Sonstiges",
-                           "emoji": "❓", "farbe": 0x34495E},
+    # "catch_all", "unparsed" und "status" bewusst NICHT mehr als eigene
+    # Feed-Karten (auf Brigardes Wunsch entfernt, 2026-09-16): "catch_all"
+    # bleibt als interner Ausweich-Kandidat in _dispatch/_post_feed bestehen,
+    # ist ueber das Dashboard aber nicht mehr konfigurierbar. "unparsed" ist
+    # komplett entfernt (siehe Diagnose-Seite fuer unerkannte Zeilen). "status"
+    # (Auto-Status-Embed) hat laut Brigarde keinen Nutzen mehr.
     # ── Bot-eigene Feeds (keine Log-Ereignisse) ──────────────
     "shop_log":           {"label": "Shop-Log",            "gruppe": "Bot",
                            "emoji": "🛒", "farbe": 0x1ABC9C},
     "economy_log":        {"label": "Economy-Log",         "gruppe": "Bot",
                            "emoji": "💰", "farbe": 0xF1C40F},
-    "status":             {"label": "Status-Embed",        "gruppe": "Bot",
-                           "emoji": "📊", "farbe": 0x3498DB},
     "restart":            {"label": "Restart-Ankündigung", "gruppe": "Bot",
                            "emoji": "🔄", "farbe": 0xE67E22},
     # "zone" bewusst NICHT als eigener Feed: jede Zone hat ihren Channel
@@ -5022,10 +5018,6 @@ class DayZBot(discord.Client):
                 for ev in events:
                     await self._dispatch(ev, conn)
 
-            # Unerkannte Zeilen dieses Zyklus (falls der Betreiber einen
-            # "unparsed"-Feed eingerichtet hat) gedrosselt/entdoppelt posten.
-            await self._post_unparsed_zeilen(conn)
-
             # Zonen-Pings: frisch getrackte Positionen gegen /zone-Zonen prüfen
             await self._check_zones(conn)
             # Spielzeit-Belohnung für offene Sitzungen gutschreiben
@@ -5035,53 +5027,6 @@ class DayZBot(discord.Client):
         except Exception as e:
             log.error(f"[POLL] {conn.name}: {e}")
             await self._check_ftp_health(conn)
-
-    UNPARSED_MAX_JE_ZYKLUS = 5
-
-    async def _post_unparsed_zeilen(self, conn: ServerConnection,
-                                    parser: Optional["DayZLogParser"] = None) -> None:
-        """Postet neue unerkannte Log-Zeilen in den "unparsed"-Feed – NUR,
-        wenn der Betreiber ihm einen Channel gegeben hat, sonst bleiben sie
-        rein auf der Diagnose-Seite sichtbar. Entdoppelt und auf
-        UNPARSED_MAX_JE_ZYKLUS gedeckelt, sonst würde eine rauschige ADM-Datei
-        (z. B. ein Mod, der pro Tick eine Zeile schreibt) die Feeds fluten.
-        """
-        parser = parser or (conn.parser if conn is not None else self.parser)
-        if parser is None or not parser.frisch_unerkannt:
-            return
-        zeilen = parser.frisch_unerkannt
-        parser.frisch_unerkannt = []
-        if conn is None or conn.guild_id is None:
-            return
-        feed = cfg.feed_settings(int(conn.guild_id), "unparsed", conn.service_id)
-        if not feed:
-            return  # nicht eingerichtet – Zeilen bleiben nur in der Diagnose sichtbar
-        # Entdoppeln (Reihenfolge behalten), dann deckeln.
-        eindeutig: List[str] = []
-        gesehen: set = set()
-        for z in zeilen:
-            if z not in gesehen:
-                gesehen.add(z)
-                eindeutig.append(z)
-        ueberschuss = len(eindeutig) - self.UNPARSED_MAX_JE_ZYKLUS
-        gezeigt = eindeutig[:self.UNPARSED_MAX_JE_ZYKLUS]
-        text = "\n".join(gezeigt)
-        if len(text) > 1000:
-            text = text[:997] + "…"
-        embed = discord.Embed(
-            title="❓ Unerkannte Log-Zeilen",
-            description=f"```\n{text}\n```",
-            color=FEED_TYPES["unparsed"]["farbe"])
-        if ueberschuss > 0:
-            embed.set_footer(text=f"… und {ueberschuss} weitere in diesem Zyklus "
-                                  f"(vollständig auf der Diagnose-Seite).")
-        send_embed = _feed_anwenden(embed, feed)
-        ch = await self._resolve_channel(int(feed["channel_id"]))
-        if ch:
-            try:
-                await ch.send(embed=send_embed)
-            except Exception as e:  # noqa: BLE001 – darf den Poll-Zyklus nicht stoppen
-                log.warning(f"[POLL] {conn.name}: unparsed-Feed nicht postbar: {e}")
 
     @log_poll.before_loop
     async def _before_poll(self):
@@ -25925,7 +25870,6 @@ async def api_diagnose_nachlesen(request: web.Request) -> web.Response:
         events = events[-cap:]
     for ev in events:
         await bot._dispatch(ev, conn, nebenwirkungen=False)
-    await bot._post_unparsed_zeilen(conn, parser=eigen)
     verlauf = list(conn.dispatch_verlauf)[-len(events):] if events else []
     gepostet = sum(1 for e in verlauf if e.get("ergebnis") == "gepostet")
     return ok({
