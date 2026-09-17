@@ -758,6 +758,32 @@ _CE_EVENT_SCHALTER_LABEL: Dict[str, Tuple[str, str]] = {
 _CE_EVENT_ZEILE_RE = re.compile(
     r"^\s*(?:\d+:\d+:\d+\.\d+\s+)?([A-Za-z_][A-Za-z0-9_ ]*?)\s+\((\d+)\)\s*$")
 
+# Anzeigename je kanonischer Karte (_canonical_map_name) fuer den
+# CE-Events-Feedtext - siehe _ce_events_beschreibung.
+_CE_MAP_ANZEIGE: Dict[str, str] = {
+    "ChernarusPlus": "Chernarus", "Livonia": "Livonia", "Sakhal": "Sakhal",
+}
+
+# Offizieller Bohemia-Vanilla-Fallback (NUR Anzahl der <pos>-Eintraege je Karte
+# und Event-Typ, keine Koordinaten - die reichen fuer den Feedtext "einer von
+# N Punkten"). Quelle: DayZ-Central-Economy-Repository, Commit
+# 9a21bb9f5fb9c62a7ce2761402196091588133e6, cfgeventspawns.xml je Karte.
+# Nur die vier Nicht-Fahrzeug-Typen - fuer "Vehicle*"-Events gibt es keinen
+# pauschalen Vanilla-Pool (siehe _CE_EVENT_ZEILE_RE-Kommentar/Anleitung:
+# Fahrzeuge koennen sich nach dem Spawn bewegen, ein Pool waere ohnehin nur
+# der urspruengliche Spawnpunkt). Sakhal fehlt bewusst: die Events sind dort
+# in der offiziellen events.xml inaktiv, kein Pool vorhanden.
+_CE_VANILLA_SPAWN_COUNT: Dict[str, Dict[str, int]] = {
+    "ChernarusPlus": {
+        "StaticHeliCrash": 95, "StaticMilitaryConvoy": 23,
+        "StaticPoliceSituation": 39, "StaticTrain": 21,
+    },
+    "Livonia": {
+        "StaticHeliCrash": 79, "StaticMilitaryConvoy": 14,
+        "StaticPoliceSituation": 33, "StaticTrain": 14,
+    },
+}
+
 # Kurztexte je Abandoned-Bases-Regel für die Digest-Zeilen - _tt() braucht
 # eine feste Sprache je Server, nicht die des jeweiligen Discord-Nutzers,
 # darum hier ein einfaches Dict statt _t()/_tt() (Sprache kommt vom Digest-
@@ -3165,6 +3191,17 @@ class ServerConnection:
         # ohnehin nur als neue Baseline gelten statt "alles neu aufgetaucht"
         # zu melden). Siehe _lese_ce_events/_ce_events_zeilen_auswerten.
         self.ce_event_counts: Dict[str, int] = {}
+        # Unvollstaendiger Rest eines "[CE][DE] DynamicEvent Types"-Blocks vom
+        # letzten Poll-Zyklus (siehe _ce_events_bloecke_extrahieren) - RPT
+        # schreibt den Dump ueber mehrere Zeilen, ein Poll kann mittendrin
+        # abschneiden.
+        self.ce_events_puffer: str = ""
+        # cfgeventspawns.xml dieses Servers, fuer den Positions-Kandidaten-Pool
+        # im ce_events-Feed (siehe _ce_events_pool_laden). None = noch nicht
+        # geladen, False = versucht, aber nicht erreichbar (z.B. PS4 ohne
+        # Mission-Ordner-Zugriff) - beides fuehrt zum Vanilla-Fallback.
+        self.ce_pool_root: Optional[Any] = None
+        self.ce_pool_geladen_ts: float = 0.0
         # Grund, aus dem der Poll-Zyklus diesen Server gerade uebergeht
         # (None = laeuft normal). Nur bei einer AENDERUNG geloggt (siehe
         # _poll_zustand_melden) – sonst waere das Terminal bei einem
@@ -3873,21 +3910,65 @@ async def _log_lesen_ab_offset(conn: "ServerConnection", path: str,
     return await loop.run_in_executor(None, conn.ftp.read_from_offset, path, offset)
 
 
-def _ce_events_zeilen_auswerten(zeilen: List[str], counts: Dict[str, int]
-                                ) -> List[Tuple[str, str, int]]:
-    """Reine Funktion (kein I/O) fuer den CE-Events-Zaehler-Diff: DayZ schreibt
-    alle 5 Sekunden ALLE 56 Event-Typen mit ihrem aktuellen Zaehlerstand neu
-    ins RPT-Log (``  StaticHeliCrash (3)``), nie eine einzelne "Event ist da"-
-    Zeile. Ein neues Event erkennt man nur daran, dass die Zahl zwischen zwei
-    Dumps steigt. ``counts`` wird IN-PLACE aktualisiert (letzter bekannter
-    Stand je Typ) - beim ersten je gesehenen Typ wird nur der Stand gemerkt,
-    NICHTS gemeldet (sonst waere nach jedem Bot-/Cursor-Neustart der komplette
-    Bestand faelschlich "neu aufgetaucht").
+_CE_EVENT_HEADER_RE = re.compile(r"\[CE\]\[DE\] DynamicEvent Types \(\d+\):\s*$")
 
-    Gibt eine Liste ``(typ_name, schalter_key, neuer_stand)`` zurueck, EIN
-    Eintrag pro Zaehler-Schritt (steigt der Stand um mehr als 1 zwischen zwei
-    Dumps, z.B. zwei Heli-Crashes kurz hintereinander, entsprechend oft)."""
-    ergebnisse: List[Tuple[str, str, int]] = []
+
+def _ce_events_bloecke_extrahieren(text: str) -> Tuple[List[List[str]], str]:
+    """Reine Funktion (kein I/O): trennt neu gelesenen RPT-Text in VOLLSTAENDIGE
+    ``[CE][DE] DynamicEvent Types (N):``-Bloecke auf (siehe _CE_EVENT_HEADER_RE)
+    und gibt zusaetzlich den nicht auswertbaren Rest zurueck.
+
+    Wichtig fuer die Robustheit: eine Zeile wird NUR dann als Zaehler-Eintrag
+    gewertet, wenn sie direkt auf einen erkannten Block-Header folgt (oder auf
+    eine andere Zeile, die selbst schon zu diesem Block gehoert) - nicht jede
+    beliebige RPT-Zeile im Format ``<Name> (<Zahl>)`` irgendwo im Log. Ohne
+    diese Bindung koennte eine zufaellig gleich aussehende Zeile ausserhalb
+    des Zaehler-Dumps faelschlich als CE-Event gewertet werden.
+
+    Ein Block gilt erst als VOLLSTAENDIG, wenn nach seinen Zaehler-Zeilen eine
+    nicht mehr passende Zeile (oder der naechste Header) folgt - sonst koennte
+    ein Poll-Zyklus mitten im Dump abschneiden. Ein am Ende des Textes noch
+    offener (letzter) Block wird deshalb NICHT ausgewertet, sondern unveraendert
+    als ``rest`` zurueckgegeben und beim naechsten Aufruf erneut versucht."""
+    zeilen = text.split("\n")
+    if zeilen and zeilen[-1] == "":
+        zeilen.pop()  # _log_lesen_ab_offset liefert Text stets bis zum Zeilenende
+    bloecke: List[List[str]] = []
+    i = 0
+    n = len(zeilen)
+    while i < n:
+        if not _CE_EVENT_HEADER_RE.search(zeilen[i]):
+            i += 1
+            continue
+        j = i + 1
+        while j < n and _CE_EVENT_ZEILE_RE.match(zeilen[j]):
+            j += 1
+        if j >= n:
+            # Block reicht bis ans Ende des gelesenen Textes - koennte noch
+            # unvollstaendig sein. Ab hier (inkl. Header) fuer naechstes Mal merken.
+            rest = "\n".join(zeilen[i:]) + "\n"
+            return bloecke, rest
+        bloecke.append(zeilen[i + 1:j])
+        i = j
+    return bloecke, ""
+
+
+def _ce_events_zeilen_auswerten(zeilen: List[str], counts: Dict[str, int]
+                                ) -> List[Tuple[str, str, int, int]]:
+    """Reine Funktion (kein I/O) fuer den CE-Events-Zaehler-Diff INNERHALB eines
+    einzelnen, vollstaendigen Blocks (siehe _ce_events_bloecke_extrahieren).
+    DayZ schreibt alle 5 Sekunden ALLE Event-Typen mit ihrem aktuellen
+    Zaehlerstand neu ins RPT-Log (``  StaticHeliCrash (3)``), nie eine
+    einzelne "Event ist da"-Zeile. Ein neues Event erkennt man nur daran,
+    dass die Zahl zwischen zwei Bloecken steigt. ``counts`` wird IN-PLACE
+    aktualisiert (letzter bekannter Stand je Typ) - beim ersten je gesehenen
+    Typ wird nur der Stand gemerkt, NICHTS gemeldet (sonst waere nach jedem
+    Bot-/Cursor-Neustart der komplette Bestand faelschlich "neu aufgetaucht").
+
+    Gibt eine Liste ``(typ_name, schalter_key, delta, neuer_stand)`` zurueck -
+    EIN zusammengefasster Eintrag pro Typ und Block, auch wenn der Stand um
+    mehr als 1 gestiegen ist (z. B. zwei Heli-Crashes im selben Block)."""
+    ergebnisse: List[Tuple[str, str, int, int]] = []
     for zeile in zeilen:
         treffer = _CE_EVENT_ZEILE_RE.match(zeile)
         if not treffer:
@@ -3904,9 +3985,20 @@ def _ce_events_zeilen_auswerten(zeilen: List[str], counts: Dict[str, int]
         counts[typ_name] = neuer_stand
         if alter_stand is None:
             continue  # erster gesehener Dump fuer diesen Typ - nur merken
-        for schritt in range(alter_stand + 1, neuer_stand + 1):
-            ergebnisse.append((typ_name, schalter, schritt))
+        delta = neuer_stand - alter_stand
+        if delta > 0:
+            ergebnisse.append((typ_name, schalter, delta, neuer_stand))
     return ergebnisse
+
+
+def _ce_events_pool_anzahl_aus_xml(root: "ET.Element", typ_name: str) -> Optional[int]:
+    """Anzahl der <pos>-Kandidaten fuer ``typ_name`` in einer geparsten
+    cfgeventspawns.xml (Stufe A: die ECHTE Datei dieses Servers). None, wenn
+    dieser Event-Name darin gar nicht vorkommt (z.B. vom Kunden entfernt)."""
+    event = root.find(f'.//event[@name="{typ_name}"]')
+    if event is None:
+        return None
+    return len(event.findall("pos"))
 
 
 async def _poll_zustand_melden(conn: ServerConnection, grund: Optional[str]) -> None:
@@ -6097,12 +6189,15 @@ class DayZBot(discord.Client):
     async def _lese_ce_events(self, conn: ServerConnection, log_dir: str, loop):
         """Liest neue Zeilen der aktuellen RPT-Datei (ab gespeichertem Offset,
         wie beim ADM-Cursor) und wertet den periodischen
-        ``[CE][DE] DynamicEvent Types (56):``-Zaehler-Dump aus (siehe
-        _ce_events_zeilen_auswerten). Die RPT-Datei wird sonst im ganzen Bot
-        NIE inhaltlich gelesen (nur ihr Dateiname fuer die Neustart-Erkennung,
-        siehe _pruefe_neustart) - das hier ist der einzige Ort, der tatsaechlich
-        RPT-Text parst, deshalb ein eigener Cursor statt Mitbenutzung des
-        ADM-Zustands."""
+        ``[CE][DE] DynamicEvent Types (56):``-Zaehler-Dump aus. Anders als der
+        fruehere, einfachere Ansatz wird jede Zeile nur innerhalb eines
+        VOLLSTAENDIG erkannten Blocks gewertet (siehe
+        _ce_events_bloecke_extrahieren) - ein am Textende noch offener Block
+        bleibt im Puffer (conn.ce_events_puffer) fuer den naechsten Zyklus.
+        Die RPT-Datei wird sonst im ganzen Bot NIE inhaltlich gelesen (nur ihr
+        Dateiname fuer die Neustart-Erkennung, siehe _pruefe_neustart) - das
+        hier ist der einzige Ort, der tatsaechlich RPT-Text parst, deshalb ein
+        eigener Cursor statt Mitbenutzung des ADM-Zustands."""
         if conn.guild_id is None:
             return
         try:
@@ -6124,6 +6219,7 @@ class DayZBot(discord.Client):
                 return
             conn.log_state["ce_events"] = {"file": aktuelle_datei, "offset": int(size_now)}
             conn.ce_event_counts = {}
+            conn.ce_events_puffer = ""
             connections.save()
             return
         text, neuer_offset = await _log_lesen_ab_offset(conn, aktuelle_datei, state.get("offset", 0))
@@ -6133,21 +6229,88 @@ class DayZBot(discord.Client):
         connections.save()
         if not text:
             return
-        postings = _ce_events_zeilen_auswerten(text.splitlines(), conn.ce_event_counts)
-        for typ_name, schalter, neuer_stand in postings:
-            schluessel = f"ce_events_{schalter}_enabled"
-            if not conn.get(schluessel, True):
-                continue
-            emoji, label = _CE_EVENT_SCHALTER_LABEL[schalter]
-            if schalter == "vehicle_event":
-                beschreibung = f"**{typ_name}** ist aufgetaucht (jetzt {neuer_stand} aktiv)"
-            else:
-                beschreibung = f"ist aufgetaucht (jetzt {neuer_stand} aktiv)"
-            embed = discord.Embed(title=f"{emoji} {label}", description=beschreibung,
-                                  color=FEED_TYPES["ce_events"]["farbe"])
-            ok, grund = await _post_feed(conn.guild_id, "ce_events", embed, service_id=conn.service_id)
-            if not ok:
-                log.debug(f"[POLL] {conn.name}: ce_events fuer {typ_name} nicht gesendet ({grund}).")
+        bloecke, rest = _ce_events_bloecke_extrahieren(conn.ce_events_puffer + text)
+        conn.ce_events_puffer = rest
+        for block_zeilen in bloecke:
+            postings = _ce_events_zeilen_auswerten(block_zeilen, conn.ce_event_counts)
+            for typ_name, schalter, delta, neuer_stand in postings:
+                schluessel = f"ce_events_{schalter}_enabled"
+                if not conn.get(schluessel, True):
+                    continue
+                embed = await self._ce_events_embed(conn, typ_name, schalter, delta, neuer_stand, loop)
+                ok, grund = await _post_feed(conn.guild_id, "ce_events", embed, service_id=conn.service_id)
+                if not ok:
+                    log.debug(f"[POLL] {conn.name}: ce_events fuer {typ_name} nicht gesendet ({grund}).")
+
+    async def _ce_events_embed(self, conn: ServerConnection, typ_name: str, schalter: str,
+                               delta: int, neuer_stand: int, loop) -> "discord.Embed":
+        """Baut das Feed-Embed inkl. Positions-Kandidaten-Pool (siehe Anleitung
+        zu CE-Events-Positionen: eine exakte Live-Position ist auf DayZ-Konsole
+        technisch nicht ermittelbar - stattdessen wird, wenn moeglich, die
+        Groesse des moeglichen Spawnpools genannt: zuerst aus der ECHTEN
+        cfgeventspawns.xml dieses Servers (Stufe A), sonst aus dem offiziellen
+        Bohemia-Vanilla-Datensatz (Stufe B), sonst gar keine Ortsangabe
+        (Stufe C). Nie eine einzelne Koordinate als "der" aktive Ort."""
+        emoji, label = _CE_EVENT_SCHALTER_LABEL[schalter]
+        kopf = (f"{delta}× neu aufgetaucht (jetzt {neuer_stand} aktiv)" if delta > 1
+               else f"ist aufgetaucht (jetzt {neuer_stand} aktiv)")
+        if schalter == "vehicle_event":
+            kopf = f"**{typ_name}** {kopf}"
+        anzahl, quelle = await self._ce_events_pool_info(conn, typ_name, loop)
+        if anzahl is not None:
+            karte = _canonical_map_name(conn.get("map_name", "")) or "ChernarusPlus"
+            kartenname = _CE_MAP_ANZEIGE.get(karte, karte)
+            art = "serverkonfigurierten" if quelle == "server" else "Vanilla"
+            zusatz = ("Quelle: aktuelle Server-Mission" if quelle == "server"
+                     else "Hinweis: Custom-Spawnpunkte des Servers können abweichen.")
+            beschreibung = (f"{kopf}\n\nOrt: nicht live bestimmbar\n"
+                           f"Möglicher Spawnpool: einer von {anzahl} {art} Punkten auf {kartenname}\n"
+                           f"{zusatz}")
+        else:
+            beschreibung = f"{kopf}\n\nOrt unbekannt – das RPT meldet nur die Anzahl aktiver Events."
+        return discord.Embed(title=f"{emoji} {label}", description=beschreibung,
+                             color=FEED_TYPES["ce_events"]["farbe"])
+
+    async def _ce_events_pool_info(self, conn: ServerConnection, typ_name: str,
+                                   loop) -> Tuple[Optional[int], Optional[str]]:
+        """(Anzahl, Quelle) des Positions-Kandidaten-Pools fuer ``typ_name``,
+        oder (None, None) wenn keiner ermittelbar ist. Quelle ist "server"
+        (echte cfgeventspawns.xml, siehe _ce_events_pool_laden) oder "vanilla"
+        (_CE_VANILLA_SPAWN_COUNT). Fuer Vehicle-Events gibt es bewusst KEINEN
+        Vanilla-Fallback (kein belegter Datensatz, und ein Fahrzeug kann sich
+        nach dem Spawn ohnehin vom urspruenglichen Punkt wegbewegt haben)."""
+        await self._ce_events_pool_laden(conn, loop)
+        if conn.ce_pool_root:
+            anzahl = _ce_events_pool_anzahl_aus_xml(conn.ce_pool_root, typ_name)
+            if anzahl is not None:
+                return anzahl, "server"
+        if schalter_fuer_typ := _CE_EVENT_TYP_ZU_SCHALTER.get(typ_name):
+            karte = _canonical_map_name(conn.get("map_name", "")) or "ChernarusPlus"
+            anzahl = _CE_VANILLA_SPAWN_COUNT.get(karte, {}).get(typ_name)
+            if anzahl is not None:
+                return anzahl, "vanilla"
+        return None, None
+
+    async def _ce_events_pool_laden(self, conn: ServerConnection, loop) -> None:
+        """Laedt/erneuert conn.ce_pool_root (geparste cfgeventspawns.xml dieses
+        Servers) hoechstens einmal pro Stunde - die Datei aendert sich nicht
+        staendig, ein FTP-Lesevorgang bei JEDEM Event waere unnoetig. Bleibt
+        conn.ce_pool_root auf ``False`` stehen (nicht erreichbar, z.B. PS4 ohne
+        Mission-Ordner), greift der Vanilla-Fallback in _ce_events_pool_info."""
+        jetzt = time.time()
+        if conn.ce_pool_root is not None and jetzt - conn.ce_pool_geladen_ts < 3600:
+            return
+        conn.ce_pool_geladen_ts = jetzt
+        if _mission_dir_of(conn) is None or conn.ftp is None:
+            conn.ce_pool_root = False
+            return
+        try:
+            root, status = await _tools_xml_lesen(conn, "cfgeventspawns.xml", loop)
+        except Exception as e:  # noqa: BLE001 – darf den Poll nie kippen
+            log.debug(f"[POLL] {conn.name}: cfgeventspawns.xml fuer ce_events nicht lesbar: {e}")
+            conn.ce_pool_root = False
+            return
+        conn.ce_pool_root = root if status == "ok" else False
 
     async def _pruefe_neustart(self, conn: ServerConnection, log_dir: str, loop):
         """Neue .RPT-Datei erkannt = der Gameserver wurde neu gestartet.
