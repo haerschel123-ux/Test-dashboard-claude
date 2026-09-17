@@ -758,31 +758,69 @@ _CE_EVENT_SCHALTER_LABEL: Dict[str, Tuple[str, str]] = {
 _CE_EVENT_ZEILE_RE = re.compile(
     r"^\s*(?:\d+:\d+:\d+\.\d+\s+)?([A-Za-z_][A-Za-z0-9_ ]*?)\s+\((\d+)\)\s*$")
 
-# Anzeigename je kanonischer Karte (_canonical_map_name) fuer den
-# CE-Events-Feedtext - siehe _ce_events_beschreibung.
-_CE_MAP_ANZEIGE: Dict[str, str] = {
-    "ChernarusPlus": "Chernarus", "Livonia": "Livonia", "Sakhal": "Sakhal",
-}
+# Erkennung ECHTER Spawn-Positionen ueber die Loot-Erzeugung eines
+# CE-Dynamic-Events: DayZ schreibt beim Erzeugen der Beute eines Events (nicht
+# beim Event-Objekt selbst) Zeilen wie ``Adding AK74_Hndgrd at [6203,8300]`` -
+# mehrere Gegenstaende im selben Sekundenbruchteil, auf engstem Raum. Anhand
+# einer echten RPT-Datei verifiziert: bei einem Heli-Crash tauchten so 9
+# Gegenstaende binnen 3ms im Umkreis von 10m auf; 39 Minuten spaeter raeumte
+# der Server das Wrack an EXAKT dieser Koordinate auf
+# (``<cleanup> Remove:"Wreck_UH1Y" at [6205,8303] ... DE="StaticHeliCrash"``).
+# Diese Zeilen tragen selbst KEINEN Event-Typ/keine ID - die Zuordnung zu
+# einem CE-Events-Zaehleranstieg passiert deshalb nur zeitlich (FIFO), siehe
+# _lese_ce_events. Das ist ein Best-Effort-Verfahren: spawnen zwei
+# verschiedene Event-Typen binnen weniger Sekunden, kann die Zuordnung
+# vertauscht sein - aber es ist eine ECHTE Position, keine Vermutung aus
+# einem Pool.
+_CE_ADDING_ZEILE_RE = re.compile(
+    r"^\s*(\d{1,2}):(\d{2}):(\d{2})\.(\d{1,3})\s+Adding\s+\S+\s+at\s+"
+    r"\[(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)\]\s*$")
+_CE_ADDING_CLUSTER_MIN_ITEMS = 3     # weniger ist ein normaler Einzel-Loot-Respawn
+_CE_ADDING_CLUSTER_RADIUS_M = 25.0   # Beute eines Events liegt eng um den Spawnpunkt
+_CE_ADDING_CLUSTER_MAX_LUECKE_S = 1.0  # groessere Zeitluecke = neuer Cluster
+_CE_PENDING_POSITIONEN_MAX = 8       # verhindert unbegrenztes Wachstum bei nie
+                                     # zugeordneten Clustern (z.B. normale Loot-Respawns,
+                                     # die zufaellig die Mindestgroesse erreichen)
 
-# Offizieller Bohemia-Vanilla-Fallback (NUR Anzahl der <pos>-Eintraege je Karte
-# und Event-Typ, keine Koordinaten - die reichen fuer den Feedtext "einer von
-# N Punkten"). Quelle: DayZ-Central-Economy-Repository, Commit
-# 9a21bb9f5fb9c62a7ce2761402196091588133e6, cfgeventspawns.xml je Karte.
-# Nur die vier Nicht-Fahrzeug-Typen - fuer "Vehicle*"-Events gibt es keinen
-# pauschalen Vanilla-Pool (siehe _CE_EVENT_ZEILE_RE-Kommentar/Anleitung:
-# Fahrzeuge koennen sich nach dem Spawn bewegen, ein Pool waere ohnehin nur
-# der urspruengliche Spawnpunkt). Sakhal fehlt bewusst: die Events sind dort
-# in der offiziellen events.xml inaktiv, kein Pool vorhanden.
-_CE_VANILLA_SPAWN_COUNT: Dict[str, Dict[str, int]] = {
-    "ChernarusPlus": {
-        "StaticHeliCrash": 95, "StaticMilitaryConvoy": 23,
-        "StaticPoliceSituation": 39, "StaticTrain": 21,
-    },
-    "Livonia": {
-        "StaticHeliCrash": 79, "StaticMilitaryConvoy": 14,
-        "StaticPoliceSituation": 33, "StaticTrain": 14,
-    },
-}
+
+def _ce_events_adding_cluster_erkennen(zeilen: List[str]) -> List[Tuple[float, float, int]]:
+    """Reine Funktion (kein I/O): gruppiert ``Adding <Item> at [x,z]``-Zeilen zu
+    Clustern (siehe Konstanten oben) und gibt fuer jeden ausreichend grossen
+    Cluster ``(x_mittelwert, z_mittelwert, anzahl)`` zurueck, in der
+    Reihenfolge des Auftretens."""
+    eintraege: List[Tuple[float, float, float]] = []
+    for zeile in zeilen:
+        treffer = _CE_ADDING_ZEILE_RE.match(zeile)
+        if not treffer:
+            continue
+        h, m, s, frac, x_text, z_text = treffer.groups()
+        zeit = int(h) * 3600 + int(m) * 60 + int(s) + int(frac) / (10 ** len(frac))
+        eintraege.append((zeit, float(x_text), float(z_text)))
+
+    cluster: List[Tuple[float, float, int]] = []
+    aktuell: List[Tuple[float, float, float]] = []
+
+    def abschliessen():
+        if len(aktuell) >= _CE_ADDING_CLUSTER_MIN_ITEMS:
+            x_avg = sum(e[1] for e in aktuell) / len(aktuell)
+            z_avg = sum(e[2] for e in aktuell) / len(aktuell)
+            cluster.append((x_avg, z_avg, len(aktuell)))
+
+    for eintrag in eintraege:
+        zeit, x, z = eintrag
+        if aktuell:
+            letzte_zeit = aktuell[-1][0]
+            zentrum_x = sum(e[1] for e in aktuell) / len(aktuell)
+            zentrum_z = sum(e[2] for e in aktuell) / len(aktuell)
+            abstand = ((x - zentrum_x) ** 2 + (z - zentrum_z) ** 2) ** 0.5
+            if (zeit - letzte_zeit > _CE_ADDING_CLUSTER_MAX_LUECKE_S
+                    or abstand > _CE_ADDING_CLUSTER_RADIUS_M):
+                abschliessen()
+                aktuell = []
+        aktuell.append(eintrag)
+    abschliessen()
+    return cluster
+
 
 # Kurztexte je Abandoned-Bases-Regel für die Digest-Zeilen - _tt() braucht
 # eine feste Sprache je Server, nicht die des jeweiligen Discord-Nutzers,
@@ -3196,12 +3234,10 @@ class ServerConnection:
         # schreibt den Dump ueber mehrere Zeilen, ein Poll kann mittendrin
         # abschneiden.
         self.ce_events_puffer: str = ""
-        # cfgeventspawns.xml dieses Servers, fuer den Positions-Kandidaten-Pool
-        # im ce_events-Feed (siehe _ce_events_pool_laden). None = noch nicht
-        # geladen, False = versucht, aber nicht erreichbar (z.B. PS4 ohne
-        # Mission-Ordner-Zugriff) - beides fuehrt zum Vanilla-Fallback.
-        self.ce_pool_root: Optional[Any] = None
-        self.ce_pool_geladen_ts: float = 0.0
+        # Echte, per "Adding"-Zeilen-Cluster verifizierte Spawn-Positionen fuer
+        # ce_events, wartend auf Zuordnung zu einem gemeldeten Zaehler-Anstieg
+        # (FIFO, siehe _ce_events_adding_cluster_erkennen/_ce_events_embed).
+        self.ce_pending_positionen: List[Tuple[float, float]] = []
         # Grund, aus dem der Poll-Zyklus diesen Server gerade uebergeht
         # (None = laeuft normal). Nur bei einer AENDERUNG geloggt (siehe
         # _poll_zustand_melden) – sonst waere das Terminal bei einem
@@ -3989,16 +4025,6 @@ def _ce_events_zeilen_auswerten(zeilen: List[str], counts: Dict[str, int]
         if delta > 0:
             ergebnisse.append((typ_name, schalter, delta, neuer_stand))
     return ergebnisse
-
-
-def _ce_events_pool_anzahl_aus_xml(root: "ET.Element", typ_name: str) -> Optional[int]:
-    """Anzahl der <pos>-Kandidaten fuer ``typ_name`` in einer geparsten
-    cfgeventspawns.xml (Stufe A: die ECHTE Datei dieses Servers). None, wenn
-    dieser Event-Name darin gar nicht vorkommt (z.B. vom Kunden entfernt)."""
-    event = root.find(f'.//event[@name="{typ_name}"]')
-    if event is None:
-        return None
-    return len(event.findall("pos"))
 
 
 async def _poll_zustand_melden(conn: ServerConnection, grund: Optional[str]) -> None:
@@ -6197,7 +6223,18 @@ class DayZBot(discord.Client):
         Die RPT-Datei wird sonst im ganzen Bot NIE inhaltlich gelesen (nur ihr
         Dateiname fuer die Neustart-Erkennung, siehe _pruefe_neustart) - das
         hier ist der einzige Ort, der tatsaechlich RPT-Text parst, deshalb ein
-        eigener Cursor statt Mitbenutzung des ADM-Zustands."""
+        eigener Cursor statt Mitbenutzung des ADM-Zustands.
+
+        Zusaetzlich werden im selben neu gelesenen Text "Adding <Item> at
+        [x,z]"-Zeilen auf zeitlich/raeumlich eng zusammenliegende Cluster
+        untersucht (siehe _ce_events_adding_cluster_erkennen) - das sind
+        echte, im RPT verifizierte Spawn-Positionen (Ladung eines CE-Events
+        entsteht in genau diesem Moment). Gefundene Positionen landen in
+        conn.ce_pending_positionen und werden in _ce_events_embed FIFO einem
+        gemeldeten Zaehler-Anstieg zugeordnet - eine Naeherung (welches
+        Cluster zu welchem Event gehoert ist nicht immer eindeutig), aber
+        keine Erfindung: jede angezeigte Position stammt aus echten
+        Log-Zeilen desselben Servers."""
         if conn.guild_id is None:
             return
         try:
@@ -6220,6 +6257,7 @@ class DayZBot(discord.Client):
             conn.log_state["ce_events"] = {"file": aktuelle_datei, "offset": int(size_now)}
             conn.ce_event_counts = {}
             conn.ce_events_puffer = ""
+            conn.ce_pending_positionen = []
             connections.save()
             return
         text, neuer_offset = await _log_lesen_ab_offset(conn, aktuelle_datei, state.get("offset", 0))
@@ -6229,6 +6267,15 @@ class DayZBot(discord.Client):
         connections.save()
         if not text:
             return
+        neue_zeilen = text.split("\n")
+        if neue_zeilen and neue_zeilen[-1] == "":
+            neue_zeilen.pop()  # _log_lesen_ab_offset liefert Text stets bis zum Zeilenende
+        cluster = _ce_events_adding_cluster_erkennen(neue_zeilen)
+        if cluster:
+            conn.ce_pending_positionen.extend((x, z) for x, z, _anzahl in cluster)
+            ueberschuss = len(conn.ce_pending_positionen) - _CE_PENDING_POSITIONEN_MAX
+            if ueberschuss > 0:
+                del conn.ce_pending_positionen[:ueberschuss]
         bloecke, rest = _ce_events_bloecke_extrahieren(conn.ce_events_puffer + text)
         conn.ce_events_puffer = rest
         for block_zeilen in bloecke:
@@ -6237,80 +6284,33 @@ class DayZBot(discord.Client):
                 schluessel = f"ce_events_{schalter}_enabled"
                 if not conn.get(schluessel, True):
                     continue
-                embed = await self._ce_events_embed(conn, typ_name, schalter, delta, neuer_stand, loop)
+                embed = self._ce_events_embed(conn, typ_name, schalter, delta, neuer_stand)
                 ok, grund = await _post_feed(conn.guild_id, "ce_events", embed, service_id=conn.service_id)
                 if not ok:
                     log.debug(f"[POLL] {conn.name}: ce_events fuer {typ_name} nicht gesendet ({grund}).")
 
-    async def _ce_events_embed(self, conn: ServerConnection, typ_name: str, schalter: str,
-                               delta: int, neuer_stand: int, loop) -> "discord.Embed":
-        """Baut das Feed-Embed inkl. Positions-Kandidaten-Pool (siehe Anleitung
-        zu CE-Events-Positionen: eine exakte Live-Position ist auf DayZ-Konsole
-        technisch nicht ermittelbar - stattdessen wird, wenn moeglich, die
-        Groesse des moeglichen Spawnpools genannt: zuerst aus der ECHTEN
-        cfgeventspawns.xml dieses Servers (Stufe A), sonst aus dem offiziellen
-        Bohemia-Vanilla-Datensatz (Stufe B), sonst gar keine Ortsangabe
-        (Stufe C). Nie eine einzelne Koordinate als "der" aktive Ort."""
+    def _ce_events_embed(self, conn: ServerConnection, typ_name: str, schalter: str,
+                         delta: int, neuer_stand: int) -> "discord.Embed":
+        """Baut das Feed-Embed. Zeigt einen Ort NUR, wenn eine echte, per
+        "Adding"-Zeilen-Cluster verifizierte Position vorliegt (siehe
+        _lese_ce_events/conn.ce_pending_positionen) - keine geratene oder aus
+        einem Vanilla-Datensatz gezogene Position. Ohne passendes Cluster
+        bleibt die Ortszeile schlicht weg."""
         emoji, label = _CE_EVENT_SCHALTER_LABEL[schalter]
         kopf = (f"{delta}× neu aufgetaucht (jetzt {neuer_stand} aktiv)" if delta > 1
                else f"ist aufgetaucht (jetzt {neuer_stand} aktiv)")
         if schalter == "vehicle_event":
             kopf = f"**{typ_name}** {kopf}"
-        anzahl, quelle = await self._ce_events_pool_info(conn, typ_name, loop)
-        if anzahl is not None:
+        beschreibung = kopf
+        if conn.ce_pending_positionen:
+            x, z = conn.ce_pending_positionen.pop(0)
             karte = _canonical_map_name(conn.get("map_name", "")) or "ChernarusPlus"
-            kartenname = _CE_MAP_ANZEIGE.get(karte, karte)
-            art = "serverkonfigurierten" if quelle == "server" else "Vanilla"
-            zusatz = ("Quelle: aktuelle Server-Mission" if quelle == "server"
-                     else "Hinweis: Custom-Spawnpunkte des Servers können abweichen.")
-            beschreibung = (f"{kopf}\n\nOrt: nicht live bestimmbar\n"
-                           f"Möglicher Spawnpool: einer von {anzahl} {art} Punkten auf {kartenname}\n"
-                           f"{zusatz}")
-        else:
-            beschreibung = f"{kopf}\n\nOrt unbekannt – das RPT meldet nur die Anzahl aktiver Events."
+            url = _izurvive_url(x, z, karte)
+            nah = _nearest_location(x, z, karte)
+            nah_text = f" *(Nahe {nah})*" if nah else ""
+            beschreibung = f"{kopf}\n📍 [{x:.0f} / {z:.0f}]({url}){nah_text}"
         return discord.Embed(title=f"{emoji} {label}", description=beschreibung,
                              color=FEED_TYPES["ce_events"]["farbe"])
-
-    async def _ce_events_pool_info(self, conn: ServerConnection, typ_name: str,
-                                   loop) -> Tuple[Optional[int], Optional[str]]:
-        """(Anzahl, Quelle) des Positions-Kandidaten-Pools fuer ``typ_name``,
-        oder (None, None) wenn keiner ermittelbar ist. Quelle ist "server"
-        (echte cfgeventspawns.xml, siehe _ce_events_pool_laden) oder "vanilla"
-        (_CE_VANILLA_SPAWN_COUNT). Fuer Vehicle-Events gibt es bewusst KEINEN
-        Vanilla-Fallback (kein belegter Datensatz, und ein Fahrzeug kann sich
-        nach dem Spawn ohnehin vom urspruenglichen Punkt wegbewegt haben)."""
-        await self._ce_events_pool_laden(conn, loop)
-        if conn.ce_pool_root:
-            anzahl = _ce_events_pool_anzahl_aus_xml(conn.ce_pool_root, typ_name)
-            if anzahl is not None:
-                return anzahl, "server"
-        if schalter_fuer_typ := _CE_EVENT_TYP_ZU_SCHALTER.get(typ_name):
-            karte = _canonical_map_name(conn.get("map_name", "")) or "ChernarusPlus"
-            anzahl = _CE_VANILLA_SPAWN_COUNT.get(karte, {}).get(typ_name)
-            if anzahl is not None:
-                return anzahl, "vanilla"
-        return None, None
-
-    async def _ce_events_pool_laden(self, conn: ServerConnection, loop) -> None:
-        """Laedt/erneuert conn.ce_pool_root (geparste cfgeventspawns.xml dieses
-        Servers) hoechstens einmal pro Stunde - die Datei aendert sich nicht
-        staendig, ein FTP-Lesevorgang bei JEDEM Event waere unnoetig. Bleibt
-        conn.ce_pool_root auf ``False`` stehen (nicht erreichbar, z.B. PS4 ohne
-        Mission-Ordner), greift der Vanilla-Fallback in _ce_events_pool_info."""
-        jetzt = time.time()
-        if conn.ce_pool_root is not None and jetzt - conn.ce_pool_geladen_ts < 3600:
-            return
-        conn.ce_pool_geladen_ts = jetzt
-        if _mission_dir_of(conn) is None or conn.ftp is None:
-            conn.ce_pool_root = False
-            return
-        try:
-            root, status = await _tools_xml_lesen(conn, "cfgeventspawns.xml", loop)
-        except Exception as e:  # noqa: BLE001 – darf den Poll nie kippen
-            log.debug(f"[POLL] {conn.name}: cfgeventspawns.xml fuer ce_events nicht lesbar: {e}")
-            conn.ce_pool_root = False
-            return
-        conn.ce_pool_root = root if status == "ok" else False
 
     async def _pruefe_neustart(self, conn: ServerConnection, log_dir: str, loop):
         """Neue .RPT-Datei erkannt = der Gameserver wurde neu gestartet.
