@@ -766,12 +766,17 @@ _CE_EVENT_ZEILE_RE = re.compile(
 # Gegenstaende binnen 3ms im Umkreis von 10m auf; 39 Minuten spaeter raeumte
 # der Server das Wrack an EXAKT dieser Koordinate auf
 # (``<cleanup> Remove:"Wreck_UH1Y" at [6205,8303] ... DE="StaticHeliCrash"``).
-# Diese Zeilen tragen selbst KEINEN Event-Typ/keine ID - die Zuordnung zu
-# einem CE-Events-Zaehleranstieg passiert deshalb nur zeitlich (FIFO), siehe
-# _lese_ce_events. Das ist ein Best-Effort-Verfahren: spawnen zwei
-# verschiedene Event-Typen binnen weniger Sekunden, kann die Zuordnung
-# vertauscht sein - aber es ist eine ECHTE Position, keine Vermutung aus
-# einem Pool.
+# Diese Zeilen tragen selbst KEINEN Event-Typ/keine ID. Ein erkannter Cluster
+# kann deshalb auch ein ganz normaler, in der Naehe zufaellig stattfindender
+# Loot-Nachschub sein, der rein zeitlich mit einem Zaehler-Anstieg
+# zusammenfaellt - das wurde live beobachtet und fuehrte zu falschen
+# Ortsangaben. Die Zuordnung wird deshalb zusaetzlich gegen die ECHTEN,
+# serverkonfigurierten <pos>-Punkte des jeweiligen Event-Typs in
+# cfgeventspawns.xml geprueft (siehe _ce_events_position_zuordnen/
+# _ce_events_pool_laden): nur ein Cluster nah an einem bekannten Spawnpunkt
+# GENAU dieses Typs gilt als verifiziert. Ohne erreichbare cfgeventspawns.xml
+# (z.B. PS4 ohne Mission-Ordner-Zugriff) oder ohne passenden Treffer bleibt
+# die Ortszeile schlicht weg - keine Vermutung.
 _CE_ADDING_ZEILE_RE = re.compile(
     r"^\s*(\d{1,2}):(\d{2}):(\d{2})\.(\d{1,3})\s+Adding\s+\S+\s+at\s+"
     r"\[(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)\]\s*$")
@@ -820,6 +825,55 @@ def _ce_events_adding_cluster_erkennen(zeilen: List[str]) -> List[Tuple[float, f
         aktuell.append(eintrag)
     abschliessen()
     return cluster
+
+
+# Toleranz beim Abgleich eines erkannten Clusters gegen die bekannten <pos>-
+# Punkte EINES Event-Typs in der echten cfgeventspawns.xml des Servers. Die
+# Zonen-Radien in der Datei liegen zwischen 20m (Convoy/Police/Train) und 45m
+# (HeliCrash); Loot eines Events kann sich zusaetzlich etwas verteilen (beim
+# verifizierten Beispiel lag der Cluster-Mittelwert ca. 3.4m vom naechsten
+# bekannten Punkt entfernt). 100m deckt das mit Puffer ab, ohne verschiedene,
+# oft hunderte Meter auseinanderliegende Punkte desselben Typs zu vermischen.
+_CE_POSITION_MATCH_RADIUS_M = 100.0
+
+
+def _ce_events_positionen_aus_xml(root: "ET.Element", typ_name: str
+                                  ) -> Optional[List[Tuple[float, float]]]:
+    """x/z-Koordinaten aller <pos>-Kandidaten fuer ``typ_name`` in einer
+    geparsten cfgeventspawns.xml (die ECHTE Datei dieses Servers). None, wenn
+    dieser Event-Name darin gar nicht vorkommt oder keine gueltige Position
+    hat."""
+    event = root.find(f'.//event[@name="{typ_name}"]')
+    if event is None:
+        return None
+    positionen = []
+    for pos in event.findall("pos"):
+        try:
+            positionen.append((float(pos.get("x")), float(pos.get("z"))))
+        except (TypeError, ValueError):
+            continue
+    return positionen or None
+
+
+def _ce_events_position_zuordnen(conn: "ServerConnection", typ_name: str,
+                                 pool_root: Optional["ET.Element"]) -> Optional[Tuple[float, float]]:
+    """Sucht in conn.ce_pending_positionen die ERSTE Position, die zu einem
+    bekannten <pos>-Eintrag von ``typ_name`` passt (siehe
+    _CE_POSITION_MATCH_RADIUS_M), und entfernt NUR diese eine aus der
+    Warteschlange - andere, noch nicht zugeordnete Cluster bleiben fuer
+    spaetere Postings erhalten. None, wenn kein Pool geladen werden konnte
+    (z.B. PS4 ohne Mission-Ordner-Zugriff) oder kein Cluster passt (z.B. weil
+    es tatsaechlich ein normaler Loot-Nachschub in der Naehe war)."""
+    if pool_root is None:
+        return None
+    bekannte: List[Tuple[float, float]] = _ce_events_positionen_aus_xml(pool_root, typ_name) or []
+    if not bekannte:
+        return None
+    for i, (x, z) in enumerate(conn.ce_pending_positionen):
+        if any(((x - bx) ** 2 + (z - bz) ** 2) ** 0.5 <= _CE_POSITION_MATCH_RADIUS_M
+               for bx, bz in bekannte):
+            return conn.ce_pending_positionen.pop(i)
+    return None
 
 
 # Kurztexte je Abandoned-Bases-Regel für die Digest-Zeilen - _tt() braucht
@@ -3234,10 +3288,17 @@ class ServerConnection:
         # schreibt den Dump ueber mehrere Zeilen, ein Poll kann mittendrin
         # abschneiden.
         self.ce_events_puffer: str = ""
-        # Echte, per "Adding"-Zeilen-Cluster verifizierte Spawn-Positionen fuer
-        # ce_events, wartend auf Zuordnung zu einem gemeldeten Zaehler-Anstieg
-        # (FIFO, siehe _ce_events_adding_cluster_erkennen/_ce_events_embed).
+        # Per "Adding"-Zeilen-Cluster erkannte Kandidaten-Positionen fuer
+        # ce_events, noch NICHT gegen einen Event-Typ verifiziert (siehe
+        # _ce_events_adding_cluster_erkennen/_ce_events_position_zuordnen).
         self.ce_pending_positionen: List[Tuple[float, float]] = []
+        # cfgeventspawns.xml dieses Servers, zum Verifizieren einer
+        # Kandidaten-Position gegen die ECHTEN Spawnpunkte des jeweiligen
+        # Event-Typs (siehe _ce_events_pool_laden). None = noch nicht
+        # geladen, False = versucht, aber nicht erreichbar (z.B. PS4 ohne
+        # Mission-Ordner-Zugriff) - beides bedeutet: keine Ortsangabe moeglich.
+        self.ce_eventspawns_root: Optional[Any] = None
+        self.ce_eventspawns_geladen_ts: float = 0.0
         # Grund, aus dem der Poll-Zyklus diesen Server gerade uebergeht
         # (None = laeuft normal). Nur bei einer AENDERUNG geloggt (siehe
         # _poll_zustand_melden) – sonst waere das Terminal bei einem
@@ -6284,26 +6345,32 @@ class DayZBot(discord.Client):
                 schluessel = f"ce_events_{schalter}_enabled"
                 if not conn.get(schluessel, True):
                     continue
-                embed = self._ce_events_embed(conn, typ_name, schalter, delta, neuer_stand)
+                embed = await self._ce_events_embed(conn, typ_name, schalter, delta, neuer_stand, loop)
                 ok, grund = await _post_feed(conn.guild_id, "ce_events", embed, service_id=conn.service_id)
                 if not ok:
                     log.debug(f"[POLL] {conn.name}: ce_events fuer {typ_name} nicht gesendet ({grund}).")
 
-    def _ce_events_embed(self, conn: ServerConnection, typ_name: str, schalter: str,
-                         delta: int, neuer_stand: int) -> "discord.Embed":
-        """Baut das Feed-Embed. Zeigt einen Ort NUR, wenn eine echte, per
-        "Adding"-Zeilen-Cluster verifizierte Position vorliegt (siehe
-        _lese_ce_events/conn.ce_pending_positionen) - keine geratene oder aus
-        einem Vanilla-Datensatz gezogene Position. Ohne passendes Cluster
-        bleibt die Ortszeile schlicht weg."""
+    async def _ce_events_embed(self, conn: ServerConnection, typ_name: str, schalter: str,
+                               delta: int, neuer_stand: int, loop) -> "discord.Embed":
+        """Baut das Feed-Embed. Zeigt einen Ort NUR, wenn ein per
+        "Adding"-Zeilen-Cluster erkannter Kandidat ZUSAETZLICH gegen die
+        echten <pos>-Punkte dieses Event-Typs in der cfgeventspawns.xml
+        dieses Servers passt (siehe _ce_events_position_zuordnen) - sonst
+        koennte ein zufaellig zeitgleicher, normaler Loot-Nachschub
+        faelschlich als Event-Ort gemeldet werden. Ohne erreichbare
+        cfgeventspawns.xml oder ohne passenden Kandidaten bleibt die
+        Ortszeile schlicht weg."""
         emoji, label = _CE_EVENT_SCHALTER_LABEL[schalter]
         kopf = (f"{delta}× neu aufgetaucht (jetzt {neuer_stand} aktiv)" if delta > 1
                else f"ist aufgetaucht (jetzt {neuer_stand} aktiv)")
         if schalter == "vehicle_event":
             kopf = f"**{typ_name}** {kopf}"
         beschreibung = kopf
-        if conn.ce_pending_positionen:
-            x, z = conn.ce_pending_positionen.pop(0)
+        await self._ce_events_pool_laden(conn, loop)
+        pool_root = conn.ce_eventspawns_root if conn.ce_eventspawns_root is not False else None
+        position = _ce_events_position_zuordnen(conn, typ_name, pool_root)
+        if position:
+            x, z = position
             karte = _canonical_map_name(conn.get("map_name", "")) or "ChernarusPlus"
             url = _izurvive_url(x, z, karte)
             nah = _nearest_location(x, z, karte)
@@ -6311,6 +6378,29 @@ class DayZBot(discord.Client):
             beschreibung = f"{kopf}\n📍 [{x:.0f} / {z:.0f}]({url}){nah_text}"
         return discord.Embed(title=f"{emoji} {label}", description=beschreibung,
                              color=FEED_TYPES["ce_events"]["farbe"])
+
+    async def _ce_events_pool_laden(self, conn: ServerConnection, loop) -> None:
+        """Laedt/erneuert conn.ce_eventspawns_root (geparste cfgeventspawns.xml
+        dieses Servers) hoechstens einmal pro Stunde - die Datei aendert sich
+        nicht staendig, ein FTP-Lesevorgang bei JEDEM Event waere unnoetig.
+        Bleibt conn.ce_eventspawns_root auf ``False`` stehen (nicht
+        erreichbar, z.B. PS4 ohne Mission-Ordner-Zugriff), bleibt jede
+        Ortsangabe fuer diesen Server einfach aus (siehe
+        _ce_events_position_zuordnen) - kein Rateraten ohne echte Datei."""
+        jetzt = time.time()
+        if conn.ce_eventspawns_root is not None and jetzt - conn.ce_eventspawns_geladen_ts < 3600:
+            return
+        conn.ce_eventspawns_geladen_ts = jetzt
+        if _mission_dir_of(conn) is None or conn.ftp is None:
+            conn.ce_eventspawns_root = False
+            return
+        try:
+            root, status = await _tools_xml_lesen(conn, "cfgeventspawns.xml", loop)
+        except Exception as e:  # noqa: BLE001 – darf den Poll nie kippen
+            log.debug(f"[POLL] {conn.name}: cfgeventspawns.xml fuer ce_events nicht lesbar: {e}")
+            conn.ce_eventspawns_root = False
+            return
+        conn.ce_eventspawns_root = root if status == "ok" else False
 
     async def _pruefe_neustart(self, conn: ServerConnection, log_dir: str, loop):
         """Neue .RPT-Datei erkannt = der Gameserver wurde neu gestartet.

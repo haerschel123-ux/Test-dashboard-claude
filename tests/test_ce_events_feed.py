@@ -14,12 +14,16 @@ zusaetzlich bestaetigt: DayZ schreibt sehr wohl echte Positionen ins Log -
 nicht als eigene "Event hier"-Zeile, aber als "  Adding <Item> at [x,z]"
 zum Zeitpunkt, in dem die Ladung eines Events entsteht (siehe
 _ce_events_adding_cluster_erkennen). Mehrere solcher Zeilen in enger
-zeitlicher/raeumlicher Naehe markieren zuverlaessig den Spawn-Moment eines
-Events. Auf Brigardes ausdruecklichen Wunsch zeigt der Feed deshalb NUR
-solche echten, im Log verifizierten Positionen (wie beim bestehenden
-Killfeed: iZurvive-Link + _nearest_location) - keine geratene oder aus
-einem Vanilla-Datensatz gezogene Koordinate. Ohne passendes Cluster bleibt
-die Ortszeile schlicht weg.
+zeitlicher/raeumlicher Naehe markieren OFT den Spawn-Moment eines Events -
+koennen aber auch ein ganz normaler, zufaellig zeitgleicher Loot-Nachschub in
+der Naehe sein (live beobachtet: fuehrte zu falschen Ortsangaben). Ein
+erkannter Cluster wird deshalb zusaetzlich gegen die ECHTEN <pos>-Punkte des
+gemeldeten Event-Typs in der cfgeventspawns.xml DIESES Servers geprueft
+(siehe _ce_events_position_zuordnen/_ce_events_pool_laden) - nur ein
+Treffer nah an einem bekannten Spawnpunkt GENAU dieses Typs gilt als
+verifiziert und wird angezeigt (wie beim bestehenden Killfeed: iZurvive-Link
++ _nearest_location). Ohne erreichbare cfgeventspawns.xml oder ohne
+passenden Treffer bleibt die Ortszeile schlicht weg - keine Vermutung.
 
 Aufruf aus dem Repository-Wurzelverzeichnis:
 
@@ -237,6 +241,72 @@ def test_adding_cluster_ignoriert_nicht_passende_zeilen():
     assert len(cluster) == 1
 
 
+# ── Pool-Abgleich gegen die echte cfgeventspawns.xml ──────────────────────
+
+def test_positionen_aus_xml_liest_x_z():
+    root = bot_mod.ET.fromstring(
+        '<eventposdef><event name="StaticTrain">'
+        '<pos x="1" z="2"/><pos x="3" z="4"/>'
+        '</event></eventposdef>')
+    assert bot_mod._ce_events_positionen_aus_xml(root, "StaticTrain") == [(1.0, 2.0), (3.0, 4.0)]
+
+
+def test_positionen_aus_xml_unbekannter_typ_gibt_none():
+    root = bot_mod.ET.fromstring(
+        '<eventposdef><event name="StaticTrain"><pos x="1" z="2"/></event></eventposdef>')
+    assert bot_mod._ce_events_positionen_aus_xml(root, "StaticHeliCrash") is None
+
+
+def test_position_zuordnen_ohne_pool_gibt_none():
+    conn = bot_mod.connections.upsert("ceevents-pool-1")
+    conn.ce_pending_positionen = [(6202.0, 8303.0)]
+    assert bot_mod._ce_events_position_zuordnen(conn, "StaticHeliCrash", None) is None
+    # Kandidat bleibt erhalten - kein Pool heisst nicht "verworfen".
+    assert conn.ce_pending_positionen == [(6202.0, 8303.0)]
+
+
+def test_position_zuordnen_findet_nahen_bekannten_punkt():
+    conn = bot_mod.connections.upsert("ceevents-pool-2")
+    # Echte Koordinate aus Brigardes cfgeventspawns.xml (StaticHeliCrash).
+    root = bot_mod.ET.fromstring(
+        '<eventposdef><event name="StaticHeliCrash">'
+        '<pos x="6204.925293" z="8301.290039" a="-1"/>'
+        '</event></eventposdef>')
+    conn.ce_pending_positionen = [(6202.0, 8303.0)]
+    treffer = bot_mod._ce_events_position_zuordnen(conn, "StaticHeliCrash", root)
+    assert treffer == (6202.0, 8303.0)
+    assert conn.ce_pending_positionen == []  # nur der Treffer wird entfernt
+
+
+def test_position_zuordnen_lehnt_zu_weit_entfernten_kandidaten_ab():
+    # Simuliert genau den gemeldeten Fehler: ein Cluster, das zufaellig
+    # zeitgleich mit dem Zaehler-Anstieg auftrat, aber tatsaechlich ein
+    # normaler Loot-Nachschub weit weg vom naechsten echten Spawnpunkt war.
+    conn = bot_mod.connections.upsert("ceevents-pool-3")
+    root = bot_mod.ET.fromstring(
+        '<eventposdef><event name="StaticHeliCrash">'
+        '<pos x="6204.925293" z="8301.290039" a="-1"/>'
+        '</event></eventposdef>')
+    conn.ce_pending_positionen = [(2000.0, 2000.0)]
+    treffer = bot_mod._ce_events_position_zuordnen(conn, "StaticHeliCrash", root)
+    assert treffer is None
+    # Der abgelehnte Kandidat bleibt in der Warteschlange - er koennte noch
+    # zu einem anderen, spaeter gemeldeten Typ passen.
+    assert conn.ce_pending_positionen == [(2000.0, 2000.0)]
+
+
+def test_position_zuordnen_ueberspringt_nicht_passende_und_nimmt_naechsten():
+    conn = bot_mod.connections.upsert("ceevents-pool-4")
+    root = bot_mod.ET.fromstring(
+        '<eventposdef><event name="StaticTrain">'
+        '<pos x="5587.47" z="2063.35" a="0"/>'
+        '</event></eventposdef>')
+    conn.ce_pending_positionen = [(9999.0, 9999.0), (5588.0, 2064.0)]
+    treffer = bot_mod._ce_events_position_zuordnen(conn, "StaticTrain", root)
+    assert treffer == (5588.0, 2064.0)
+    assert conn.ce_pending_positionen == [(9999.0, 9999.0)]
+
+
 # ── Sub-Toggle-Einstellungen (Speichern/Laden) ───────────────────────────
 
 def test_ce_events_payload_default_alle_aktiv():
@@ -324,9 +394,25 @@ def test_lese_ce_events_erster_zyklus_setzt_nur_cursor_ohne_post(conn_mit_ce_eve
     assert conn.log_state["ce_events"] == {"file": pfad, "offset": 500}
 
 
-def test_lese_ce_events_nutzt_echten_adding_cluster_als_ort(conn_mit_ce_events):
+def _pool_bereitstellen(conn, monkeypatch, xml_text):
+    """Simuliert eine erreichbare, echte cfgeventspawns.xml dieses Servers -
+    ohne diesen Aufruf bleibt conn.ce_eventspawns_root False (kein
+    Mission-Ordner konfiguriert) und JEDE Ortsangabe faellt weg, egal wie gut
+    ein Cluster passen wuerde."""
+    bot_mod._conn_store(conn, "ftp_mission_dir", "/mission")
+
+    async def fake_xml_lesen(_conn, _dateiname, _loop):
+        return bot_mod.ET.fromstring(xml_text), "ok"
+    monkeypatch.setattr(bot_mod, "_tools_xml_lesen", fake_xml_lesen)
+
+
+def test_lese_ce_events_nutzt_echten_adding_cluster_der_zum_pool_passt(conn_mit_ce_events, monkeypatch):
     conn, gesendet = conn_mit_ce_events
     bot_mod._conn_store(conn, "map_name", "ChernarusPlus")
+    _pool_bereitstellen(conn, monkeypatch, (
+        '<eventposdef><event name="StaticHeliCrash">'
+        '<pos x="6204.925293" z="8301.290039" a="-1"/>'
+        '</event></eventposdef>'))
     pfad = "/games/x/config/DayZServer_x.RPT"
     conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
     loop = _StubLoop()
@@ -344,7 +430,7 @@ def test_lese_ce_events_nutzt_echten_adding_cluster_als_ort(conn_mit_ce_events):
     assert "jetzt 3 aktiv" in beschreibung
     assert "📍 [6202 / 8303]" in beschreibung
     assert "izurvive.com" in beschreibung
-    assert conn.ce_pending_positionen == []  # FIFO verbraucht
+    assert conn.ce_pending_positionen == []  # Treffer verbraucht
 
 
 def test_lese_ce_events_ohne_adding_cluster_zeigt_keinen_ort(conn_mit_ce_events):
@@ -362,10 +448,66 @@ def test_lese_ce_events_ohne_adding_cluster_zeigt_keinen_ort(conn_mit_ce_events)
     assert "jetzt 1 aktiv" in beschreibung
 
 
-def test_lese_ce_events_mehrere_cluster_werden_fifo_zugeordnet(conn_mit_ce_events):
-    # Zwei Events im selben Zyklus, zwei Cluster - jede Position wird genau
-    # einmal, in der Reihenfolge ihres Auftretens im Log, verbraucht.
+def test_lese_ce_events_cluster_ohne_erreichbaren_pool_zeigt_keinen_ort(conn_mit_ce_events):
+    # Kein ftp_mission_dir konfiguriert -> conn.ce_eventspawns_root bleibt
+    # False, obwohl ein plausibler Cluster vorliegt. Ohne echte Datei keine
+    # Ortsangabe - kein Rateraten.
     conn, gesendet = conn_mit_ce_events
+    pfad = "/games/x/config/DayZServer_x.RPT"
+    conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
+    loop = _StubLoop()
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    conn.ce_event_counts["StaticHeliCrash"] = 2
+    adding_zeilen = ("12:46:25.995 Adding A at [6200,8300]\n"
+                     "12:46:25.996 Adding A at [6205,8303]\n"
+                     "12:46:25.998 Adding A at [6202,8306]\n")
+    conn.ftp.inhalte[(pfad, 500)] = adding_zeilen + _block_text(["StaticHeliCrash (3)"])
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    assert len(gesendet) == 1
+    assert "📍" not in gesendet[0]["embed"].description
+    # Der Kandidat bleibt fuer einen spaeteren Poll-Zyklus (Pool koennte dann
+    # erreichbar sein) in der Warteschlange stehen.
+    assert len(conn.ce_pending_positionen) == 1
+    x, z = conn.ce_pending_positionen[0]
+    assert round(x, 2) == round((6200 + 6205 + 6202) / 3, 2)
+    assert z == 8303.0
+
+
+def test_lese_ce_events_cluster_weit_weg_von_bekanntem_typ_zeigt_keinen_ort(conn_mit_ce_events, monkeypatch):
+    # Genau der gemeldete Fehler: ein Cluster faellt rein zeitlich mit dem
+    # Zaehler-Anstieg zusammen, liegt aber weit weg vom einzigen bekannten
+    # Spawnpunkt dieses Typs - also vermutlich normaler Loot-Nachschub, kein
+    # echter Event-Ort.
+    conn, gesendet = conn_mit_ce_events
+    _pool_bereitstellen(conn, monkeypatch, (
+        '<eventposdef><event name="StaticHeliCrash">'
+        '<pos x="6204.925293" z="8301.290039" a="-1"/>'
+        '</event></eventposdef>'))
+    pfad = "/games/x/config/DayZServer_x.RPT"
+    conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
+    loop = _StubLoop()
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    conn.ce_event_counts["StaticHeliCrash"] = 2
+    adding_zeilen = ("12:46:25.995 Adding Ammo_9x39 at [100,100]\n"
+                     "12:46:25.996 Adding Ammo_9x39 at [101,101]\n"
+                     "12:46:25.998 Adding Ammo_9x39 at [102,102]\n")
+    conn.ftp.inhalte[(pfad, 500)] = adding_zeilen + _block_text(["StaticHeliCrash (3)"])
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    assert len(gesendet) == 1
+    assert "📍" not in gesendet[0]["embed"].description
+    assert "jetzt 3 aktiv" in gesendet[0]["embed"].description
+
+
+def test_lese_ce_events_mehrere_cluster_richtigem_typ_zugeordnet(conn_mit_ce_events, monkeypatch):
+    # Zwei Events im selben Zyklus, zwei Cluster - der Pool-Abgleich (nicht
+    # die zeitliche Reihenfolge) entscheidet, welcher Cluster zu welchem Typ
+    # gehoert.
+    conn, gesendet = conn_mit_ce_events
+    _pool_bereitstellen(conn, monkeypatch, (
+        '<eventposdef>'
+        '<event name="StaticHeliCrash"><pos x="101" z="101" a="-1"/></event>'
+        '<event name="StaticTrain"><pos x="901" z="901" a="0"/></event>'
+        '</eventposdef>'))
     pfad = "/games/x/config/DayZServer_x.RPT"
     conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
     loop = _StubLoop()
