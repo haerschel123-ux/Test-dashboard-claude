@@ -9,21 +9,25 @@ neues Event erkennt man nur daran, dass die Zahl zwischen zwei Bloecken
 steigt - das ist, was _ce_events_bloecke_extrahieren/_ce_events_zeilen_auswerten
 reproduzieren.
 
-Eine anschliessende, forensische Auswertung mehrerer echter RPT-Dateien hat
-zusaetzlich bestaetigt: DayZ schreibt sehr wohl echte Positionen ins Log -
-nicht als eigene "Event hier"-Zeile, aber als "  Adding <Item> at [x,z]"
-zum Zeitpunkt, in dem die Ladung eines Events entsteht (siehe
-_ce_events_adding_cluster_erkennen). Mehrere solcher Zeilen in enger
-zeitlicher/raeumlicher Naehe markieren OFT den Spawn-Moment eines Events -
-koennen aber auch ein ganz normaler, zufaellig zeitgleicher Loot-Nachschub in
-der Naehe sein (live beobachtet: fuehrte zu falschen Ortsangaben). Ein
-erkannter Cluster wird deshalb zusaetzlich gegen die ECHTEN <pos>-Punkte des
-gemeldeten Event-Typs in der cfgeventspawns.xml DIESES Servers geprueft
-(siehe _ce_events_position_zuordnen/_ce_events_pool_laden) - nur ein
-Treffer nah an einem bekannten Spawnpunkt GENAU dieses Typs gilt als
-verifiziert und wird angezeigt (wie beim bestehenden Killfeed: iZurvive-Link
-+ _nearest_location). Ohne erreichbare cfgeventspawns.xml oder ohne
-passenden Treffer bleibt die Ortszeile schlicht weg - keine Vermutung.
+Brigarde meldete danach: "Vehicle Event"-Postings zeigen NIE einen Ort,
+obwohl "Helicopter Crash" einen zeigt. Forensische Auswertung einer echten
+RPT-Datei (im Zeitfenster eines VehicleBoat-Zaehleranstiegs) hat gezeigt: der
+zuvor genutzte "Adding <Item> at [x,z]"-Zeilen-Cluster-Ansatz kann Fahrzeuge
+strukturell nicht erfassen (alle "Adding"-Zeilen in diesem Fenster waren
+normaler, ueber die ganze Karte verstreuter Loot-Nachschub). Stattdessen gibt
+es eine universelle, bisher unbekannte Zeile fuer ALLE CE-Event-Typen
+(Static* UND Vehicle*), die die tatsaechlich verwendete Spawn-Position exakt
+tragt:
+
+    [CE][DE] [<Typ>] Spawning: EventID:[N] CurrentID:[M] at [x,y,z] a: <winkel>
+    	(child) Spawned <Klasse> EventID:[N] CurrentID:[M] at [x,y,z] a: <winkel>
+
+(bei manchen Static-Events "(group) Spawned" statt "(child) Spawned"). Ein
+Spawn-Versuch kann mit "spawn refused... too close to another one." abgelehnt
+und mit neuer Koordinate unter derselben CurrentID wiederholt werden - die
+Bestaetigungszeile traegt immer die tatsaechlich verwendete, finale Position.
+Siehe _ce_events_spawn_positionen_erkennen. Das ersetzt den vorherigen
+Adding-Cluster-/cfgeventspawns.xml-Abgleich-Mechanismus komplett.
 
 Aufruf aus dem Repository-Wurzelverzeichnis:
 
@@ -32,7 +36,6 @@ Aufruf aus dem Repository-Wurzelverzeichnis:
 import asyncio
 import os
 import sys
-import time
 
 import pytest
 
@@ -177,158 +180,63 @@ def test_bloecke_extrahieren_puffer_wird_beim_naechsten_aufruf_vervollstaendigt(
     assert rest2 == ""
 
 
-# ── "Adding"-Zeilen-Cluster-Erkennung (echte, verifizierte Positionen) ────
+# ── Spawn-Positions-Erkennung ueber "Spawning:"/"Spawned"-Zeilenpaare ─────
 
-def test_adding_cluster_erkennt_eng_gruppierte_zeilen():
+def test_spawn_positionen_erkennen_grundfall():
     zeilen = [
-        "12:46:25.995 Adding Ammo_9x39 at [6200,8300]",
-        "12:46:25.996 Adding Ammo_9x39 at [6205,8303]",
-        "12:46:25.998 Adding Wreck_UH1Y at [6202,8306]",
+        "18:42:55.572 [CE][DE] [StaticHeliCrash] Spawning: EventID:[35] CurrentID:[55370] at [1410.0,-1.0,4299.2] a: -1.000",
+        "18:42:55.573 	(child) Spawned Wreck_UH1Y EventID:[35] CurrentID:[55370] at [1410.0,-1.0,4299.2] a: -1.000",
     ]
-    cluster = bot_mod._ce_events_adding_cluster_erkennen(zeilen)
-    assert len(cluster) == 1
-    x, z, anzahl = cluster[0]
-    assert anzahl == 3
-    assert round(x, 2) == round((6200 + 6205 + 6202) / 3, 2)
-    assert round(z, 2) == round((8300 + 8303 + 8306) / 3, 2)
+    ergebnisse = bot_mod._ce_events_spawn_positionen_erkennen(zeilen)
+    assert ergebnisse == [("StaticHeliCrash", 1410.0, 4299.2)]
 
 
-def test_adding_cluster_ignoriert_zu_kleine_gruppe():
-    # Unter _CE_ADDING_CLUSTER_MIN_ITEMS (3) zaehlt es nicht als Cluster -
-    # sonst waere jede einzelne, gewoehnliche Loot-Nachschub-Zeile ein
-    # "verifiziertes" Event.
+def test_spawn_positionen_erkennen_nimmt_finale_position_nach_wiederholungen():
+    # "spawn refused"-Wiederholungen aendern die CurrentID nicht - nur die
+    # LETZTE "Spawning:"-Zeile vor dem Erfolg traegt die tatsaechlich
+    # verwendete Koordinate (die Bestaetigungszeile selbst ist massgeblich).
     zeilen = [
-        "12:46:25.995 Adding Ammo_9x39 at [100,100]",
-        "12:46:25.996 Adding Ammo_9x39 at [101,101]",
+        "18:43:25.571 [CE][DE] [VehicleBoat] Spawning: EventID:[46] CurrentID:[55375] at [6160.1,-1.0,2011.1] a: -1.000",
+        "18:43:25.571 	spawn refused... too close to another one.",
+        "18:43:25.571 [CE][DE] [VehicleBoat] Spawning: EventID:[46] CurrentID:[55375] at [6158.0,-1.0,2053.3] a: -1.000",
+        "18:43:25.572 	(child) Spawned Boat_01_Blue EventID:[46] CurrentID:[55375] at [6158.0,-1.0,2053.3] a: 10.000",
     ]
-    assert bot_mod._ce_events_adding_cluster_erkennen(zeilen) == []
+    ergebnisse = bot_mod._ce_events_spawn_positionen_erkennen(zeilen)
+    assert ergebnisse == [("VehicleBoat", 6158.0, 2053.3)]
 
 
-def test_adding_cluster_trennt_bei_grosser_zeitluecke():
+def test_spawn_positionen_erkennen_zwei_typen_gleichzeitig_nicht_vertauscht():
     zeilen = [
-        "12:00:00.000 Adding A at [0,0]",
-        "12:00:00.100 Adding A at [1,1]",
-        "12:00:00.200 Adding A at [2,2]",
-        "12:00:05.000 Adding A at [500,500]",
-        "12:00:05.100 Adding A at [501,501]",
-        "12:00:05.200 Adding A at [502,502]",
+        "18:43:25.567 [CE][DE] [VehicleBoat] Spawning: EventID:[46] CurrentID:[55371] at [13359.4,-1.0,10709.6] a: -1.000",
+        "18:42:55.572 [CE][DE] [StaticHeliCrash] Spawning: EventID:[35] CurrentID:[55370] at [1410.0,-1.0,4299.2] a: -1.000",
+        "18:43:25.568 	(child) Spawned Boat_01_Orange EventID:[46] CurrentID:[55371] at [13359.5,-0.0,10709.4] a: 10.585",
+        "18:42:55.573 	(child) Spawned Wreck_UH1Y EventID:[35] CurrentID:[55370] at [1410.0,-1.0,4299.2] a: -1.000",
     ]
-    cluster = bot_mod._ce_events_adding_cluster_erkennen(zeilen)
-    assert len(cluster) == 2
+    ergebnisse = bot_mod._ce_events_spawn_positionen_erkennen(zeilen)
+    assert ergebnisse == [
+        ("VehicleBoat", 13359.5, 10709.4),
+        ("StaticHeliCrash", 1410.0, 4299.2),
+    ]
 
 
-def test_adding_cluster_trennt_bei_grosser_raeumlicher_distanz():
+def test_spawn_positionen_erkennen_spawned_ohne_vorherige_spawning_wird_ignoriert():
+    # Simuliert einen Poll-Zyklus, der mitten in einem Zeilen-Paar
+    # abgeschnitten hat - die "Spawning:"-Zeile fehlt im gesehenen Puffer.
     zeilen = [
-        "12:00:00.000 Adding A at [0,0]",
-        "12:00:00.100 Adding A at [1,1]",
-        "12:00:00.200 Adding A at [2,2]",
-        "12:00:00.300 Adding A at [5000,5000]",
-        "12:00:00.400 Adding A at [5001,5001]",
-        "12:00:00.500 Adding A at [5002,5002]",
+        "18:42:55.573 	(child) Spawned Wreck_UH1Y EventID:[35] CurrentID:[55370] at [1410.0,-1.0,4299.2] a: -1.000",
     ]
-    cluster = bot_mod._ce_events_adding_cluster_erkennen(zeilen)
-    assert len(cluster) == 2
+    assert bot_mod._ce_events_spawn_positionen_erkennen(zeilen) == []
 
 
-def test_adding_cluster_ignoriert_nicht_passende_zeilen():
+def test_spawn_positionen_erkennen_group_spawned_wird_ebenfalls_erkannt():
+    # Manche Static-Events (z. B. StaticPoliceSituation) bestaetigen mit
+    # "(group) Spawned" statt "(child) Spawned".
     zeilen = [
-        "irgendein RPT-Text",
-        "12:00:00.000 Adding A at [10,10]",
-        "3:03:03.231 [CE][DE] DynamicEvent Types (56):",
-        "12:00:00.100 Adding A at [11,11]",
-        "12:00:00.200 Adding A at [12,12]",
+        "19:00:00.000 [CE][DE] [StaticPoliceSituation] Spawning: EventID:[10] CurrentID:[1] at [100.0,-1.0,200.0] a: 0.000",
+        "19:00:00.001 	(group) Spawned CivilianSedan EventID:[10] CurrentID:[1] at [100.0,-1.0,200.0] a: 0.000",
     ]
-    cluster = bot_mod._ce_events_adding_cluster_erkennen(zeilen)
-    assert len(cluster) == 1
-
-
-# ── Pool-Abgleich gegen die echte cfgeventspawns.xml ──────────────────────
-
-def test_positionen_aus_xml_liest_x_z():
-    root = bot_mod.ET.fromstring(
-        '<eventposdef><event name="StaticTrain">'
-        '<pos x="1" z="2"/><pos x="3" z="4"/>'
-        '</event></eventposdef>')
-    assert bot_mod._ce_events_positionen_aus_xml(root, "StaticTrain") == [(1.0, 2.0), (3.0, 4.0)]
-
-
-def test_positionen_aus_xml_unbekannter_typ_gibt_none():
-    root = bot_mod.ET.fromstring(
-        '<eventposdef><event name="StaticTrain"><pos x="1" z="2"/></event></eventposdef>')
-    assert bot_mod._ce_events_positionen_aus_xml(root, "StaticHeliCrash") is None
-
-
-def test_position_zuordnen_ohne_pool_gibt_none():
-    conn = bot_mod.connections.upsert("ceevents-pool-1")
-    conn.ce_pending_positionen = [(6202.0, 8303.0, 1000.0)]
-    assert bot_mod._ce_events_position_zuordnen(conn, "StaticHeliCrash", None) is None
-    # Kandidat bleibt erhalten - kein Pool heisst nicht "verworfen".
-    assert conn.ce_pending_positionen == [(6202.0, 8303.0, 1000.0)]
-
-
-def test_position_zuordnen_findet_nahen_bekannten_punkt():
-    conn = bot_mod.connections.upsert("ceevents-pool-2")
-    # Echte Koordinate aus Brigardes cfgeventspawns.xml (StaticHeliCrash).
-    root = bot_mod.ET.fromstring(
-        '<eventposdef><event name="StaticHeliCrash">'
-        '<pos x="6204.925293" z="8301.290039" a="-1"/>'
-        '</event></eventposdef>')
-    conn.ce_pending_positionen = [(6202.0, 8303.0, 1000.0)]
-    treffer = bot_mod._ce_events_position_zuordnen(conn, "StaticHeliCrash", root)
-    assert treffer == (6202.0, 8303.0)
-    assert conn.ce_pending_positionen == []  # nur der Treffer wird entfernt
-
-
-def test_position_zuordnen_lehnt_zu_weit_entfernten_kandidaten_ab():
-    # Simuliert genau den gemeldeten Fehler: ein Cluster, das zufaellig
-    # zeitgleich mit dem Zaehler-Anstieg auftrat, aber tatsaechlich ein
-    # normaler Loot-Nachschub weit weg vom naechsten echten Spawnpunkt war.
-    conn = bot_mod.connections.upsert("ceevents-pool-3")
-    root = bot_mod.ET.fromstring(
-        '<eventposdef><event name="StaticHeliCrash">'
-        '<pos x="6204.925293" z="8301.290039" a="-1"/>'
-        '</event></eventposdef>')
-    conn.ce_pending_positionen = [(2000.0, 2000.0, 1000.0)]
-    treffer = bot_mod._ce_events_position_zuordnen(conn, "StaticHeliCrash", root)
-    assert treffer is None
-    # Der abgelehnte Kandidat bleibt in der Warteschlange - er koennte noch
-    # zu einem anderen, spaeter gemeldeten Typ passen.
-    assert conn.ce_pending_positionen == [(2000.0, 2000.0, 1000.0)]
-
-
-def test_position_zuordnen_ueberspringt_nicht_passende_und_nimmt_naechsten():
-    conn = bot_mod.connections.upsert("ceevents-pool-4")
-    root = bot_mod.ET.fromstring(
-        '<eventposdef><event name="StaticTrain">'
-        '<pos x="5587.47" z="2063.35" a="0"/>'
-        '</event></eventposdef>')
-    conn.ce_pending_positionen = [(9999.0, 9999.0, 1000.0), (5588.0, 2064.0, 1000.0)]
-    treffer = bot_mod._ce_events_position_zuordnen(conn, "StaticTrain", root)
-    assert treffer == (5588.0, 2064.0)
-    assert conn.ce_pending_positionen == [(9999.0, 9999.0, 1000.0)]
-
-
-# ── Verfallsgrenze fuer Positions-Kandidaten ──────────────────────────────
-
-def test_pending_aufraeumen_wirft_zu_alte_kandidaten_weg():
-    # Das ganze Verfahren beruht auf zeitlicher Naehe - ein halbstuendiger
-    # Kandidat gehoert sicher nicht mehr zum gerade gemeldeten Event.
-    conn = bot_mod.connections.upsert("ceevents-verfall-1")
-    jetzt = 10_000.0
-    zu_alt = jetzt - bot_mod._CE_PENDING_POSITIONEN_MAX_ALTER_S - 1
-    frisch = jetzt - 5
-    conn.ce_pending_positionen = [(1.0, 1.0, zu_alt), (2.0, 2.0, frisch)]
-    bot_mod._ce_events_pending_aufraeumen(conn, jetzt)
-    assert conn.ce_pending_positionen == [(2.0, 2.0, frisch)]
-
-
-def test_pending_aufraeumen_behaelt_kandidaten_genau_auf_der_grenze():
-    conn = bot_mod.connections.upsert("ceevents-verfall-2")
-    jetzt = 10_000.0
-    grenze = jetzt - bot_mod._CE_PENDING_POSITIONEN_MAX_ALTER_S
-    conn.ce_pending_positionen = [(3.0, 3.0, grenze)]
-    bot_mod._ce_events_pending_aufraeumen(conn, jetzt)
-    assert conn.ce_pending_positionen == [(3.0, 3.0, grenze)]
+    ergebnisse = bot_mod._ce_events_spawn_positionen_erkennen(zeilen)
+    assert ergebnisse == [("StaticPoliceSituation", 100.0, 200.0)]
 
 
 # ── Die drei zusaetzlichen, serverseitig noch inaktiven Event-Typen ───────
@@ -447,46 +355,54 @@ def test_lese_ce_events_erster_zyklus_setzt_nur_cursor_ohne_post(conn_mit_ce_eve
     assert conn.log_state["ce_events"] == {"file": pfad, "offset": 500}
 
 
-def _pool_bereitstellen(conn, monkeypatch, xml_text):
-    """Simuliert eine erreichbare, echte cfgeventspawns.xml dieses Servers -
-    ohne diesen Aufruf bleibt conn.ce_eventspawns_root False (kein
-    Mission-Ordner konfiguriert) und JEDE Ortsangabe faellt weg, egal wie gut
-    ein Cluster passen wuerde."""
-    bot_mod._conn_store(conn, "ftp_mission_dir", "/mission")
-
-    async def fake_xml_lesen(_conn, _dateiname, _loop):
-        return bot_mod.ET.fromstring(xml_text), "ok"
-    monkeypatch.setattr(bot_mod, "_tools_xml_lesen", fake_xml_lesen)
-
-
-def test_lese_ce_events_nutzt_echten_adding_cluster_der_zum_pool_passt(conn_mit_ce_events, monkeypatch):
+def test_lese_ce_events_static_helicrash_zeigt_exakte_geloggte_position(conn_mit_ce_events):
+    # Echte Zeilen aus Brigardes RPT-Datei (Zeile 36706 des Originals).
     conn, gesendet = conn_mit_ce_events
     bot_mod._conn_store(conn, "map_name", "ChernarusPlus")
-    _pool_bereitstellen(conn, monkeypatch, (
-        '<eventposdef><event name="StaticHeliCrash">'
-        '<pos x="6204.925293" z="8301.290039" a="-1"/>'
-        '</event></eventposdef>'))
     pfad = "/games/x/config/DayZServer_x.RPT"
     conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
     loop = _StubLoop()
     _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
     conn.ce_event_counts["StaticHeliCrash"] = 2
-    adding_zeilen = (
-        "12:46:25.995 Adding Ammo_9x39 at [6200,8300]\n"
-        "12:46:25.996 Adding Ammo_9x39 at [6205,8303]\n"
-        "12:46:25.998 Adding Wreck_UH1Y at [6202,8306]\n"
+    spawn_zeilen = (
+        "18:42:55.572 [CE][DE] [StaticHeliCrash] Spawning: EventID:[35] CurrentID:[55370] at [1410.0,-1.0,4299.2] a: -1.000\n"
+        "18:42:55.573 \t(child) Spawned Wreck_UH1Y EventID:[35] CurrentID:[55370] at [1410.0,-1.0,4299.2] a: -1.000\n"
     )
-    conn.ftp.inhalte[(pfad, 500)] = adding_zeilen + _block_text(["StaticHeliCrash (3)"])
+    conn.ftp.inhalte[(pfad, 500)] = spawn_zeilen + _block_text(["StaticHeliCrash (3)"])
     _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
     assert len(gesendet) == 1
     beschreibung = gesendet[0]["embed"].description
     assert "jetzt 3 aktiv" in beschreibung
-    assert "📍 [6202 / 8303]" in beschreibung
+    assert "📍 [1410 / 4299]" in beschreibung
     assert "izurvive.com" in beschreibung
-    assert conn.ce_pending_positionen == []  # Treffer verbraucht
+    assert conn.ce_pending_positionen["StaticHeliCrash"] == []  # Treffer verbraucht
 
 
-def test_lese_ce_events_ohne_adding_cluster_zeigt_keinen_ort(conn_mit_ce_events):
+def test_lese_ce_events_vehicleboat_zeigt_jetzt_ebenfalls_eine_position(conn_mit_ce_events):
+    # Genau das gemeldete Problem: Vehicle-Events zeigten NIE einen Ort. Echte
+    # Zeilen aus Brigardes RPT-Datei (CurrentID:[55371], Zeile 37080/37081).
+    conn, gesendet = conn_mit_ce_events
+    bot_mod._conn_store(conn, "map_name", "ChernarusPlus")
+    pfad = "/games/x/config/DayZServer_x.RPT"
+    conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
+    loop = _StubLoop()
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    conn.ce_event_counts["VehicleBoat"] = 0
+    spawn_zeilen = (
+        "18:43:25.567 [CE][DE] [VehicleBoat] Spawning: EventID:[46] CurrentID:[55371] at [13359.4,-1.0,10709.6] a: -1.000\n"
+        "18:43:25.568 \t(child) Spawned Boat_01_Orange EventID:[46] CurrentID:[55371] at [13359.5,-0.0,10709.4] a: 10.585\n"
+    )
+    conn.ftp.inhalte[(pfad, 500)] = spawn_zeilen + _block_text(["VehicleBoat (1)"])
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    assert len(gesendet) == 1
+    beschreibung = gesendet[0]["embed"].description
+    assert "jetzt 1 aktiv" in beschreibung
+    assert "📍 [13360 / 10709]" in beschreibung  # x/z gerundet, KEIN Mittelwert
+    assert "izurvive.com" in beschreibung
+    assert conn.ce_pending_positionen["VehicleBoat"] == []
+
+
+def test_lese_ce_events_ohne_spawn_zeile_zeigt_keinen_ort(conn_mit_ce_events):
     conn, gesendet = conn_mit_ce_events
     pfad = "/games/x/config/DayZServer_x.RPT"
     conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
@@ -501,87 +417,31 @@ def test_lese_ce_events_ohne_adding_cluster_zeigt_keinen_ort(conn_mit_ce_events)
     assert "jetzt 1 aktiv" in beschreibung
 
 
-def test_lese_ce_events_cluster_ohne_erreichbaren_pool_zeigt_keinen_ort(conn_mit_ce_events):
-    # Kein ftp_mission_dir konfiguriert -> conn.ce_eventspawns_root bleibt
-    # False, obwohl ein plausibler Cluster vorliegt. Ohne echte Datei keine
-    # Ortsangabe - kein Rateraten.
+def test_lese_ce_events_zwei_gleichzeitige_typen_nicht_vertauscht(conn_mit_ce_events):
+    # Zwei Events verschiedener Typen im selben Poll-Zyklus - die Zuordnung
+    # ueber CurrentID/Typname darf sie nicht vertauschen.
     conn, gesendet = conn_mit_ce_events
-    pfad = "/games/x/config/DayZServer_x.RPT"
-    conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
-    loop = _StubLoop()
-    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
-    conn.ce_event_counts["StaticHeliCrash"] = 2
-    adding_zeilen = ("12:46:25.995 Adding A at [6200,8300]\n"
-                     "12:46:25.996 Adding A at [6205,8303]\n"
-                     "12:46:25.998 Adding A at [6202,8306]\n")
-    conn.ftp.inhalte[(pfad, 500)] = adding_zeilen + _block_text(["StaticHeliCrash (3)"])
-    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
-    assert len(gesendet) == 1
-    assert "📍" not in gesendet[0]["embed"].description
-    # Der Kandidat bleibt fuer einen spaeteren Poll-Zyklus (Pool koennte dann
-    # erreichbar sein) in der Warteschlange stehen.
-    assert len(conn.ce_pending_positionen) == 1
-    x, z, erkannt_ts = conn.ce_pending_positionen[0]
-    assert round(x, 2) == round((6200 + 6205 + 6202) / 3, 2)
-    assert z == 8303.0
-    assert abs(erkannt_ts - time.time()) < 60  # Wanduhrzeit des Poll-Zyklus
-
-
-def test_lese_ce_events_cluster_weit_weg_von_bekanntem_typ_zeigt_keinen_ort(conn_mit_ce_events, monkeypatch):
-    # Genau der gemeldete Fehler: ein Cluster faellt rein zeitlich mit dem
-    # Zaehler-Anstieg zusammen, liegt aber weit weg vom einzigen bekannten
-    # Spawnpunkt dieses Typs - also vermutlich normaler Loot-Nachschub, kein
-    # echter Event-Ort.
-    conn, gesendet = conn_mit_ce_events
-    _pool_bereitstellen(conn, monkeypatch, (
-        '<eventposdef><event name="StaticHeliCrash">'
-        '<pos x="6204.925293" z="8301.290039" a="-1"/>'
-        '</event></eventposdef>'))
-    pfad = "/games/x/config/DayZServer_x.RPT"
-    conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
-    loop = _StubLoop()
-    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
-    conn.ce_event_counts["StaticHeliCrash"] = 2
-    adding_zeilen = ("12:46:25.995 Adding Ammo_9x39 at [100,100]\n"
-                     "12:46:25.996 Adding Ammo_9x39 at [101,101]\n"
-                     "12:46:25.998 Adding Ammo_9x39 at [102,102]\n")
-    conn.ftp.inhalte[(pfad, 500)] = adding_zeilen + _block_text(["StaticHeliCrash (3)"])
-    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
-    assert len(gesendet) == 1
-    assert "📍" not in gesendet[0]["embed"].description
-    assert "jetzt 3 aktiv" in gesendet[0]["embed"].description
-
-
-def test_lese_ce_events_mehrere_cluster_richtigem_typ_zugeordnet(conn_mit_ce_events, monkeypatch):
-    # Zwei Events im selben Zyklus, zwei Cluster - der Pool-Abgleich (nicht
-    # die zeitliche Reihenfolge) entscheidet, welcher Cluster zu welchem Typ
-    # gehoert.
-    conn, gesendet = conn_mit_ce_events
-    _pool_bereitstellen(conn, monkeypatch, (
-        '<eventposdef>'
-        '<event name="StaticHeliCrash"><pos x="101" z="101" a="-1"/></event>'
-        '<event name="StaticTrain"><pos x="901" z="901" a="0"/></event>'
-        '</eventposdef>'))
+    bot_mod._conn_store(conn, "map_name", "ChernarusPlus")
     pfad = "/games/x/config/DayZServer_x.RPT"
     conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
     loop = _StubLoop()
     _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
     conn.ce_event_counts["StaticHeliCrash"] = 0
-    conn.ce_event_counts["StaticTrain"] = 0
-    cluster_a = ("1:00:00.000 Adding A at [100,100]\n"
-                "1:00:00.100 Adding A at [101,101]\n"
-                "1:00:00.200 Adding A at [102,102]\n")
-    cluster_b = ("1:00:10.000 Adding B at [900,900]\n"
-                "1:00:10.100 Adding B at [901,901]\n"
-                "1:00:10.200 Adding B at [902,902]\n")
-    text = (cluster_a + _block_text(["StaticHeliCrash (1)"])
-           + cluster_b + _block_text(["StaticTrain (1)"]))
+    conn.ce_event_counts["VehicleBoat"] = 0
+    spawn_zeilen = (
+        "18:42:55.572 [CE][DE] [StaticHeliCrash] Spawning: EventID:[35] CurrentID:[55370] at [1410.0,-1.0,4299.2] a: -1.000\n"
+        "18:42:55.573 \t(child) Spawned Wreck_UH1Y EventID:[35] CurrentID:[55370] at [1410.0,-1.0,4299.2] a: -1.000\n"
+        "18:43:25.567 [CE][DE] [VehicleBoat] Spawning: EventID:[46] CurrentID:[55371] at [13359.4,-1.0,10709.6] a: -1.000\n"
+        "18:43:25.568 \t(child) Spawned Boat_01_Orange EventID:[46] CurrentID:[55371] at [13359.5,-0.0,10709.4] a: 10.585\n"
+    )
+    text = spawn_zeilen + _block_text(["StaticHeliCrash (1)", "VehicleBoat (1)"])
     conn.ftp.inhalte[(pfad, 500)] = text
     _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
     assert len(gesendet) == 2
-    assert "📍 [101 / 101]" in gesendet[0]["embed"].description
-    assert "📍 [901 / 901]" in gesendet[1]["embed"].description
-    assert conn.ce_pending_positionen == []
+    assert "📍 [1410 / 4299]" in gesendet[0]["embed"].description
+    assert "📍 [13360 / 10709]" in gesendet[1]["embed"].description
+    assert conn.ce_pending_positionen["StaticHeliCrash"] == []
+    assert conn.ce_pending_positionen["VehicleBoat"] == []
 
 
 def test_lese_ce_events_unvollstaendiger_block_wird_nicht_gepostet(conn_mit_ce_events):
@@ -634,39 +494,16 @@ def test_lese_ce_events_rotation_setzt_baseline_puffer_und_positionen_zurueck(co
     _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
     conn.ce_event_counts["StaticHeliCrash"] = 3
     conn.ce_events_puffer = "3:03:03.231 [CE][DE] DynamicEvent Types (1):\n  StaticHeliCrash (5)\n"
-    conn.ce_pending_positionen = [(1.0, 2.0, time.time())]
+    conn.ce_pending_positionen = {"StaticHeliCrash": [(1.0, 2.0)]}
     # Rotation: neue Datei, DayZ-Zaehler faengt bei 0 wieder an.
     conn.ftp.dateien = [neuer_pfad]
     conn.ftp.groessen[neuer_pfad] = 0
     _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
     assert conn.ce_event_counts == {}
     assert conn.ce_events_puffer == ""
-    assert conn.ce_pending_positionen == []
+    assert conn.ce_pending_positionen == {}
     assert conn.log_state["ce_events"] == {"file": neuer_pfad, "offset": 0}
     assert gesendet == []
-
-
-def test_lese_ce_events_veralteter_kandidat_wird_nicht_mehr_zugeordnet(conn_mit_ce_events, monkeypatch):
-    # Ein alter Kandidat liegt GENAU auf dem bekannten Spawnpunkt - wuerde
-    # ohne Verfallsgrenze also passen. Er ist aber zu alt und darf dem jetzt
-    # gemeldeten Event keinen Ort mehr verpassen.
-    conn, gesendet = conn_mit_ce_events
-    _pool_bereitstellen(conn, monkeypatch, (
-        '<eventposdef><event name="StaticHeliCrash">'
-        '<pos x="6204.925293" z="8301.290039" a="-1"/>'
-        '</event></eventposdef>'))
-    pfad = "/games/x/config/DayZServer_x.RPT"
-    conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
-    loop = _StubLoop()
-    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
-    conn.ce_event_counts["StaticHeliCrash"] = 2
-    veraltet = time.time() - bot_mod._CE_PENDING_POSITIONEN_MAX_ALTER_S - 60
-    conn.ce_pending_positionen = [(6205.0, 8301.0, veraltet)]
-    conn.ftp.inhalte[(pfad, 500)] = _block_text(["StaticHeliCrash (3)"])
-    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
-    assert len(gesendet) == 1
-    assert "📍" not in gesendet[0]["embed"].description
-    assert conn.ce_pending_positionen == []  # veralteter Kandidat entfernt
 
 
 def test_lese_ce_events_inaktiver_typ_ohne_zaehlerzeile_bleibt_stumm(conn_mit_ce_events):

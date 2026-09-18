@@ -768,139 +768,54 @@ _CE_EVENT_SCHALTER_LABEL: Dict[str, Tuple[str, str]] = {
 _CE_EVENT_ZEILE_RE = re.compile(
     r"^\s*(?:\d+:\d+:\d+\.\d+\s+)?([A-Za-z_][A-Za-z0-9_ ]*?)\s+\((\d+)\)\s*$")
 
-# Erkennung ECHTER Spawn-Positionen ueber die Loot-Erzeugung eines
-# CE-Dynamic-Events: DayZ schreibt beim Erzeugen der Beute eines Events (nicht
-# beim Event-Objekt selbst) Zeilen wie ``Adding AK74_Hndgrd at [6203,8300]`` -
-# mehrere Gegenstaende im selben Sekundenbruchteil, auf engstem Raum. Anhand
-# einer echten RPT-Datei verifiziert: bei einem Heli-Crash tauchten so 9
-# Gegenstaende binnen 3ms im Umkreis von 10m auf; 39 Minuten spaeter raeumte
-# der Server das Wrack an EXAKT dieser Koordinate auf
-# (``<cleanup> Remove:"Wreck_UH1Y" at [6205,8303] ... DE="StaticHeliCrash"``).
-# Diese Zeilen tragen selbst KEINEN Event-Typ/keine ID. Ein erkannter Cluster
-# kann deshalb auch ein ganz normaler, in der Naehe zufaellig stattfindender
-# Loot-Nachschub sein, der rein zeitlich mit einem Zaehler-Anstieg
-# zusammenfaellt - das wurde live beobachtet und fuehrte zu falschen
-# Ortsangaben. Die Zuordnung wird deshalb zusaetzlich gegen die ECHTEN,
-# serverkonfigurierten <pos>-Punkte des jeweiligen Event-Typs in
-# cfgeventspawns.xml geprueft (siehe _ce_events_position_zuordnen/
-# _ce_events_pool_laden): nur ein Cluster nah an einem bekannten Spawnpunkt
-# GENAU dieses Typs gilt als verifiziert. Ohne erreichbare cfgeventspawns.xml
-# (z.B. PS4 ohne Mission-Ordner-Zugriff) oder ohne passenden Treffer bleibt
-# die Ortszeile schlicht weg - keine Vermutung.
-_CE_ADDING_ZEILE_RE = re.compile(
-    r"^\s*(\d{1,2}):(\d{2}):(\d{2})\.(\d{1,3})\s+Adding\s+\S+\s+at\s+"
-    r"\[(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)\]\s*$")
-_CE_ADDING_CLUSTER_MIN_ITEMS = 3     # weniger ist ein normaler Einzel-Loot-Respawn
-_CE_ADDING_CLUSTER_RADIUS_M = 25.0   # Beute eines Events liegt eng um den Spawnpunkt
-_CE_ADDING_CLUSTER_MAX_LUECKE_S = 1.0  # groessere Zeitluecke = neuer Cluster
-_CE_PENDING_POSITIONEN_MAX = 8       # verhindert unbegrenztes Wachstum bei nie
-                                     # zugeordneten Clustern (z.B. normale Loot-Respawns,
-                                     # die zufaellig die Mindestgroesse erreichen)
-# Wie lange ein noch nicht zugeordneter Kandidat hoechstens aufgehoben wird.
-# Das ganze Verfahren beruht auf zeitlicher Naehe zwischen Loot-Erzeugung und
-# Zaehler-Anstieg; ein Cluster von vor einer halben Stunde gehoert mit
-# Sicherheit nicht mehr zum gerade gemeldeten Event. Ohne diese Grenze blieben
-# alte Kandidaten bis zum Erreichen von _CE_PENDING_POSITIONEN_MAX liegen und
-# koennten einem viel spaeteren Event faelschlich einen Ort verpassen.
-_CE_PENDING_POSITIONEN_MAX_ALTER_S = 300.0
+# Erkennung ECHTER Spawn-Positionen ueber die Spawn-Protokollzeilen eines
+# CE-Dynamic-Events. An einer echten RPT-Datei verifiziert: DayZ schreibt in
+# genau dem Moment, in dem es ein Event-Objekt platziert, ZWEI Zeilen mit dem
+# Typnamen UND der Koordinate - fuer ALLE Typen (Static* und Vehicle*
+# gleichermassen):
+#   [CE][DE] [StaticHeliCrash] Spawning: EventID:[35] CurrentID:[55370] at [1410.0,-1.0,4299.2] a: -1.000
+#   ...
+#   (child) Spawned Wreck_UH1Y EventID:[35] CurrentID:[55370] at [1410.0,-1.0,4299.2] a: -1.000
+# Ein Spawn-Versuch kann abgelehnt werden ("spawn refused... too close to
+# another one") und wird mit neuer Koordinate wiederholt - die tatsaechlich
+# verwendete Position steht erst in der Bestaetigungszeile ("(child) Spawned"
+# bzw. bei manchen Static-Events "(group) Spawned"), NICHT notwendigerweise in
+# der ersten "Spawning:"-Zeile. Die Zuordnung Typname<->Position laeuft ueber
+# die gemeinsame CurrentID beider Zeilen - eindeutig, ohne Cluster-Bildung
+# oder Abgleich gegen cfgeventspawns.xml noetig.
+_CE_SPAWNING_ZEILE_RE = re.compile(
+    r"\[CE\]\[DE\]\s+\[([^\]]+)\]\s+Spawning:\s+EventID:\[\d+\]\s+"
+    r"CurrentID:\[(\d+)\]\s+at\s+\[(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)\]")
+_CE_SPAWNED_ZEILE_RE = re.compile(
+    r"\((?:child|group)\)\s+Spawned\s+\S+\s+EventID:\[\d+\]\s+CurrentID:\[(\d+)\]\s+"
+    r"at\s+\[(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)\]")
+_CE_PENDING_POSITIONEN_MAX = 8  # verhindert unbegrenztes Wachstum je Typ, falls
+                                # ein Schalter dauerhaft deaktiviert ist
 
 
-def _ce_events_adding_cluster_erkennen(zeilen: List[str]) -> List[Tuple[float, float, int]]:
-    """Reine Funktion (kein I/O): gruppiert ``Adding <Item> at [x,z]``-Zeilen zu
-    Clustern (siehe Konstanten oben) und gibt fuer jeden ausreichend grossen
-    Cluster ``(x_mittelwert, z_mittelwert, anzahl)`` zurueck, in der
-    Reihenfolge des Auftretens."""
-    eintraege: List[Tuple[float, float, float]] = []
+def _ce_events_spawn_positionen_erkennen(zeilen: List[str]) -> List[Tuple[str, float, float]]:
+    """Reine Funktion (kein I/O): verfolgt je CurrentID den zuletzt gesehenen
+    Typnamen aus "Spawning:"-Zeilen (ueberlebt "spawn refused"-Wiederholungen
+    unveraendert, da der Typ dabei gleich bleibt) und gibt fuer jede
+    "(child|group) Spawned"-Bestaetigung ``(typ_name, x, z)`` zurueck - das
+    ist die tatsaechlich verwendete Position, in der Reihenfolge des
+    Auftretens. Eine "Spawned"-Zeile ohne vorher gesehene "Spawning:"-Zeile
+    fuer dieselbe CurrentID (z.B. durch einen mitten im Block abgeschnittenen
+    Poll-Zyklus) wird ignoriert statt geraten."""
+    typ_je_currentid: Dict[str, str] = {}
+    ergebnisse: List[Tuple[str, float, float]] = []
     for zeile in zeilen:
-        treffer = _CE_ADDING_ZEILE_RE.match(zeile)
-        if not treffer:
+        treffer = _CE_SPAWNING_ZEILE_RE.search(zeile)
+        if treffer:
+            typ_je_currentid[treffer.group(2)] = treffer.group(1)
             continue
-        h, m, s, frac, x_text, z_text = treffer.groups()
-        zeit = int(h) * 3600 + int(m) * 60 + int(s) + int(frac) / (10 ** len(frac))
-        eintraege.append((zeit, float(x_text), float(z_text)))
-
-    cluster: List[Tuple[float, float, int]] = []
-    aktuell: List[Tuple[float, float, float]] = []
-
-    def abschliessen():
-        if len(aktuell) >= _CE_ADDING_CLUSTER_MIN_ITEMS:
-            x_avg = sum(e[1] for e in aktuell) / len(aktuell)
-            z_avg = sum(e[2] for e in aktuell) / len(aktuell)
-            cluster.append((x_avg, z_avg, len(aktuell)))
-
-    for eintrag in eintraege:
-        zeit, x, z = eintrag
-        if aktuell:
-            letzte_zeit = aktuell[-1][0]
-            zentrum_x = sum(e[1] for e in aktuell) / len(aktuell)
-            zentrum_z = sum(e[2] for e in aktuell) / len(aktuell)
-            abstand = ((x - zentrum_x) ** 2 + (z - zentrum_z) ** 2) ** 0.5
-            if (zeit - letzte_zeit > _CE_ADDING_CLUSTER_MAX_LUECKE_S
-                    or abstand > _CE_ADDING_CLUSTER_RADIUS_M):
-                abschliessen()
-                aktuell = []
-        aktuell.append(eintrag)
-    abschliessen()
-    return cluster
-
-
-# Toleranz beim Abgleich eines erkannten Clusters gegen die bekannten <pos>-
-# Punkte EINES Event-Typs in der echten cfgeventspawns.xml des Servers. Die
-# Zonen-Radien in der Datei liegen zwischen 20m (Convoy/Police/Train) und 45m
-# (HeliCrash); Loot eines Events kann sich zusaetzlich etwas verteilen (beim
-# verifizierten Beispiel lag der Cluster-Mittelwert ca. 3.4m vom naechsten
-# bekannten Punkt entfernt). 100m deckt das mit Puffer ab, ohne verschiedene,
-# oft hunderte Meter auseinanderliegende Punkte desselben Typs zu vermischen.
-_CE_POSITION_MATCH_RADIUS_M = 100.0
-
-
-def _ce_events_positionen_aus_xml(root: "ET.Element", typ_name: str
-                                  ) -> Optional[List[Tuple[float, float]]]:
-    """x/z-Koordinaten aller <pos>-Kandidaten fuer ``typ_name`` in einer
-    geparsten cfgeventspawns.xml (die ECHTE Datei dieses Servers). None, wenn
-    dieser Event-Name darin gar nicht vorkommt oder keine gueltige Position
-    hat."""
-    event = root.find(f'.//event[@name="{typ_name}"]')
-    if event is None:
-        return None
-    positionen = []
-    for pos in event.findall("pos"):
-        try:
-            positionen.append((float(pos.get("x")), float(pos.get("z"))))
-        except (TypeError, ValueError):
-            continue
-    return positionen or None
-
-
-def _ce_events_pending_aufraeumen(conn: "ServerConnection", jetzt: float) -> None:
-    """Wirft Kandidaten weg, die aelter als _CE_PENDING_POSITIONEN_MAX_ALTER_S
-    sind - sie koennen zum gerade gemeldeten Event zeitlich nicht mehr
-    gehoeren."""
-    conn.ce_pending_positionen = [
-        eintrag for eintrag in conn.ce_pending_positionen
-        if jetzt - eintrag[2] <= _CE_PENDING_POSITIONEN_MAX_ALTER_S]
-
-
-def _ce_events_position_zuordnen(conn: "ServerConnection", typ_name: str,
-                                 pool_root: Optional["ET.Element"]) -> Optional[Tuple[float, float]]:
-    """Sucht in conn.ce_pending_positionen die ERSTE Position, die zu einem
-    bekannten <pos>-Eintrag von ``typ_name`` passt (siehe
-    _CE_POSITION_MATCH_RADIUS_M), und entfernt NUR diese eine aus der
-    Warteschlange - andere, noch nicht zugeordnete Cluster bleiben fuer
-    spaetere Postings erhalten. None, wenn kein Pool geladen werden konnte
-    (z.B. PS4 ohne Mission-Ordner-Zugriff) oder kein Cluster passt (z.B. weil
-    es tatsaechlich ein normaler Loot-Nachschub in der Naehe war)."""
-    if pool_root is None:
-        return None
-    bekannte: List[Tuple[float, float]] = _ce_events_positionen_aus_xml(pool_root, typ_name) or []
-    if not bekannte:
-        return None
-    for i, (x, z, _ts) in enumerate(conn.ce_pending_positionen):
-        if any(((x - bx) ** 2 + (z - bz) ** 2) ** 0.5 <= _CE_POSITION_MATCH_RADIUS_M
-               for bx, bz in bekannte):
-            conn.ce_pending_positionen.pop(i)
-            return x, z
-    return None
+        treffer = _CE_SPAWNED_ZEILE_RE.search(zeile)
+        if treffer:
+            currentid, x_text, _y_text, z_text = treffer.groups()
+            typ_name = typ_je_currentid.get(currentid)
+            if typ_name:
+                ergebnisse.append((typ_name, float(x_text), float(z_text)))
+    return ergebnisse
 
 
 # Kurztexte je Abandoned-Bases-Regel für die Digest-Zeilen - _tt() braucht
@@ -3315,20 +3230,12 @@ class ServerConnection:
         # schreibt den Dump ueber mehrere Zeilen, ein Poll kann mittendrin
         # abschneiden.
         self.ce_events_puffer: str = ""
-        # Per "Adding"-Zeilen-Cluster erkannte Kandidaten-Positionen fuer
-        # ce_events als (x, z, erkannt_ts), noch NICHT gegen einen Event-Typ
-        # verifiziert (siehe _ce_events_adding_cluster_erkennen/
-        # _ce_events_position_zuordnen). Der Zeitstempel ist die Wanduhrzeit
-        # des Poll-Zyklus, in dem der Cluster gelesen wurde - aelteres wird
-        # verworfen (_ce_events_pending_aufraeumen).
-        self.ce_pending_positionen: List[Tuple[float, float, float]] = []
-        # cfgeventspawns.xml dieses Servers, zum Verifizieren einer
-        # Kandidaten-Position gegen die ECHTEN Spawnpunkte des jeweiligen
-        # Event-Typs (siehe _ce_events_pool_laden). None = noch nicht
-        # geladen, False = versucht, aber nicht erreichbar (z.B. PS4 ohne
-        # Mission-Ordner-Zugriff) - beides bedeutet: keine Ortsangabe moeglich.
-        self.ce_eventspawns_root: Optional[Any] = None
-        self.ce_eventspawns_geladen_ts: float = 0.0
+        # Aus "[CE][DE] [Typ] Spawning:"/"Spawned"-Zeilenpaaren erkannte,
+        # ECHTE Spawn-Positionen je Event-Typ (siehe
+        # _ce_events_spawn_positionen_erkennen) - eine eigene FIFO-Liste pro
+        # Typname, da die Zuordnung ueber die CurrentID bereits eindeutig ist
+        # und keinen Zeit-/Abstands-Abgleich mehr braucht.
+        self.ce_pending_positionen: Dict[str, List[Tuple[float, float]]] = {}
         # Grund, aus dem der Poll-Zyklus diesen Server gerade uebergeht
         # (None = laeuft normal). Nur bei einer AENDERUNG geloggt (siehe
         # _poll_zustand_melden) – sonst waere das Terminal bei einem
@@ -6393,16 +6300,12 @@ class DayZBot(discord.Client):
         hier ist der einzige Ort, der tatsaechlich RPT-Text parst, deshalb ein
         eigener Cursor statt Mitbenutzung des ADM-Zustands.
 
-        Zusaetzlich werden im selben neu gelesenen Text "Adding <Item> at
-        [x,z]"-Zeilen auf zeitlich/raeumlich eng zusammenliegende Cluster
-        untersucht (siehe _ce_events_adding_cluster_erkennen) - das sind
-        echte, im RPT verifizierte Spawn-Positionen (Ladung eines CE-Events
-        entsteht in genau diesem Moment). Gefundene Positionen landen in
-        conn.ce_pending_positionen und werden in _ce_events_embed FIFO einem
-        gemeldeten Zaehler-Anstieg zugeordnet - eine Naeherung (welches
-        Cluster zu welchem Event gehoert ist nicht immer eindeutig), aber
-        keine Erfindung: jede angezeigte Position stammt aus echten
-        Log-Zeilen desselben Servers."""
+        Zusaetzlich werden im selben neu gelesenen Text die
+        "[CE][DE] [Typ] Spawning:"/"Spawned"-Zeilenpaare ausgewertet (siehe
+        _ce_events_spawn_positionen_erkennen) - das sind echte, im RPT
+        verifizierte Spawn-Positionen, exakt einem Typnamen zugeordnet.
+        Gefundene Positionen landen typisiert in conn.ce_pending_positionen
+        und werden in _ce_events_embed FIFO demselben Typ zugeordnet."""
         if conn.guild_id is None:
             return
         try:
@@ -6425,7 +6328,7 @@ class DayZBot(discord.Client):
             conn.log_state["ce_events"] = {"file": aktuelle_datei, "offset": int(size_now)}
             conn.ce_event_counts = {}
             conn.ce_events_puffer = ""
-            conn.ce_pending_positionen = []
+            conn.ce_pending_positionen = {}
             connections.save()
             return
         text, neuer_offset = await _log_lesen_ab_offset(conn, aktuelle_datei, state.get("offset", 0))
@@ -6438,14 +6341,12 @@ class DayZBot(discord.Client):
         neue_zeilen = text.split("\n")
         if neue_zeilen and neue_zeilen[-1] == "":
             neue_zeilen.pop()  # _log_lesen_ab_offset liefert Text stets bis zum Zeilenende
-        jetzt = time.time()
-        _ce_events_pending_aufraeumen(conn, jetzt)
-        cluster = _ce_events_adding_cluster_erkennen(neue_zeilen)
-        if cluster:
-            conn.ce_pending_positionen.extend((x, z, jetzt) for x, z, _anzahl in cluster)
-            ueberschuss = len(conn.ce_pending_positionen) - _CE_PENDING_POSITIONEN_MAX
+        for typ_name, x, z in _ce_events_spawn_positionen_erkennen(neue_zeilen):
+            warteschlange = conn.ce_pending_positionen.setdefault(typ_name, [])
+            warteschlange.append((x, z))
+            ueberschuss = len(warteschlange) - _CE_PENDING_POSITIONEN_MAX
             if ueberschuss > 0:
-                del conn.ce_pending_positionen[:ueberschuss]
+                del warteschlange[:ueberschuss]
         bloecke, rest = _ce_events_bloecke_extrahieren(conn.ce_events_puffer + text)
         conn.ce_events_puffer = rest
         for block_zeilen in bloecke:
@@ -6454,32 +6355,26 @@ class DayZBot(discord.Client):
                 schluessel = f"ce_events_{schalter}_enabled"
                 if not conn.get(schluessel, True):
                     continue
-                embed = await self._ce_events_embed(conn, typ_name, schalter, delta, neuer_stand, loop)
+                embed = self._ce_events_embed(conn, typ_name, schalter, delta, neuer_stand)
                 ok, grund = await _post_feed(conn.guild_id, "ce_events", embed, service_id=conn.service_id)
                 if not ok:
                     log.debug(f"[POLL] {conn.name}: ce_events fuer {typ_name} nicht gesendet ({grund}).")
 
-    async def _ce_events_embed(self, conn: ServerConnection, typ_name: str, schalter: str,
-                               delta: int, neuer_stand: int, loop) -> "discord.Embed":
-        """Baut das Feed-Embed. Zeigt einen Ort NUR, wenn ein per
-        "Adding"-Zeilen-Cluster erkannter Kandidat ZUSAETZLICH gegen die
-        echten <pos>-Punkte dieses Event-Typs in der cfgeventspawns.xml
-        dieses Servers passt (siehe _ce_events_position_zuordnen) - sonst
-        koennte ein zufaellig zeitgleicher, normaler Loot-Nachschub
-        faelschlich als Event-Ort gemeldet werden. Ohne erreichbare
-        cfgeventspawns.xml oder ohne passenden Kandidaten bleibt die
-        Ortszeile schlicht weg."""
+    def _ce_events_embed(self, conn: ServerConnection, typ_name: str, schalter: str,
+                         delta: int, neuer_stand: int) -> "discord.Embed":
+        """Baut das Feed-Embed. Zeigt einen Ort NUR, wenn eine echte, per
+        "[CE][DE] [Typ] Spawning:"/"Spawned"-Zeilenpaar erkannte Position fuer
+        GENAU diesen Typ vorliegt (siehe conn.ce_pending_positionen) - sonst
+        bleibt die Ortszeile schlicht weg."""
         emoji, label = _CE_EVENT_SCHALTER_LABEL[schalter]
         kopf = (f"{delta}× neu aufgetaucht (jetzt {neuer_stand} aktiv)" if delta > 1
                else f"ist aufgetaucht (jetzt {neuer_stand} aktiv)")
         if schalter == "vehicle_event":
             kopf = f"**{typ_name}** {kopf}"
         beschreibung = kopf
-        await self._ce_events_pool_laden(conn, loop)
-        pool_root = conn.ce_eventspawns_root if conn.ce_eventspawns_root is not False else None
-        position = _ce_events_position_zuordnen(conn, typ_name, pool_root)
-        if position:
-            x, z = position
+        warteschlange = conn.ce_pending_positionen.get(typ_name)
+        if warteschlange:
+            x, z = warteschlange.pop(0)
             karte = _canonical_map_name(conn.get("map_name", "")) or "ChernarusPlus"
             url = _izurvive_url(x, z, karte)
             nah = _nearest_location(x, z, karte)
@@ -6487,29 +6382,6 @@ class DayZBot(discord.Client):
             beschreibung = f"{kopf}\n📍 [{x:.0f} / {z:.0f}]({url}){nah_text}"
         return discord.Embed(title=f"{emoji} {label}", description=beschreibung,
                              color=FEED_TYPES["ce_events"]["farbe"])
-
-    async def _ce_events_pool_laden(self, conn: ServerConnection, loop) -> None:
-        """Laedt/erneuert conn.ce_eventspawns_root (geparste cfgeventspawns.xml
-        dieses Servers) hoechstens einmal pro Stunde - die Datei aendert sich
-        nicht staendig, ein FTP-Lesevorgang bei JEDEM Event waere unnoetig.
-        Bleibt conn.ce_eventspawns_root auf ``False`` stehen (nicht
-        erreichbar, z.B. PS4 ohne Mission-Ordner-Zugriff), bleibt jede
-        Ortsangabe fuer diesen Server einfach aus (siehe
-        _ce_events_position_zuordnen) - kein Rateraten ohne echte Datei."""
-        jetzt = time.time()
-        if conn.ce_eventspawns_root is not None and jetzt - conn.ce_eventspawns_geladen_ts < 3600:
-            return
-        conn.ce_eventspawns_geladen_ts = jetzt
-        if _mission_dir_of(conn) is None or conn.ftp is None:
-            conn.ce_eventspawns_root = False
-            return
-        try:
-            root, status = await _tools_xml_lesen(conn, "cfgeventspawns.xml", loop)
-        except Exception as e:  # noqa: BLE001 – darf den Poll nie kippen
-            log.debug(f"[POLL] {conn.name}: cfgeventspawns.xml fuer ce_events nicht lesbar: {e}")
-            conn.ce_eventspawns_root = False
-            return
-        conn.ce_eventspawns_root = root if status == "ok" else False
 
     async def _pruefe_neustart(self, conn: ServerConnection, log_dir: str, loop):
         """Neue .RPT-Datei erkannt = der Gameserver wurde neu gestartet.
