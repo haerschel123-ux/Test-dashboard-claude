@@ -6968,6 +6968,12 @@ _SUBCMD_DEFS: Tuple[Tuple[str, str, str, str, str], ...] = (
     ("shop_check", "Shop", "Shop", "/shop check – Delivery-Diagnose", "/shop check – Delivery diagnostics"),
     ("shop_enable", "Shop", "Shop", "/shop enable – Aktiviert/deaktiviert ein Shop-Item", "/shop enable – Enables/disables a shop item"),
     ("faction_list", "Fraktionen", "Factions", "/faction list – Zeigt alle Fraktionen dieses Servers", "/faction list – Shows all factions on this server"),
+    ("gcreate", "Gewinnspiele", "Giveaways", "/gcreate – Erstellt ein Gewinnspiel per Formular", "/gcreate – Creates a giveaway via form"),
+    ("gstart", "Gewinnspiele", "Giveaways", "/gstart – Startet ein Gewinnspiel direkt", "/gstart – Starts a giveaway directly"),
+    ("glist", "Gewinnspiele", "Giveaways", "/glist – Zeigt laufende Gewinnspiele", "/glist – Shows running giveaways"),
+    ("gdelete", "Gewinnspiele", "Giveaways", "/gdelete – Löscht ein Gewinnspiel", "/gdelete – Deletes a giveaway"),
+    ("greroll", "Gewinnspiele", "Giveaways", "/greroll – Lost neue Sieger nach", "/greroll – Draws new winners"),
+    ("gsettings_set", "Gewinnspiele", "Giveaways", "/gsettings set – Setzt Farbe/Pflichtrolle für Gewinnspiele", "/gsettings set – Sets color/required role for giveaways"),
 )
 _SUBCMD_KEYS = frozenset(k for k, *_ in _SUBCMD_DEFS)
 

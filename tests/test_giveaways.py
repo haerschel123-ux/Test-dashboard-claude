@@ -444,3 +444,16 @@ def test_hilfe_enthaelt_keine_phantom_befehle_mehr():
         assert phantom not in text
     for echt in ("/gcreate", "/faction info", "/ticket add", "/send ticket panel"):
         assert echt in text
+
+
+def test_gewinnspiel_befehle_im_subcommand_permission_system_registriert():
+    # Brigarde meldete: fuer alle Gewinnspiel-Befehle reicht der reine
+    # Discord-Administrator-Haken, sie kann sie nicht gezielt auf Rollen/
+    # Personen einschraenken - das lag daran, dass diese Schluessel in
+    # _SUBCMD_DEFS fehlten und deshalb im Dashboard unter "Permissions" ->
+    # "Subcommand Permissions" gar nicht erst auftauchten.
+    giveaway_keys = ("gcreate", "gstart", "glist", "gdelete", "greroll", "gsettings_set")
+    for key in giveaway_keys:
+        assert key in bot_mod._SUBCMD_KEYS
+    kategorien = {kd for k, kd, *_ in bot_mod._SUBCMD_DEFS if k in giveaway_keys}
+    assert kategorien == {"Gewinnspiele"}
