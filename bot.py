@@ -338,8 +338,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "shop_items_file: generierter Groß-Katalog. Wird beim Bot-Start automatisch aus",
         "  einer types.xml im Bot-Ordner erzeugt, falls die Datei noch fehlt. Existiert",
         "  sie, hat sie Vorrang vor shop_items. Preise pro Kategorie: shop_category_prices",
-        "  (Datei löschen + Neustart = neu generieren) oder einzeln per /shop setprice",
-        "  bzw. /edit shopitem. Items hinzufügen/ändern: /add shopitem, /edit shopitem.",
+        "  (Datei löschen + Neustart = neu generieren). Items, Bundles und Mietartikel",
+        "  im Dashboard unter „Shop“ verwalten.",
         "Nach Änderungen an dieser Datei: /economy_reload im Discord (kein Neustart nötig, "
         "nur Bot-Eigentümer)."
     ],
@@ -1326,30 +1326,30 @@ Economy-Admin-Befehle (admin_role_ids / economy_admin_role_ids):
 /shop check                     → Delivery-Diagnose: prüft cfgEffectArea.json und
    trägt fehlende Einträge offener Käufe automatisch wieder ein
 /shop cleanup                   → Lieferungen abschließen + verwaiste SHOP_-Einträge entfernen
-/shop setprice <item> <preis>   → Item-Preis ändern
 /shop enable <item> <true/false>→ Item im Shop (de)aktivieren
-/add shopitem <classnames> <preis> → Item/Bundle in den Katalog aufnehmen
-   Anzeigename = Classname; mehrere Classnames (Komma getrennt) = Bundle,
-   dann spawnen alle Items zusammen an der Kauf-Koordinate
-/bundle add                     → Bundle per Formular anlegen: Kategorie im
-   Dropdown wählen, dann Items zeilenweise als "2xClassname" (mit Menge),
-   Name, Preis und Max-Kauf-Limit eingeben
-/edit shopitem <item> [...]     → Classnames, Preis, Name, Kategorie oder
-   Max-Menge eines vorhandenen Items/Bundles ändern
-/shop removeitem <item>         → Item/Bundle aus dem Katalog löschen
+/shop rentals                   → Aktive Miet-Katalog-Einträge anzeigen
 /economy_reload                 → config.json + Katalog neu laden (ohne Bot-Neustart,
                                    nur Bot-Eigentümer)
+
+GEWINNSPIELE
+────────────
+/gcreate                        → Gewinnspiel per Formular erstellen
+/gstart <dauer> <sieger> <preis> [beschreibung] → Gewinnspiel direkt starten
+/glist                          → Laufende Gewinnspiele anzeigen
+/gdelete <id>                   → Gewinnspiel löschen
+/greroll <id> [anzahl]          → Neue Sieger für ein beendetes Gewinnspiel auslosen
+/gsettings set [farbe] [rolle]  → Embed-Farbe und Pflichtrolle festlegen
 
 ITEM-KATALOG (shop_items.json)
 ──────────────────────────────
 Der große Katalog wird beim Bot-Start AUTOMATISCH aus deiner types.xml
 erzeugt, falls shop_items.json noch fehlt (types.xml einfach in den
 Bot-Ordner legen – der Generator steckt im Bot selbst, keine 2. Datei).
-Neu generieren: shop_items.json löschen und den Bot neu starten;
-per /add shopitem angelegte Items bleiben dabei erhalten.
-Preise pro Kategorie: shop_category_prices in config.json; einzeln per
-/shop setprice oder /edit shopitem. Existiert shop_items.json, hat sie
-Vorrang vor der kleinen shop_items-Liste in config.json.
+Neu generieren: shop_items.json löschen und den Bot neu starten.
+Preise pro Kategorie: shop_category_prices in config.json; einzelne Items,
+Bundles und Mietartikel im Dashboard unter „Shop“ verwalten. Existiert
+shop_items.json, hat sie Vorrang vor der kleinen shop_items-Liste in
+config.json.
 
 ITEM-AUSLIEFERUNG (cfgEffectArea.json)
 ──────────────────────────────────────
@@ -3473,6 +3473,11 @@ class ServerConnection:
         "map_name", "auto_restart_schedule", "auto_restart_after_purchase",
         "welcome_message", "leave_message", "reaction_roles",
         "ticket_categories", "ticket_open", "ticket_language",
+        # Gewinnspiele (inkl. Teilnehmerlisten) und ihre Server-Einstellungen
+        # sind strikt serverspezifisch - ein Rueckfall auf cfg.config wuerde
+        # (wie bei den Tickets oben) fremde Teilnehmerdaten oder eine falsche
+        # Pflichtrolle/Embed-Farbe zwischen Kunden durchreichen.
+        "giveaways", "giveaway_farbe", "giveaway_required_role_id",
         # Die Sicherungen gehoeren genau einem Server; geerbt wuerde ein
         # Kunde die Sicherungen eines fremden Servers sehen und
         # zurueckspielen koennen.
@@ -4510,6 +4515,19 @@ class DayZBot(discord.Client):
         except Exception as e:
             log.error(f"[BOT] Persistente Ticket-Views konnten nicht registriert werden: {e}")
 
+        # Gewinnspiele: Teilnahme-Buttons noch laufender Gewinnspiele
+        # wiederherstellen, damit ein Klick nach einem Bot-Neustart nicht ins
+        # Leere laeuft (Vorbild: Ticket-/Whitelist-Views oben).
+        try:
+            for _c in connections.all():
+                if not _c.service_id:
+                    continue
+                for _g in _giveaways(_c):
+                    if isinstance(_g, dict) and _g.get("status") == "running" and _g.get("id"):
+                        self.add_view(GiveawayEntryView(_c.service_id, int(_g["id"])))
+        except Exception as e:
+            log.error(f"[BOT] Persistente Gewinnspiel-Views konnten nicht registriert werden: {e}")
+
         # /ping GLOBAL registrieren (einziger Befehl) - fuer Discords
         # "Unterstuetzt Befehle"-Symbol auf dem App-Profil (das erscheint nur
         # bei global registrierten Befehlen, nicht bei den unten je Guild
@@ -4765,6 +4783,8 @@ class DayZBot(discord.Client):
             self.restart_scheduler.start()
         if not self.scheduled_tasks_loop.is_running():
             self.scheduled_tasks_loop.start()
+        if not self.giveaways_loop.is_running():
+            self.giveaways_loop.start()
         if not announcement_scheduler.is_running():
             announcement_scheduler.start()
         if not self.abandoned_bases_digest.is_running():
@@ -6051,6 +6071,63 @@ class DayZBot(discord.Client):
     @scheduled_tasks_loop.before_loop
     async def _before_scheduled_tasks_loop(self):
         await self.wait_until_ready()
+
+    # ── Gewinnspiele: automatisches Beenden abgelaufener Gewinnspiele ────
+    @tasks.loop(seconds=30)
+    async def giveaways_loop(self):
+        try:
+            await self._giveaways_once()
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stoppen
+            log.error(f"[GEWINNSPIELE] Fehler: {e}")
+
+    @giveaways_loop.before_loop
+    async def _before_giveaways_loop(self):
+        await self.wait_until_ready()
+
+    async def _giveaways_once(self):
+        for conn in connections.all():
+            try:
+                await self._giveaways_conn(conn)
+            except Exception as e:  # noqa: BLE001 – ein Server darf die anderen nicht stoppen
+                log.error(f"[GEWINNSPIELE] {conn.name}: {e}")
+
+    async def _giveaways_conn(self, conn: ServerConnection):
+        jetzt = time.time()
+        alle = _giveaways(conn)
+        faellig = [g for g in alle if isinstance(g, dict) and g.get("status") == "running"
+                  and float(g.get("ends_at", 0)) <= jetzt]
+        if not faellig:
+            return
+        for eintrag in faellig:
+            await self._giveaway_beenden(conn, eintrag)
+        _conn_store(conn, "giveaways", alle)
+
+    async def _giveaway_beenden(self, conn: ServerConnection, eintrag: Dict[str, Any]) -> None:
+        """Zieht die Sieger, editiert die Original-Nachricht und postet eine
+        Sieger-Ankuendigung. Faengt jeden Discord-Fehler (Nachricht/Kanal
+        geloescht) ab - der Datensatz wird in JEDEM Fall auf 'ended' gesetzt,
+        sonst wuerde ein geloeschter Kanal dasselbe Gewinnspiel jeden
+        Poll-Zyklus erneut zu beenden versuchen."""
+        entrants = list(eintrag.get("entrants") or [])
+        anzahl = max(1, int(eintrag.get("winners_count") or 1))
+        sieger = random.sample(entrants, min(anzahl, len(entrants))) if entrants else []
+        eintrag["winners"] = sieger
+        eintrag["status"] = "ended"
+        sprache = str(eintrag.get("sprache") or "de")
+        kanal = await self._resolve_channel(int(eintrag.get("channel_id") or 0))
+        if kanal is None:
+            return
+        embed = _giveaway_embed(eintrag, sprache, beendet=True)
+        try:
+            nachricht = await kanal.fetch_message(int(eintrag.get("message_id") or 0))
+            await nachricht.edit(embed=embed, view=None)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.debug(f"[GEWINNSPIELE] Nachricht {eintrag.get('message_id')} nicht editierbar: {e}")
+        text = _giveaway_sieger_text(eintrag, sprache)
+        try:
+            await kanal.send(text)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.debug(f"[GEWINNSPIELE] Sieger-Ankuendigung fehlgeschlagen: {e}")
 
     async def _post_restart_feed(self, embed: discord.Embed,
                                  conn: Optional[ServerConnection] = None,
@@ -16349,19 +16426,13 @@ async def cmd_hilfe(interaction: discord.Interaction):
         interaction,
         "`/shop list [category]` — Item-Katalog (leer = Kategorie-Übersicht)\n"
         "`/buy <item> <amount> <x> <z> [y]` — Item kaufen (spawnt nach Neustart)\n"
-        "`/add shopitem <classnames> <price>` — Item/Bundle hinzufügen *(Admin)*\n"
-        "`/bundle add` — Bundle per Formular anlegen (Menge je Item, Dropdown-Kategorie) *(Admin)*\n"
-        "`/edit shopitem <item> […]` — Classnames/Preis/Name/Kategorie ändern *(Admin)*\n"
-        "`/shop pending` `/shop check` `/shop cleanup` `/shop setprice` "
-        "`/shop enable` `/shop removeitem` *(Admin)*\n"
+        "`/shop pending` `/shop check` `/shop cleanup` `/shop enable` `/shop rentals` *(Admin)*\n"
+        "*Katalog, Bundles und Mietartikel im Dashboard unter „Shop“ verwalten.*\n"
         "*Shop-Log und Economy-Log als Feed einrichten: Dashboard → „Feeds“.*",
         "`/shop list [category]` — Item catalog (empty = category overview)\n"
         "`/buy <item> <amount> <x> <z> [y]` — Buy an item (spawns after the next restart)\n"
-        "`/add shopitem <classnames> <price>` — Add an item/bundle *(admin)*\n"
-        "`/bundle add` — Create a bundle via form (amount per item, dropdown category) *(admin)*\n"
-        "`/edit shopitem <item> […]` — Change classnames/price/name/category *(admin)*\n"
-        "`/shop pending` `/shop check` `/shop cleanup` `/shop setprice` "
-        "`/shop enable` `/shop removeitem` *(admin)*\n"
+        "`/shop pending` `/shop check` `/shop cleanup` `/shop enable` `/shop rentals` *(admin)*\n"
+        "*Manage the catalog, bundles and rental items in the dashboard under „Shop“.*\n"
         "*Set up shop log and economy log as a feed: dashboard → „Feeds“.*"
     ), inline=False)
     embed.add_field(name=_t(interaction, "📢 Ankündigungen", "📢 Announcements"), value=_t(
@@ -16376,6 +16447,51 @@ async def cmd_hilfe(interaction: discord.Interaction):
         "`/delete <index>` — Delete an announcement\n"
         "`/edit announcement <index>` — Change an announcement's message/image\n"
         "`/hackban <user_id> [reason]` — Ban a Discord user by ID"
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "🎉 Gewinnspiele", "🎉 Giveaways"), value=_t(
+        interaction,
+        "`/gcreate` — Gewinnspiel per Formular erstellen\n"
+        "`/gstart <dauer> <sieger> <preis> [beschreibung]` — Gewinnspiel direkt starten\n"
+        "`/glist` — Laufende Gewinnspiele anzeigen\n"
+        "`/gdelete <id>` — Gewinnspiel löschen\n"
+        "`/greroll <id> [anzahl]` — Neue Sieger für ein beendetes Gewinnspiel auslosen\n"
+        "`/gsettings set [farbe] [rolle]` — Embed-Farbe und Pflichtrolle festlegen",
+        "`/gcreate` — Create a giveaway via form\n"
+        "`/gstart <duration> <winners> <prize> [description]` — Start a giveaway directly\n"
+        "`/glist` — Show running giveaways\n"
+        "`/gdelete <id>` — Delete a giveaway\n"
+        "`/greroll <id> [count]` — Draw new winners for an ended giveaway\n"
+        "`/gsettings set [color] [role]` — Set embed color and required role"
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "🚩 Fraktionen", "🚩 Factions"), value=_t(
+        interaction,
+        "`/faction info [fraktion]` — Details einer Fraktion\n"
+        "`/faction list` — Alle Fraktionen dieses Servers *(Admin)*\n"
+        "`/faction balance [fraktion]` — Kontostand der Fraktionskasse\n"
+        "`/faction deposit/withdraw/pay <betrag>` — Fraktionskasse verwalten\n"
+        "`/faction stats [fraktion]` / `/faction map [fraktion]` — Statistiken / Kartenbild\n"
+        "`/faction member add|remove <spieler>` — Mitglieder verwalten (Leader/Officer)\n"
+        "`/faction permission grant|revoke <mitglied>` — Officer-Rechte vergeben (Leader)\n"
+        "*Fraktionen anlegen im Dashboard unter „Factions“.*",
+        "`/faction info [faction]` — Details of a faction\n"
+        "`/faction list` — All factions of this server *(admin)*\n"
+        "`/faction balance [faction]` — Faction treasury balance\n"
+        "`/faction deposit/withdraw/pay <amount>` — Manage the faction treasury\n"
+        "`/faction stats [faction]` / `/faction map [faction]` — Statistics / map image\n"
+        "`/faction member add|remove <player>` — Manage members (leader/officer)\n"
+        "`/faction permission grant|revoke <member>` — Grant officer permissions (leader)\n"
+        "*Create factions in the dashboard under „Factions“.*"
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "🎫 Tickets", "🎫 Tickets"), value=_t(
+        interaction,
+        "`/send ticket panel <panel>` — Ticket-Panel senden (Admin)\n"
+        "`/ticket add|remove <channel> <mitglied>` — Person zu einem Ticket hinzufügen/entfernen (Support)\n"
+        "`/ticket clear_stale` — Verwaiste Ticket-Sperren aufräumen (Admin)\n"
+        "*Öffnen läuft über den Panel-Knopf, Kategorien im Dashboard unter „Tickets“.*",
+        "`/send ticket panel <panel>` — Send the ticket panel (admin)\n"
+        "`/ticket add|remove <channel> <member>` — Add/remove a person from a ticket (support)\n"
+        "`/ticket clear_stale` — Clean up orphaned ticket locks (admin)\n"
+        "*Opening happens via the panel button; manage categories in the dashboard under „Tickets“.*"
     ), inline=False)
     _c_hilfe = _conn_of(interaction)
     admin_ids = _c_hilfe.get("admin_role_ids", []) if _c_hilfe is not None else []
@@ -17111,6 +17227,432 @@ async def cmd_hackban(
             f"❌ {_t(interaction, 'Fehler', 'Error')}: {e}",
             ephemeral=True
         )
+
+
+# ══════════════════════════════════════════════════════════════
+#  GEWINNSPIELE (/gcreate, /gstart, /glist, /gdelete, /greroll, /gsettings)
+#  Teilnahme über einen persistenten Button, automatisches Beenden per
+#  Hintergrund-Schleife (siehe DayZBot.giveaways_loop). Ein Gewinnspiel ist
+#  ein kleiner, seltener Datensatz je Server - JSON ueber _conn_store, wie
+#  Tickets/Zonen/Fraktionen, kein eigenes SQLite noetig.
+# ══════════════════════════════════════════════════════════════
+_GIVEAWAY_FARBE_DEFAULT = 0xF1C40F  # Gold, giveaway-typisch
+
+
+def _giveaways(conn: ServerConnection) -> List[Dict[str, Any]]:
+    gw = conn.get("giveaways")
+    if not isinstance(gw, list):
+        gw = []
+        conn.set("giveaways", gw)
+    return gw
+
+
+def _ensure_giveaway_ids(eintraege: List[Dict]) -> bool:
+    """Vergibt fortlaufende `id`-Felder an Gewinnspiele ohne eins (analog
+    _ensure_ticket_ids)."""
+    changed = False
+    next_id = 1 + max([int(e.get("id") or 0) for e in eintraege if isinstance(e, dict)] or [0])
+    for e in eintraege:
+        if isinstance(e, dict) and not e.get("id"):
+            e["id"] = next_id
+            next_id += 1
+            changed = True
+    return changed
+
+
+_DAUER_EINHEITEN: Dict[str, float] = {
+    "s": 1, "sek": 1, "sekunde": 1, "sekunden": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minuten": 60, "minutes": 60,
+    "h": 3600, "std": 3600, "stunde": 3600, "stunden": 3600, "hr": 3600, "hrs": 3600,
+    "hour": 3600, "hours": 3600,
+    "d": 86400, "tag": 86400, "tage": 86400, "day": 86400, "days": 86400,
+    "w": 604800, "woche": 604800, "wochen": 604800, "week": 604800, "weeks": 604800,
+}
+_DAUER_TOKEN_RE = re.compile(r"(\d+)\s*([a-zA-ZäöüÄÖÜ]+)")
+
+
+def _dauer_parsen(text: str) -> Optional[float]:
+    """"10 minutes"/"1h30m"/"2 Tage" -> Sekunden, oder None bei ungueltigem
+    Text. Reine Funktion, unterstuetzt mehrere Zahl+Einheit-Paare
+    hintereinander (deutsche und englische Einheiten-Aliase)."""
+    treffer = list(_DAUER_TOKEN_RE.finditer(text or ""))
+    if not treffer:
+        return None
+    gesamt = 0.0
+    for match in treffer:
+        zahl_text, einheit_text = match.group(1), match.group(2).lower()
+        faktor = _DAUER_EINHEITEN.get(einheit_text)
+        if faktor is None:
+            return None
+        gesamt += int(zahl_text) * faktor
+    return gesamt if gesamt > 0 else None
+
+
+def _giveaway_finden(conn: ServerConnection, giveaway_id: int) -> Optional[Dict[str, Any]]:
+    return next((g for g in _giveaways(conn)
+                if isinstance(g, dict) and int(g.get("id") or 0) == giveaway_id), None)
+
+
+def _giveaway_embed(eintrag: Dict[str, Any], sprache: str, beendet: bool) -> "discord.Embed":
+    farbe = int(eintrag.get("farbe") or _GIVEAWAY_FARBE_DEFAULT)
+    titel = _tt(sprache, "🎉 Gewinnspiel beendet", "🎉 Giveaway Ended") if beendet \
+        else _tt(sprache, "🎉 Gewinnspiel", "🎉 Giveaway")
+    embed = discord.Embed(title=titel, description=str(eintrag.get("description") or "") or None,
+                          color=farbe)
+    embed.add_field(name=_tt(sprache, "🎁 Preis", "🎁 Prize"), value=str(eintrag.get("prize") or "–"),
+                    inline=True)
+    embed.add_field(name=_tt(sprache, "🏆 Sieger-Anzahl", "🏆 Winners"),
+                    value=str(eintrag.get("winners_count") or 1), inline=True)
+    if beendet:
+        sieger = eintrag.get("winners") or []
+        wert = ", ".join(f"<@{uid}>" for uid in sieger) if sieger else \
+            _tt(sprache, "Niemand hat teilgenommen", "Nobody entered")
+        embed.add_field(name=_tt(sprache, "🏆 Sieger", "🏆 Winners"), value=wert, inline=False)
+    else:
+        ends_at = int(eintrag.get("ends_at") or 0)
+        embed.add_field(name=_tt(sprache, "⏰ Endet", "⏰ Ends"), value=f"<t:{ends_at}:R>", inline=False)
+        embed.add_field(name=_tt(sprache, "🎟️ Teilnehmer", "🎟️ Entrants"),
+                        value=str(len(eintrag.get("entrants") or [])), inline=True)
+    ersteller = eintrag.get("created_by")
+    if ersteller:
+        embed.set_footer(text=_tt(sprache, f"Erstellt von {ersteller}", f"Created by {ersteller}")
+                         if isinstance(ersteller, str) else None)
+    return embed
+
+
+def _giveaway_sieger_text(eintrag: Dict[str, Any], sprache: str) -> str:
+    sieger = eintrag.get("winners") or []
+    preis = str(eintrag.get("prize") or "–")
+    if not sieger:
+        return _tt(sprache, f"🎉 Das Gewinnspiel um **{preis}** ist beendet – niemand hat teilgenommen.",
+                   f"🎉 The giveaway for **{preis}** has ended – nobody entered.")
+    mentions = ", ".join(f"<@{uid}>" for uid in sieger)
+    return _tt(sprache, f"🎉 Herzlichen Glückwunsch {mentions}! Ihr habt **{preis}** gewonnen.",
+              f"🎉 Congratulations {mentions}! You won **{preis}**.")
+
+
+class GiveawayCreateModal(discord.ui.Modal):
+    """Formular fuer /gcreate - Vorbild: WhitelistRequestModal."""
+
+    def __init__(self, service_id: str, sprache: str = "de"):
+        super().__init__(title="🎉 Gewinnspiel erstellen" if sprache == "de" else "🎉 Create a Giveaway")
+        self.service_id = service_id
+        self.sprache = sprache
+        self.dauer_in = discord.ui.TextInput(
+            label="Dauer" if sprache == "de" else "Duration",
+            placeholder="z.B. 10 minutes" if sprache == "de" else "Ex: 10 minutes",
+            required=True, max_length=32)
+        self.sieger_in = discord.ui.TextInput(
+            label="Anzahl der Sieger" if sprache == "de" else "Number of Winners",
+            default="1", required=True, max_length=4)
+        self.preis_in = discord.ui.TextInput(
+            label="Preis" if sprache == "de" else "Prize", required=True, max_length=200)
+        self.beschreibung_in = discord.ui.TextInput(
+            label="Beschreibung" if sprache == "de" else "Description",
+            required=False, max_length=500, style=discord.TextStyle.paragraph)
+        for feld in (self.dauer_in, self.sieger_in, self.preis_in, self.beschreibung_in):
+            self.add_item(feld)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        dauer_s = _dauer_parsen(str(self.dauer_in.value))
+        if dauer_s is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Ungültige Dauer. Beispiel: `10 minutes`, `1h30m`, `2 Tage`.",
+                "❌ Invalid duration. Example: `10 minutes`, `1h30m`, `2 days`."), ephemeral=True)
+        try:
+            sieger_anzahl = int(str(self.sieger_in.value).strip())
+        except ValueError:
+            sieger_anzahl = 0
+        if sieger_anzahl < 1:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Die Anzahl der Sieger muss mindestens 1 sein.",
+                "❌ The number of winners must be at least 1."), ephemeral=True)
+        conn = connections.for_service(self.service_id)
+        if conn is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieser Server ist nicht mehr verfügbar.",
+                "❌ This server is no longer available."), ephemeral=True)
+        await _giveaway_erstellen(
+            interaction, conn, prize=str(self.preis_in.value).strip(),
+            winners_count=sieger_anzahl, ends_in_seconds=dauer_s,
+            description=str(self.beschreibung_in.value or "").strip(), sprache=self.sprache)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.error(f"[GEWINNSPIELE] Erstell-Modal-Fehler: {error}")
+        msg = _t(interaction, "❌ Etwas ist schiefgelaufen. Bitte versuche es erneut.",
+                 "❌ Something went wrong. Please try again.")
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+
+
+async def _giveaway_erstellen(interaction: discord.Interaction, conn: ServerConnection, *,
+                              prize: str, winners_count: int, ends_in_seconds: float,
+                              description: str, sprache: str) -> None:
+    """Gemeinsamer Erstell-Pfad fuer /gcreate (Modal) UND /gstart (direkte
+    Parameter) - baut Embed + Button, postet in den Aufrufer-Channel, legt
+    den Datensatz an."""
+    if not prize:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Bitte einen Preis angeben.", "❌ Please enter a prize."), ephemeral=True)
+    if interaction.channel is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ In diesem Kanal kann kein Gewinnspiel gestartet werden.",
+            "❌ A giveaway can't be started in this channel."), ephemeral=True)
+    eintraege = _giveaways(conn)
+    _ensure_giveaway_ids(eintraege)
+    neue_id = 1 + max([int(e.get("id") or 0) for e in eintraege if isinstance(e, dict)] or [0])
+    eintrag = {
+        "id": neue_id,
+        "message_id": None,
+        "channel_id": interaction.channel_id,
+        "guild_id": interaction.guild_id,
+        "created_by": str(interaction.user),
+        "prize": prize,
+        "description": description,
+        "winners_count": winners_count,
+        "ends_at": time.time() + ends_in_seconds,
+        "sprache": sprache,
+        "farbe": conn.get("giveaway_farbe", _GIVEAWAY_FARBE_DEFAULT),
+        "required_role_id": conn.get("giveaway_required_role_id"),
+        "entrants": [],
+        "winners": [],
+        "status": "running",
+    }
+    embed = _giveaway_embed(eintrag, sprache, beendet=False)
+    view = GiveawayEntryView(conn.service_id, neue_id)
+    try:
+        nachricht = await interaction.channel.send(embed=embed, view=view)
+    except discord.Forbidden:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Ich darf in diesem Kanal nicht schreiben.",
+            "❌ I'm not allowed to post in this channel."), ephemeral=True)
+    eintrag["message_id"] = nachricht.id
+    eintraege.append(eintrag)
+    _conn_store(conn, "giveaways", eintraege)
+    await interaction.response.send_message(_t(
+        interaction, f"✅ Gewinnspiel #{neue_id} gestartet.", f"✅ Giveaway #{neue_id} started."),
+        ephemeral=True)
+
+
+class GiveawayEntryView(discord.ui.View):
+    """Persistenter Teilnahme-Button - Vorbild: TicketChannelView. custom_id
+    traegt Service-ID + Gewinnspiel-ID, damit ein Bot-Neustart ihn nicht
+    verwaist (siehe Wiederanmeldung in setup_hook)."""
+
+    def __init__(self, service_id: str, giveaway_id: int):
+        super().__init__(timeout=None)
+        self.service_id = str(service_id)
+        self.giveaway_id = int(giveaway_id)
+        knopf = discord.ui.Button(
+            label="Teilnehmen", emoji="🎉", style=discord.ButtonStyle.primary,
+            custom_id=f"giveaway_enter:{self.service_id}:{self.giveaway_id}")
+        knopf.callback = self._teilnehmen
+        self.add_item(knopf)
+
+    async def _teilnehmen(self, interaction: discord.Interaction):
+        conn = connections.for_service(self.service_id) if self.service_id else None
+        eintrag = _giveaway_finden(conn, self.giveaway_id) if conn is not None else None
+        if conn is None or eintrag is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieses Gewinnspiel ist nicht mehr bekannt.",
+                "❌ This giveaway is no longer known."), ephemeral=True)
+        if eintrag.get("status") != "running":
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieses Gewinnspiel ist bereits beendet.",
+                "❌ This giveaway has already ended."), ephemeral=True)
+        rolle_id = eintrag.get("required_role_id")
+        if rolle_id and (not isinstance(interaction.user, discord.Member)
+                        or not any(r.id == int(rolle_id) for r in interaction.user.roles)):
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dir fehlt die Rolle, die für die Teilnahme nötig ist.",
+                "❌ You're missing the role required to enter."), ephemeral=True)
+        entrants = eintrag.setdefault("entrants", [])
+        if interaction.user.id in entrants:
+            return await interaction.response.send_message(_t(
+                interaction, "ℹ️ Du nimmst bereits teil.", "ℹ️ You're already entered."), ephemeral=True)
+        entrants.append(interaction.user.id)
+        _conn_store(conn, "giveaways", _giveaways(conn))
+        try:
+            embed = _giveaway_embed(eintrag, str(eintrag.get("sprache") or "de"), beendet=False)
+            await interaction.message.edit(embed=embed)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.debug(f"[GEWINNSPIELE] Teilnehmerzahl-Update fehlgeschlagen: {e}")
+        await interaction.response.send_message(_t(
+            interaction, "✅ Du nimmst jetzt teil!", "✅ You're now entered!"), ephemeral=True)
+
+
+gsettings_group = app_commands.Group(
+    name="gsettings", description=app_commands.locale_str("🎉 Gewinnspiel-Einstellungen (Admin)"))
+
+
+@gsettings_group.command(
+    name="set", description=app_commands.locale_str("🎉 Farbe und/oder Pflichtrolle für Gewinnspiele setzen (Admin)"))
+@app_commands.describe(
+    color="Hex-Farbe fürs Gewinnspiel-Embed, z. B. #F1C40F (leer = unverändert)",
+    required_role="Rolle, die zum Teilnehmen nötig ist (leer lassen, um wieder jeden zuzulassen)",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def gsettings_set(interaction: discord.Interaction, color: Optional[str] = None,
+                        required_role: Optional[discord.Role] = None,
+                        server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "gsettings_set"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    if color:
+        roh = color.strip().lstrip("#")
+        if not re.fullmatch(r"[0-9a-fA-F]{6}", roh):
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Ungültige Farbe. Beispiel: `#F1C40F`.",
+                "❌ Invalid color. Example: `#F1C40F`."), ephemeral=True)
+        _conn_store(conn, "giveaway_farbe", int(roh, 16))
+    if required_role is not None:
+        _conn_store(conn, "giveaway_required_role_id", required_role.id)
+    embed = discord.Embed(
+        title=_t(interaction, "🎉 Gewinnspiel-Einstellungen", "🎉 Giveaway Settings"),
+        color=int(conn.get("giveaway_farbe", _GIVEAWAY_FARBE_DEFAULT)))
+    embed.add_field(name=_t(interaction, "Farbe", "Color"),
+                    value=f"#{int(conn.get('giveaway_farbe', _GIVEAWAY_FARBE_DEFAULT)):06X}")
+    rid = conn.get("giveaway_required_role_id")
+    embed.add_field(name=_t(interaction, "Pflichtrolle", "Required role"),
+                    value=f"<@&{rid}>" if rid else _t(interaction, "Keine (jeder darf teilnehmen)",
+                                                       "None (everyone can enter)"))
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="gcreate", description=app_commands.locale_str(
+    "🎉 Gewinnspiel per Formular erstellen (Admin)"))
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_gcreate(interaction: discord.Interaction, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "gcreate"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    await interaction.response.send_modal(GiveawayCreateModal(conn.service_id, _sprache(interaction)))
+
+
+@bot.tree.command(name="gstart", description=app_commands.locale_str(
+    "🎉 Gewinnspiel direkt starten (Admin)"))
+@app_commands.describe(
+    duration="Dauer, z. B. `10 minutes`, `1h30m`, `2 Tage`",
+    winners="Anzahl der Sieger",
+    prize="Der Preis",
+    description="Optionale Beschreibung",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_gstart(interaction: discord.Interaction, duration: str,
+                     winners: app_commands.Range[int, 1], prize: str,
+                     description: Optional[str] = None, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "gstart"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    dauer_s = _dauer_parsen(duration)
+    if dauer_s is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Ungültige Dauer. Beispiel: `10 minutes`, `1h30m`, `2 Tage`.",
+            "❌ Invalid duration. Example: `10 minutes`, `1h30m`, `2 days`."), ephemeral=True)
+    await _giveaway_erstellen(
+        interaction, conn, prize=prize, winners_count=int(winners), ends_in_seconds=dauer_s,
+        description=(description or "").strip(), sprache=_sprache(interaction))
+
+
+@bot.tree.command(name="glist", description=app_commands.locale_str("🎉 Laufende Gewinnspiele anzeigen"))
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_glist(interaction: discord.Interaction, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "glist"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    laufend = [g for g in _giveaways(conn) if isinstance(g, dict) and g.get("status") == "running"]
+    if not laufend:
+        return await interaction.response.send_message(_t(
+            interaction, "ℹ️ Keine laufenden Gewinnspiele.", "ℹ️ No running giveaways."), ephemeral=True)
+    embed = discord.Embed(title=_t(interaction, f"🎉 Laufende Gewinnspiele ({len(laufend)})",
+                                   f"🎉 Running Giveaways ({len(laufend)})"),
+                          color=_GIVEAWAY_FARBE_DEFAULT)
+    for g in laufend[:25]:
+        embed.add_field(
+            name=f"#{g.get('id')} — {g.get('prize')}",
+            value=_t(interaction,
+                    f"🏆 {g.get('winners_count')} Sieger · 🎟️ {len(g.get('entrants') or [])} Teilnehmer · "
+                    f"Endet <t:{int(g.get('ends_at') or 0)}:R>",
+                    f"🏆 {g.get('winners_count')} winners · 🎟️ {len(g.get('entrants') or [])} entrants · "
+                    f"Ends <t:{int(g.get('ends_at') or 0)}:R>"),
+            inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="gdelete", description=app_commands.locale_str("🎉 Gewinnspiel löschen (Admin)"))
+@app_commands.describe(giveaway_id="Die ID des Gewinnspiels (siehe /glist)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_gdelete(interaction: discord.Interaction, giveaway_id: int, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "gdelete"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    eintraege = _giveaways(conn)
+    eintrag = _giveaway_finden(conn, giveaway_id)
+    if eintrag is None:
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Kein Gewinnspiel mit der ID {giveaway_id} gefunden.",
+            f"❌ No giveaway with ID {giveaway_id} found."), ephemeral=True)
+    kanal = await bot._resolve_channel(int(eintrag.get("channel_id") or 0))
+    if kanal is not None and eintrag.get("message_id"):
+        try:
+            nachricht = await kanal.fetch_message(int(eintrag["message_id"]))
+            await nachricht.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.debug(f"[GEWINNSPIELE] Nachricht beim Löschen nicht entfernbar: {e}")
+    eintraege.remove(eintrag)
+    _conn_store(conn, "giveaways", eintraege)
+    await interaction.response.send_message(_t(
+        interaction, f"✅ Gewinnspiel #{giveaway_id} gelöscht.",
+        f"✅ Giveaway #{giveaway_id} deleted."), ephemeral=True)
+
+
+@bot.tree.command(name="greroll", description=app_commands.locale_str(
+    "🎉 Neue Sieger für ein beendetes Gewinnspiel auslosen (Admin)"))
+@app_commands.describe(giveaway_id="Die ID des Gewinnspiels (siehe /glist)",
+                       count="Wie viele neue Sieger? (Standard: 1)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_greroll(interaction: discord.Interaction, giveaway_id: int,
+                      count: app_commands.Range[int, 1] = 1, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "greroll"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    eintrag = _giveaway_finden(conn, giveaway_id)
+    if eintrag is None or eintrag.get("status") != "ended":
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Kein beendetes Gewinnspiel mit der ID {giveaway_id} gefunden.",
+            f"❌ No ended giveaway with ID {giveaway_id} found."), ephemeral=True)
+    bisherige_sieger = set(eintrag.get("winners") or [])
+    kandidaten = [u for u in (eintrag.get("entrants") or []) if u not in bisherige_sieger]
+    if not kandidaten:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Keine weiteren Teilnehmer für einen Reroll übrig.",
+            "❌ No remaining entrants for a reroll."), ephemeral=True)
+    neue_sieger = random.sample(kandidaten, min(int(count), len(kandidaten)))
+    eintrag["winners"] = list(bisherige_sieger) + neue_sieger
+    _conn_store(conn, "giveaways", _giveaways(conn))
+    sprache = str(eintrag.get("sprache") or "de")
+    mentions = ", ".join(f"<@{uid}>" for uid in neue_sieger)
+    text = _tt(sprache, f"🎉 Neue Auslosung für **{eintrag.get('prize')}**: Herzlichen Glückwunsch {mentions}!",
+              f"🎉 New draw for **{eintrag.get('prize')}**: Congratulations {mentions}!")
+    if len(neue_sieger) < int(count):
+        text += _tt(sprache, "\n(nicht genug Teilnehmer für so viele Sieger)",
+                   "\n(not enough entrants for that many winners)")
+    await interaction.response.send_message(text)
+
+
+bot.tree.add_command(gsettings_group)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -20550,9 +21092,11 @@ async def shop_list(interaction: discord.Interaction, category: Optional[str] = 
         return await interaction.response.send_message(_t(
             interaction,
             "🛒 Der Shop ist aktuell leer. Admins: `types.xml` neben den Bot legen "
-            "und neu starten (der Katalog wird automatisch generiert), oder `/add shopitem` nutzen.",
+            "und neu starten (der Katalog wird automatisch generiert), oder Items im "
+            "Dashboard unter „Shop“ anlegen.",
             "🛒 The shop is currently empty. Admins: put your `types.xml` next to the bot "
-            "and restart (the catalog is generated automatically), or use `/add shopitem`."),
+            "and restart (the catalog is generated automatically), or add items in the "
+            "dashboard under „Shop“."),
             ephemeral=True)
 
     if category is not None:
@@ -21155,7 +21699,7 @@ bot.tree.add_command(shop_group)
 
 
 # ══════════════════════════════════════════════════════════════
-#  /edit shopitem – Classnames, Preis, Name usw. eines Items ändern
+#  /edit ankuendigung – Nachricht/Bild einer geplanten Ankündigung ändern
 # ══════════════════════════════════════════════════════════════
 edit_group = app_commands.Group(name="edit", description="✏️ Edit entries of the shop catalog")
 
@@ -21538,8 +22082,8 @@ def generate_shop_items_from_types(input_path: str = TYPES_XML_FILE,
         "_generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "_source":    os.path.basename(input_path),
         "_note":      ("Automatisch aus types.xml generiert. Neu erzeugen: diese Datei "
-                       "löschen und den Bot neu starten. Preise: /shop setprice oder "
-                       "/edit shopitem; Kategorie-Preise: shop_category_prices in config.json."),
+                       "löschen und den Bot neu starten. Preise im Dashboard unter „Shop“ "
+                       "ändern; Kategorie-Preise: shop_category_prices in config.json."),
         "items": items,
     }
     try:
