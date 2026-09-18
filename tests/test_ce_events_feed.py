@@ -32,6 +32,7 @@ Aufruf aus dem Repository-Wurzelverzeichnis:
 import asyncio
 import os
 import sys
+import time
 
 import pytest
 
@@ -259,10 +260,10 @@ def test_positionen_aus_xml_unbekannter_typ_gibt_none():
 
 def test_position_zuordnen_ohne_pool_gibt_none():
     conn = bot_mod.connections.upsert("ceevents-pool-1")
-    conn.ce_pending_positionen = [(6202.0, 8303.0)]
+    conn.ce_pending_positionen = [(6202.0, 8303.0, 1000.0)]
     assert bot_mod._ce_events_position_zuordnen(conn, "StaticHeliCrash", None) is None
     # Kandidat bleibt erhalten - kein Pool heisst nicht "verworfen".
-    assert conn.ce_pending_positionen == [(6202.0, 8303.0)]
+    assert conn.ce_pending_positionen == [(6202.0, 8303.0, 1000.0)]
 
 
 def test_position_zuordnen_findet_nahen_bekannten_punkt():
@@ -272,7 +273,7 @@ def test_position_zuordnen_findet_nahen_bekannten_punkt():
         '<eventposdef><event name="StaticHeliCrash">'
         '<pos x="6204.925293" z="8301.290039" a="-1"/>'
         '</event></eventposdef>')
-    conn.ce_pending_positionen = [(6202.0, 8303.0)]
+    conn.ce_pending_positionen = [(6202.0, 8303.0, 1000.0)]
     treffer = bot_mod._ce_events_position_zuordnen(conn, "StaticHeliCrash", root)
     assert treffer == (6202.0, 8303.0)
     assert conn.ce_pending_positionen == []  # nur der Treffer wird entfernt
@@ -287,12 +288,12 @@ def test_position_zuordnen_lehnt_zu_weit_entfernten_kandidaten_ab():
         '<eventposdef><event name="StaticHeliCrash">'
         '<pos x="6204.925293" z="8301.290039" a="-1"/>'
         '</event></eventposdef>')
-    conn.ce_pending_positionen = [(2000.0, 2000.0)]
+    conn.ce_pending_positionen = [(2000.0, 2000.0, 1000.0)]
     treffer = bot_mod._ce_events_position_zuordnen(conn, "StaticHeliCrash", root)
     assert treffer is None
     # Der abgelehnte Kandidat bleibt in der Warteschlange - er koennte noch
     # zu einem anderen, spaeter gemeldeten Typ passen.
-    assert conn.ce_pending_positionen == [(2000.0, 2000.0)]
+    assert conn.ce_pending_positionen == [(2000.0, 2000.0, 1000.0)]
 
 
 def test_position_zuordnen_ueberspringt_nicht_passende_und_nimmt_naechsten():
@@ -301,10 +302,61 @@ def test_position_zuordnen_ueberspringt_nicht_passende_und_nimmt_naechsten():
         '<eventposdef><event name="StaticTrain">'
         '<pos x="5587.47" z="2063.35" a="0"/>'
         '</event></eventposdef>')
-    conn.ce_pending_positionen = [(9999.0, 9999.0), (5588.0, 2064.0)]
+    conn.ce_pending_positionen = [(9999.0, 9999.0, 1000.0), (5588.0, 2064.0, 1000.0)]
     treffer = bot_mod._ce_events_position_zuordnen(conn, "StaticTrain", root)
     assert treffer == (5588.0, 2064.0)
-    assert conn.ce_pending_positionen == [(9999.0, 9999.0)]
+    assert conn.ce_pending_positionen == [(9999.0, 9999.0, 1000.0)]
+
+
+# ── Verfallsgrenze fuer Positions-Kandidaten ──────────────────────────────
+
+def test_pending_aufraeumen_wirft_zu_alte_kandidaten_weg():
+    # Das ganze Verfahren beruht auf zeitlicher Naehe - ein halbstuendiger
+    # Kandidat gehoert sicher nicht mehr zum gerade gemeldeten Event.
+    conn = bot_mod.connections.upsert("ceevents-verfall-1")
+    jetzt = 10_000.0
+    zu_alt = jetzt - bot_mod._CE_PENDING_POSITIONEN_MAX_ALTER_S - 1
+    frisch = jetzt - 5
+    conn.ce_pending_positionen = [(1.0, 1.0, zu_alt), (2.0, 2.0, frisch)]
+    bot_mod._ce_events_pending_aufraeumen(conn, jetzt)
+    assert conn.ce_pending_positionen == [(2.0, 2.0, frisch)]
+
+
+def test_pending_aufraeumen_behaelt_kandidaten_genau_auf_der_grenze():
+    conn = bot_mod.connections.upsert("ceevents-verfall-2")
+    jetzt = 10_000.0
+    grenze = jetzt - bot_mod._CE_PENDING_POSITIONEN_MAX_ALTER_S
+    conn.ce_pending_positionen = [(3.0, 3.0, grenze)]
+    bot_mod._ce_events_pending_aufraeumen(conn, jetzt)
+    assert conn.ce_pending_positionen == [(3.0, 3.0, grenze)]
+
+
+# ── Die drei zusaetzlichen, serverseitig noch inaktiven Event-Typen ───────
+
+def test_neue_typen_sind_eigenen_schaltern_zugeordnet():
+    assert bot_mod._CE_EVENT_TYP_ZU_SCHALTER["StaticContaminatedArea"] == "contaminated_zone"
+    assert bot_mod._CE_EVENT_TYP_ZU_SCHALTER["StaticAirplaneCrate"] == "airplane_crate"
+    assert bot_mod._CE_EVENT_TYP_ZU_SCHALTER["StaticSantaCrash"] == "santa_crash"
+    for schalter in ("contaminated_zone", "airplane_crate", "santa_crash"):
+        emoji, name = bot_mod._CE_EVENT_SCHALTER_LABEL[schalter]
+        assert emoji and name
+
+
+def test_neue_typen_werden_im_zaehler_dump_erkannt():
+    counts = {"StaticContaminatedArea": 0, "StaticAirplaneCrate": 1, "StaticSantaCrash": 0}
+    zeilen = [
+        "  StaticContaminatedArea (2)",
+        "  StaticAirplaneCrate (3)",
+        "  StaticSantaCrash (1)",
+    ]
+    ergebnisse = bot_mod._ce_events_zeilen_auswerten(zeilen, counts)
+    assert ergebnisse == [
+        ("StaticContaminatedArea", "contaminated_zone", 2, 2),
+        ("StaticAirplaneCrate", "airplane_crate", 2, 3),
+        ("StaticSantaCrash", "santa_crash", 1, 1),
+    ]
+
+
 
 
 # ── Sub-Toggle-Einstellungen (Speichern/Laden) ───────────────────────────
@@ -317,6 +369,7 @@ def test_ce_events_payload_default_alle_aktiv():
     assert payload == {
         "helicopter_crash": True, "convoy": True, "checkpoint": True,
         "abandoned_train": True, "vehicle_event": True,
+        "contaminated_zone": True, "airplane_crate": True, "santa_crash": True,
     }
 
 
@@ -468,9 +521,10 @@ def test_lese_ce_events_cluster_ohne_erreichbaren_pool_zeigt_keinen_ort(conn_mit
     # Der Kandidat bleibt fuer einen spaeteren Poll-Zyklus (Pool koennte dann
     # erreichbar sein) in der Warteschlange stehen.
     assert len(conn.ce_pending_positionen) == 1
-    x, z = conn.ce_pending_positionen[0]
+    x, z, erkannt_ts = conn.ce_pending_positionen[0]
     assert round(x, 2) == round((6200 + 6205 + 6202) / 3, 2)
     assert z == 8303.0
+    assert abs(erkannt_ts - time.time()) < 60  # Wanduhrzeit des Poll-Zyklus
 
 
 def test_lese_ce_events_cluster_weit_weg_von_bekanntem_typ_zeigt_keinen_ort(conn_mit_ce_events, monkeypatch):
@@ -580,7 +634,7 @@ def test_lese_ce_events_rotation_setzt_baseline_puffer_und_positionen_zurueck(co
     _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
     conn.ce_event_counts["StaticHeliCrash"] = 3
     conn.ce_events_puffer = "3:03:03.231 [CE][DE] DynamicEvent Types (1):\n  StaticHeliCrash (5)\n"
-    conn.ce_pending_positionen = [(1.0, 2.0)]
+    conn.ce_pending_positionen = [(1.0, 2.0, time.time())]
     # Rotation: neue Datei, DayZ-Zaehler faengt bei 0 wieder an.
     conn.ftp.dateien = [neuer_pfad]
     conn.ftp.groessen[neuer_pfad] = 0
@@ -589,4 +643,72 @@ def test_lese_ce_events_rotation_setzt_baseline_puffer_und_positionen_zurueck(co
     assert conn.ce_events_puffer == ""
     assert conn.ce_pending_positionen == []
     assert conn.log_state["ce_events"] == {"file": neuer_pfad, "offset": 0}
+    assert gesendet == []
+
+
+def test_lese_ce_events_veralteter_kandidat_wird_nicht_mehr_zugeordnet(conn_mit_ce_events, monkeypatch):
+    # Ein alter Kandidat liegt GENAU auf dem bekannten Spawnpunkt - wuerde
+    # ohne Verfallsgrenze also passen. Er ist aber zu alt und darf dem jetzt
+    # gemeldeten Event keinen Ort mehr verpassen.
+    conn, gesendet = conn_mit_ce_events
+    _pool_bereitstellen(conn, monkeypatch, (
+        '<eventposdef><event name="StaticHeliCrash">'
+        '<pos x="6204.925293" z="8301.290039" a="-1"/>'
+        '</event></eventposdef>'))
+    pfad = "/games/x/config/DayZServer_x.RPT"
+    conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
+    loop = _StubLoop()
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    conn.ce_event_counts["StaticHeliCrash"] = 2
+    veraltet = time.time() - bot_mod._CE_PENDING_POSITIONEN_MAX_ALTER_S - 60
+    conn.ce_pending_positionen = [(6205.0, 8301.0, veraltet)]
+    conn.ftp.inhalte[(pfad, 500)] = _block_text(["StaticHeliCrash (3)"])
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    assert len(gesendet) == 1
+    assert "📍" not in gesendet[0]["embed"].description
+    assert conn.ce_pending_positionen == []  # veralteter Kandidat entfernt
+
+
+def test_lese_ce_events_inaktiver_typ_ohne_zaehlerzeile_bleibt_stumm(conn_mit_ce_events):
+    # Genau Brigardes Fall: die drei neuen Typen sind auf ihrem Server (noch)
+    # nicht aktiviert und tauchen deshalb im Dump gar nicht auf - der Feed
+    # darf dadurch weder etwas melden noch anderweitig stolpern.
+    conn, gesendet = conn_mit_ce_events
+    pfad = "/games/x/config/DayZServer_x.RPT"
+    conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
+    loop = _StubLoop()
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    conn.ce_event_counts["StaticHeliCrash"] = 3
+    conn.ftp.inhalte[(pfad, 500)] = _block_text(["StaticHeliCrash (3)"])
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    assert gesendet == []
+    assert "StaticSantaCrash" not in conn.ce_event_counts
+
+
+def test_lese_ce_events_neuer_typ_wird_nach_aktivierung_gemeldet(conn_mit_ce_events):
+    # Sobald Brigarde den Typ in der events.xml aktiviert, taucht er im Dump
+    # auf und der zugehoerige Schalter meldet ihn - ohne Code-Aenderung.
+    conn, gesendet = conn_mit_ce_events
+    pfad = "/games/x/config/DayZServer_x.RPT"
+    conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
+    loop = _StubLoop()
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    conn.ce_event_counts["StaticContaminatedArea"] = 0
+    conn.ftp.inhalte[(pfad, 500)] = _block_text(["StaticContaminatedArea (1)"])
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    assert len(gesendet) == 1
+    assert "Contaminated Zone" in gesendet[0]["embed"].title
+    assert "jetzt 1 aktiv" in gesendet[0]["embed"].description
+
+
+def test_lese_ce_events_deaktivierter_neuer_schalter_postet_nicht(conn_mit_ce_events):
+    conn, gesendet = conn_mit_ce_events
+    bot_mod._conn_store(conn, "ce_events_santa_crash_enabled", False)
+    pfad = "/games/x/config/DayZServer_x.RPT"
+    conn.ftp = _StubFTP([pfad], {pfad: 500}, {})
+    loop = _StubLoop()
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    conn.ce_event_counts["StaticSantaCrash"] = 0
+    conn.ftp.inhalte[(pfad, 500)] = _block_text(["StaticSantaCrash (1)"])
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
     assert gesendet == []

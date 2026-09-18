@@ -728,32 +728,42 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
     "abandoned_bases":    {"label": "Verlassene Basen",      "gruppe": "Bau",
                            "emoji": "🏚️", "farbe": 0xA16207},
     # CE-Dynamic-Events (Heli-Crash, Convoy, Checkpoint, Abandoned Train,
-    # Vehicle) - erkannt ueber den periodischen "[CE][DE] DynamicEvent Types"-
-    # Zaehler-Dump im RPT-Log, siehe _lese_ce_events. Ein Feed-Kanal, fuenf
-    # unabhaengige Sub-Schalter (ce_events_<key>_enabled je Server).
+    # Vehicle, Contaminated Zone, Airplane Crate, Santa Crash) - erkannt ueber
+    # den periodischen "[CE][DE] DynamicEvent Types"-Zaehler-Dump im RPT-Log,
+    # siehe _lese_ce_events. Ein Feed-Kanal, acht unabhaengige Sub-Schalter
+    # (ce_events_<key>_enabled je Server).
     "ce_events":          {"label": "CE-Events",             "gruppe": "Bot",
                            "emoji": "🚁", "farbe": 0x2E86C1},
 }
 
 # Zuordnung der tatsaechlichen DayZ-CE-Event-Typnamen (wie sie im RPT-
-# Zaehler-Dump stehen) zu den Sub-Schaltern des ce_events-Feeds. Anhand einer
-# echten RPT-Datei verifiziert - "Contaminated Zone"/"Loot Container" kommen
-# in DayZ als solche gar nicht vor und wurden bewusst weggelassen. Alle
-# "Vehicle*"-Typen (VehicleBoat, VehicleCivilianSedan, ...) fallen zusammen
-# unter EINEN Schalter, das Embed nennt aber den konkreten Typnamen.
+# Zaehler-Dump stehen) zu den Sub-Schaltern des ce_events-Feeds. Die ersten
+# vier sind an einer echten RPT-Datei verifiziert. Die letzten drei stehen in
+# Brigardes echter cfgeventspawns.xml, sind auf ihrem Server aber (noch)
+# nicht aktiviert - sie tauchen im Zaehler-Dump erst auf, sobald sie in der
+# events.xml aktiv sind. Das ist unkritisch: der Parser meldet ausschliesslich
+# bei STEIGENDEM Zaehler, ein nie auftauchender Typ bleibt also einfach stumm.
+# Alle "Vehicle*"-Typen (VehicleBoat, VehicleCivilianSedan, ...) fallen
+# zusammen unter EINEN Schalter, das Embed nennt aber den konkreten Typnamen.
 _CE_EVENT_TYP_ZU_SCHALTER: Dict[str, str] = {
-    "StaticHeliCrash":       "helicopter_crash",
-    "StaticMilitaryConvoy":  "convoy",
-    "StaticPoliceSituation": "checkpoint",
-    "StaticTrain":           "abandoned_train",
+    "StaticHeliCrash":        "helicopter_crash",
+    "StaticMilitaryConvoy":   "convoy",
+    "StaticPoliceSituation":  "checkpoint",
+    "StaticTrain":            "abandoned_train",
+    "StaticContaminatedArea": "contaminated_zone",
+    "StaticAirplaneCrate":    "airplane_crate",
+    "StaticSantaCrash":       "santa_crash",
 }
 _CE_EVENT_SCHALTER_LABEL: Dict[str, Tuple[str, str]] = {
     # schalter_key -> (emoji, Anzeigename)
-    "helicopter_crash": ("🚁", "Helicopter Crash"),
+    "helicopter_crash":  ("🚁", "Helicopter Crash"),
     "convoy":            ("🚙", "Convoy"),
-    "checkpoint":         ("🚓", "Police Checkpoint"),
-    "abandoned_train":    ("🚂", "Abandoned Train"),
-    "vehicle_event":      ("🚗", "Vehicle Event"),
+    "checkpoint":        ("🚓", "Police Checkpoint"),
+    "abandoned_train":   ("🚂", "Abandoned Train"),
+    "vehicle_event":     ("🚗", "Vehicle Event"),
+    "contaminated_zone": ("☢️", "Contaminated Zone"),
+    "airplane_crate":    ("✈️", "Airplane Crate"),
+    "santa_crash":       ("🎅", "Santa Crash"),
 }
 _CE_EVENT_ZEILE_RE = re.compile(
     r"^\s*(?:\d+:\d+:\d+\.\d+\s+)?([A-Za-z_][A-Za-z0-9_ ]*?)\s+\((\d+)\)\s*$")
@@ -786,6 +796,13 @@ _CE_ADDING_CLUSTER_MAX_LUECKE_S = 1.0  # groessere Zeitluecke = neuer Cluster
 _CE_PENDING_POSITIONEN_MAX = 8       # verhindert unbegrenztes Wachstum bei nie
                                      # zugeordneten Clustern (z.B. normale Loot-Respawns,
                                      # die zufaellig die Mindestgroesse erreichen)
+# Wie lange ein noch nicht zugeordneter Kandidat hoechstens aufgehoben wird.
+# Das ganze Verfahren beruht auf zeitlicher Naehe zwischen Loot-Erzeugung und
+# Zaehler-Anstieg; ein Cluster von vor einer halben Stunde gehoert mit
+# Sicherheit nicht mehr zum gerade gemeldeten Event. Ohne diese Grenze blieben
+# alte Kandidaten bis zum Erreichen von _CE_PENDING_POSITIONEN_MAX liegen und
+# koennten einem viel spaeteren Event faelschlich einen Ort verpassen.
+_CE_PENDING_POSITIONEN_MAX_ALTER_S = 300.0
 
 
 def _ce_events_adding_cluster_erkennen(zeilen: List[str]) -> List[Tuple[float, float, int]]:
@@ -855,6 +872,15 @@ def _ce_events_positionen_aus_xml(root: "ET.Element", typ_name: str
     return positionen or None
 
 
+def _ce_events_pending_aufraeumen(conn: "ServerConnection", jetzt: float) -> None:
+    """Wirft Kandidaten weg, die aelter als _CE_PENDING_POSITIONEN_MAX_ALTER_S
+    sind - sie koennen zum gerade gemeldeten Event zeitlich nicht mehr
+    gehoeren."""
+    conn.ce_pending_positionen = [
+        eintrag for eintrag in conn.ce_pending_positionen
+        if jetzt - eintrag[2] <= _CE_PENDING_POSITIONEN_MAX_ALTER_S]
+
+
 def _ce_events_position_zuordnen(conn: "ServerConnection", typ_name: str,
                                  pool_root: Optional["ET.Element"]) -> Optional[Tuple[float, float]]:
     """Sucht in conn.ce_pending_positionen die ERSTE Position, die zu einem
@@ -869,10 +895,11 @@ def _ce_events_position_zuordnen(conn: "ServerConnection", typ_name: str,
     bekannte: List[Tuple[float, float]] = _ce_events_positionen_aus_xml(pool_root, typ_name) or []
     if not bekannte:
         return None
-    for i, (x, z) in enumerate(conn.ce_pending_positionen):
+    for i, (x, z, _ts) in enumerate(conn.ce_pending_positionen):
         if any(((x - bx) ** 2 + (z - bz) ** 2) ** 0.5 <= _CE_POSITION_MATCH_RADIUS_M
                for bx, bz in bekannte):
-            return conn.ce_pending_positionen.pop(i)
+            conn.ce_pending_positionen.pop(i)
+            return x, z
     return None
 
 
@@ -3289,9 +3316,12 @@ class ServerConnection:
         # abschneiden.
         self.ce_events_puffer: str = ""
         # Per "Adding"-Zeilen-Cluster erkannte Kandidaten-Positionen fuer
-        # ce_events, noch NICHT gegen einen Event-Typ verifiziert (siehe
-        # _ce_events_adding_cluster_erkennen/_ce_events_position_zuordnen).
-        self.ce_pending_positionen: List[Tuple[float, float]] = []
+        # ce_events als (x, z, erkannt_ts), noch NICHT gegen einen Event-Typ
+        # verifiziert (siehe _ce_events_adding_cluster_erkennen/
+        # _ce_events_position_zuordnen). Der Zeitstempel ist die Wanduhrzeit
+        # des Poll-Zyklus, in dem der Cluster gelesen wurde - aelteres wird
+        # verworfen (_ce_events_pending_aufraeumen).
+        self.ce_pending_positionen: List[Tuple[float, float, float]] = []
         # cfgeventspawns.xml dieses Servers, zum Verifizieren einer
         # Kandidaten-Position gegen die ECHTEN Spawnpunkte des jeweiligen
         # Event-Typs (siehe _ce_events_pool_laden). None = noch nicht
@@ -6331,9 +6361,11 @@ class DayZBot(discord.Client):
         neue_zeilen = text.split("\n")
         if neue_zeilen and neue_zeilen[-1] == "":
             neue_zeilen.pop()  # _log_lesen_ab_offset liefert Text stets bis zum Zeilenende
+        jetzt = time.time()
+        _ce_events_pending_aufraeumen(conn, jetzt)
         cluster = _ce_events_adding_cluster_erkennen(neue_zeilen)
         if cluster:
-            conn.ce_pending_positionen.extend((x, z) for x, z, _anzahl in cluster)
+            conn.ce_pending_positionen.extend((x, z, jetzt) for x, z, _anzahl in cluster)
             ueberschuss = len(conn.ce_pending_positionen) - _CE_PENDING_POSITIONEN_MAX
             if ueberschuss > 0:
                 del conn.ce_pending_positionen[:ueberschuss]
@@ -14534,7 +14566,7 @@ async def api_abandoned_bases_post(request: web.Request) -> web.Response:
 
 # ──────────────────────────────────────────────────────────────────────────
 #  CE-Dynamic-Events-Feed: ein Feed-Kanal ("ce_events", siehe FEED_TYPES),
-#  fuenf unabhaengige Sub-Schalter je Server. Erkennung selbst laeuft im
+#  acht unabhaengige Sub-Schalter je Server. Erkennung selbst laeuft im
 #  Poll-Zyklus (_lese_ce_events/_ce_events_zeilen_auswerten), hier nur die
 #  Ein/Aus-Schalter-Verwaltung - 1:1 dasselbe Muster wie Verlassene Basen.
 # ──────────────────────────────────────────────────────────────────────────
@@ -31642,6 +31674,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "9b4e2f56a40d6631eb5a2bc7ac19b8a13d2c50228f749653878c6d07fea8648d",
     ),
     "app.js": (
+        "7a0855f4465fc3d6358f1d3d63189705ed0faf180a3d42b8ea817f278b554daf",
         "fa03cf05e5cadcc50fb55f078eb3b5cb6ebd60e88e28b8193a1f6b888b8308db",
         "c2a36e8ca74fb9814ebfd5593a9f4aaff0fad6be3e66cd01679705673f21b820",
         "ae5d2c0724cc800275197cbd634aadb4875064b8f28f879d417b1da7f5d09edb",
