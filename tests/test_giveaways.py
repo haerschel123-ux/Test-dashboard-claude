@@ -178,6 +178,7 @@ class _StubInteraction:
         self.channel = channel
         self.channel_id = channel.id if channel else None
         self.guild_id = guild_id
+        self.guild = None  # _is_admin() greift zuerst auf interaction.guild zu
         self.locale = None
         self.response = _StubResponse()
         self.followup = _StubFollowup()
@@ -197,6 +198,57 @@ def _giveaway_conn(service_id="gw-service"):
     bot_mod.connections.upsert(service_id)
     bot_mod.connections.assign_guild(service_id, _gw_guild_zaehler[0])
     return bot_mod.connections.for_service(service_id)
+
+
+# ── Discord-Administrator reicht IMMER, auch ohne granulare Freigabe ─────
+
+class _StubPerms:
+    def __init__(self, administrator=False):
+        self.administrator = administrator
+
+
+class _StubAdminMember:
+    def __init__(self, id_, administrator=False, roles=None):
+        self.id = id_
+        self.roles = roles or []
+        self.guild_permissions = _StubPerms(administrator)
+
+
+class _StubGuild:
+    def __init__(self, owner_id):
+        self.owner_id = owner_id
+
+
+def test_gcreate_erlaubt_mit_discord_administrator_ohne_granulare_freigabe(monkeypatch):
+    # Brigarde meldete per Screenshot: trotz Discord-Rolle "Administrator"
+    # kam bei /gcreate "Keine Berechtigung" - die Gewinnspiel-Befehle riefen
+    # nur _subcmd_allowed() auf, ohne den bei allen anderen admin-gesperrten
+    # Befehlen (z.B. /ticket clear_stale, /send ticket panel) ueblichen
+    # zusaetzlichen _is_admin()-ODER. Ohne einen manuell im Dashboard
+    # vergebenen Eintrag blieb dadurch selbst ein echter Administrator
+    # aussen vor.
+    conn = _giveaway_conn("gw-admin-bypass")
+    monkeypatch.setattr(bot_mod, "_subcmd_allowed", lambda interaction, key: False)
+    monkeypatch.setattr(bot_mod, "_conns_of", lambda interaction: [conn])
+    monkeypatch.setattr(bot_mod.discord, "Member", _StubAdminMember)
+    member = _StubAdminMember(1, administrator=True)
+    interaction = _StubInteraction(member, _StubChannel(), guild_id=conn.guild_id)
+    interaction.guild = _StubGuild(owner_id=999)  # NICHT der Server-Eigentuemer
+    _run(bot_mod.cmd_gcreate.callback(interaction, None))
+    assert interaction.response.modal is not None
+
+
+def test_gcreate_ohne_administrator_und_ohne_freigabe_bleibt_gesperrt(monkeypatch):
+    conn = _giveaway_conn("gw-admin-denied")
+    monkeypatch.setattr(bot_mod, "_subcmd_allowed", lambda interaction, key: False)
+    monkeypatch.setattr(bot_mod, "_conns_of", lambda interaction: [conn])
+    monkeypatch.setattr(bot_mod.discord, "Member", _StubAdminMember)
+    member = _StubAdminMember(2, administrator=False)
+    interaction = _StubInteraction(member, _StubChannel(), guild_id=conn.guild_id)
+    interaction.guild = _StubGuild(owner_id=999)
+    _run(bot_mod.cmd_gcreate.callback(interaction, None))
+    assert interaction.response.modal is None
+    assert "Keine Berechtigung" in interaction.response.sent[0]["content"]
 
 
 # ── /gcreate + /gstart (gemeinsamer Erstell-Pfad) ────────────────────────
@@ -391,6 +443,54 @@ def test_gdelete_entfernt_datensatz_unabhaengig_vom_status(monkeypatch):
     assert nachricht.deleted is True
 
 
+# ── /gend ─────────────────────────────────────────────────────────────────
+
+def test_gend_beendet_laufendes_gewinnspiel_sofort_und_lost_sieger(monkeypatch):
+    conn = _giveaway_conn("gw-end")
+    kanal = _StubChannel()
+    nachricht = _run(kanal.send())
+    eintrag = {"id": 1, "message_id": nachricht.id, "channel_id": kanal.id, "prize": "x",
+              "winners_count": 1, "ends_at": time.time() + 3600, "sprache": "de",
+              "required_role_id": None, "entrants": [1, 2, 3], "winners": [], "status": "running"}
+    conn.data["giveaways"] = [eintrag]
+
+    async def fake_resolve_channel(cid):
+        return kanal
+    monkeypatch.setattr(bot_mod.bot, "_resolve_channel", fake_resolve_channel)
+    monkeypatch.setattr(bot_mod, "_subcmd_allowed", lambda interaction, key: True)
+    interaction = _StubInteraction(_StubMember(1), kanal, guild_id=conn.guild_id)
+    _run(bot_mod.cmd_gend.callback(interaction, 1, None))
+    assert eintrag["status"] == "ended"
+    assert len(eintrag["winners"]) == 1
+    assert eintrag["winners"][0] in (1, 2, 3)
+    assert "beendet" in interaction.response.sent[0]["content"]
+
+
+def test_gend_lehnt_bereits_beendetes_gewinnspiel_ab(monkeypatch):
+    conn = _giveaway_conn("gw-end-schon")
+    eintrag = {"id": 1, "message_id": None, "channel_id": 0, "prize": "x", "winners_count": 1,
+              "ends_at": 0, "sprache": "de", "required_role_id": None,
+              "entrants": [1], "winners": [1], "status": "ended"}
+    conn.data["giveaways"] = [eintrag]
+    monkeypatch.setattr(bot_mod, "_subcmd_allowed", lambda interaction, key: True)
+    interaction = _StubInteraction(_StubMember(1), _StubChannel(), guild_id=conn.guild_id)
+    _run(bot_mod.cmd_gend.callback(interaction, 1, None))
+    assert eintrag["winners"] == [1]  # unveraendert, kein erneutes Auslosen
+    assert "Kein laufendes" in interaction.response.sent[0]["content"]
+
+
+def test_gend_ohne_berechtigung_wird_abgelehnt(monkeypatch):
+    conn = _giveaway_conn("gw-end-denied")
+    eintrag = {"id": 1, "message_id": None, "channel_id": 0, "prize": "x", "winners_count": 1,
+              "ends_at": time.time() + 3600, "sprache": "de", "required_role_id": None,
+              "entrants": [1], "winners": [], "status": "running"}
+    conn.data["giveaways"] = [eintrag]
+    monkeypatch.setattr(bot_mod, "_subcmd_allowed", lambda interaction, key: False)
+    interaction = _StubInteraction(_StubMember(1), _StubChannel(), guild_id=conn.guild_id)
+    _run(bot_mod.cmd_gend.callback(interaction, 1, None))
+    assert eintrag["status"] == "running"
+
+
 def test_greroll_zieht_neue_sieger_ohne_vorherige(monkeypatch):
     conn = _giveaway_conn("gw-reroll")
     eintrag = {"id": 1, "message_id": None, "channel_id": 0, "prize": "x", "winners_count": 1,
@@ -442,7 +542,7 @@ def test_hilfe_enthaelt_keine_phantom_befehle_mehr():
     for phantom in ("/add shopitem", "/bundle add", "/shop setprice",
                     "/shop removeitem", "/edit shopitem"):
         assert phantom not in text
-    for echt in ("/gcreate", "/faction info", "/ticket add", "/send ticket panel"):
+    for echt in ("/gcreate", "/gend", "/faction info", "/ticket add", "/send ticket panel"):
         assert echt in text
 
 
@@ -452,7 +552,7 @@ def test_gewinnspiel_befehle_im_subcommand_permission_system_registriert():
     # Personen einschraenken - das lag daran, dass diese Schluessel in
     # _SUBCMD_DEFS fehlten und deshalb im Dashboard unter "Permissions" ->
     # "Subcommand Permissions" gar nicht erst auftauchten.
-    giveaway_keys = ("gcreate", "gstart", "glist", "gdelete", "greroll", "gsettings_set")
+    giveaway_keys = ("gcreate", "gstart", "glist", "gdelete", "gend", "greroll", "gsettings_set")
     for key in giveaway_keys:
         assert key in bot_mod._SUBCMD_KEYS
     kategorien = {kd for k, kd, *_ in bot_mod._SUBCMD_DEFS if k in giveaway_keys}

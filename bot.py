@@ -1252,6 +1252,7 @@ GEWINNSPIELE
 /gstart <dauer> <sieger> <preis> [beschreibung] → Gewinnspiel direkt starten
 /glist                          → Laufende Gewinnspiele anzeigen
 /gdelete <id>                   → Gewinnspiel löschen
+/gend <id>                      → Gewinnspiel vorzeitig beenden und Sieger auslosen
 /greroll <id> [anzahl]          → Neue Sieger für ein beendetes Gewinnspiel auslosen
 /gsettings set [farbe] [rolle]  → Embed-Farbe und Pflichtrolle festlegen
 
@@ -6968,12 +6969,13 @@ _SUBCMD_DEFS: Tuple[Tuple[str, str, str, str, str], ...] = (
     ("shop_check", "Shop", "Shop", "/shop check – Delivery-Diagnose", "/shop check – Delivery diagnostics"),
     ("shop_enable", "Shop", "Shop", "/shop enable – Aktiviert/deaktiviert ein Shop-Item", "/shop enable – Enables/disables a shop item"),
     ("faction_list", "Fraktionen", "Factions", "/faction list – Zeigt alle Fraktionen dieses Servers", "/faction list – Shows all factions on this server"),
-    ("gcreate", "Gewinnspiele", "Giveaways", "/gcreate – Erstellt ein Gewinnspiel per Formular", "/gcreate – Creates a giveaway via form"),
-    ("gstart", "Gewinnspiele", "Giveaways", "/gstart – Startet ein Gewinnspiel direkt", "/gstart – Starts a giveaway directly"),
-    ("glist", "Gewinnspiele", "Giveaways", "/glist – Zeigt laufende Gewinnspiele", "/glist – Shows running giveaways"),
-    ("gdelete", "Gewinnspiele", "Giveaways", "/gdelete – Löscht ein Gewinnspiel", "/gdelete – Deletes a giveaway"),
-    ("greroll", "Gewinnspiele", "Giveaways", "/greroll – Lost neue Sieger nach", "/greroll – Draws new winners"),
-    ("gsettings_set", "Gewinnspiele", "Giveaways", "/gsettings set – Setzt Farbe/Pflichtrolle für Gewinnspiele", "/gsettings set – Sets color/required role for giveaways"),
+    ("gcreate", "Gewinnspiele", "Giveaways", "/gcreate – Erstellt ein Gewinnspiel per Formular (zusätzlich zu Administrator)", "/gcreate – Creates a giveaway via form (in addition to Administrator)"),
+    ("gstart", "Gewinnspiele", "Giveaways", "/gstart – Startet ein Gewinnspiel direkt (zusätzlich zu Administrator)", "/gstart – Starts a giveaway directly (in addition to Administrator)"),
+    ("glist", "Gewinnspiele", "Giveaways", "/glist – Zeigt laufende Gewinnspiele (zusätzlich zu Administrator)", "/glist – Shows running giveaways (in addition to Administrator)"),
+    ("gdelete", "Gewinnspiele", "Giveaways", "/gdelete – Löscht ein Gewinnspiel (zusätzlich zu Administrator)", "/gdelete – Deletes a giveaway (in addition to Administrator)"),
+    ("gend", "Gewinnspiele", "Giveaways", "/gend – Beendet ein Gewinnspiel vorzeitig und lost Sieger aus (zusätzlich zu Administrator)", "/gend – Ends a giveaway early and draws winners (in addition to Administrator)"),
+    ("greroll", "Gewinnspiele", "Giveaways", "/greroll – Lost neue Sieger nach (zusätzlich zu Administrator)", "/greroll – Draws new winners (in addition to Administrator)"),
+    ("gsettings_set", "Gewinnspiele", "Giveaways", "/gsettings set – Setzt Farbe/Pflichtrolle für Gewinnspiele (zusätzlich zu Administrator)", "/gsettings set – Sets color/required role for giveaways (in addition to Administrator)"),
 )
 _SUBCMD_KEYS = frozenset(k for k, *_ in _SUBCMD_DEFS)
 
@@ -16332,12 +16334,14 @@ async def cmd_hilfe(interaction: discord.Interaction):
         "`/gstart <dauer> <sieger> <preis> [beschreibung]` — Gewinnspiel direkt starten\n"
         "`/glist` — Laufende Gewinnspiele anzeigen\n"
         "`/gdelete <id>` — Gewinnspiel löschen\n"
+        "`/gend <id>` — Gewinnspiel vorzeitig beenden und Sieger auslosen\n"
         "`/greroll <id> [anzahl]` — Neue Sieger für ein beendetes Gewinnspiel auslosen\n"
         "`/gsettings set [farbe] [rolle]` — Embed-Farbe und Pflichtrolle festlegen",
         "`/gcreate` — Create a giveaway via form\n"
         "`/gstart <duration> <winners> <prize> [description]` — Start a giveaway directly\n"
         "`/glist` — Show running giveaways\n"
         "`/gdelete <id>` — Delete a giveaway\n"
+        "`/gend <id>` — End a giveaway early and draw winners\n"
         "`/greroll <id> [count]` — Draw new winners for an ended giveaway\n"
         "`/gsettings set [color] [role]` — Set embed color and required role"
     ), inline=False)
@@ -17374,7 +17378,7 @@ gsettings_group = app_commands.Group(
 async def gsettings_set(interaction: discord.Interaction, color: Optional[str] = None,
                         required_role: Optional[discord.Role] = None,
                         server: Optional[str] = None):
-    if not _subcmd_allowed(interaction, "gsettings_set"):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gsettings_set")):
         return await _deny_subcmd(interaction)
     conn, fehler = _conn_waehlen(interaction, server)
     if conn is None:
@@ -17404,7 +17408,7 @@ async def gsettings_set(interaction: discord.Interaction, color: Optional[str] =
     "🎉 Gewinnspiel per Formular erstellen (Admin)"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_gcreate(interaction: discord.Interaction, server: Optional[str] = None):
-    if not _subcmd_allowed(interaction, "gcreate"):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gcreate")):
         return await _deny_subcmd(interaction)
     conn, fehler = _conn_waehlen(interaction, server)
     if conn is None:
@@ -17423,7 +17427,7 @@ async def cmd_gcreate(interaction: discord.Interaction, server: Optional[str] = 
 async def cmd_gstart(interaction: discord.Interaction, duration: str,
                      winners: app_commands.Range[int, 1], prize: str,
                      description: Optional[str] = None, server: Optional[str] = None):
-    if not _subcmd_allowed(interaction, "gstart"):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gstart")):
         return await _deny_subcmd(interaction)
     conn, fehler = _conn_waehlen(interaction, server)
     if conn is None:
@@ -17441,7 +17445,7 @@ async def cmd_gstart(interaction: discord.Interaction, duration: str,
 @bot.tree.command(name="glist", description=app_commands.locale_str("🎉 Laufende Gewinnspiele anzeigen"))
 @app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_glist(interaction: discord.Interaction, server: Optional[str] = None):
-    if not _subcmd_allowed(interaction, "glist"):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "glist")):
         return await _deny_subcmd(interaction)
     conn, fehler = _conn_waehlen(interaction, server)
     if conn is None:
@@ -17469,7 +17473,7 @@ async def cmd_glist(interaction: discord.Interaction, server: Optional[str] = No
 @app_commands.describe(giveaway_id="Die ID des Gewinnspiels (siehe /glist)",
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_gdelete(interaction: discord.Interaction, giveaway_id: int, server: Optional[str] = None):
-    if not _subcmd_allowed(interaction, "gdelete"):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gdelete")):
         return await _deny_subcmd(interaction)
     conn, fehler = _conn_waehlen(interaction, server)
     if conn is None:
@@ -17501,7 +17505,7 @@ async def cmd_gdelete(interaction: discord.Interaction, giveaway_id: int, server
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_greroll(interaction: discord.Interaction, giveaway_id: int,
                       count: app_commands.Range[int, 1] = 1, server: Optional[str] = None):
-    if not _subcmd_allowed(interaction, "greroll"):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "greroll")):
         return await _deny_subcmd(interaction)
     conn, fehler = _conn_waehlen(interaction, server)
     if conn is None:
@@ -17528,6 +17532,28 @@ async def cmd_greroll(interaction: discord.Interaction, giveaway_id: int,
         text += _tt(sprache, "\n(nicht genug Teilnehmer für so viele Sieger)",
                    "\n(not enough entrants for that many winners)")
     await interaction.response.send_message(text)
+
+
+@bot.tree.command(name="gend", description=app_commands.locale_str(
+    "🎉 Gewinnspiel vorzeitig beenden und Sieger auslosen (Admin)"))
+@app_commands.describe(giveaway_id="Die ID des Gewinnspiels (siehe /glist)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_gend(interaction: discord.Interaction, giveaway_id: int, server: Optional[str] = None):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gend")):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    eintrag = _giveaway_finden(conn, giveaway_id)
+    if eintrag is None or eintrag.get("status") != "running":
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Kein laufendes Gewinnspiel mit der ID {giveaway_id} gefunden.",
+            f"❌ No running giveaway with ID {giveaway_id} found."), ephemeral=True)
+    await bot._giveaway_beenden(conn, eintrag)
+    _conn_store(conn, "giveaways", _giveaways(conn))
+    await interaction.response.send_message(_t(
+        interaction, f"✅ Gewinnspiel #{giveaway_id} vorzeitig beendet.",
+        f"✅ Giveaway #{giveaway_id} ended early."), ephemeral=True)
 
 
 bot.tree.add_command(gsettings_group)
