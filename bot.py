@@ -895,6 +895,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "discord_mgmt":                      {"label": "Discord Management (gesamt)", "gruppe": "Discord Management"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
     "permissions.subcommands":           {"label": "Subcommand Permissions", "gruppe": "Permissions"},
+    "event_catalog":                     {"label": "Event Vorlagen (gesamt)", "gruppe": "Event Vorlagen"},
 }
 
 # Discord-Befehlsgruppe (name.split(" ")[0]) -> Modul-Schluessel fuer
@@ -1255,6 +1256,13 @@ GEWINNSPIELE
 /gend <id>                      → Gewinnspiel vorzeitig beenden und Sieger auslosen
 /greroll <id> [anzahl]          → Neue Sieger für ein beendetes Gewinnspiel auslosen
 /gsettings set [farbe] [rolle]  → Embed-Farbe und Pflichtrolle festlegen
+
+EVENT VORLAGEN
+──────────────
+/events add <vorlage> <x> <z> [y] [name] → Vorlage an einer Position hinzufügen
+/events list                    → Zeigt alle hinzugefügten Event-Instanzen
+/events remove <name>           → Entfernt eine hinzugefügte Instanz
+Vorlagen werden im Dashboard unter "Event Vorlagen" angelegt.
 
 ITEM-KATALOG (shop_items.json)
 ──────────────────────────────
@@ -3208,6 +3216,7 @@ class ServerConnection:
         self.rentals: Optional[Any] = None
         self._catalog: Optional[Any] = None
         self._rentals_catalog: Optional[Any] = None
+        self._event_catalog: Optional[Any] = None
         # Lief die FTP-Auto-Erkennung fuer DIESEN Server schon?
         self.discovered: bool = False
         # FTP-Warnzustand je Server (sonst verschluckt ein Kunde die Warnung
@@ -3471,6 +3480,16 @@ class ServerConnection:
             self._rentals_catalog = RentalCatalog(self.service_id)
             self._rentals_catalog.load()
         return self._rentals_catalog
+
+    @property
+    def event_catalog(self) -> "EventTemplateCatalog":
+        """Eigener Event-Vorlagen-Katalog dieses Servers (beim ersten Zugriff
+        geladen) - Vorlagen fuer /events add. Getrennt von RentalCatalog: hier
+        gibt es weder Preis noch Neustart-Grenzen, nur die reine XML-Vorlage."""
+        if self._event_catalog is None:
+            self._event_catalog = EventTemplateCatalog(self.service_id)
+            self._event_catalog.load()
+        return self._event_catalog
 
     def masked_token(self) -> str:
         """Token fuer die Anzeige: nur die letzten vier Zeichen bleiben lesbar."""
@@ -6998,6 +7017,9 @@ _SUBCMD_DEFS: Tuple[Tuple[str, str, str, str, str], ...] = (
     ("gend", "Gewinnspiele", "Giveaways", "/gend – Beendet ein Gewinnspiel vorzeitig und lost Sieger aus (zusätzlich zu Administrator)", "/gend – Ends a giveaway early and draws winners (in addition to Administrator)"),
     ("greroll", "Gewinnspiele", "Giveaways", "/greroll – Lost neue Sieger nach (zusätzlich zu Administrator)", "/greroll – Draws new winners (in addition to Administrator)"),
     ("gsettings_set", "Gewinnspiele", "Giveaways", "/gsettings set – Setzt Farbe/Pflichtrolle für Gewinnspiele (zusätzlich zu Administrator)", "/gsettings set – Sets color/required role for giveaways (in addition to Administrator)"),
+    ("events_add", "Event Vorlagen", "Event Templates", "/events add – Fügt eine Event-Vorlage an einer Position hinzu", "/events add – Adds an event template at a position"),
+    ("events_list", "Event Vorlagen", "Event Templates", "/events list – Zeigt alle hinzugefügten Event-Instanzen", "/events list – Shows all added event instances"),
+    ("events_remove", "Event Vorlagen", "Event Templates", "/events remove – Entfernt eine hinzugefügte Event-Instanz", "/events remove – Removes an added event instance"),
 )
 _SUBCMD_KEYS = frozenset(k for k, *_ in _SUBCMD_DEFS)
 
@@ -16491,6 +16513,17 @@ async def cmd_hilfe(interaction: discord.Interaction):
         "`/greroll <id> [count]` — Draw new winners for an ended giveaway\n"
         "`/gsettings set [color] [role]` — Set embed color and required role"
     ), inline=False)
+    embed.add_field(name=_t(interaction, "🗺️ Event Vorlagen", "🗺️ Event Templates"), value=_t(
+        interaction,
+        "`/events add <vorlage> <x> <z> [y] [name]` — Vorlage an einer Position hinzufügen\n"
+        "`/events list` — Zeigt alle hinzugefügten Event-Instanzen\n"
+        "`/events remove <name>` — Entfernt eine hinzugefügte Instanz\n"
+        "Vorlagen werden im Dashboard unter „Event Vorlagen“ angelegt.",
+        "`/events add <template> <x> <z> [y] [name]` — Add a template at a position\n"
+        "`/events list` — Show all added event instances\n"
+        "`/events remove <name>` — Remove an added instance\n"
+        "Templates are created in the dashboard under „Event Templates“."
+    ), inline=False)
     embed.add_field(name=_t(interaction, "🚩 Fraktionen", "🚩 Factions"), value=_t(
         interaction,
         "`/faction info [fraktion]` — Details einer Fraktion\n"
@@ -20844,6 +20877,78 @@ class RentalCatalog:
             return False
 
 
+class EventTemplateCatalog:
+    """Event-Vorlagen-Katalog **eines** Nitrado-Servers, eigene Datei
+    ``event_templates_<service_id>.json``.
+
+    Bewusst kein gemeinsamer Code mit ``RentalCatalog``/``ShopCatalog``: eine
+    Vorlage hier hat weder Preis noch Neustart-Grenzen noch Rollen - nur
+    Name, optionale Event-Gruppe, die rohe Event-XML und eine optionale
+    Zonen-XML fuer /events add.
+    """
+
+    def __init__(self, service_id: str = ""):
+        self.service_id = str(service_id or "")
+        self.items: List[Dict] = []
+        self._by_key: Dict[str, Dict] = {}
+        self._ac_index: List[Tuple[str, str, str]] = []  # (suchtext, label, value)
+
+    @property
+    def path(self) -> str:
+        if self.service_id:
+            return f"event_templates_{self.service_id}.json"
+        return "event_templates.json"
+
+    def load(self):
+        items: Optional[List[Dict]] = None
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                cand = data.get("items") if isinstance(data, dict) else data
+                if isinstance(cand, list):
+                    items = cand
+            except Exception as e:  # noqa: BLE001
+                log.error(f"[EVENTVORLAGE] {self.path} unlesbar ({e}).")
+        self.items = [it for it in (items or []) if isinstance(it, dict) and it.get("name")]
+        self.rebuild_index()
+
+    def rebuild_index(self):
+        self._by_key.clear()
+        self._ac_index = []
+        for it in self.items:
+            name = str(it.get("name") or "")
+            if not name:
+                continue
+            self._by_key[name.lower()] = it
+            gruppe = str(it.get("event_group") or "").strip()
+            label = f"{name} ({gruppe})" if gruppe else name
+            self._ac_index.append((name.lower(), label[:100], name[:100]))
+
+    def find(self, key: str) -> Optional[Dict]:
+        return self._by_key.get(str(key or "").strip().lower())
+
+    def save(self) -> bool:
+        data: Dict[str, Any] = {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            pass
+        data["items"] = self.items
+        data["_updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.rebuild_index()
+            return True
+        except Exception as e:
+            log.error(f"[EVENTVORLAGE] Konnte {self.path} nicht speichern: {e}")
+            return False
+
+
 # ══════════════════════════════════════════════════════════════
 #  SHOP-COMMANDS – /shop list|pending|cleanup|setprice und /buy
 # ══════════════════════════════════════════════════════════════
@@ -21746,6 +21851,284 @@ shop_buy_rental.autocomplete("server")(_server_autocomplete)
 
 
 bot.tree.add_command(shop_group)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /events add|list|remove – Event-Vorlagen (im Dashboard angelegt) an einer
+#  Position hinzufuegen. Anders als /shop buy rental: kein Preis, keine
+#  Neustart-Grenzen, kein automatischer Ablauf - eine Instanz bleibt
+#  dauerhaft bestehen, bis sie per /events remove wieder entfernt wird.
+#  Nutzt dieselben generischen XML-Werkzeuge wie das Rental-System
+#  (_tool_rental_event_umbenennen/_einfuegen/_pos_schreiben sind trotz des
+#  Namens generisch - keine Duplizierung noetig).
+# ══════════════════════════════════════════════════════════════
+_EVENT_NAME_RE = re.compile(r'^[A-Za-z0-9_\-]{1,64}$')
+
+
+def _event_instances(conn: ServerConnection) -> List[Dict[str, Any]]:
+    inst = conn.get("event_instances")
+    if not isinstance(inst, list):
+        inst = []
+        conn.set("event_instances", inst)
+    return inst
+
+
+def _event_katalog_zufallsname(vorhandener_text: str) -> str:
+    """Erzeugt einen freien Event-Namen im Format "item<4 Ziffern>" (z. B.
+    "item6645"), wenn /events add keinen eigenen Namen bekommt - probiert
+    neu, bis ein Name gefunden ist, der in events.xml noch nicht vorkommt."""
+    for _ in range(50):
+        kandidat = f"item{random.randint(1000, 9999)}"
+        if _tool_finde_benannten_block(vorhandener_text, "event", kandidat) is None:
+            return kandidat
+    return f"item{uuid.uuid4().hex[:6]}"  # praktisch unerreichbar, reines Sicherheitsnetz
+
+
+events_group = app_commands.Group(name="events", description=app_commands.locale_str(
+    "🗺️ Event-Vorlagen an einer Position hinzufügen"))
+
+
+async def _event_template_autocomplete(interaction: discord.Interaction,
+                                       current: str) -> List[app_commands.Choice[str]]:
+    conns = _ac_conns(interaction)
+    if not conns:
+        return []
+    mehrere = len(conns) > 1
+    cur = current.strip().lower()
+    out: List[app_commands.Choice] = []
+    gesehen = set()
+    for c in conns:
+        for search, label, value in c.event_catalog._ac_index:
+            if cur and cur not in search:
+                continue
+            if value in gesehen:
+                continue
+            gesehen.add(value)
+            out.append(app_commands.Choice(
+                name=f"{label} – {c.name}"[:100] if mehrere else label, value=value))
+            if len(out) >= 25:
+                return out
+    return out
+
+
+async def _event_instance_autocomplete(interaction: discord.Interaction,
+                                       current: str) -> List[app_commands.Choice[str]]:
+    conns = _ac_conns(interaction)
+    if not conns:
+        return []
+    mehrere = len(conns) > 1
+    cur = current.strip().lower()
+    out: List[app_commands.Choice] = []
+    for c in conns:
+        for inst in _event_instances(c):
+            name = str(inst.get("event_name") or "")
+            if not name or (cur and cur not in name.lower()):
+                continue
+            label = f"{name} ({inst.get('template')})"
+            out.append(app_commands.Choice(
+                name=f"{label} – {c.name}"[:100] if mehrere else label[:100], value=name))
+            if len(out) >= 25:
+                return out
+    return out
+
+
+@events_group.command(name="add", description=app_commands.locale_str(
+    "🗺️ Fügt eine Event-Vorlage an einer Position hinzu"))
+@app_commands.describe(
+    name="Name der Event-Vorlage (im Dashboard unter „Event Vorlagen“ angelegt)",
+    x="iZurvive X-Koordinate (Ost)",
+    z="iZurvive Z-Koordinate (Nord)",
+    y="Höhe (optional)",
+    event_name="Name bei Nitrado (optional - sonst zufällig, z. B. item6645)",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def events_add(interaction: discord.Interaction, name: str, x: float, z: float,
+                     y: Optional[float] = None, event_name: Optional[str] = None,
+                     server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "events_add"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    vorlage = conn.event_catalog.find(name)
+    if not vorlage:
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Keine Event-Vorlage namens „{name}“ gefunden. Im Dashboard unter "
+            "„Event Vorlagen“ anlegen.",
+            f"❌ No event template named \"{name}\" found. Create one in the dashboard under "
+            "\"Event Templates\"."), ephemeral=True)
+    if not (0.0 <= x <= 20000.0 and 0.0 <= z <= 20000.0):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Koordinaten außerhalb der Map (0–20000).",
+            "❌ Coordinates out of range (0-20000)."), ephemeral=True)
+    if event_name:
+        event_name = event_name.strip()
+        if not _EVENT_NAME_RE.match(event_name):
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Event-Name darf nur Buchstaben, Zahlen, „_“ und „-“ enthalten "
+                "(max. 64 Zeichen).",
+                "❌ Event name may only contain letters, digits, \"_\" and \"-\" (max 64 chars)."),
+                ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    if conn.api is None or conn.ftp is None:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn kann nichts "
+            "hinzugefügt werden.",
+            "❌ This server is missing FTP access – without it nothing can be added."),
+            ephemeral=True)
+    if not _mission_dir_of(conn):
+        return await interaction.followup.send(_t(
+            interaction, "❌ Kein Mission-Ordner bekannt – bitte gleich noch einmal versuchen.",
+            "❌ No mission folder known yet – please try again in a moment."), ephemeral=True)
+
+    loop = asyncio.get_running_loop()
+    async with conn.events_lock:
+        ev_text, ev_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, conn, "db/events.xml")
+        sp_text, sp_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, conn, "cfgeventspawns.xml")
+        if ev_status != "ok" or sp_status != "ok":
+            return await interaction.followup.send(_t(
+                interaction, "❌ db/events.xml oder cfgeventspawns.xml sind per FTP nicht lesbar.",
+                "❌ db/events.xml or cfgeventspawns.xml could not be read via FTP."), ephemeral=True)
+        finaler_name = event_name or _event_katalog_zufallsname(ev_text)
+        if _tool_finde_benannten_block(ev_text, "event", finaler_name) is not None:
+            return await interaction.followup.send(_t(
+                interaction, f"❌ Es gibt bereits ein Event namens „{finaler_name}“.",
+                f"❌ An event named \"{finaler_name}\" already exists."), ephemeral=True)
+        try:
+            umbenannt = _tool_rental_event_umbenennen(str(vorlage.get("event_xml") or ""), finaler_name)
+            neu_ev = _tool_rental_event_einfuegen(ev_text, finaler_name, umbenannt)
+        except ValueError as e:
+            return await interaction.followup.send(f"❌ {e}", ephemeral=True)
+        gruppe = str(vorlage.get("event_group") or "").strip() or None
+        neu_sp = _tool_rental_pos_schreiben(
+            sp_text, finaler_name, x, z, y=y, gruppe=gruppe,
+            zone_xml=(str(vorlage.get("event_zone") or "") or None))
+
+        ok_ev = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, conn, "db/events.xml", neu_ev)
+        if not ok_ev:
+            return await interaction.followup.send(_t(
+                interaction, "❌ db/events.xml konnte nicht gespeichert werden.",
+                "❌ db/events.xml could not be saved."), ephemeral=True)
+        ok_sp = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, conn, "cfgeventspawns.xml", neu_sp)
+        if not ok_sp:
+            # Event wurde geschrieben, Position nicht - zurueckrollen, sonst
+            # bleibt ein Event ohne Position uebrig.
+            neu_ev_rollback, _ = _tool_delete_event(neu_ev, finaler_name)
+            await loop.run_in_executor(
+                None, _tool_datei_schreiben_sync, conn, "db/events.xml", neu_ev_rollback)
+            return await interaction.followup.send(_t(
+                interaction, "❌ cfgeventspawns.xml konnte nicht gespeichert werden.",
+                "❌ cfgeventspawns.xml could not be saved."), ephemeral=True)
+
+    instanzen = _event_instances(conn)
+    instanzen.append({
+        "template": vorlage["name"], "event_name": finaler_name,
+        "x": x, "y": y, "z": z,
+        "created_at": time.time(), "created_by": interaction.user.id,
+    })
+    _conn_store(conn, "event_instances", instanzen)
+
+    map_name = conn.get("map_name", "ChernarusPlus")
+    loc_url = _izurvive_url(x, z, map_name)
+    near = _nearest_location(x, z, map_name)
+    near_txt = _t(interaction, f"\n*(Nahe {near})*", f"\n*(Near {near})*") if near else ""
+    embed = discord.Embed(
+        title=_t(interaction, "🗺️ Event hinzugefügt", "🗺️ Event added"),
+        description=_t(
+            interaction, f"**{vorlage['name']}** wurde als `{finaler_name}` hinzugefügt.",
+            f"**{vorlage['name']}** was added as `{finaler_name}`."),
+        color=0x2ECC71)
+    embed.add_field(name=_t(interaction, "📍 Position", "📍 Location"),
+                    value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@events_group.command(name="list", description=app_commands.locale_str(
+    "🗺️ Zeigt alle per /events add hinzugefügten Event-Instanzen"))
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def events_list_cmd(interaction: discord.Interaction, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "events_list"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    instanzen = _event_instances(conn)
+    if not instanzen:
+        return await interaction.response.send_message(_t(
+            interaction, "ℹ️ Noch keine Event-Instanzen hinzugefügt.",
+            "ℹ️ No event instances added yet."), ephemeral=True)
+    lines = [f"**{i.get('event_name')}** ({i.get('template')}) — "
+            f"[{float(i.get('x', 0)):.0f} / {float(i.get('z', 0)):.0f}]"
+            for i in instanzen[:25]]
+    embed = discord.Embed(
+        title=_t(interaction, f"🗺️ Event-Instanzen ({len(instanzen)})",
+                 f"🗺️ Event Instances ({len(instanzen)})"),
+        description="\n".join(lines), color=0x5865F2)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@events_group.command(name="remove", description=app_commands.locale_str(
+    "🗺️ Entfernt eine per /events add hinzugefügte Event-Instanz"))
+@app_commands.describe(event_name="Der bei Nitrado vergebene Event-Name (siehe /events list)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def events_remove_cmd(interaction: discord.Interaction, event_name: str,
+                            server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "events_remove"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    instanzen = _event_instances(conn)
+    eintrag = next((i for i in instanzen if str(i.get("event_name")) == event_name), None)
+    if eintrag is None:
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Keine Instanz namens „{event_name}“ gefunden. `/events list` zeigt alle.",
+            f"❌ No instance named \"{event_name}\" found. `/events list` shows all."), ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    if conn.api is None or conn.ftp is None or not _mission_dir_of(conn):
+        return await interaction.followup.send(_t(
+            interaction, "❌ Für diesen Server fehlt der FTP-Zugang.",
+            "❌ This server is missing FTP access."), ephemeral=True)
+
+    loop = asyncio.get_running_loop()
+    async with conn.events_lock:
+        ev_text, ev_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, conn, "db/events.xml")
+        sp_text, sp_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, conn, "cfgeventspawns.xml")
+        if ev_status != "ok" or sp_status != "ok":
+            return await interaction.followup.send(_t(
+                interaction, "❌ db/events.xml oder cfgeventspawns.xml sind per FTP nicht lesbar.",
+                "❌ db/events.xml or cfgeventspawns.xml could not be read via FTP."), ephemeral=True)
+        neu_ev, _ = _tool_delete_event(ev_text, event_name)
+        neu_sp, _ = _tool_delete_eventspawns(sp_text, event_name)
+        ok_ev = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, conn, "db/events.xml", neu_ev)
+        ok_sp = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, conn, "cfgeventspawns.xml", neu_sp)
+    if not (ok_ev and ok_sp):
+        return await interaction.followup.send(_t(
+            interaction, "❌ Konnte nicht vollständig gespeichert werden – bitte erneut versuchen.",
+            "❌ Could not save completely – please try again."), ephemeral=True)
+
+    instanzen.remove(eintrag)
+    _conn_store(conn, "event_instances", instanzen)
+    await interaction.followup.send(_t(
+        interaction, f"✅ „{event_name}“ entfernt.", f"✅ \"{event_name}\" removed."), ephemeral=True)
+
+
+events_add.autocomplete("name")(_event_template_autocomplete)
+events_add.autocomplete("server")(_server_autocomplete)
+events_list_cmd.autocomplete("server")(_server_autocomplete)
+events_remove_cmd.autocomplete("event_name")(_event_instance_autocomplete)
+events_remove_cmd.autocomplete("server")(_server_autocomplete)
+
+bot.tree.add_command(events_group)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -24649,6 +25032,7 @@ _DASH_PERM_CATS: Tuple[Tuple[str, str, str, Tuple[str, ...]], ...] = (
     ("economy", "Economy", "Economy", ("view", "edit")),
     ("announce", "Ankündigungen", "Announcements", ("view", "create", "delete")),
     ("server", "Server", "Server", ("view", "edit")),
+    ("events", "Event Vorlagen", "Event Templates", ("view", "create", "edit", "delete")),
 )
 _DASH_PERM_CAT_KEYS = frozenset(k for k, *_ in _DASH_PERM_CATS)
 _DASH_PERM_ACTIONS = ("view", "create", "edit", "delete")
@@ -29656,6 +30040,138 @@ async def api_shop_rentals_delete(request: web.Request) -> web.Response:
     return ok({"removed": str(it.get("name")), "saved": saved})
 
 
+# ── Event Vorlagen: Dashboard-Verwaltung des Katalogs für /events add ────
+def _event_template_view(it: dict) -> dict:
+    return {
+        "name": str(it.get("name") or "?"),
+        "event_xml": str(it.get("event_xml") or ""),
+        "event_zone": str(it.get("event_zone") or ""),
+        "event_group": str(it.get("event_group") or ""),
+    }
+
+
+async def api_event_templates_list(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "event_catalog")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("event_catalog", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "events", "view")
+    if fehler is not None:
+        return fehler
+    items = [_event_template_view(it) for it in conn.event_catalog.items]
+    return ok({"items": items, "server": conn.name, "service_id": conn.service_id})
+
+
+async def api_event_templates_create(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "event_catalog")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("event_catalog", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "events", "create")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "events.template", 5)
+    if fehler is not None:
+        return fehler
+    katalog = conn.event_catalog
+    data = await body(request)
+    name = str(data.get("name") or "").strip()
+    if not name:
+        return err("Bitte einen Namen angeben.")
+    if katalog.find(name):
+        return err(f"'{name}' existiert bereits als Event-Vorlage.")
+    event_xml, xml_fehler = _tool_rental_xml_validieren(data.get("event_xml"), "event")
+    if xml_fehler:
+        return err(f"Event XML: {xml_fehler}")
+    event_zone = ""
+    if str(data.get("event_zone") or "").strip():
+        event_zone, zone_fehler = _tool_rental_xml_validieren(data.get("event_zone"), "zone")
+        if zone_fehler:
+            return err(f"Event zone: {zone_fehler}")
+    it = {
+        "name": name[:100],
+        "event_xml": event_xml,
+        "event_zone": event_zone,
+        "event_group": str(data.get("event_group") or "").strip()[:100],
+    }
+    katalog.items.append(it)
+    saved = katalog.save()
+    return ok({"item": _event_template_view(it), "saved": saved})
+
+
+async def api_event_templates_update(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "event_catalog")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("event_catalog", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "events", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "events.template", 5)
+    if fehler is not None:
+        return fehler
+    katalog = conn.event_catalog
+    it = katalog.find(request.match_info["name"])
+    if not it:
+        return err("Event-Vorlage nicht gefunden.", 404)
+    data = await body(request)
+    if "name" in data:
+        new_name = str(data["name"]).strip()
+        if new_name and new_name.lower() != str(it.get("name", "")).lower():
+            if katalog.find(new_name):
+                return err(f"'{new_name}' existiert bereits.")
+            it["name"] = new_name[:100]
+    if "event_xml" in data:
+        event_xml, xml_fehler = _tool_rental_xml_validieren(data.get("event_xml"), "event")
+        if xml_fehler:
+            return err(f"Event XML: {xml_fehler}")
+        it["event_xml"] = event_xml
+    if "event_zone" in data:
+        roh = str(data.get("event_zone") or "").strip()
+        if not roh:
+            it["event_zone"] = ""
+        else:
+            event_zone, zone_fehler = _tool_rental_xml_validieren(roh, "zone")
+            if zone_fehler:
+                return err(f"Event zone: {zone_fehler}")
+            it["event_zone"] = event_zone
+    if "event_group" in data:
+        it["event_group"] = str(data.get("event_group") or "").strip()[:100]
+    saved = katalog.save()
+    return ok({"item": _event_template_view(it), "saved": saved})
+
+
+async def api_event_templates_delete(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "event_catalog")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("event_catalog", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "events", "delete")
+    if fehler is not None:
+        return fehler
+    katalog = conn.event_catalog
+    it = katalog.find(request.match_info["name"])
+    if not it:
+        return err("Event-Vorlage nicht gefunden.", 404)
+    fehler = _dash_rate_limited(request, "events.template", 5)
+    if fehler is not None:
+        return fehler
+    try:
+        katalog.items.remove(it)
+    except ValueError:
+        pass
+    saved = katalog.save()
+    return ok({"removed": str(it.get("name")), "saved": saved})
+
+
 async def api_shop_reset(request: web.Request) -> web.Response:
     """Kompletten Shop-Katalog DIESES Servers leeren - unwiderruflich.
 
@@ -31536,6 +32052,10 @@ def build_app() -> web.Application:
     r.add_post("/api/shop/rentals", api_shop_rentals_create)
     r.add_put("/api/shop/rentals/{name}", api_shop_rentals_update)
     r.add_delete("/api/shop/rentals/{name}", api_shop_rentals_delete)
+    r.add_get("/api/events/templates", api_event_templates_list)
+    r.add_post("/api/events/templates", api_event_templates_create)
+    r.add_put("/api/events/templates/{name}", api_event_templates_update)
+    r.add_delete("/api/events/templates/{name}", api_event_templates_delete)
     r.add_post("/api/shop/upload-types", api_shop_upload_types)
     r.add_get("/api/shop/export", api_shop_export)
     r.add_post("/api/shop/import", api_shop_import)
@@ -32276,6 +32796,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "f03188b82504bc4de8ffd8c554d287e2e16d7a2acca7762ce13b836357f97a8e",
         "53e4ad609bb4d57bb0f07e4c050cc88586bcccd3a9d5954af67a669b1a3d49da",
         "9b4e2f56a40d6631eb5a2bc7ac19b8a13d2c50228f749653878c6d07fea8648d",
+        "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
         "7a0855f4465fc3d6358f1d3d63189705ed0faf180a3d42b8ea817f278b554daf",
@@ -32455,6 +32976,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "4a0103e79b8162074de072be7855de916e7ed8f60382dbc0c0a92c714ecb1a71",
         "aca029422e2780b263e70d4e8ac69704814894d47acd829abd7ae7657eb93f4f",
         "1eeffa7f5de28ebe32fc885dc8a5c5e9317e00a167ca97459fb6190ebce36c4d",
+        "66a8cced120d446e3fdbb016c00e08a1b0a9401b0d56cf45b574ca71c4ebbd4a",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
