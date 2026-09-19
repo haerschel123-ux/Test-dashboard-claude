@@ -3820,7 +3820,14 @@ connections = ConnectionRegistry()
 
 # Befehle, die auch ohne zugeordneten Server laufen müssen – sonst käme man
 # aus der Premium-Sperre nicht mehr heraus bzw. bekäme keine Hilfe mehr.
-_PREMIUM_FREE_COMMANDS = ("setup", "hilfe", "ping")
+# "bypass" MUSS hier stehen: er ist genau das Werkzeug, das eine Guild ohne
+# Nitrado-Token erst premium-faehig macht - liefe er selbst durch die
+# Premium-Pruefung, koennte ihn niemand je zum ersten Mal ausfuehren (siehe
+# Brigardes Meldung: "Du hast kein Premium" beim Versuch, /bypass guildid in
+# ihrer eigenen, noch nicht zugeordneten Guild zu benutzen). Die
+# Owner+Guild-Pruefung in _bypass_zugriff_pruefen() gilt weiterhin unabhaengig
+# davon.
+_PREMIUM_FREE_COMMANDS = ("setup", "hilfe", "ping", "bypass")
 
 def _premium_missing_text(interaction: discord.Interaction) -> str:
     return _t(

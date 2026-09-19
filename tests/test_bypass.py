@@ -197,3 +197,25 @@ def test_bypass_list_ohne_aktive_bypasses(monkeypatch):
     interaction = _StubInteraction(_StubMember(42), guild_id=bot_mod._BYPASS_HAUPT_GUILD_ID)
     _run(bot_mod.bypass_list.callback(interaction))
     assert "Keine aktiven" in interaction.followup.sent[0]["content"]
+
+
+# ── Regression: /bypass darf nicht selbst an der Premium-Sperre scheitern ──
+
+class _StubCommand:
+    def __init__(self, qualified_name):
+        self.qualified_name = qualified_name
+
+
+def test_premium_check_laesst_bypass_immer_durch(monkeypatch):
+    # Brigarde meldete per Screenshot: /bypass guildid antwortete in ihrer
+    # EIGENEN, noch nicht zugeordneten Guild mit "Du hast kein Premium" -
+    # der globale _premium_check lief VOR dem Befehl selbst und blockierte
+    # damit genau das Werkzeug, das eine Guild ueberhaupt erst freischalten
+    # soll (Henne-Ei-Problem). "bypass" muss deshalb wie "setup"/"hilfe"/
+    # "ping" in _PREMIUM_FREE_COMMANDS stehen.
+    unbekannte_guild = 987654321
+    assert bot_mod.connections.all_for_guild(unbekannte_guild) == []
+    interaction = _StubInteraction(_StubMember(42), guild_id=unbekannte_guild)
+    interaction.command = _StubCommand("bypass guildid")
+    erlaubt = _run(bot_mod._premium_check(interaction))
+    assert erlaubt is True
