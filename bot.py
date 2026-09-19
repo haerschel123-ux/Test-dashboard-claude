@@ -3747,6 +3747,17 @@ class ConnectionRegistry:
         if conn is None:
             return False, "Dieser Server ist nicht (mehr) verbunden."
 
+        # Wird hier ein ECHTER Server zugeordnet (nicht der Aufruf aus
+        # /bypass guildid selbst), hat ein evtl. per /bypass angelegter
+        # Platzhalter fuer dieselbe Guild seinen Zweck erfuellt und wird
+        # entfernt - sonst zaehlte er unten als "zweiter Server" mit und
+        # loeste faelschlich die Feed-Uebernahme aus, obwohl er nie ein
+        # echter, per Nitrado-Token verbundener Server war.
+        if guild_id and not conn.data.get("bypass"):
+            for other in list(self.all_for_guild(guild_id)):
+                if other.data.get("bypass") and other.service_id != conn.service_id:
+                    self.remove(other.service_id)
+
         neu_in_guild = False
         bestehende: List[ServerConnection] = []
         if guild_id:
@@ -4478,6 +4489,17 @@ class DayZBot(discord.Client):
                 self.tree.copy_global_to(guild=g)
                 await self.tree.sync(guild=g)
                 log.info(f"[BOT] Slash-Befehle für Guild {gid} registriert.")
+
+        # bypass_group traegt sein eigenes guild_ids=[...] (siehe dort) und
+        # steckt deshalb nie im globalen Baum, den copy_global_to() oben in
+        # jede Kunden-Guild kopiert - unabhaengig davon einmal separat
+        # synchronisieren, damit Discord die Anmeldung auch nach einem
+        # Neustart sicher uebernimmt.
+        try:
+            await self.tree.sync(guild=discord.Object(id=_BYPASS_HAUPT_GUILD_ID))
+            log.info(f"[BOT] /bypass in Guild {_BYPASS_HAUPT_GUILD_ID} registriert.")
+        except Exception as e:
+            log.error(f"[BOT] /bypass konnte nicht registriert werden: {e}")
 
     async def on_interaction(self, interaction: discord.Interaction):
         """Jeden Slash-Befehl ins Aktions-Protokoll schreiben.
@@ -7626,6 +7648,130 @@ async def betreiber_alarm_channel(interaction: discord.Interaction,
 
 
 bot.tree.add_command(betreiber_group)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /bypass – Notschalter fuer den Bot-BETREIBER: schaltet eine Discord-Guild
+#  ohne Nitrado-Token frei, damit Befehle ohne echten Serverzugriff schon vor
+#  der eigentlichen Zuordnung funktionieren. Bewusst NICHT ueber
+#  _subcmd_allowed/_SUBCMD_DEFS delegierbar - anders als /betreiber ist das
+#  hier nicht mal fuer eine Admin-Rolle in Brigardes eigenem Discord gedacht,
+#  sondern ausschliesslich fuer sie selbst als Bot-Eigentuemerin. Nur als
+#  Guild-Befehl in ihrem eigenen Discord registriert (siehe setup_hook) -
+#  taucht dadurch in KEINEM Kunden-Discord im Slash-Menue auf.
+# ══════════════════════════════════════════════════════════════
+_BYPASS_HAUPT_GUILD_ID = 1534352039713439855
+
+
+def _bypass_platzhalter_service_id(guild_id: int) -> str:
+    """Eindeutig von echten (rein numerischen) Nitrado-Service-IDs
+    unterscheidbar, damit ein Platzhalter nie mit einem echten Server
+    kollidiert oder dafuer gehalten wird."""
+    return f"bypass-{int(guild_id)}"
+
+
+async def _bypass_zugriff_pruefen(interaction: discord.Interaction) -> Optional[str]:
+    """None = Zugriff erlaubt, sonst die anzuzeigende Fehlermeldung.
+
+    Zwei unabhaengige Bedingungen (Verteidigung in der Tiefe): die
+    Guild-Bindung der Befehlsregistrierung verhindert bereits, dass der
+    Befehl anderswo ueberhaupt sichtbar ist - dieser Code verlaesst sich
+    aber nicht allein darauf, falls Discord die Befehle mal in einer
+    falschen Guild zwischenspeichert.
+    """
+    if interaction.guild_id != _BYPASS_HAUPT_GUILD_ID:
+        return _t(interaction, "❌ Dieser Befehl funktioniert nur in Brigardes Haupt-Discord.",
+                  "❌ This command only works in Brigarde's main Discord.")
+    try:
+        ist_eigentuemer = await _ist_bot_eigentuemer(interaction.user)
+    except Exception as e:  # noqa: BLE001
+        log.error(f"[BYPASS] Eigentümer-Prüfung fehlgeschlagen: {e}")
+        return _t(interaction, f"❌ Eigentümer-Prüfung bei Discord fehlgeschlagen: `{e}`",
+                  f"❌ Owner check with Discord failed: `{e}`")
+    if not ist_eigentuemer:
+        return _t(interaction, "❌ Nur der Bot-Eigentümer darf das.",
+                  "❌ Only the bot owner can do this.")
+    return None
+
+
+bypass_group = app_commands.Group(
+    name="bypass", description=app_commands.locale_str("🔓 Notschalter für den Bot-Eigentümer"),
+    guild_ids=[_BYPASS_HAUPT_GUILD_ID],
+    default_permissions=discord.Permissions(administrator=True))
+
+
+@bypass_group.command(
+    name="guildid",
+    description=app_commands.locale_str(
+        "🔓 (Nur Bot-Eigentümer) Schaltet eine Guild ohne Nitrado-Token frei"))
+@app_commands.describe(guild_id="Discord-Guild-ID, die freigeschaltet werden soll")
+async def bypass_guildid(interaction: discord.Interaction, guild_id: str):
+    await interaction.response.defer(ephemeral=True)
+    fehler = await _bypass_zugriff_pruefen(interaction)
+    if fehler is not None:
+        return await interaction.followup.send(fehler, ephemeral=True)
+    try:
+        gid = int(guild_id)
+    except ValueError:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Ungültige Guild-ID.", "❌ Invalid guild ID."), ephemeral=True)
+    echte = [c for c in connections.all_for_guild(gid) if not c.data.get("bypass")]
+    if echte:
+        return await interaction.followup.send(_t(
+            interaction,
+            f"ℹ️ Diese Guild hat bereits einen echten, per Token verbundenen "
+            f"Server ({echte[0].service_id}) - Bypass ist nicht nötig.",
+            f"ℹ️ This guild already has a real, token-connected server "
+            f"({echte[0].service_id}) - a bypass isn't needed."), ephemeral=True)
+    sid = _bypass_platzhalter_service_id(gid)
+    connections.upsert(sid, guild_id=gid, bypass=True,
+                       bypass_created_at=time.time(), name=f"Bypass {gid}")
+    await interaction.followup.send(_t(
+        interaction,
+        f"✅ Guild {gid} ist jetzt per Bypass freigeschaltet. Befehle, die "
+        f"echten Serverzugriff brauchen (Neustart, Bans, Logs, …), bleiben "
+        f"weiterhin gesperrt, bis du dort einen echten Server per Nitrado-"
+        f"Token verbindest und im Dashboard unter Serverliste zuordnest - "
+        f"der Platzhalter wird dann automatisch entfernt.",
+        f"✅ Guild {gid} is now unlocked via bypass. Commands that need real "
+        f"server access (restart, bans, logs, …) remain locked until you "
+        f"connect a real server there via a Nitrado token and assign it "
+        f"under Server List in the dashboard - the placeholder is then "
+        f"removed automatically."), ephemeral=True)
+
+
+@bypass_group.command(
+    name="list",
+    description=app_commands.locale_str("🔓 (Nur Bot-Eigentümer) Zeigt alle aktiven Bypass-Freischaltungen"))
+async def bypass_list(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    fehler = await _bypass_zugriff_pruefen(interaction)
+    if fehler is not None:
+        return await interaction.followup.send(fehler, ephemeral=True)
+    aktive = [c for c in connections.all() if c.data.get("bypass")]
+    if not aktive:
+        return await interaction.followup.send(_t(
+            interaction, "ℹ️ Keine aktiven Bypass-Freischaltungen.",
+            "ℹ️ No active bypasses."), ephemeral=True)
+    zeilen = []
+    for conn in aktive:
+        erstellt = conn.data.get("bypass_created_at")
+        wann = f" · <t:{int(erstellt)}:R>" if erstellt else ""
+        zeilen.append(f"• Guild `{conn.guild_id}`{wann}")
+    embed = discord.Embed(
+        title=_t(interaction, f"🔓 Aktive Bypass-Freischaltungen ({len(aktive)})",
+                 f"🔓 Active Bypasses ({len(aktive)})"),
+        description="\n".join(zeilen), color=0xE67E22)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# bypass_group traegt sein eigenes guild_ids=[...] - add_command() landet
+# dadurch direkt im guild-eigenen Befehlsbestand, NIE im globalen Baum, den
+# copy_global_to() in setup_hook in jede Kunden-Guild kopiert. Die Reihenfolge
+# hier ist deshalb unkritisch; synchronisiert wird trotzdem erst in
+# setup_hook (siehe dort), damit ein Neustart die Anmeldung bei Discord
+# regelmaessig auffrischt.
+bot.tree.add_command(bypass_group)
 
 
 # ══════════════════════════════════════════════════════════════
