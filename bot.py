@@ -23178,6 +23178,16 @@ async def _discord_user_is_admin(user_id: int) -> bool:
         return False
     if not role_id or bot is None or getattr(bot, "user", None) is None:
         return False
+    # Direkt nach einem Bot-Neustart ist der Guild-Cache oft noch leer -
+    # bot.get_guild() liefert dann faelschlich None und das wurde weiter
+    # unten wie "keine Rolle" behandelt (die ADMIN-Kategorie im Dashboard
+    # verschwand dadurch nach einem Neustart, bis zum naechsten kompletten
+    # Login). Kurz auf on_ready warten statt sofort auf False zu schliessen.
+    if not bot.is_ready():
+        try:
+            await asyncio.wait_for(bot.wait_until_ready(), timeout=15)
+        except asyncio.TimeoutError:
+            pass
     for gid in _configured_guild_ids():
         guild = bot.get_guild(gid)
         if guild is None:
@@ -32444,6 +32454,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "f23b31b77382784facdaddf0da34a85dce10f105b23e9cd8098613b5f6d9bd9e",
         "4a0103e79b8162074de072be7855de916e7ed8f60382dbc0c0a92c714ecb1a71",
         "aca029422e2780b263e70d4e8ac69704814894d47acd829abd7ae7657eb93f4f",
+        "1eeffa7f5de28ebe32fc885dc8a5c5e9317e00a167ca97459fb6190ebce36c4d",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
