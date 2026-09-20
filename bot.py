@@ -19102,6 +19102,12 @@ class ShopManager:
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("Wurzel-Element ist kein JSON-Objekt")
+        # Ein Kunde kann eine cfgEffectArea.json mitbringen, die "SafePositions"
+        # noch nie gesehen hat (von Hand gebaut oder mit einem anderen Tool
+        # erzeugt) - ohne dieses setdefault würde der Effekt-Generator (der
+        # dieses Feld nie selbst befuellt) sie beim Speichern schlicht
+        # weglassen, statt wie erwartet "SafePositions": [] zu haben.
+        data.setdefault("SafePositions", [])
         # 1) Key 'Areas' (Groß-/Kleinschreibung egal)
         for key, val in data.items():
             if key.lower() == "areas" and isinstance(val, list):
