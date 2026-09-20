@@ -12672,8 +12672,13 @@ async def api_tools_gaszone_post(request: web.Request) -> web.Response:
     if commit:
         _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Gaszone gespeichert",
                   f"{name} ({len(new_areas)} Zone(n)) · {conn.name}")
+    # Als vollstaendiges cfgEffectArea.json-Fragment anzeigen (Areas +
+    # SafePositions), nicht als nackte Liste - eine bare-Array-Vorschau
+    # entspricht keiner gueltigen cfgEffectArea.json und liess sich so nicht
+    # direkt als eigenstaendige Datei verwenden.
+    vorschau_ausgabe = {"Areas": new_areas, "SafePositions": data.get("SafePositions", [])}
     generated = [{"filename": "cfgEffectArea.json (neue Zonen)",
-                 "content": json.dumps(new_areas, indent=2, ensure_ascii=False)}]
+                 "content": json.dumps(vorschau_ausgabe, indent=2, ensure_ascii=False)}]
     return ok({"areas": len(new_areas), "generated": generated})
 
 
@@ -12848,8 +12853,12 @@ async def api_tools_effectgenerator_post(request: web.Request) -> web.Response:
     if commit:
         _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Effekt-Generator gespeichert",
                   f"{voller_name} · {conn.name}")
+    # Wie beim Gaszonen-Builder: vollstaendiges Areas+SafePositions-Fragment
+    # zeigen statt eines nackten Objekts, das keiner gueltigen
+    # cfgEffectArea.json entspricht.
+    vorschau_ausgabe = {"Areas": [neue_area], "SafePositions": data.get("SafePositions", [])}
     generated = [{"filename": "cfgEffectArea.json (neuer Bereich)",
-                 "content": json.dumps(neue_area, indent=2, ensure_ascii=False)}]
+                 "content": json.dumps(vorschau_ausgabe, indent=2, ensure_ascii=False)}]
     return ok({"generated": generated})
 
 
