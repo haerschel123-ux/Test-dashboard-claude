@@ -3605,8 +3605,12 @@ class ServerConnection:
             "token_masked": self.masked_token(),
             # Vom Kunden im Onboarding genannte Guild(s) – freigeschaltet wird
             # eine erst, wenn der Betreiber sie in der Serverliste zuordnet.
-            "guild_id_requested": (str(self.data.get("guild_id_requested"))
-                                   if self.data.get("guild_id_requested") else None),
+            # "guild_id_requested" (Einzelwert) bleibt aus Kompatibilitaet die
+            # ERSTE offene Anfrage, abgeleitet aus guild_ids_requested - sonst
+            # zeigt die Serverliste neue Anfragen nicht mehr an (die werden
+            # seit dem Mehrfach-Guild-Umbau nur noch in die Liste geschrieben).
+            "guild_id_requested": (str(self.guild_ids_requested[0])
+                                   if self.guild_ids_requested else None),
             "guild_ids_requested": [str(g) for g in self.guild_ids_requested],
             "kunden_stufe": _kunden_stufe(self),
         }
@@ -27090,9 +27094,8 @@ async def api_get_session(request: web.Request) -> web.Response:
         # Fuer das Status-Abzeichen unter dem Discord-Namen: unabhaengig von
         # Premium, siehe _sitzung_hat_beta_zugriff.
         "beta": await _sitzung_hat_beta_zugriff(sess),
-        "guild_id_requested": (str(_conn.data.get("guild_id_requested"))
-                               if _conn is not None
-                               and _conn.data.get("guild_id_requested") else None),
+        "guild_id_requested": (str(_conn.guild_ids_requested[0])
+                               if _conn is not None and _conn.guild_ids_requested else None),
         "discord_login": login_required,
         "discord": discord_user,
         "consent_ok": _consent_ok(discord_user),
@@ -33056,6 +33059,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "47d22532d8398efcc9d6ad0ca1016b5b46913fd6f1345d512078347f91fb6280",
         "7a0855f4465fc3d6358f1d3d63189705ed0faf180a3d42b8ea817f278b554daf",
         "fa03cf05e5cadcc50fb55f078eb3b5cb6ebd60e88e28b8193a1f6b888b8308db",
         "c2a36e8ca74fb9814ebfd5593a9f4aaff0fad6be3e66cd01679705673f21b820",
