@@ -89,7 +89,7 @@ def test_zweite_guild_anfrage_wird_trotz_bestehender_zuordnung_gespeichert(monke
     _run(bot.post_select_server(req))
 
     # Kernpruefung: die NEUE Anfrage ist vermerkt ...
-    assert conn.data.get("guild_id_requested") == neue_guild
+    assert neue_guild in conn.guild_ids_requested
     # ... und die BESTEHENDE Freischaltung bleibt unangetastet.
     assert conn.guild_id == alte_guild
     bot._SESS_STORE.pop(sid, None)

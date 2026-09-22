@@ -52,7 +52,7 @@ import ipaddress
 import urllib.parse
 from collections import deque
 from datetime import datetime, timezone, timedelta, date
-from typing import Optional, Dict, List, Tuple, Any, Deque, Set, Iterable
+from typing import Optional, Dict, List, Tuple, Any, Deque, Set, Iterable, Union
 from zoneinfo import ZoneInfo
 from embedded_assets import _EMBEDDED_ASSETS  # riesiges Dict-Literal ausgelagert (siehe dortige Docstring)
 
@@ -3361,12 +3361,63 @@ class ServerConnection:
         return str(self.data.get("nitrado_token") or "")
 
     @property
+    def guild_ids(self) -> List[int]:
+        """Alle Discord-Guilds, die diesen Server aktuell nutzen duerfen.
+
+        Liest bevorzugt "guild_ids" (Liste); ist das Feld noch nicht
+        vorhanden (alte connections.json von vor dem Mehrfach-Guild-Umbau),
+        wird lesend aus dem alten Einzelwert "guild_id" abgeleitet - keine
+        separate Migration noetig, das naechste connections.save() schreibt
+        automatisch das neue Format. Der alte Schluessel wird danach nicht
+        mehr gelesen (guild_ids hat Vorrang), bleibt aber harmlos liegen."""
+        roh = self.data.get("guild_ids")
+        if roh is None:
+            alt = self.data.get("guild_id")
+            roh = [alt] if alt else []
+        out: List[int] = []
+        for wert in roh:
+            try:
+                iv = int(wert or 0)
+            except (TypeError, ValueError):
+                continue
+            if iv and iv not in out:
+                out.append(iv)
+        return out
+
+    @property
     def guild_id(self) -> Optional[int]:
-        try:
-            gid = int(self.data.get("guild_id") or 0)
-        except (TypeError, ValueError):
-            return None
-        return gid or None
+        """Nur-Lese-Kompatibilitaet: die ERSTE zugeordnete Guild, oder None.
+
+        Fuer Stellen, die absichtlich nur EINE Guild kennen (z.B. eine
+        einzelne Zone/ein einzelnes Ticket, das seine eigene guild_id aus der
+        erstellenden Interaktion traegt) oder als einfacher Vorbelegungs-
+        Standard in der Oberflaeche. Ueberall, wo es um "welche Guild(s) darf
+        DIESER SERVER bedienen" geht (Feeds, Commands, Sicherheitspruefungen),
+        muss stattdessen guild_ids verwendet werden - siehe dort."""
+        ids = self.guild_ids
+        return ids[0] if ids else None
+
+    @property
+    def guild_ids_requested(self) -> List[int]:
+        """Discord-Guilds, die dieser Server-Kunde per Login angefragt hat,
+        aber noch NICHT freigeschaltet sind (siehe guild_ids). Mehrere
+        gleichzeitig moeglich - anders als bei guild_ids frueher gab es hier
+        noch nie eine Migration von einem Einzelwert, aber derselbe lesende
+        Rueckfall auf den alten Schluessel "guild_id_requested" schadet nicht
+        und haelt beide Stellen konsistent."""
+        roh = self.data.get("guild_ids_requested")
+        if roh is None:
+            alt = self.data.get("guild_id_requested")
+            roh = [alt] if alt else []
+        out: List[int] = []
+        for wert in roh:
+            try:
+                iv = int(wert or 0)
+            except (TypeError, ValueError):
+                continue
+            if iv and iv not in out:
+                out.append(iv)
+        return out
 
     @property
     def log_state(self) -> Dict[str, Any]:
@@ -3543,16 +3594,20 @@ class ServerConnection:
         out = {
             "service_id": self.service_id,
             "name": self.name,
+            # "guild_id" (Einzelwert) bleibt aus Kompatibilitaet die ERSTE
+            # zugeordnete Guild - neuer Code im Dashboard nutzt "guild_ids".
             "guild_id": (str(self.guild_id) if self.guild_id else None),
+            "guild_ids": [str(g) for g in self.guild_ids],
             "map_name": self.get("map_name"),
             "server_ip": self.get("server_ip") or None,
             "ftp_host": self.get("ftp_host") or None,
             "has_ftp": bool(self.get("ftp_host") and self.get("ftp_user")),
             "token_masked": self.masked_token(),
-            # Vom Kunden im Onboarding genannte Guild – freigeschaltet wird sie
-            # erst, wenn der Betreiber sie in der Serverliste zuordnet.
+            # Vom Kunden im Onboarding genannte Guild(s) – freigeschaltet wird
+            # eine erst, wenn der Betreiber sie in der Serverliste zuordnet.
             "guild_id_requested": (str(self.data.get("guild_id_requested"))
                                    if self.data.get("guild_id_requested") else None),
+            "guild_ids_requested": [str(g) for g in self.guild_ids_requested],
             "kunden_stufe": _kunden_stufe(self),
         }
         if with_token:
@@ -3662,7 +3717,7 @@ class ConnectionRegistry:
             return []
         if not gid:
             return []
-        treffer = [c for c in self._conns.values() if c.guild_id == gid]
+        treffer = [c for c in self._conns.values() if gid in c.guild_ids]
         treffer.sort(key=lambda c: (not bool(c.data.get("guild_primary")),
                                     c.name.lower()))
         return treffer
@@ -3681,7 +3736,7 @@ class ConnectionRegistry:
     def set_guild_primary(self, service_id: Any) -> bool:
         """Diesen Server zum Leitserver seiner Guild machen."""
         conn = self.for_service(service_id)
-        if conn is None or conn.guild_id is None:
+        if conn is None or not conn.guild_ids:
             return False
         for other in self.all_for_guild(conn.guild_id):
             other.data.pop("guild_primary", None)
@@ -3754,17 +3809,24 @@ class ConnectionRegistry:
         self.save()
         return conn
 
-    def assign_guild(self, service_id: Any, guild_id: Optional[int]) -> Tuple[bool, str]:
-        """Guild einem Server zuordnen.
-
-        Eine Guild darf MEHRERE Nitrado-Server verwalten. Wer das darf, pruefen
-        die Aufrufer: der Betreiber frei, ein Kunde nur in einer Guild, in der
-        ihm schon ein Server gehoert – sonst koennte er sich per zweitem Server
-        in einen fremden Discord einklinken.
+    def add_guild(self, service_id: Any, guild_id: int) -> Tuple[bool, str]:
+        """Fuegt diesem Server eine WEITERE Discord-Guild hinzu, ohne bereits
+        zugeordnete zu entfernen - seit dem Mehrfach-Guild-Umbau darf ein
+        Server mehreren Guilds gleichzeitig gehoeren (Feeds UND Commands
+        laufen dann auf allen zugeordneten Guilds). Wer das darf, pruefen die
+        Aufrufer: der Betreiber frei, ein Kunde nur in einer Guild, in der ihm
+        schon ein Server gehoert – sonst koennte er sich per zweitem Server in
+        einen fremden Discord einklinken.
         """
         conn = self.for_service(service_id)
         if conn is None:
             return False, "Dieser Server ist nicht (mehr) verbunden."
+        try:
+            gid = int(guild_id)
+        except (TypeError, ValueError):
+            return False, "Ungueltige Guild-ID."
+        if not gid:
+            return False, "Ungueltige Guild-ID."
 
         # Wird hier ein ECHTER Server zugeordnet (nicht der Aufruf aus
         # /bypass guildid selbst), hat ein evtl. per /bypass angelegter
@@ -3772,36 +3834,66 @@ class ConnectionRegistry:
         # entfernt - sonst zaehlte er unten als "zweiter Server" mit und
         # loeste faelschlich die Feed-Uebernahme aus, obwohl er nie ein
         # echter, per Nitrado-Token verbundener Server war.
-        if guild_id and not conn.data.get("bypass"):
-            for other in list(self.all_for_guild(guild_id)):
+        if not conn.data.get("bypass"):
+            for other in list(self.all_for_guild(gid)):
                 if other.data.get("bypass") and other.service_id != conn.service_id:
                     self.remove(other.service_id)
 
-        neu_in_guild = False
-        bestehende: List[ServerConnection] = []
-        if guild_id:
-            bestehende = [c for c in self.all_for_guild(guild_id)
-                          if c.service_id != conn.service_id]
-            neu_in_guild = conn.guild_id != int(guild_id)
+        bestehende = [c for c in self.all_for_guild(gid) if c.service_id != conn.service_id]
+        neu_in_guild = gid not in conn.guild_ids
 
-        conn.data["guild_id"] = int(guild_id) if guild_id else None
+        aktuelle = list(conn.guild_ids)
+        if gid not in aktuelle:
+            aktuelle.append(gid)
+        conn.data["guild_ids"] = aktuelle
         self.save()
 
         # Bekommt die Guild damit ihren ZWEITEN Server, gehen die bisher
         # guildweiten Feed-Einstellungen an den Bestandsserver ueber. Sonst
         # wuerde der neue Server ueber den Rueckfall in dieselben Channels
         # posten – genau das soll die Trennung verhindern.
-        if guild_id and neu_in_guild and len(bestehende) == 1:
+        if neu_in_guild and len(bestehende) == 1:
             try:
-                cfg.uebernimm_guild_feeds(int(guild_id), bestehende[0].service_id)
+                cfg.uebernimm_guild_feeds(gid, bestehende[0].service_id)
             except Exception as e:  # noqa: BLE001
                 log.warning(f"[FEED] Uebergabe an {bestehende[0].service_id} "
                             f"fehlgeschlagen: {e}")
 
-        if guild_id and len(bestehende) >= 1:
+        if len(bestehende) >= 1:
             return True, (f"Zuordnung gespeichert – diese Guild verwaltet jetzt "
                           f"{len(bestehende) + 1} Server.")
-        return True, ("Zuordnung gespeichert." if guild_id else "Zuordnung entfernt.")
+        return True, "Zuordnung gespeichert."
+
+    def remove_guild(self, service_id: Any, guild_id: Optional[int]) -> Tuple[bool, str]:
+        """Entfernt genau EINE Guild-Zuordnung von diesem Server, alle
+        anderen bleiben bestehen. ``guild_id=None`` entfernt ALLE (z.B. beim
+        vollstaendigen Zuruecksetzen eines Servers, Eigentuemerwechsel)."""
+        conn = self.for_service(service_id)
+        if conn is None:
+            return False, "Dieser Server ist nicht (mehr) verbunden."
+        if guild_id is None:
+            conn.data["guild_ids"] = []
+            self.save()
+            return True, "Zuordnung entfernt."
+        try:
+            gid = int(guild_id)
+        except (TypeError, ValueError):
+            return False, "Ungueltige Guild-ID."
+        aktuelle = list(conn.guild_ids)
+        if gid in aktuelle:
+            aktuelle.remove(gid)
+        conn.data["guild_ids"] = aktuelle
+        self.save()
+        return True, "Zuordnung entfernt."
+
+    def assign_guild(self, service_id: Any, guild_id: Optional[int]) -> Tuple[bool, str]:
+        """Kompatibilitaets-Alias aus der Zeit vor dem Mehrfach-Guild-Umbau:
+        ``guild_id`` gesetzt -> add_guild (hinzufuegen, nicht ersetzen),
+        ``guild_id=None`` -> remove_guild(service_id, None) (alle entfernen).
+        Neuer Code sollte add_guild/remove_guild direkt aufrufen."""
+        if guild_id:
+            return self.add_guild(service_id, guild_id)
+        return self.remove_guild(service_id, None)
 
     def remove(self, service_id: Any) -> bool:
         """Eine Verbindung entfernen und die connections.json zurueckschreiben.
@@ -4085,21 +4177,21 @@ async def _poll_zustand_melden(conn: ServerConnection, grund: Optional[str]) -> 
     if grund:
         log.warning(f"[POLL] {conn.name}: übersprungen – {grund}")
         await _betreiber_alarm(f"⚠️ **{conn.name}**: {grund}", farbe=0xE74C3C)
-        if conn.guild_id is not None:
+        if conn.guild_ids:
             warnung = discord.Embed(
                 title="⚠️ Automatische Betriebswarnung", description=grund,
                 color=0xE74C3C, timestamp=datetime.now(timezone.utc))
-            await _post_feed(conn.guild_id, "adminlog", warnung, service_id=conn.service_id)
+            await _post_feed(conn.guild_ids, "adminlog", warnung, service_id=conn.service_id)
     elif conn.poll_zustand:
         log.info(f"[POLL] {conn.name}: läuft wieder normal "
                  f"(vorheriger Grund war: {conn.poll_zustand}).")
         await _betreiber_alarm(f"✅ **{conn.name}** läuft wieder normal.", farbe=0x2ECC71)
-        if conn.guild_id is not None:
+        if conn.guild_ids:
             erholt = discord.Embed(
                 title="✅ Läuft wieder normal",
                 description=f"Vorheriger Grund: {conn.poll_zustand}",
                 color=0x2ECC71, timestamp=datetime.now(timezone.utc))
-            await _post_feed(conn.guild_id, "adminlog", erholt, service_id=conn.service_id)
+            await _post_feed(conn.guild_ids, "adminlog", erholt, service_id=conn.service_id)
     conn.poll_zustand = grund
 
 
@@ -4890,7 +4982,7 @@ class DayZBot(discord.Client):
                 await _poll_zustand_melden(conn, "kein FTP aufgebaut (Zugangsdaten "
                                            "unvollständig oder Verbindung noch nicht eingerichtet)")
                 continue
-            if conn.guild_id is None:
+            if not conn.guild_ids:
                 # Ohne zugeordnete Guild gibt es keinen Discord-Server, der
                 # diesen Nitrado-Server verwaltet ("kein Premium"). Wuerde er
                 # trotzdem gepollt, gingen seine Ereignisse mangels Ziel an
@@ -5205,7 +5297,7 @@ class DayZBot(discord.Client):
                                          f"dieser Zeit werden nicht nachgepostet, um die Feeds nicht zu "
                                          f"fluten (Grenze: `max_backlog_minutes` in config.json)."),
                             color=0x95A5A6)
-                        await _post_feed(conn.guild_id, "adminlog", info,
+                        await _post_feed(conn.guild_ids, "adminlog", info,
                                          service_id=conn.service_id)
                     await self._check_ftp_health(conn)
                     await _poll_zustand_melden(conn, None)
@@ -5330,7 +5422,7 @@ class DayZBot(discord.Client):
         await self.wait_until_ready()
 
     async def _abandoned_bases_digest_for(self, conn: ServerConnection):
-        if conn.guild_id is None or not conn.get("abandoned_bases_enabled", False):
+        if not conn.guild_ids or not conn.get("abandoned_bases_enabled", False):
             return
         intervall_s = max(1, float(conn.get("abandoned_bases_report_every_hours", 24) or 24)) * 3600
         zuletzt = float(conn.get("abandoned_bases_last_digest_at", 0) or 0)
@@ -5377,7 +5469,7 @@ class DayZBot(discord.Client):
             description=(f"{len(kandidaten)} Standort(e) benötigen eine Prüfung.\n\n{beschreibung}"),
             color=farbe)
         embed.set_footer(text="Meldungen sind Prüfhinweise und löschen keine Objekte.")
-        ok_gesendet, _ = await _post_feed(conn.guild_id, "abandoned_bases", embed,
+        ok_gesendet, _ = await _post_feed(conn.guild_ids, "abandoned_bases", embed,
                                           service_id=conn.service_id)
         if ok_gesendet:
             await loop.run_in_executor(
@@ -5398,7 +5490,7 @@ class DayZBot(discord.Client):
             await self._status_update_for(conn)
 
     async def _status_update_for(self, conn: ServerConnection):
-        if conn.guild_id is None:
+        if not conn.guild_ids:
             return          # keine Guild → nichts anzuzeigen, also auch nicht abfragen
         ip = str(conn.get("server_ip") or "").split(":")[0].strip()
         qport = int(conn.get("query_port", 0) or 0)
@@ -5414,7 +5506,7 @@ class DayZBot(discord.Client):
         embed = self._build_status_embed(info, conn)
         # Nur die Guild dieses Servers – sonst saehe jeder Discord-Server den
         # Status aller Kunden.
-        for gid_str in [str(conn.guild_id)]:
+        for gid_str in [str(g) for g in conn.guild_ids]:
             ch_id = cfg.get_channel(int(gid_str), "status", conn.service_id)
             if not ch_id:
                 continue
@@ -5583,7 +5675,7 @@ class DayZBot(discord.Client):
             # GESPEICHERTE, aber veraltete guild_id (Pruefung direkt danach):
             # dort bleibt die Sperre bestehen, das ist der eigentliche
             # Sicherheitsfall (Server-Eigentuemerwechsel).
-            if conn is not None and conn.guild_id is not None:
+            if conn is not None and conn.guild_ids:
                 gid = int(conn.guild_id)
             else:
                 log.warning(f"[ZONE] {zone.get('name')}: keine guild_id – Ping unterdrueckt.")
@@ -5597,9 +5689,9 @@ class DayZBot(discord.Client):
         # Discord – Spielernamen und exakte Koordinaten des NEUEN Betreibers
         # gingen dann an den frueheren. Passt die gespeicherte Guild nicht mehr
         # zur Verbindung, wird nicht gepostet.
-        if conn is not None and conn.guild_id is not None and gid != int(conn.guild_id):
+        if conn is not None and conn.guild_ids and gid not in conn.guild_ids:
             log.warning(f"[ZONE] {zone.get('name')}: gespeicherte Guild {gid} gehört "
-                        f"nicht mehr zu {conn.name} (jetzt {conn.guild_id}) – Ping "
+                        f"nicht mehr zu {conn.name} (jetzt {conn.guild_ids}) – Ping "
                         f"unterdrückt. Zone im Dashboard neu speichern.")
             _audit_add("system", conn.name,
                       "Zonen-Ping unterdrückt",
@@ -6093,8 +6185,8 @@ class DayZBot(discord.Client):
         Mit Verbindung nur in deren Guild – ein Neustart-Hinweis eines Servers
         hat in fremden Discord-Servern nichts zu suchen.
         """
-        ziele = ([str(conn.guild_id)] if conn is not None and conn.guild_id
-                 else ([] if conn is not None else list(cfg.guilds)))
+        ziele = ([str(g) for g in conn.guild_ids] if conn is not None
+                 else list(cfg.guilds))
         for gid_str in ziele:
             gid = int(gid_str)
             _sid = conn.service_id if conn is not None else None
@@ -6355,7 +6447,7 @@ class DayZBot(discord.Client):
         verifizierte Spawn-Positionen, exakt einem Typnamen zugeordnet.
         Gefundene Positionen landen typisiert in conn.ce_pending_positionen
         und werden in _ce_events_embed FIFO demselben Typ zugeordnet."""
-        if conn.guild_id is None:
+        if not conn.guild_ids:
             return
         try:
             rpt = await _log_dateien(conn, log_dir, ".rpt")
@@ -6405,7 +6497,7 @@ class DayZBot(discord.Client):
                 if not conn.get(schluessel, True):
                     continue
                 embed = self._ce_events_embed(conn, typ_name, schalter, delta, neuer_stand)
-                ok, grund = await _post_feed(conn.guild_id, "ce_events", embed, service_id=conn.service_id)
+                ok, grund = await _post_feed(conn.guild_ids, "ce_events", embed, service_id=conn.service_id)
                 if not ok:
                     log.debug(f"[POLL] {conn.name}: ce_events fuer {typ_name} nicht gesendet ({grund}).")
 
@@ -6521,7 +6613,8 @@ class DayZBot(discord.Client):
         FTP-Hakler, Kanal ohne Rechte) darf den Poll-Zyklus NIE kippen."""
         dateiname = pfad.split("/")[-1]
         ev = {"type": feed_key}
-        ch_id = cfg.get_channel(conn.guild_id, feed_key, conn.service_id) if conn.guild_id else None
+        ch_id = (any(cfg.get_channel(g, feed_key, conn.service_id) for g in conn.guild_ids)
+                if conn.guild_ids else None)
         if not ch_id:
             self._dispatch_merken(conn, ev, "kein Feed/Channel gesetzt", datei=dateiname)
             return
@@ -6541,7 +6634,7 @@ class DayZBot(discord.Client):
                 title=f"{meta['emoji']} {meta['label']}",
                 description=f"`{dateiname}` ({len(data) / 1024:.0f} KB)",
                 color=meta["farbe"])
-            ok, grund = await _post_feed(conn.guild_id, feed_key, embed,
+            ok, grund = await _post_feed(conn.guild_ids, feed_key, embed,
                                          service_id=conn.service_id,
                                          anhang=(data, dateiname))
             if not ok:
@@ -6582,7 +6675,7 @@ class DayZBot(discord.Client):
                                      "hat die Zugangsdaten über den Nitrado-Token neu "
                                      "geholt und die Verbindung neu aufgebaut."),
                         color=0x2ECC71)
-                    await _post_feed(conn.guild_id, "adminlog", embed,
+                    await _post_feed(conn.guild_ids, "adminlog", embed,
                                      service_id=conn.service_id)
                     return
                 conn.ftp_warn_active = True
@@ -6594,7 +6687,7 @@ class DayZBot(discord.Client):
                                  f"Mögliche Ursachen: FTP-Passwort geändert, Nitrado-Wartung.\n"
                                  f"Letzter Fehler: `{ftp.last_error or 'unbekannt'}`"),
                     color=0xE74C3C)
-                await _post_feed(conn.guild_id, "adminlog", embed,
+                await _post_feed(conn.guild_ids, "adminlog", embed,
                                  service_id=conn.service_id)
         elif fails == 0 and conn.ftp_warn_active:
             conn.ftp_warn_active = False
@@ -6603,7 +6696,7 @@ class DayZBot(discord.Client):
                 title="✅ FTP-Verbindung wiederhergestellt",
                 description="Der FTP-Zugriff funktioniert wieder – die Feeds laufen normal weiter.",
                 color=0x2ECC71)
-            await _post_feed(conn.guild_id, "adminlog", embed,
+            await _post_feed(conn.guild_ids, "adminlog", embed,
                              service_id=conn.service_id)
 
     async def _resolve_channel(self, channel_id: int):
@@ -6644,7 +6737,7 @@ class DayZBot(discord.Client):
         auf True – dort kommt jede Zeile genau einmal vorbei.
         """
         _setze_aktuellen_server(conn)
-        if conn is not None and conn.guild_id is None:
+        if conn is not None and not conn.guild_ids:
             # Ohne zugeordnete Guild gibt es kein Ziel. Frueher fiel der
             # Versand hier auf ALLE konfigurierten Guilds zurueck – Kills,
             # Chat und Positionen eines Servers landeten dann bei fremden
@@ -6654,7 +6747,7 @@ class DayZBot(discord.Client):
         # "connect" ueberhaupt ein Feed eingerichtet ist, sonst wuerden nur
         # Namen von Servern mit aktivem Connect-Feed gemerkt.
         if nebenwirkungen and ev.get("type") == "connect" and ev.get("player"):
-            for gid_str in ([str(conn.guild_id)] if conn is not None else list(cfg.guilds)):
+            for gid_str in ([str(g) for g in conn.guild_ids] if conn is not None else list(cfg.guilds)):
                 cfg.record_seen_player(int(gid_str), ev["player"],
                                        conn.service_id if conn is not None else None)
             # Abandoned Bases: "Erbauer inaktiv seit"-Regel braucht die letzte
@@ -6696,7 +6789,7 @@ class DayZBot(discord.Client):
                     color=0xF39C12)
                 alarm.set_footer(text="Account-ID mit anderem Gamertag wiedererkannt. "
                                       "Bitte manuell prüfen.")
-                await _post_feed(conn.guild_id, "alt_account", alarm, service_id=conn.service_id)
+                await _post_feed(conn.guild_ids, "alt_account", alarm, service_id=conn.service_id)
         # Rückfallkette statt einem einzelnen Schlüssel: erst die feine
         # Zuordnung (Zombie Death statt "Umwelttod"), dann die grobe
         # Sammelkategorie (macht EVENT_TO_LOG wieder nutzbar – vorher toter
@@ -6732,7 +6825,7 @@ class DayZBot(discord.Client):
         if not embed:
             self._dispatch_merken(conn, ev, "kein Embed erzeugt", kandidaten=kandidaten)
             return
-        targets = ([str(conn.guild_id)] if conn is not None
+        targets = ([str(g) for g in conn.guild_ids] if conn is not None
                    else list(cfg.guilds))
         _sid = conn.service_id if conn is not None else None
         for gid_str in targets:
@@ -6802,15 +6895,22 @@ class DayZBot(discord.Client):
         loop = asyncio.get_running_loop()
         t = ev["type"]
         sid = conn.service_id if conn is not None else ""
-        gid_ev = conn.guild_id if conn is not None else None
+        # Ein Server kann seit dem Mehrfach-Guild-Umbau mehreren Guilds
+        # gleichzeitig gehoeren - Verknuepfungen sind PRO Guild gespeichert
+        # (derselbe Spielername kann in Guild A und Guild B unabhaengig
+        # verlinkt sein), deshalb hier je Guild einzeln nachschlagen statt
+        # einer einzelnen guild_id. Kein conn (globaler Dispatch) verhaelt
+        # sich wie zuvor: [None] bedeutet "ueber alle Guilds hinweg".
+        gids_ev: List[Optional[int]] = list(conn.guild_ids) if conn is not None else [None]
         try:
             if t == "connect":
                 pid = ev.get("player_id")
                 pid = pid if pid and pid != "Unbekannt" else None
                 await loop.run_in_executor(None, db.open_session, sid, ev["player"], pid)
                 if pid:
-                    await loop.run_in_executor(None, db.update_link_id,
-                                               ev["player"], pid, gid_ev)
+                    for gid_ev in gids_ev:
+                        await loop.run_in_executor(None, db.update_link_id,
+                                                   ev["player"], pid, gid_ev)
 
             elif t == "disconnect":
                 await loop.run_in_executor(None, db.close_session, sid, ev["player"])
@@ -6824,27 +6924,29 @@ class DayZBot(discord.Client):
                 for nm, key in ((killer, "killer_id"), (victim, "victim_id")):
                     pid = ev.get(key)
                     if nm and pid and pid != "Unbekannt":
-                        await loop.run_in_executor(None, db.update_link_id, nm, pid, gid_ev)
+                        for gid_ev in gids_ev:
+                            await loop.run_in_executor(None, db.update_link_id, nm, pid, gid_ev)
                 if killer and victim and killer.lower() != victim.lower():
                     reward = max(0, int((conn.get("kill_reward", 0) if conn is not None
                                          else cfg.config.get("kill_reward", 0)) or 0))
-                    links = await loop.run_in_executor(None, db.links_for_name,
-                                                       killer, gid_ev)
-                    for lk in links:
-                        gid, uid = int(lk["guild_id"]), int(lk["user_id"])
-                        parts: List[str] = []
-                        total = 0
-                        if reward > 0:
-                            total += reward
-                            parts.append(f"+{_fmt_money(reward)} Kill-Belohnung")
-                        bounty = await loop.run_in_executor(
-                            None, db.claim_bounties, gid, victim, uid)
-                        if bounty > 0:
-                            total += bounty
-                            parts.append(f"+{_fmt_money(bounty)} Kopfgeld 🎯")
-                        if total > 0:
-                            await loop.run_in_executor(None, db.add_wallet, gid, uid, total)
-                            out[gid] = f"{' · '.join(parts)} → <@{uid}>"
+                    for gid_ev in gids_ev:
+                        links = await loop.run_in_executor(None, db.links_for_name,
+                                                           killer, gid_ev)
+                        for lk in links:
+                            gid, uid = int(lk["guild_id"]), int(lk["user_id"])
+                            parts: List[str] = []
+                            total = 0
+                            if reward > 0:
+                                total += reward
+                                parts.append(f"+{_fmt_money(reward)} Kill-Belohnung")
+                            bounty = await loop.run_in_executor(
+                                None, db.claim_bounties, gid, victim, uid)
+                            if bounty > 0:
+                                total += bounty
+                                parts.append(f"+{_fmt_money(bounty)} Kopfgeld 🎯")
+                            if total > 0:
+                                await loop.run_in_executor(None, db.add_wallet, gid, uid, total)
+                                out[gid] = f"{' · '.join(parts)} → <@{uid}>"
         except Exception as e:
             log.error(f"[REWARD] Event-Verarbeitung fehlgeschlagen: {e}")
         return out
@@ -6852,7 +6954,7 @@ class DayZBot(discord.Client):
     async def _credit_playtime(self, conn: Optional[ServerConnection] = None):
         """Schreibt verlinkten Spielern volle Spielzeit-Blöcke gut
         (playtime_reward: amount pro interval_minutes, z.B. 500 pro 30 Min)."""
-        if conn is not None and conn.guild_id is None:
+        if conn is not None and not conn.guild_ids:
             return          # kein Discord-Server → keine Auszahlung
         conf = ((conn.get("playtime_reward") if conn is not None
                  else cfg.config.get("playtime_reward")) or {})
@@ -6869,18 +6971,22 @@ class DayZBot(discord.Client):
             positions = dict((conn.parser.player_positions if conn.parser else {})
                              if conn is not None else self.parser.player_positions)
             sid = conn.service_id if conn is not None else ""
-            gid_conn = conn.guild_id if conn is not None else None
-            await loop.run_in_executor(None, db.sync_sessions_from_positions,
-                                       sid, positions, 300, gid_conn)
+            # Wie bei _process_event_rewards: mehrere Guilds je Server bedeuten
+            # mehrere unabhaengige Verknuepfungen desselben Spielers.
+            gids_conn: List[Optional[int]] = list(conn.guild_ids) if conn is not None else [None]
+            for gid_conn in gids_conn:
+                await loop.run_in_executor(None, db.sync_sessions_from_positions,
+                                           sid, positions, 300, gid_conn)
             due = await loop.run_in_executor(None, db.playtime_credits_due, sid, interval)
             for entry in due:
-                links = await loop.run_in_executor(None, db.links_for_name,
-                                                   entry["name"], gid_conn)
-                for lk in links:
-                    gid, uid = int(lk["guild_id"]), int(lk["user_id"])
-                    credit = amount * int(entry["blocks"])
-                    await loop.run_in_executor(None, db.add_wallet, gid, uid, credit)
-                    log.info(f"[PLAYTIME] {entry['name']}: +{credit} für <@{uid}> (Guild {gid})")
+                for gid_conn in gids_conn:
+                    links = await loop.run_in_executor(None, db.links_for_name,
+                                                       entry["name"], gid_conn)
+                    for lk in links:
+                        gid, uid = int(lk["guild_id"]), int(lk["user_id"])
+                        credit = amount * int(entry["blocks"])
+                        await loop.run_in_executor(None, db.add_wallet, gid, uid, credit)
+                        log.info(f"[PLAYTIME] {entry['name']}: +{credit} für <@{uid}> (Guild {gid})")
         except Exception as e:
             log.error(f"[PLAYTIME] Gutschrift fehlgeschlagen: {e}")
 
@@ -7860,8 +7966,8 @@ class AutoRestartView(discord.ui.View):
         # Zeit kann der Server einem anderen Discord-Server zugeordnet worden
         # sein oder die Person ihre Adminrolle verloren haben – sonst liesse
         # sich hier noch ein Neustartplan fuer einen fremden Server setzen.
-        if conn.guild_id is not None and itx.guild_id \
-                and int(conn.guild_id) != int(itx.guild_id):
+        if conn.guild_ids and itx.guild_id \
+                and int(itx.guild_id) not in conn.guild_ids:
             return await itx.response.send_message(_t(
                 itx,
                 "❌ Dieser Server gehört inzwischen zu einem anderen Discord-Server. "
@@ -10007,10 +10113,10 @@ def _whitelist_conn(req: Dict[str, Any],
         # Panels und offene Anfragen ueberdauern eine Neuzuordnung. Gehoert der
         # Server inzwischen einem anderen Discord-Server, darf ein Admin aus
         # dem alten hier nicht weiter dessen Nitrado-Whitelist aendern.
-        if conn is not None and conn.guild_id is not None and interaction.guild_id \
-                and int(conn.guild_id) != int(interaction.guild_id):
+        if conn is not None and conn.guild_ids and interaction.guild_id \
+                and int(interaction.guild_id) not in conn.guild_ids:
             log.warning(f"[WHITELIST] Panel in Guild {interaction.guild_id} zeigt auf "
-                        f"{conn.name}, der inzwischen zu Guild {conn.guild_id} gehört – "
+                        f"{conn.name}, der inzwischen zu {conn.guild_ids} gehört – "
                         f"abgelehnt.")
             return None
         return conn
@@ -10049,8 +10155,8 @@ class TicketPanelView(discord.ui.View):
     def _erstellen_callback(self, kategorie_id: int):
         async def _callback(interaction: discord.Interaction):
             conn = connections.for_service(self.service_id) if self.service_id else None
-            if conn is None or conn.guild_id is None or interaction.guild_id is None \
-                    or int(conn.guild_id) != int(interaction.guild_id):
+            if conn is None or not conn.guild_ids or interaction.guild_id is None \
+                    or int(interaction.guild_id) not in conn.guild_ids:
                 return await interaction.response.send_message(_t(
                     interaction, "❌ Für dieses Panel ist gerade kein Server zugeordnet.",
                     "❌ No server is currently assigned to this panel."), ephemeral=True)
@@ -18946,7 +19052,8 @@ def _validate_bet(bet: int, conf: Dict) -> Optional[str]:
         return f"Maximum bet is **{_fmt_money(mx)}**."
     return None
 
-async def _post_feed(guild_id: Optional[int], log_type: str, embed: discord.Embed,
+async def _post_feed(guild_id: Union[int, str, List[int], List[str], None],
+                     log_type: str, embed: discord.Embed,
                      content: Optional[str] = None, channel_id: Optional[int] = None,
                      service_id: Optional[str] = None,
                      anhang: Optional[Tuple[bytes, str]] = None,
@@ -19003,7 +19110,12 @@ async def _post_feed(guild_id: Optional[int], log_type: str, embed: discord.Embe
     for ersatz in (_FEED_ALIASSE.get(log_type), "catch_all"):
         if ersatz and ersatz not in kandidaten:
             kandidaten.append(ersatz)
-    gids = [str(guild_id)] if guild_id else list(cfg.guilds.keys())
+    if isinstance(guild_id, (list, tuple, set)):
+        gids = [str(g) for g in guild_id]
+    elif guild_id:
+        gids = [str(guild_id)]
+    else:
+        gids = list(cfg.guilds.keys())
     irgendein_ziel = False
     letzter_grund = "channel_not_configured"
     erfolg_gesamt = False
@@ -23736,9 +23848,11 @@ def _login_guild_vorauswahl(discord_id: str, eigene: List[Dict[str, Any]],
     anmeldet (gemeldeter Fehler: die Anfrage tauchte nie in der Serverliste
     auf). Nur ueberspringen, wenn es keine solche unverbundene Guild gibt.
     """
-    if conn is None or not conn.guild_id:
+    if conn is None or not conn.guild_ids:
         return None
-    verbundene = {c.guild_id for c in connections.for_owner(discord_id) if c.guild_id}
+    verbundene: Set[int] = set()
+    for c in connections.for_owner(discord_id):
+        verbundene.update(c.guild_ids)
     verbundene_str = {str(v) for v in verbundene}
     weitere_unverbundene = any(str(g.get("id")) not in verbundene_str for g in eigene)
     return None if weitere_unverbundene else str(conn.guild_id)
@@ -23843,7 +23957,7 @@ async def _conn_for_login(discord_id: str,
         return None, False
 
     # Mehrere Server: der mit zugeordneter Guild ist der aktive.
-    conn = next((c for c in owned if c.guild_id), owned[0])
+    conn = next((c for c in owned if c.guild_ids), owned[0])
     if not conn.token:
         return None, False
 
@@ -24974,7 +25088,7 @@ def _sitzung_hat_premium(sess: Optional[Dict[str, Any]],
     """
     if (sess or {}).get("is_admin"):
         return True
-    return bool(conn is not None and conn.guild_id
+    return bool(conn is not None and conn.guild_ids
                and _kunden_stufe(conn) in ("premium", "premium_beta"))
 
 
@@ -25291,7 +25405,7 @@ def _dash_guest_conn_for_login(discord_id: str) -> Optional["ServerConnection"]:
     aber als Gast (Person oder Rolle) in dashboard_perms eingetragen ist –
     fuers Login (siehe _conn_for_login)."""
     for c in connections.all():
-        if c.guild_id and _dash_guest_actions(discord_id, c):
+        if c.guild_ids and _dash_guest_actions(discord_id, c):
             return c
     return None
 
@@ -25361,7 +25475,7 @@ def _session_guilds(request: web.Request) -> List[int]:
                 continue
         return out
     conn = _conn_for_session(sess)
-    return [conn.guild_id] if (conn is not None and conn.guild_id) else []
+    return list(conn.guild_ids) if conn is not None else []
 
 
 async def _refresh_server_name(conn: ServerConnection) -> None:
@@ -25393,10 +25507,15 @@ async def api_admin_servers(request: web.Request) -> web.Response:
     for conn in connections.all():
         await _refresh_server_name(conn)
         view = conn.view()
-        guild = (bot.get_guild(conn.guild_id)
-                 if (bot is not None and conn.guild_id) else None)
-        view["guild_name"] = (guild.name if guild is not None else None)
-        view["guild_available"] = guild is not None
+        guilds_view = []
+        for gid in conn.guild_ids:
+            g = bot.get_guild(gid) if bot is not None else None
+            guilds_view.append({"id": str(gid), "name": (g.name if g else None),
+                                "available": g is not None})
+        view["guilds"] = guilds_view
+        # Kompatibilitaet: erste zugeordnete Guild wie bisher als Einzelwert.
+        view["guild_name"] = (guilds_view[0]["name"] if guilds_view else None)
+        view["guild_available"] = bool(guilds_view and guilds_view[0]["available"])
         # Wer diesen Server verbunden bzw. die Freischaltung angefragt hat.
         # Je Konto nur einmal nachschlagen – ein Kunde mit mehreren Servern
         # soll nicht mehrfach dieselbe Discord-Anfrage auslösen.
@@ -25408,17 +25527,20 @@ async def api_admin_servers(request: web.Request) -> web.Response:
         else:
             view["owner"] = None
         out.append(view)
-    out.sort(key=lambda v: (v["guild_id"] is None, v["name"].lower()))
+    out.sort(key=lambda v: (not v["guilds"], v["name"].lower()))
     return ok({"servers": out})
 
 
 async def post_admin_server_guild(request: web.Request) -> web.Response:
-    """Guild-ID einem Nitrado-Server zuordnen oder die Zuordnung entfernen -
-    der Stift-Dialog in der Serverliste. Aendert bewusst NUR die Guild-
-    Zuordnung, nicht die Kunden-Stufe (Premium/Beta) - die bleibt, wie sie
-    zuletzt gesetzt wurde (Default "premium" fuer Server ohne eigenen
-    Eintrag, siehe _kunden_stufe). Eine neue Stufe waehlen bzw. bestehende
-    hoch-/runterstufen geht ueber post_admin_server_status."""
+    """Eine weitere Guild-ID einem Nitrado-Server HINZUFUEGEN, oder (leere
+    Eingabe) ALLE bisherigen Zuordnungen entfernen - der Stift-Dialog in der
+    Serverliste. Seit dem Mehrfach-Guild-Umbau ersetzt eine neue Guild keine
+    bestehende mehr; einzelne Guilds gezielt entfernen geht ueber
+    post_admin_server_guild_remove (die "x"-Knoepfe je Badge). Aendert
+    bewusst NUR die Guild-Zuordnung, nicht die Kunden-Stufe (Premium/Beta) -
+    die bleibt, wie sie zuletzt gesetzt wurde (Default "premium" fuer Server
+    ohne eigenen Eintrag, siehe _kunden_stufe). Eine neue Stufe waehlen bzw.
+    bestehende hoch-/runterstufen geht ueber post_admin_server_status."""
     denied = await _require_admin(request)
     if denied is not None:
         return denied
@@ -25426,16 +25548,18 @@ async def post_admin_server_guild(request: web.Request) -> web.Response:
     data = await body(request)
     raw = str(data.get("guild_id", "")).strip()
 
-    if not raw:                                   # leer = Zuordnung entfernen
-        # Die bisherige Guild VOR dem Zuordnen lesen – danach ist sie None.
+    if not raw:                          # leer = ALLE Zuordnungen entfernen
         _alt = connections.for_service(service_id)
-        alte_gid = _alt.guild_id if _alt is not None else None
+        alte_gids = list(_alt.guild_ids) if _alt is not None else []
         besitzer = _alt.data.get("owner_discord_id") if _alt is not None else None
-        okay, msg = connections.assign_guild(service_id, None)
+        okay, msg = connections.remove_guild(service_id, None)
         if not okay:
             return err(msg)
-        result = await _guild_aufraeumen(alte_gid)
-        # Erst NACH assign_guild pruefen – sonst zaehlt der gerade entzogene
+        result: Dict[str, Any] = {}
+        for alte_gid in alte_gids:
+            teilergebnis = await _guild_aufraeumen(alte_gid)
+            result.update(teilergebnis)
+        # Erst NACH remove_guild pruefen – sonst zaehlt der gerade entzogene
         # Server noch mit und die Rolle(n) blieben stehen. Deckt Premium UND
         # Beta ab, je nachdem, welche Stufe dieser Server zuletzt hatte.
         hinweise = await _rollen_fuer_kunden_stufe(besitzer)
@@ -25450,13 +25574,16 @@ async def post_admin_server_guild(request: web.Request) -> web.Response:
     if gid in _PLACEHOLDER_GUILD_IDS:
         return err("Das ist die Beispiel-ID aus der Anleitung, nicht die deines Servers.")
 
-    okay, msg = connections.assign_guild(service_id, gid)
+    okay, msg = connections.add_guild(service_id, gid)
     if not okay:
         return err(msg)
     _ziel = connections.for_service(service_id)
     if _ziel is not None:
-        _ziel.data.pop("guild_id_requested", None)   # Anfrage ist erledigt
-        connections.save()
+        aktuelle = [g for g in _ziel.guild_ids_requested if g != gid]
+        if aktuelle != _ziel.guild_ids_requested:
+            _ziel.data["guild_ids_requested"] = aktuelle
+            _ziel.data.pop("guild_id_requested", None)   # Alt-Schluessel raeumen
+            connections.save()
 
     # Zuordnung heißt Freischaltung – die Befehle sollen sofort dort stehen.
     ids = _configured_guild_ids()
@@ -25465,6 +25592,31 @@ async def post_admin_server_guild(request: web.Request) -> web.Response:
         cfg.config["guild_ids"] = ids
         cfg.save_config()
     result = await _register_guild_commands(gid)
+    result["message"] = msg
+    return ok(result)
+
+
+async def post_admin_server_guild_remove(request: web.Request) -> web.Response:
+    """Entfernt GENAU EINE Guild-Zuordnung eines Servers (der "x"-Knopf an
+    einem einzelnen Guild-Badge in der Serverliste) - die uebrigen
+    zugeordneten Guilds dieses Servers bleiben bestehen."""
+    denied = await _require_admin(request)
+    if denied is not None:
+        return denied
+    service_id = request.match_info["service_id"]
+    raw = str(request.match_info.get("guild_id", "")).strip()
+    if not raw.isdigit():
+        return err("Ungueltige Guild-ID.")
+    gid = int(raw)
+    besitzer_conn = connections.for_service(service_id)
+    besitzer = besitzer_conn.data.get("owner_discord_id") if besitzer_conn is not None else None
+    okay, msg = connections.remove_guild(service_id, gid)
+    if not okay:
+        return err(msg)
+    result = await _guild_aufraeumen(gid)
+    hinweise = await _rollen_fuer_kunden_stufe(besitzer)
+    if hinweise:
+        result["premium_rolle"] = " ".join(hinweise)
     result["message"] = msg
     return ok(result)
 
@@ -25492,12 +25644,13 @@ async def post_admin_server_status(request: web.Request) -> web.Response:
     if gid in _PLACEHOLDER_GUILD_IDS:
         return err("Das ist die Beispiel-ID aus der Anleitung, nicht die deines Servers.")
 
-    okay, msg = connections.assign_guild(service_id, gid)
+    okay, msg = connections.add_guild(service_id, gid)
     if not okay:
         return err(msg)
     _ziel = connections.for_service(service_id)
     if _ziel is None:
         return err("Dieser Server ist nicht (mehr) verbunden.")
+    _ziel.data["guild_ids_requested"] = [g for g in _ziel.guild_ids_requested if g != gid]
     _ziel.data.pop("guild_id_requested", None)
     _ziel.data["kunden_stufe"] = stufe
     connections.save()
@@ -25527,7 +25680,7 @@ def _hat_noch_stufe(owner_id: Any, stufen: Tuple[str, ...]) -> bool:
     uid = str(owner_id or "").strip()
     if not uid:
         return False
-    return any(str(c.data.get("owner_discord_id") or "") == uid and c.guild_id
+    return any(str(c.data.get("owner_discord_id") or "") == uid and c.guild_ids
                and _kunden_stufe(c) in stufen
                for c in connections.all())
 
@@ -25544,23 +25697,26 @@ def _hat_noch_beta_stufe(owner_id: Any) -> bool:
 
 
 async def _premium_wegen_discord_austritt_entziehen(owner_id: Any, quelle: str) -> None:
-    """Entzieht ALLE Premium-Zuordnungen eines Kunden, der das Betreiber-
-    Discord verlassen hat oder dort gebannt wurde (siehe on_member_remove/
-    on_member_ban in DayZBot). Die Badge-Rolle selbst braucht hier kein
-    eigenes Entfernen - Discord nimmt sie beim Verlassen/Bannen automatisch
-    weg. Was hier faellt, ist die eigentliche Freischaltung im jeweiligen
-    KUNDENSERVER (die Guild-Zuordnung, die _premium_check abfragt).
+    """Entzieht ALLE Guild-Zuordnungen eines Kunden, der das Betreiber-Discord
+    verlassen hat oder dort gebannt wurde (siehe on_member_remove/
+    on_member_ban) - auf ALLEN seinen Servern, nicht nur die Betreiber-Guild
+    selbst (ausdrueckliche Vorgabe: "Dazu natuerlich alle guilds die mit ihm
+    verbunden sind"). Die Badge-Rolle selbst braucht hier kein eigenes
+    Entfernen - Discord nimmt sie beim Verlassen/Bannen automatisch weg. Was
+    hier faellt, ist die eigentliche Freischaltung in jedem KUNDENSERVER (die
+    Guild-Zuordnung, die _premium_check abfragt).
     """
-    betroffen = [c for c in connections.for_owner(owner_id) if c.guild_id]
+    betroffen = [c for c in connections.for_owner(owner_id) if c.guild_ids]
     for conn in betroffen:
-        gid = conn.guild_id
-        okay, _msg = connections.assign_guild(conn.service_id, None)
+        alte_gids = list(conn.guild_ids)
+        okay, _msg = connections.remove_guild(conn.service_id, None)
         if not okay:
             continue
-        try:
-            await _guild_aufraeumen(gid)
-        except Exception as e:  # noqa: BLE001 – Entzug selbst hat schon gegriffen
-            log.debug(f"[PREMIUM] _guild_aufraeumen nach {quelle}: {e}")
+        for gid in alte_gids:
+            try:
+                await _guild_aufraeumen(gid)
+            except Exception as e:  # noqa: BLE001 – Entzug selbst hat schon gegriffen
+                log.debug(f"[PREMIUM] _guild_aufraeumen nach {quelle}: {e}")
         log.info(f"[PREMIUM] {quelle} im Betreiber-Discord: Freischaltung fuer "
                  f"„{conn.name}“ (Kunde {owner_id}) entzogen.")
 
@@ -25834,10 +25990,11 @@ async def _stripe_freischalten(ticket: Dict[str, Any], quelle: str) -> web.Respo
     besitzer = ticket["discord_user_id"]
     gid = ticket["guild_id"]
     conn.data["owner_discord_id"] = besitzer
-    okay, msg = connections.assign_guild(conn.service_id, gid)
+    okay, msg = connections.add_guild(conn.service_id, gid)
     if not okay:
         log.warning(f"[STRIPE] {quelle}: Freischaltung fehlgeschlagen: {msg}")
         return web.Response(status=200, text="assign failed")
+    conn.data["guild_ids_requested"] = [g for g in conn.guild_ids_requested if g != gid]
     conn.data.pop("guild_id_requested", None)
     connections.save()
 
@@ -25868,13 +26025,13 @@ async def _stripe_sperren(subscription_id: str, grund: str) -> web.Response:
     cfg.save_stripe_subscriptions()
 
     conn = connections.for_service(eintrag["service_id"])
-    if conn is None or conn.guild_id != eintrag["guild_id"]:
+    if conn is None or int(eintrag["guild_id"]) not in conn.guild_ids:
         # Server wurde zwischenzeitlich entfernt oder anders zugeordnet -
         # nichts mehr zurueckzunehmen.
         return web.Response(status=200, text="nothing to revoke")
-    alte_gid = conn.guild_id
+    alte_gid = int(eintrag["guild_id"])
     besitzer = conn.data.get("owner_discord_id")
-    okay, msg = connections.assign_guild(conn.service_id, None)
+    okay, msg = connections.remove_guild(conn.service_id, alte_gid)
     if not okay:
         log.warning(f"[STRIPE] Sperren ({grund}) fehlgeschlagen: {msg}")
         return web.Response(status=200, text="revoke failed")
@@ -26112,8 +26269,7 @@ async def api_options(request: web.Request) -> web.Response:
         return ok(out)
     out["map_name"] = conn.get("map_name")
     out["token_masked"] = conn.masked_token()
-    out["guild_id_requested"] = (str(conn.data.get("guild_id_requested"))
-                                 if conn.data.get("guild_id_requested") else None)
+    out["guild_ids_requested"] = [str(g) for g in conn.guild_ids_requested]
     return ok(out)
 
 
@@ -26545,7 +26701,9 @@ async def post_select_server(request: web.Request) -> web.Response:
     # Admin-Ausnahme, auch Brigarde soll sie beim Umziehen neu vergeben statt
     # versehentlich mitzunehmen.
     if wechsel:
-        conn.data["guild_id"] = None
+        conn.data["guild_ids"] = []
+        conn.data.pop("guild_id", None)
+        conn.data["guild_ids_requested"] = []
         conn.data.pop("guild_id_requested", None)
         connections.save()
         await _betreiber_alarm(
@@ -26557,22 +26715,24 @@ async def post_select_server(request: web.Request) -> web.Response:
 
     # Die beim Login gewaehlte Guild gilt als Anfrage – das ersetzt das
     # Abtippen der Server-ID. Freischalten bleibt Sache des Betreibers, deshalb
-    # NUR guild_id_requested und niemals guild_id – eine bereits bestehende
+    # NUR guild_ids_requested und niemals guild_ids – eine bereits bestehende
     # Freischaltung wird dadurch NICHT veraendert, nur eine neue Anfrage fuer
     # eine ANDERE Guild vermerkt (dasselbe Konto kann Mitglied/Eigentuemer
     # mehrerer Discord-Server sein und denselben Nitrado-Server dort ebenfalls
-    # anfragen wollen - vorher blockierte "not conn.guild_id" das komplett,
-    # sobald irgendeine Guild schon zugeordnet war; jetzt nur noch, wenn genau
-    # DIESE Guild es bereits ist - konsistent mit post_setup_guild, das
-    # dieselbe Anfrage seit jeher ohne diese Einschraenkung entgegennimmt).
+    # anfragen wollen - seit dem Mehrfach-Guild-Umbau kann ein Server dauerhaft
+    # mehreren Guilds gleichzeitig gehoeren, mehrere GLEICHZEITIGE Anfragen
+    # bleiben deshalb unabhaengig nebeneinander bestehen statt sich
+    # gegenseitig zu ueberschreiben).
     _gewaehlt = str(sess.get("guild_id") or "").strip()
     if (_gewaehlt.isdigit() and _gehoert_mir(sess, _gewaehlt)
-            and conn.guild_id != int(_gewaehlt)):
-        conn.data["guild_id_requested"] = int(_gewaehlt)
-        connections.save()
-        await _betreiber_alarm(
-            f"🆕 Neue Premium-Anfrage: **{conn.name}** ({conn.service_id}) → "
-            f"Discord-Server `{_gewaehlt}`.", farbe=0x3498DB)
+            and int(_gewaehlt) not in conn.guild_ids):
+        offen = conn.guild_ids_requested
+        if int(_gewaehlt) not in offen:
+            conn.data["guild_ids_requested"] = offen + [int(_gewaehlt)]
+            connections.save()
+            await _betreiber_alarm(
+                f"🆕 Neue Premium-Anfrage: **{conn.name}** ({conn.service_id}) → "
+                f"Discord-Server `{_gewaehlt}`.", farbe=0x3498DB)
 
     if info and _apply:
         _apply(info, conn)
@@ -26827,8 +26987,12 @@ async def post_setup_guild(request: web.Request) -> web.Response:
 
     if not (sess.get("is_admin") or schon_meine or eigener_bestand):
         # Freischalten ist sonst Sache des Bot-Betreibers (Serverliste).
-        conn.data["guild_id_requested"] = gid
-        connections.save()
+        # Ergaenzt die Anfrage-Liste statt sie zu ueberschreiben - eine
+        # gleichzeitig laufende Anfrage fuer eine ANDERE Guild bleibt erhalten.
+        offen = conn.guild_ids_requested
+        if gid not in offen:
+            conn.data["guild_ids_requested"] = offen + [gid]
+            connections.save()
         _audit_add("dashboard", _audit_actor(sess),
                    "Discord-Server angefragt", f"Guild {gid}")
         await _betreiber_alarm(
@@ -26847,10 +27011,11 @@ async def post_setup_guild(request: web.Request) -> web.Response:
     # Ab hier darf zugeordnet werden: Betreiber, eigene bereits freigeschaltete
     # Guild, oder eine Guild, in der dem Konto schon ein Server gehoert.
     if not schon_meine:
-        okay, meldung = connections.assign_guild(conn.service_id, gid)
+        okay, meldung = connections.add_guild(conn.service_id, gid)
         if not okay:
             return err(meldung)
-        conn.data.pop("guild_id_requested", None)   # Anfrage erledigt
+        conn.data["guild_ids_requested"] = [g for g in conn.guild_ids_requested if g != gid]
+        conn.data.pop("guild_id_requested", None)   # Alt-Schluessel raeumen
         connections.save()
         _audit_add("dashboard", _audit_actor(sess),
                    "Discord-Server zugeordnet", f"Guild {gid} → {conn.name}")
@@ -27137,7 +27302,7 @@ async def set_feed(request: web.Request) -> web.Response:
     fehler = _dash_rate_limited(request, "feeds.edit", 3)
     if fehler is not None:
         return fehler
-    if conn.guild_id and int(conn.guild_id) != int(gid):
+    if conn.guild_ids and int(gid) not in conn.guild_ids:
         return err("Dieser Discord-Server gehört nicht zu deinem Nitrado-Server.", 403)
     if log_type in FEED_TYPES and not await _module_erlaubt(log_type, _sess_get(request), conn):
         return err("Dieses Feature ist für deinen Server aktuell nicht freigeschaltet.", 403)
@@ -28289,11 +28454,11 @@ async def _reaction_role_nachricht_holen(conn: ServerConnection, link: str
     if geparst is None:
         return None, err("Das ist kein gültiger Discord-Nachrichten-Link.")
     link_guild_id, channel_id, message_id = geparst
-    if not conn.guild_id:
+    if not conn.guild_ids:
         return None, err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
-    if int(link_guild_id) != int(conn.guild_id):
+    if int(link_guild_id) not in conn.guild_ids:
         return None, err("Dieser Link gehört nicht zu deinem Discord-Server.", 403)
-    fehler = _kanal_gehoert_guild(int(conn.guild_id), channel_id, "Nachrichten-Channel")
+    fehler = _kanal_gehoert_guild(int(link_guild_id), channel_id, "Nachrichten-Channel")
     if fehler is not None:
         return None, fehler
     kanal = bot.get_channel(int(channel_id)) if bot else None
@@ -32058,6 +32223,8 @@ def build_app() -> web.Application:
     r.add_post("/api/modules/{key}", post_module_tier)
     r.add_get("/api/admin/servers", api_admin_servers)
     r.add_post("/api/admin/servers/{service_id}/guild", post_admin_server_guild)
+    r.add_delete("/api/admin/servers/{service_id}/guild/{guild_id}",
+                 post_admin_server_guild_remove)
     r.add_post("/api/admin/servers/{service_id}/status", post_admin_server_status)
     r.add_delete("/api/admin/servers/{service_id}", delete_admin_server)
     r.add_get("/api/payment/info", api_payment_info)

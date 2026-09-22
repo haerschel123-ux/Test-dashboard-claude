@@ -208,6 +208,7 @@ class _FakeConnDispatch:
     def __init__(self, enabled=True):
         self.service_id = "1000"
         self.guild_id = 111
+        self.guild_ids = [111]
         self.name = "Testserver"
         self.parser = None
         self.dispatch_verlauf = []
