@@ -26496,10 +26496,17 @@ async def post_select_server(request: web.Request) -> web.Response:
 
     # Die beim Login gewaehlte Guild gilt als Anfrage – das ersetzt das
     # Abtippen der Server-ID. Freischalten bleibt Sache des Betreibers, deshalb
-    # NUR guild_id_requested und niemals guild_id. Eine bereits bestehende
-    # Freischaltung wird nicht angefasst.
+    # NUR guild_id_requested und niemals guild_id – eine bereits bestehende
+    # Freischaltung wird dadurch NICHT veraendert, nur eine neue Anfrage fuer
+    # eine ANDERE Guild vermerkt (dasselbe Konto kann Mitglied/Eigentuemer
+    # mehrerer Discord-Server sein und denselben Nitrado-Server dort ebenfalls
+    # anfragen wollen - vorher blockierte "not conn.guild_id" das komplett,
+    # sobald irgendeine Guild schon zugeordnet war; jetzt nur noch, wenn genau
+    # DIESE Guild es bereits ist - konsistent mit post_setup_guild, das
+    # dieselbe Anfrage seit jeher ohne diese Einschraenkung entgegennimmt).
     _gewaehlt = str(sess.get("guild_id") or "").strip()
-    if _gewaehlt.isdigit() and not conn.guild_id and _gehoert_mir(sess, _gewaehlt):
+    if (_gewaehlt.isdigit() and _gehoert_mir(sess, _gewaehlt)
+            and conn.guild_id != int(_gewaehlt)):
         conn.data["guild_id_requested"] = int(_gewaehlt)
         connections.save()
         await _betreiber_alarm(
