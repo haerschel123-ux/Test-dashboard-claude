@@ -23410,6 +23410,45 @@ def _server_view(svc: dict) -> dict:
     }
 
 
+async def _server_view_mit_echtem_namen(token: str, base: str, svc: dict) -> dict:
+    """Wie _server_view(), aber mit dem ECHTEN DayZ-Servernamen statt des
+    generischen Nitrado-Servicenamens ("Gameserver - 10 Slots") - falls
+    ermittelbar. Nitrados eigener Name (details.name) ist nur ein von
+    Nitrado vergebenes Label, nicht der Name, den der Kunde im Spiel sieht;
+    der steckt erst in der Live-A2S-Antwort des laufenden Servers. Nur bei
+    der Server-Auswahl beim Token-Eintragen genutzt (einmaliger Vorgang, bis
+    zu 25 Server) - nicht am generischen _server_view() geändert, weil der
+    an vielen Stellen (u. a. /api/session bei jedem Poll) verwendet wird und
+    dort ein zusätzlicher Netzwerk-Umweg je Aufruf zu teuer wäre. Schlägt die
+    Ermittlung fehl (Server offline, Zeitüberschreitung, API-Fehler), bleibt
+    einfach der bisherige Name stehen - reines Beiwerk, kein Fehlergrund."""
+    view = _server_view(svc)
+    if str(svc.get("status", "")).lower() not in ("active", "started"):
+        return view
+    api = NitradoAPI(token=token, service_id=str(svc.get("id")), base=base)
+    try:
+        info = await api.get_info()
+    except Exception:  # noqa: BLE001 – Name ist Beiwerk, kein Fehlergrund
+        info = None
+    finally:
+        await api.close()
+    if not info:
+        return view
+    ip = info.get("ip")
+    qport = (info.get("query") or {}).get("connect_port") or info.get("query_port")
+    if not (ip and qport):
+        return view
+    try:
+        loop = asyncio.get_running_loop()
+        a2s = await loop.run_in_executor(None, a2s_query, str(ip), int(qport), 2.0)
+    except Exception:  # noqa: BLE001 – Name ist Beiwerk, kein Fehlergrund
+        a2s = None
+    echter_name = str((a2s or {}).get("name") or "").strip()
+    if echter_name:
+        view["name"] = echter_name
+    return view
+
+
 # ══════════════════════════════════════════════════════════════
 #  Discord-Login fürs Dashboard (OAuth2) + Aktions-Protokoll
 # ══════════════════════════════════════════════════════════════
@@ -26182,7 +26221,8 @@ async def post_token(request: web.Request) -> web.Response:
                    "Prüfe, ob der Long-Life-Token korrekt kopiert wurde "
                    "(Nitrado → Benutzereinstellungen → API-Schlüssel).", 401)
 
-    view = [_server_view(s) for s in gameservers[:25]]
+    view = await asyncio.gather(
+        *(_server_view_mit_echtem_namen(token, base, s) for s in gameservers[:25]))
     resp = ok({"servers": view, "count": len(gameservers)})
     if pre is not None:
         # Die Session gibt es schon (Discord-Login) – sie wird ergänzt, nicht
