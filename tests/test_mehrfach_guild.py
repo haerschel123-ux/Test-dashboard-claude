@@ -89,3 +89,36 @@ def test_guild_ids_requested_erlaubt_mehrere_gleichzeitige_anfragen():
     if 222 not in offen:
         conn.data["guild_ids_requested"] = offen + [222]
     assert set(conn.guild_ids_requested) == {111, 222}
+
+
+def test_zonen_ziel_waehlt_erste_guild_ohne_angabe():
+    service_id = "mfg-zone-1"
+    bot.connections.upsert(service_id, nitrado_token="fake", owner_discord_id="6")
+    bot.connections.add_guild(service_id, 111)
+    bot.connections.add_guild(service_id, 222)
+    conn = bot.connections.for_service(service_id)
+    ziel, denied = bot._zonen_ziel(None, conn, {})
+    assert denied is None
+    assert ziel["guild_id"] == 111
+
+
+def test_zonen_ziel_akzeptiert_gezielte_zweite_guild():
+    service_id = "mfg-zone-2"
+    bot.connections.upsert(service_id, nitrado_token="fake", owner_discord_id="7")
+    bot.connections.add_guild(service_id, 111)
+    bot.connections.add_guild(service_id, 222)
+    conn = bot.connections.for_service(service_id)
+    ziel, denied = bot._zonen_ziel(None, conn, {"guild_id": 222})
+    assert denied is None
+    assert ziel["guild_id"] == 222
+
+
+def test_zonen_ziel_lehnt_fremde_guild_ab():
+    service_id = "mfg-zone-3"
+    bot.connections.upsert(service_id, nitrado_token="fake", owner_discord_id="8")
+    bot.connections.add_guild(service_id, 111)
+    conn = bot.connections.for_service(service_id)
+    ziel, denied = bot._zonen_ziel(None, conn, {"guild_id": 999})
+    assert ziel is None
+    assert denied is not None
+    assert denied.status == 403

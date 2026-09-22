@@ -27234,7 +27234,7 @@ async def get_feeds(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     sid = conn.service_id if conn is not None else None
-    guild_ids = [int(conn.guild_id)] if (conn is not None and conn.guild_id) else []
+    guild_ids = list(conn.guild_ids) if conn is not None else []
     # Nicht freigeschaltete "beta"/"premium"-Module bleiben unsichtbar, damit
     # ein Kunde sie nicht ueber die API sieht, obwohl set_feed sie ohnehin
     # ablehnt. "under_review" ist die Ausnahme: sichtbar, aber mit
@@ -27635,17 +27635,29 @@ def _zonen_ziel(request: web.Request, conn: ServerConnection,
     und als Ziel einen Channel im Discord eines anderen Kunden eintragen – der
     Bot wuerde dann dort Alarme samt Rollen-Ping posten.
 
-    Die Ziel-Guild kommt bewusst NIE aus dem Browser-Payload, sondern immer
-    ausschliesslich aus ``conn.guild_id``: ``_session_guilds`` liefert einem
-    Dashboard-Admin alle konfigurierten Guilds, nicht nur die dieses Servers –
-    eine akzeptierte fremde ``guild_id`` sah im Dashboard wie gespeichert aus,
-    wurde aber von ``_post_zone_ping`` zur Laufzeit still verworfen, weil sie
-    nicht zu ``conn.guild_id`` passte. Die Zone postete dann nie.
+    Die Ziel-Guild kommt NIE ungeprueft aus dem Browser-Payload: ``_session_guilds``
+    liefert einem Dashboard-Admin alle konfigurierten Guilds, nicht nur die
+    dieses Servers – eine akzeptierte fremde ``guild_id`` sah im Dashboard wie
+    gespeichert aus, wurde aber von ``_post_zone_ping`` zur Laufzeit still
+    verworfen, weil sie nicht zu einer der zugeordneten Guilds passte. Die Zone
+    postete dann nie. Hat ein Server dank des Mehrfach-Guild-Umbaus MEHRERE
+    Guilds, darf das Formular gezielt eine davon waehlen (``data["guild_id"]``);
+    ohne Angabe oder bei nur einer zugeordneten Guild gilt weiterhin die erste
+    (unveraendertes Verhalten fuer den haeufigen Ein-Guild-Fall). Jede Angabe
+    wird gegen ``conn.guild_ids`` geprueft, nie blind uebernommen.
     """
-    gid = int(conn.guild_id) if conn.guild_id else 0
-    if not gid:
+    if not conn.guild_ids:
         return None, err("Für diesen Server ist noch kein Discord-Server "
                          "zugeordnet – der Bot-Betreiber schaltet ihn frei.", 409)
+    gid = conn.guild_ids[0]
+    if "guild_id" in data and data.get("guild_id"):
+        try:
+            gewaehlt = int(data["guild_id"])
+        except (TypeError, ValueError):
+            return None, err("Guild-ID muss eine Zahl sein.")
+        if gewaehlt not in conn.guild_ids:
+            return None, err("Diese Discord-Guild gehört nicht zu diesem Server.", 403)
+        gid = gewaehlt
 
     g = bot.get_guild(gid) if bot else None
     ziel: Dict[str, Any] = {"guild_id": gid}
@@ -33059,6 +33071,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "9b92dbf482bccaa106187aa84be254ff499f285c76c013b7901e478a8f5659ee",
         "47d22532d8398efcc9d6ad0ca1016b5b46913fd6f1345d512078347f91fb6280",
         "7a0855f4465fc3d6358f1d3d63189705ed0faf180a3d42b8ea817f278b554daf",
         "fa03cf05e5cadcc50fb55f078eb3b5cb6ebd60e88e28b8193a1f6b888b8308db",
