@@ -23681,6 +23681,30 @@ async def api_discord_start(request: web.Request) -> web.Response:
     return antwort
 
 
+def _login_guild_vorauswahl(discord_id: str, eigene: List[Dict[str, Any]],
+                            conn: Optional[ServerConnection]) -> Optional[str]:
+    """Welche Guild-ID soll die neue Session vorbelegen (oder None, damit das
+    Frontend die Guild-Auswahl zeigt)?
+
+    Wiedererkannt: die Guild des eigenen Servers gilt als vorausgewaehlt, der
+    Auswahlschritt entfaellt - ABER nur, wenn es dabei nichts zu entscheiden
+    gibt. Besitzt das Konto noch eine WEITERE eigene Guild ohne eigenen
+    Server (z.B. eine zweite Community), wuerde ein festes Vorbelegen die
+    Guild-Auswahl im Frontend komplett ueberspringen (siehe
+    showOnboarding()) - ein Kunde, der denselben Nitrado-Server zusaetzlich
+    bei einem ANDEREN Discord anfragen will, kaeme so nie mehr bis zu
+    /api/auth/guild bzw. /api/auth/select-server, egal wie oft er sich neu
+    anmeldet (gemeldeter Fehler: die Anfrage tauchte nie in der Serverliste
+    auf). Nur ueberspringen, wenn es keine solche unverbundene Guild gibt.
+    """
+    if conn is None or not conn.guild_id:
+        return None
+    verbundene = {c.guild_id for c in connections.for_owner(discord_id) if c.guild_id}
+    verbundene_str = {str(v) for v in verbundene}
+    weitere_unverbundene = any(str(g.get("id")) not in verbundene_str for g in eigene)
+    return None if weitere_unverbundene else str(conn.guild_id)
+
+
 async def api_discord_callback(request: web.Request) -> web.Response:
     """Rücksprung von Discord: Code einlösen, Session anlegen, ins Dashboard."""
     def _back(reason: str) -> web.Response:
@@ -23737,10 +23761,7 @@ async def api_discord_callback(request: web.Request) -> web.Response:
                        token_invalid=token_invalid,
                        owned_guilds=eigene,
                        is_guest=is_guest,
-                       # Wiedererkannt: die Guild des eigenen Servers ist damit
-                       # schon gewaehlt, der Auswahlschritt entfaellt.
-                       guild_id=(str(conn.guild_id)
-                                 if (conn is not None and conn.guild_id) else None))
+                       guild_id=_login_guild_vorauswahl(view["id"], eigene, conn))
     if conn is not None:
         _SESS_STORE[sid]["map_name"] = conn.get("map_name")
 
