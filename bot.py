@@ -3333,6 +3333,10 @@ class ServerConnection:
         self.last_read_erfolg_ts: float = 0.0
         self.last_read_status: str = "noch kein Leseversuch"
         self.remote_size: Optional[int] = None
+        # Ruecklese-Abgleich alter ADM-Dateien in die Spieler-Liste
+        # (player_roster) - nur EINMAL je Prozesslauf versucht, nicht bei
+        # jedem Poll-Zyklus (siehe DayZBot._roster_backfill_falls_noetig).
+        self.roster_backfill_done: bool = False
 
     @property
     def hydrate_lock(self) -> asyncio.Lock:
@@ -4106,6 +4110,26 @@ async def _log_lesen_ab_offset(conn: "ServerConnection", path: str,
         return raw.decode("utf-8", errors="replace"), offset + len(raw)
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, conn.ftp.read_from_offset, path, offset)
+
+
+async def _log_kompletten_inhalt(conn: "ServerConnection", path: str) -> str:
+    """Liest eine Log-Datei GANZ ein, ab Offset 0 - fuer den einmaligen
+    Ruecklese-Abgleich alter ADM-Dateien (siehe
+    DayZBot._roster_backfill_falls_noetig), nicht fuer den laufenden Poll
+    (der liest nur inkrementell ab dem gespeicherten Cursor). Die
+    Nitrado-API begrenzt einen einzelnen seek_file-Aufruf auf 65535 Bytes -
+    deshalb in einer Schleife weiterlesen, bis nichts Neues mehr kommt."""
+    teile: List[str] = []
+    offset = 0
+    for _ in range(2000):  # Sicherheitsnetz gegen Endlosschleife bei kaputtem FTP/API
+        inhalt, neuer_offset = await _log_lesen_ab_offset(conn, path, offset)
+        if not inhalt:
+            break
+        teile.append(inhalt)
+        if neuer_offset <= offset:
+            break
+        offset = neuer_offset
+    return "".join(teile)
 
 
 _CE_EVENT_HEADER_RE = re.compile(r"\[CE\]\[DE\] DynamicEvent Types \(\d+\):\s*$")
@@ -5034,6 +5058,56 @@ class DayZBot(discord.Client):
             log.error(f"[POLL] {conn.name}: {e}")
             await self._check_ftp_health(conn)
 
+    async def _roster_backfill_falls_noetig(self, conn: ServerConnection,
+                                            adm_files: List[str]) -> None:
+        """Einmal je Prozesslauf: alte ADM-Dateien nach Spielern durchsuchen,
+        die noch nicht in der Spieler-Liste (player_roster) stehen, und sie
+        nachtragen - so kennt der Bot auch Namen, die vor dem (Neu-)Einrichten
+        oder vor dem letzten Bot-Neustart schon verbunden waren.
+
+        Anzahl der durchsuchten Dateien: 5, wenn diese Guild NOCH GAR KEINE
+        Spieler-Liste hat (frisch eingerichtet), sonst 3 (Brigardes Vorgabe).
+        Laeuft NIE erneut fuer dieselbe Verbindung in diesem Prozesslauf
+        (``conn.roster_backfill_done``), auch nicht nach einem Fehler - ein
+        haengender FTP-Zugang soll nicht bei jedem Poll-Zyklus erneut alte
+        Dateien komplett einlesen.
+        """
+        if conn.roster_backfill_done:
+            return
+        conn.roster_backfill_done = True
+        if not conn.guild_ids:
+            return
+        try:
+            frisch = all(db.roster_list(gid, conn.service_id, limit=1)[1] == 0
+                        for gid in conn.guild_ids)
+            anzahl = 5 if frisch else 3
+            dateien = adm_files[-anzahl:]
+            gefundene_namen: set = set()
+            for pfad in dateien:
+                inhalt = await _log_kompletten_inhalt(conn, pfad)
+                if not inhalt:
+                    continue
+                temp_parser = DayZLogParser()
+                for zeile in inhalt.splitlines():
+                    ev = temp_parser.parse_line(zeile)
+                    if ev and ev.get("type") == "connect" and ev.get("player"):
+                        gefundene_namen.add(ev["player"])
+            if not gefundene_namen:
+                return
+            loop = asyncio.get_running_loop()
+            neu = 0
+            for name in gefundene_namen:
+                for gid in conn.guild_ids:
+                    if await loop.run_in_executor(
+                            None, db.roster_backfill_add, gid, conn.service_id, name):
+                        neu += 1
+            if neu:
+                log.info(f"[ROSTER] {conn.name}: {len(gefundene_namen)} Spieler aus "
+                         f"{len(dateien)} alten ADM-Datei(en) geprüft, {neu} neue "
+                         f"Eintrag(e) in der Spieler-Liste nachgetragen.")
+        except Exception as e:  # noqa: BLE001 – Ruecklese-Abgleich ist eine Zugabe
+            log.warning(f"[ROSTER] {conn.name}: Ruecklese-Abgleich fehlgeschlagen: {e}")
+
     async def _poll_connection(self, conn: ServerConnection):
         # Waehrung/Anzeige gehoeren zu DIESEM Server (siehe _cur_symbol)
         _setze_aktuellen_server(conn)
@@ -5097,6 +5171,7 @@ class DayZBot(discord.Client):
                 await self._check_ftp_health(conn)
                 return
             conn.adm_leer_zaehler = 0
+            await self._roster_backfill_falls_noetig(conn, adm_files)
 
             latest = adm_files[-1]
             # Welche Datei von welchen gewaehlt wurde – die eine Zeile, an der
@@ -19022,6 +19097,23 @@ class EconomyDB:
                 "DO UPDATE SET last_login=excluded.last_login",
                 (guild_id, sid, ingame_name, now, now))
             self._conn.commit()
+
+    def roster_backfill_add(self, guild_id: int, service_id: str, ingame_name: str) -> bool:
+        """Traegt einen Namen NUR ein, wenn er noch nicht in der Liste steht -
+        fuer den Ruecklese-Abgleich alter ADM-Dateien beim (Neu-)Start
+        (siehe DayZBot._roster_backfill_falls_noetig). Anders als
+        roster_upsert_login wird ein bereits bekannter Namen NICHT
+        angefasst (kein "last_login" auf jetzt setzen fuer einen Alt-Fund).
+        Gibt True zurueck, wenn tatsaechlich eine neue Zeile entstanden ist."""
+        sid = str(service_id or "")
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO player_roster (guild_id, service_id, ingame_name, "
+                "first_seen, last_login, total_playtime_seconds) VALUES (?,?,?,?,?,0)",
+                (guild_id, sid, ingame_name, now, now))
+            self._conn.commit()
+        return cur.rowcount > 0
 
     def roster_add_playtime(self, guild_id: int, service_id: str,
                             ingame_name: str, seconds: float) -> None:
