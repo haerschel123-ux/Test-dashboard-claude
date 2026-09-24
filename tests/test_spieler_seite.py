@@ -79,9 +79,9 @@ def test_roster_delete_entfernt_zeile(edb):
 def test_roster_delete_entlinkt_falls_verlinkt(edb):
     edb.roster_upsert_login(111, "1000", "SpielerA")
     edb.link_user(111, 999, "SpielerA")
-    assert edb.get_link_by_user(111, 999) is not None
+    assert edb.get_links_by_user(111, 999) != []
     edb.roster_delete(111, "1000", "SpielerA")
-    assert edb.get_link_by_user(111, 999) is None
+    assert edb.get_links_by_user(111, 999) == []
 
 
 def test_roster_delete_unbekannter_name_liefert_false(edb):

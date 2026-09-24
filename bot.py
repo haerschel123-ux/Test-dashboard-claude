@@ -295,6 +295,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "ftp_fail_warn_cycles":           10,
     "kill_reward":                    100,
     "action_economy":                 {},
+    "max_linked_accounts":            1,
     "status_update_interval_seconds": 180,
     "auto_restart_schedule":          {"enabled": False, "first_time": "04:00", "interval_hours": 4},
     "economy_backup_keep":            7,
@@ -3501,7 +3502,7 @@ class ServerConnection:
         "economy_enabled", "wipe_money_on_leave", "prepend_currency_symbol",
         "max_balance_bank", "max_balance_cash",
         "check_other_balances", "check_other_balances_bypass_role_ids",
-        "kill_reward", "action_economy",
+        "kill_reward", "action_economy", "max_linked_accounts",
         "shop_default_price", "shop_category_prices", "shop_categories_custom",
         "default_radius", "default_pos_y",
         "delivery_grace_seconds", "delivery_cleanup_delay_seconds",
@@ -9011,10 +9012,12 @@ async def _faction_sync_zone_allowlist(conn: ServerConnection, faction: Dict,
                                        remove_ids: Iterable[Any] = ()) -> None:
     """Traegt Fraktionsmitglieder in die Allowlist der verknuepften Zone ein/aus.
 
-    Loest jede Discord-User-ID ueber `/link` (`EconomyDB.get_link_by_user`) in
-    ihren Ingame-Namen auf – ohne Verlinkung gibt es fuer diese ID (noch)
-    nichts einzutragen; ein spaeteres `/link` synct erst beim naechsten
-    member add/remove oder Dashboard-Save nach, nicht automatisch.
+    Loest jede Discord-User-ID ueber `/link` (`EconomyDB.get_main_link_by_user`)
+    in ihren Ingame-HAUPTnamen auf (Alt-Accounts bleiben hier bewusst außen
+    vor - die Zonen-Allowlist folgt nur dem Hauptaccount) – ohne Verlinkung
+    gibt es fuer diese ID (noch) nichts einzutragen; ein spaeteres `/link`
+    synct erst beim naechsten member add/remove oder Dashboard-Save nach,
+    nicht automatisch.
     """
     zone = _find_zone_by_id(faction.get("zone_id"), conn)
     if zone is None:
@@ -9029,7 +9032,7 @@ async def _faction_sync_zone_allowlist(conn: ServerConnection, faction: Dict,
     changed = False
     for uid in remove_ids:
         try:
-            row = db.get_link_by_user(gid, int(uid))
+            row = db.get_main_link_by_user(gid, int(uid))
         except (TypeError, ValueError):
             continue
         name = row["ingame_name"] if row else None
@@ -9038,7 +9041,7 @@ async def _faction_sync_zone_allowlist(conn: ServerConnection, faction: Dict,
             changed = True
     for uid in add_ids:
         try:
-            row = db.get_link_by_user(gid, int(uid))
+            row = db.get_main_link_by_user(gid, int(uid))
         except (TypeError, ValueError):
             continue
         name = row["ingame_name"] if row else None
@@ -9302,7 +9305,7 @@ async def faction_stats(interaction: discord.Interaction, faction: Optional[str]
     kills = deaths = 0
     for uid in (f.get("member_user_ids") or []):
         try:
-            row = db.get_link_by_user(gid, int(uid))
+            row = db.get_main_link_by_user(gid, int(uid))
         except (TypeError, ValueError):
             continue
         if not row:
@@ -18056,14 +18059,20 @@ class EconomyDB:
                 victim_id   TEXT,
                 weapon      TEXT,
                 distance    REAL)""")
-            # Discord-User ↔ Ingame-Name (pro Guild, ein Name nur einmal)
+            # Discord-User ↔ Ingame-Name(n) - seit dem Mehrfach-Account-Umbau
+            # pro User mehrere Namen moeglich (Server-Limit siehe
+            # max_linked_accounts), ein Name bleibt aber weiterhin nur EINEM
+            # User zugeordnet (UNIQUE guild_id+ingame_name). is_main markiert
+            # den zuerst verlinkten Namen; wird er entfernt, ruecktw der
+            # naechstaeltere Alt-Name nach (siehe unlink_specific).
             c.execute("""CREATE TABLE IF NOT EXISTS links (
                 guild_id    INTEGER NOT NULL,
                 user_id     INTEGER NOT NULL,
                 ingame_name TEXT    NOT NULL COLLATE NOCASE,
                 ingame_id   TEXT,
+                is_main     INTEGER NOT NULL DEFAULT 0,
                 created_at  REAL,
-                PRIMARY KEY (guild_id, user_id),
+                PRIMARY KEY (guild_id, user_id, ingame_name),
                 UNIQUE (guild_id, ingame_name))""")
             # Kopfgelder (Betrag wurde beim Aussetzen bereits abgebucht)
             c.execute("""CREATE TABLE IF NOT EXISTS bounties (
@@ -18175,6 +18184,27 @@ class EconomyDB:
             alt_id = haupt.service_id if haupt is not None else ""
         except Exception:  # noqa: BLE001 – Registry evtl. noch nicht geladen
             alt_id = ""
+        spalten_links = {r["name"] for r in c.execute("PRAGMA table_info(links)")}
+        if spalten_links and "is_main" not in spalten_links:
+            # Primaerschluessel aendert sich (mehrere Namen pro User moeglich)
+            # → Tabelle neu aufbauen. Jede Bestandszeile war bisher die
+            # einzige ihres Users, wird also zum Hauptaccount.
+            c.execute("ALTER TABLE links RENAME TO links_alt")
+            c.execute("""CREATE TABLE links (
+                guild_id    INTEGER NOT NULL,
+                user_id     INTEGER NOT NULL,
+                ingame_name TEXT    NOT NULL COLLATE NOCASE,
+                ingame_id   TEXT,
+                is_main     INTEGER NOT NULL DEFAULT 0,
+                created_at  REAL,
+                PRIMARY KEY (guild_id, user_id, ingame_name),
+                UNIQUE (guild_id, ingame_name))""")
+            c.execute(
+                "INSERT INTO links (guild_id, user_id, ingame_name, ingame_id, is_main, created_at) "
+                "SELECT guild_id, user_id, ingame_name, ingame_id, 1, created_at FROM links_alt")
+            c.execute("DROP TABLE links_alt")
+            log.info("[ECON] Tabelle 'links' auf Mehrfach-Accounts umgestellt "
+                     "(Bestand → jeweils Hauptaccount).")
         for tabelle in ("kills", "sessions", "purchases"):
             spalten = {r["name"] for r in c.execute(f"PRAGMA table_info({tabelle})")}
             if not spalten or "service_id" in spalten:
@@ -18859,38 +18889,80 @@ class EconomyDB:
         return [r["name"] for r in rows if r["name"]]
 
     # ── /link: Discord ↔ Ingame-Name ──────────────────────────
+    def count_links_of_user(self, guild_id: int, user_id: int) -> int:
+        """Wie viele Namen dieser User in dieser Guild schon verlinkt hat -
+        Grundlage fuer das max_linked_accounts-Limit in /link."""
+        with self._lock:
+            return int(self._conn.execute(
+                "SELECT COUNT(*) AS n FROM links WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id)).fetchone()["n"])
+
     def link_user(self, guild_id: int, user_id: int, ingame_name: str) -> Tuple[bool, str]:
-        """Verknüpft einen Discord-User mit einem Ingame-Namen (pro Guild eindeutig)."""
+        """Verknüpft einen Discord-User mit einem weiteren Ingame-Namen (ein
+        Name bleibt pro Guild eindeutig). Der ERSTE Name eines Users wird
+        automatisch Hauptaccount (is_main), jeder weitere ein Alt-Account -
+        das Server-Limit dafuer prueft der Aufrufer (conn.get
+        "max_linked_accounts"), nicht diese Methode."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT user_id FROM links WHERE guild_id=? AND ingame_name=?",
+                "SELECT user_id FROM links WHERE guild_id=? AND ingame_name=? COLLATE NOCASE",
                 (guild_id, ingame_name)).fetchone()
             if row and int(row["user_id"]) != user_id:
                 return False, "name_taken"
+            ist_erster = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM links WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id)).fetchone()["n"] == 0
             self._conn.execute(
-                "INSERT OR REPLACE INTO links (guild_id, user_id, ingame_name, ingame_id, created_at) "
-                "VALUES (?,?,?,?,?)",
-                (guild_id, user_id, ingame_name, None, time.time()))
+                "INSERT OR REPLACE INTO links "
+                "(guild_id, user_id, ingame_name, ingame_id, is_main, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (guild_id, user_id, ingame_name, None, 1 if ist_erster else 0, time.time()))
             self._conn.commit()
         return True, "ok"
 
-    def unlink_user(self, guild_id: int, user_id: int) -> Optional[str]:
-        """Entfernt die Verknüpfung; gibt den bisherigen Ingame-Namen zurück."""
+    def unlink_specific(self, guild_id: int, user_id: int, ingame_name: str) -> bool:
+        """Entfernt GENAU diesen verlinkten Namen dieses Users. War er der
+        Hauptaccount, ruecktw der naechstaeltere Alt-Account automatisch nach
+        (ein Hauptaccount bleibt bestehen, solange noch irgendein Name
+        verlinkt ist). Gibt False, wenn der User nicht MIT DIESEM Namen
+        verlinkt war."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT ingame_name FROM links WHERE guild_id=? AND user_id=?",
-                (guild_id, user_id)).fetchone()
+                "SELECT is_main FROM links WHERE guild_id=? AND user_id=? "
+                "AND ingame_name=? COLLATE NOCASE",
+                (guild_id, user_id, ingame_name)).fetchone()
             if not row:
-                return None
-            self._conn.execute("DELETE FROM links WHERE guild_id=? AND user_id=?",
-                               (guild_id, user_id))
+                return False
+            self._conn.execute(
+                "DELETE FROM links WHERE guild_id=? AND user_id=? AND ingame_name=? COLLATE NOCASE",
+                (guild_id, user_id, ingame_name))
+            if row["is_main"]:
+                naechster = self._conn.execute(
+                    "SELECT ingame_name FROM links WHERE guild_id=? AND user_id=? "
+                    "ORDER BY created_at ASC LIMIT 1", (guild_id, user_id)).fetchone()
+                if naechster:
+                    self._conn.execute(
+                        "UPDATE links SET is_main=1 WHERE guild_id=? AND user_id=? "
+                        "AND ingame_name=? COLLATE NOCASE",
+                        (guild_id, user_id, naechster["ingame_name"]))
             self._conn.commit()
-        return row["ingame_name"]
+        return True
 
-    def get_link_by_user(self, guild_id: int, user_id: int) -> Optional[sqlite3.Row]:
+    def get_links_by_user(self, guild_id: int, user_id: int) -> List[sqlite3.Row]:
+        """Alle verlinkten Namen dieses Users in dieser Guild, Hauptaccount
+        zuerst, danach Alt-Accounts nach Alter."""
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT * FROM links WHERE guild_id=? AND user_id=? "
+                "ORDER BY is_main DESC, created_at ASC", (guild_id, user_id)).fetchall())
+
+    def get_main_link_by_user(self, guild_id: int, user_id: int) -> Optional[sqlite3.Row]:
+        """Nur der Hauptaccount dieses Users - fuer Stellen, die absichtlich
+        nur EINEN Namen brauchen (Fraktions-Zonen-Allowlist, Karten-Position,
+        Selbst-Kopfgeld-Sperre bei /bounty), nicht alle Alt-Accounts."""
         with self._lock:
             return self._conn.execute(
-                "SELECT * FROM links WHERE guild_id=? AND user_id=?",
+                "SELECT * FROM links WHERE guild_id=? AND user_id=? AND is_main=1",
                 (guild_id, user_id)).fetchone()
 
     def links_for_name(self, ingame_name: str,
@@ -19004,18 +19076,30 @@ class EconomyDB:
         return [dict(r) for r in rows], int(gesamt)
 
     def roster_delete(self, guild_id: int, service_id: str, ingame_name: str) -> bool:
-        """Loescht eine Spieler-Zeile und entlinkt sie zuvor, falls verknuepft
-        - ein spaeterer erneuter Connect legt den Namen frisch UND unverlinkt
-        wieder an."""
+        """Loescht eine Spieler-Zeile und entlinkt NUR DIESEN Namen, falls
+        verknuepft - andere Accounts (Haupt/Alt) desselben Discord-Users
+        bleiben unangetastet. War der entfernte Name der Hauptaccount, ruecktw
+        der naechstaeltere Alt-Account nach. Ein spaeterer erneuter Connect
+        legt den Namen frisch UND unverlinkt wieder an."""
         sid = str(service_id or "")
         with self._lock:
             link = self._conn.execute(
-                "SELECT user_id FROM links WHERE guild_id=? AND ingame_name=? COLLATE NOCASE",
-                (guild_id, ingame_name)).fetchone()
+                "SELECT user_id, is_main FROM links WHERE guild_id=? "
+                "AND ingame_name=? COLLATE NOCASE", (guild_id, ingame_name)).fetchone()
             if link:
+                uid = int(link["user_id"])
                 self._conn.execute(
-                    "DELETE FROM links WHERE guild_id=? AND user_id=?",
-                    (guild_id, int(link["user_id"])))
+                    "DELETE FROM links WHERE guild_id=? AND ingame_name=? COLLATE NOCASE",
+                    (guild_id, ingame_name))
+                if link["is_main"]:
+                    naechster = self._conn.execute(
+                        "SELECT ingame_name FROM links WHERE guild_id=? AND user_id=? "
+                        "ORDER BY created_at ASC LIMIT 1", (guild_id, uid)).fetchone()
+                    if naechster:
+                        self._conn.execute(
+                            "UPDATE links SET is_main=1 WHERE guild_id=? AND user_id=? "
+                            "AND ingame_name=? COLLATE NOCASE",
+                            (guild_id, uid, naechster["ingame_name"]))
             cur = self._conn.execute(
                 "DELETE FROM player_roster WHERE guild_id=? AND service_id=? "
                 "AND ingame_name=? COLLATE NOCASE",
@@ -20413,20 +20497,22 @@ async def cmd_link(interaction: discord.Interaction, playstation_name: str):
     if not name or len(name) > 64:
         return await interaction.response.send_message(_t(
             interaction, "❌ Ungültiger Name.", "❌ Invalid name."), ephemeral=True)
-    existing = db.get_link_by_user(interaction.guild_id, interaction.user.id)
-    if existing:
-        old_name = str(existing["ingame_name"])
-        if old_name.lower() == name.lower():
-            return await interaction.response.send_message(_t(
-                interaction, f"✅ Du bist bereits mit **{old_name}** verbunden.",
-                f"✅ You are already linked to **{old_name}**."), ephemeral=True)
+    bestehende = db.get_links_by_user(interaction.guild_id, interaction.user.id)
+    if any(str(r["ingame_name"]).lower() == name.lower() for r in bestehende):
+        return await interaction.response.send_message(_t(
+            interaction, f"✅ Du bist bereits mit **{name}** verbunden.",
+            f"✅ You are already linked to **{name}**."), ephemeral=True)
+    _conn = _conn_of(interaction)
+    limit = int((_conn.get("max_linked_accounts", 1) if _conn is not None
+                else cfg.config.get("max_linked_accounts", 1)) or 1)
+    if len(bestehende) >= limit:
+        namen = ", ".join(f"**{r['ingame_name']}**" for r in bestehende)
         return await interaction.response.send_message(_t(
             interaction,
-            f"❌ Du bist bereits mit **{old_name}** verbunden – nutze zuerst `/unlink`, "
-            f"um den Namen zu wechseln.",
-            f"❌ You are already linked to **{old_name}** – use `/unlink` first "
-            f"to change the name."), ephemeral=True)
-    _conn = _conn_of(interaction)
+            f"❌ Du hast bereits die maximal erlaubten {limit} Account(s) verlinkt "
+            f"({namen}). Trenne zuerst einen mit `/unlink`, um einen anderen zu verknüpfen.",
+            f"❌ You have already linked the maximum of {limit} account(s) "
+            f"({namen}). Use `/unlink` first to free up a slot."), ephemeral=True)
     _sid_check = _conn.service_id if _conn is not None else ""
     if not db.roster_hat_namen(interaction.guild_id, _sid_check, name):
         return await interaction.response.send_message(_t(
@@ -20476,38 +20562,71 @@ async def cmd_link(interaction: discord.Interaction, playstation_name: str):
                    f"\n⏱️ Spielzeit: **{_fmt_money(pro_stunde)}** pro Stunde auf dem Server",
                    f"\n⏱️ Playtime: **{_fmt_money(pro_stunde)}** per hour on the server")
                 if pro_stunde != 0 else "")
+    ist_haupt = not bestehende
+    rolle_line = _t(interaction, "🥇 Hauptaccount" if ist_haupt else "➕ Zusatz-Account",
+                    "🥇 Main account" if ist_haupt else "➕ Alt account")
     e = discord.Embed(
         title=_t(interaction, "🔗 Account verknüpft", "🔗 Account linked"),
         description=_t(
             interaction,
-            f"{interaction.user.mention} ↔ **{name}**\n"
+            f"{interaction.user.mention} ↔ **{name}** ({rolle_line})\n"
             f"☠️ Pro PvP-Kill: **{_fmt_money(reward)}**{pt_line}{online_line}",
-            f"{interaction.user.mention} ↔ **{name}**\n"
+            f"{interaction.user.mention} ↔ **{name}** ({rolle_line})\n"
             f"☠️ Per PvP kill: **{_fmt_money(reward)}**{pt_line}{online_line}"),
         color=0x2ECC71)
     await interaction.response.send_message(embed=e)
     note = discord.Embed(
         title="🔗 /link verwendet",
-        description=f"{interaction.user.mention} (`{interaction.user}`) hat sich mit **{name}** verknüpft.",
+        description=(f"{interaction.user.mention} (`{interaction.user}`) hat sich mit **{name}** "
+                     f"verknüpft ({'Hauptaccount' if ist_haupt else 'Zusatz-Account'})."),
         color=0x2ECC71)
     await _notify_link_change(interaction.guild_id, note)
 
 
-@bot.tree.command(name="unlink", description=app_commands.locale_str("🔓 Entfernt deine eigene Ingame-Verknüpfung"))
-async def cmd_unlink(interaction: discord.Interaction):
+async def _eigene_links_ac(interaction: discord.Interaction, current: str):
+    if interaction.guild_id is None:
+        return []
+    rows = db.get_links_by_user(interaction.guild_id, interaction.user.id)
+    cur = (current or "").lower()
+    return [app_commands.Choice(name=str(r["ingame_name"]), value=str(r["ingame_name"]))
+           for r in rows if cur in str(r["ingame_name"]).lower()][:25]
+
+
+@bot.tree.command(name="unlink", description=app_commands.locale_str("🔓 Entfernt eine deiner Ingame-Verknüpfungen"))
+@app_commands.describe(playstation_name="Welcher deiner verlinkten Namen getrennt werden soll "
+                                       "(bei nur einem Account: weglassen)")
+@app_commands.autocomplete(playstation_name=_eigene_links_ac)
+async def cmd_unlink(interaction: discord.Interaction, playstation_name: Optional[str] = None):
     if not await _require_guild(interaction):
         return
-    old = db.unlink_user(interaction.guild_id, interaction.user.id)
-    if not old:
+    bestehende = db.get_links_by_user(interaction.guild_id, interaction.user.id)
+    if not bestehende:
         return await interaction.response.send_message(_t(
             interaction, "❌ Du bist mit keinem Ingame-Namen verknüpft.",
             "❌ You are not linked to any in-game name."), ephemeral=True)
+    if playstation_name is None:
+        if len(bestehende) > 1:
+            namen = ", ".join(f"**{r['ingame_name']}**" for r in bestehende)
+            return await interaction.response.send_message(_t(
+                interaction,
+                f"❌ Du hast mehrere Accounts verlinkt ({namen}) – gib bei `/unlink` an, "
+                f"welchen du trennen willst.",
+                f"❌ You have multiple linked accounts ({namen}) – specify which one "
+                f"to unlink with `/unlink`."), ephemeral=True)
+        ziel = str(bestehende[0]["ingame_name"])
+    else:
+        ziel = playstation_name.strip()
+        if not any(str(r["ingame_name"]).lower() == ziel.lower() for r in bestehende):
+            return await interaction.response.send_message(_t(
+                interaction, f"❌ Du bist nicht mit **{ziel}** verknüpft.",
+                f"❌ You are not linked to **{ziel}**."), ephemeral=True)
+    db.unlink_specific(interaction.guild_id, interaction.user.id, ziel)
     await interaction.response.send_message(_t(
-        interaction, f"🔓 Verknüpfung mit **{old}** entfernt.",
-        f"🔓 Link to **{old}** removed."), ephemeral=True)
+        interaction, f"🔓 Verknüpfung mit **{ziel}** entfernt.",
+        f"🔓 Link to **{ziel}** removed."), ephemeral=True)
     note = discord.Embed(
         title="🔓 /unlink verwendet",
-        description=f"{interaction.user.mention} (`{interaction.user}`) hat die Verknüpfung mit **{old}** entfernt.",
+        description=f"{interaction.user.mention} (`{interaction.user}`) hat die Verknüpfung mit **{ziel}** entfernt.",
         color=0xE67E22)
     await _notify_link_change(interaction.guild_id, note)
 
@@ -20523,10 +20642,11 @@ async def cmd_forcelink(interaction: discord.Interaction,
     if not await _require_guild(interaction):
         return
     name = playstation_name.strip()
-    # Bestehende Verknüpfung dieses Namens (anderer User) lösen
+    # Bestehende Verknüpfung dieses Namens (anderer User) lösen - /forcelink
+    # ignoriert bewusst das max_linked_accounts-Limit (Admin-Sonderfall).
     for lk in db.links_for_name(name, interaction.guild_id):
         if int(lk["user_id"]) != user.id:
-            db.unlink_user(interaction.guild_id, int(lk["user_id"]))
+            db.unlink_specific(interaction.guild_id, int(lk["user_id"]), str(lk["ingame_name"]))
     db.link_user(interaction.guild_id, user.id, name)
     await interaction.response.send_message(_t(
         interaction, f"🔗 **{name}** ↔ {user.mention} verknüpft (Admin).",
@@ -20539,25 +20659,58 @@ async def cmd_forcelink(interaction: discord.Interaction,
     await _notify_link_change(interaction.guild_id, note)
 
 
-@bot.tree.command(name="forceunlink", description=app_commands.locale_str("🔓 (Admin) Entfernt die Verknüpfung eines Discord-Accounts"))
-@app_commands.describe(user="Discord-Mitglied")
-async def cmd_forceunlink(interaction: discord.Interaction, user: discord.Member):
+async def _ziel_user_links_ac(interaction: discord.Interaction, current: str):
+    if interaction.guild_id is None:
+        return []
+    ziel_user = getattr(interaction.namespace, "user", None)
+    if ziel_user is None:
+        return []
+    rows = db.get_links_by_user(interaction.guild_id, int(ziel_user.id))
+    cur = (current or "").lower()
+    return [app_commands.Choice(name=str(r["ingame_name"]), value=str(r["ingame_name"]))
+           for r in rows if cur in str(r["ingame_name"]).lower()][:25]
+
+
+@bot.tree.command(name="forceunlink", description=app_commands.locale_str("🔓 (Admin) Entfernt eine Verknüpfung eines Discord-Accounts"))
+@app_commands.describe(user="Discord-Mitglied",
+                       playstation_name="Welcher verlinkte Name getrennt werden soll "
+                                       "(bei nur einem Account: weglassen)")
+@app_commands.autocomplete(playstation_name=_ziel_user_links_ac)
+async def cmd_forceunlink(interaction: discord.Interaction, user: discord.Member,
+                          playstation_name: Optional[str] = None):
     if not _subcmd_allowed(interaction, "forceunlink"):
         return await _deny_subcmd(interaction)
     if not await _require_guild(interaction):
         return
-    old = db.unlink_user(interaction.guild_id, user.id)
-    if not old:
+    bestehende = db.get_links_by_user(interaction.guild_id, user.id)
+    if not bestehende:
         return await interaction.response.send_message(_t(
             interaction, f"❌ {user.mention} ist mit keinem Ingame-Namen verknüpft.",
             f"❌ {user.mention} is not linked to any in-game name."), ephemeral=True)
+    if playstation_name is None:
+        if len(bestehende) > 1:
+            namen = ", ".join(f"**{r['ingame_name']}**" for r in bestehende)
+            return await interaction.response.send_message(_t(
+                interaction,
+                f"❌ {user.mention} hat mehrere Accounts verlinkt ({namen}) – gib an, "
+                f"welchen du trennen willst.",
+                f"❌ {user.mention} has multiple linked accounts ({namen}) – specify "
+                f"which one to unlink."), ephemeral=True)
+        ziel = str(bestehende[0]["ingame_name"])
+    else:
+        ziel = playstation_name.strip()
+        if not any(str(r["ingame_name"]).lower() == ziel.lower() for r in bestehende):
+            return await interaction.response.send_message(_t(
+                interaction, f"❌ {user.mention} ist nicht mit **{ziel}** verknüpft.",
+                f"❌ {user.mention} is not linked to **{ziel}**."), ephemeral=True)
+    db.unlink_specific(interaction.guild_id, user.id, ziel)
     await interaction.response.send_message(_t(
-        interaction, f"🔓 Verknüpfung {user.mention} ↔ **{old}** entfernt (Admin).",
-        f"🔓 Link {user.mention} ↔ **{old}** removed (admin)."), ephemeral=True)
+        interaction, f"🔓 Verknüpfung {user.mention} ↔ **{ziel}** entfernt (Admin).",
+        f"🔓 Link {user.mention} ↔ **{ziel}** removed (admin)."), ephemeral=True)
     note = discord.Embed(
         title="🔓 /forceunlink verwendet",
         description=(f"{interaction.user.mention} hat die Verknüpfung "
-                     f"{user.mention} ↔ **{old}** entfernt."),
+                     f"{user.mention} ↔ **{ziel}** entfernt."),
         color=0xE67E22)
     await _notify_link_change(interaction.guild_id, note)
 
@@ -20571,23 +20724,27 @@ async def username_list(interaction: discord.Interaction):
     if not await _require_guild(interaction):
         return
     if not _subcmd_allowed(interaction, "username_list"):
-        # Normale Nutzer sehen nur die eigene Verknüpfung
-        own = db.get_link_by_user(interaction.guild_id, interaction.user.id)
-        if not own:
+        # Normale Nutzer sehen nur die eigenen Verknüpfungen
+        eigene = db.get_links_by_user(interaction.guild_id, interaction.user.id)
+        if not eigene:
             return await interaction.response.send_message(_t(
                 interaction, "ℹ️ Du bist mit keinem PSN-Namen verknüpft. Nutze `/link <psn-name>`.",
                 "ℹ️ You are not linked to any PSN name. Use `/link <psn-name>`."),
                 ephemeral=True)
-        name   = str(own["ingame_name"])
         _conn  = _conn_of(interaction)
         _sid   = _conn.service_id if _conn is not None else ""
-        online = "🟢 " if db.has_session(_sid, name) else "⚫ "
+        zeilen = []
+        for r in eigene:
+            online = "🟢 " if db.has_session(_sid, str(r["ingame_name"])) else "⚫ "
+            rolle = "🥇" if r["is_main"] else "➕"
+            zeilen.append(f"{online}{rolle} **{r['ingame_name']}**")
         e = discord.Embed(
-            title=_t(interaction, "🔗 Deine Verknüpfung", "🔗 Your Link"),
-            description=f"{online}**{name}** ↔ {interaction.user.mention}",
+            title=_t(interaction, "🔗 Deine Verknüpfungen", "🔗 Your Links"),
+            description="\n".join(zeilen),
             color=0x5865F2)
-        e.set_footer(text=_t(interaction, "🟢 = gerade auf dem Server · Admins sehen die vollständige Liste",
-                             "🟢 = currently on the server · Admins see the full list"))
+        e.set_footer(text=_t(
+            interaction, "🟢 = gerade auf dem Server · 🥇 = Hauptaccount · ➕ = Zusatz-Account",
+            "🟢 = currently on the server · 🥇 = main account · ➕ = alt account"))
         return await interaction.response.send_message(embed=e, ephemeral=True)
     rows = db.list_links(interaction.guild_id)
     if not rows:
@@ -20601,7 +20758,8 @@ async def username_list(interaction: discord.Interaction):
     _sid  = _conn.service_id if _conn is not None else ""
     for r in rows[:50]:
         online = "🟢 " if db.has_session(_sid, str(r["ingame_name"])) else "⚫ "
-        lines.append(f"{online}**{r['ingame_name']}** ↔ <@{int(r['user_id'])}>")
+        rolle = "🥇" if r["is_main"] else "➕"
+        lines.append(f"{online}{rolle} **{r['ingame_name']}** ↔ <@{int(r['user_id'])}>")
     e = discord.Embed(
         title=_t(interaction, f"🔗 Verknüpfte PSN-Namen ({len(rows)})",
                  f"🔗 Linked PSN Names ({len(rows)})"),
@@ -20609,9 +20767,9 @@ async def username_list(interaction: discord.Interaction):
         color=0x5865F2)
     e.set_footer(text=_t(
         interaction,
-        "🟢 = gerade auf dem Server (offene Spielzeit-Sitzung)"
+        "🟢 = gerade auf dem Server · 🥇 = Hauptaccount · ➕ = Zusatz-Account"
         + (f" · … und {len(rows) - 50} weitere" if len(rows) > 50 else ""),
-        "🟢 = currently on the server (open playtime session)"
+        "🟢 = currently on the server · 🥇 = main account · ➕ = alt account"
         + (f" · … and {len(rows) - 50} more" if len(rows) > 50 else "")))
     await interaction.response.send_message(embed=e, ephemeral=True)
 
@@ -20627,8 +20785,8 @@ async def cmd_bounty(interaction: discord.Interaction,
     if not await _require_guild(interaction):
         return
     name = spieler.strip()
-    own = db.get_link_by_user(interaction.guild_id, interaction.user.id)
-    if own and str(own["ingame_name"]).lower() == name.lower():
+    eigene = db.get_links_by_user(interaction.guild_id, interaction.user.id)
+    if any(str(r["ingame_name"]).lower() == name.lower() for r in eigene):
         return await interaction.response.send_message(_t(
             interaction, "❌ Auf deinen eigenen Kopf kannst du kein Kopfgeld aussetzen.",
             "❌ You can't place a bounty on your own head."), ephemeral=True)
@@ -31091,7 +31249,7 @@ def _faction_online_positions(conn: "ServerConnection", faction: Dict) -> List[D
     verlinkte_namen = set()
     for uid in (faction.get("member_user_ids") or []):
         try:
-            row = db.get_link_by_user(gid, int(uid))
+            row = db.get_main_link_by_user(gid, int(uid))
         except (TypeError, ValueError):
             continue
         if row:
@@ -31359,7 +31517,8 @@ def _read_balances(guild_id: int, limit: int = 200):
         rows = con.execute(
             """SELECT b.user_id, b.wallet, b.bank,
                       (SELECT ingame_name FROM links l
-                       WHERE l.guild_id=b.guild_id AND l.user_id=b.user_id) AS ingame
+                       WHERE l.guild_id=b.guild_id AND l.user_id=b.user_id
+                       AND l.is_main=1) AS ingame
                FROM balances b WHERE b.guild_id=?
                ORDER BY (b.wallet + b.bank) DESC LIMIT ?""",
             (guild_id, limit)).fetchall()
@@ -31449,6 +31608,7 @@ async def api_economy_get_config(request: web.Request) -> web.Response:
         "check_other_balances": conn.get("check_other_balances", True),
         "check_other_balances_bypass_role_ids":
             conn.get("check_other_balances_bypass_role_ids", []),
+        "max_linked_accounts": int(conn.get("max_linked_accounts", 1) or 1),
     })
 
 
@@ -31541,6 +31701,14 @@ async def api_economy_set_config(request: web.Request) -> web.Response:
         # Geldbewegung mit OverflowError abgebrochen – ein Klick auf
         # "Speichern" ohne jede Aenderung haette die Economy lahmgelegt.
         _conn_store(conn, key, min(wert, _SQLITE_INT_MAX))
+    if "max_linked_accounts" in data and data["max_linked_accounts"] is not None:
+        try:
+            limit = int(data["max_linked_accounts"])
+        except (TypeError, ValueError):
+            return err("max_linked_accounts muss eine Zahl sein.")
+        if limit < 1:
+            return err("max_linked_accounts muss mindestens 1 sein.")
+        _conn_store(conn, "max_linked_accounts", min(limit, 100))
     for key in ("economy_enabled", "wipe_money_on_leave",
                "prepend_currency_symbol", "check_other_balances"):
         if key in data:
@@ -33563,6 +33731,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "1eeffa7f5de28ebe32fc885dc8a5c5e9317e00a167ca97459fb6190ebce36c4d",
         "66a8cced120d446e3fdbb016c00e08a1b0a9401b0d56cf45b574ca71c4ebbd4a",
         "9b92dbf482bccaa106187aa84be254ff499f285c76c013b7901e478a8f5659ee",
+        "9644668e5481d94af80b959a1131de882b92db1b76a3b3891b4aedccb21c6ecc",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",

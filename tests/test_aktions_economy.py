@@ -134,7 +134,7 @@ def test_unverlinkter_spieler_bekommt_nichts(monkeypatch, edb):
     edb.roster_upsert_login(111, "1000", "SpielerA")
     conn = _FakeConn(action_economy={"connect": 50})
     _run(bot.bot._process_event_rewards({"type": "connect", "player": "SpielerA", "player_id": "ACC1"}, conn))
-    assert edb.get_link_by_user(111, 42) is None  # niemand verlinkt, kein Wallet-Ziel
+    assert edb.get_links_by_user(111, 42) == []  # niemand verlinkt, kein Wallet-Ziel
 
 
 def test_kill_pvp_zahlt_nur_ueber_kill_reward_kein_doppel_hook(monkeypatch, edb):
