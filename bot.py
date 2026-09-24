@@ -1688,6 +1688,15 @@ class NitradoAPI:
         self.service_id = service_id
         self.base       = base.rstrip("/")
         self._session: Optional[aiohttp.ClientSession] = None
+        # Eigener Ausfall-Zaehler fuer Server, die Logs ueber die API statt
+        # FTP lesen (_log_lesen_via_api) - _check_ftp_health beobachtete
+        # bisher NUR FTPManager.consecutive_failures, das bei einem
+        # API-Server ewig bei 0 blieb (list_files/seek_file ruehren die
+        # FTP-Verbindung nie an) und die Selbstheilung (frische
+        # Zugangsdaten ueber den Token holen) dadurch NIE ausloeste, egal
+        # wie oft die API mit HTTP 429/500 antwortete.
+        self.consecutive_failures = 0
+        self.last_error: str = ""
 
     def _headers(self) -> Dict:
         return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
@@ -1786,10 +1795,16 @@ class NitradoAPI:
                     data = await r.json()
                     entries = data.get("data", {}).get("entries")
                     if isinstance(entries, list):
+                        self.consecutive_failures = 0
+                        self.last_error = ""
                         return entries
                 log.warning(f"[NITRADO] list_files({directory}): HTTP {r.status}")
+                self.consecutive_failures += 1
+                self.last_error = f"HTTP {r.status} bei list_files({directory})"
         except Exception as e:
             log.warning(f"[NITRADO] list_files({directory}): {e}")
+            self.consecutive_failures += 1
+            self.last_error = str(e)
         return None
 
     # Live per Bisektion ermittelt: alles ueber diesem Wert antwortet mit
@@ -1821,17 +1836,27 @@ class NitradoAPI:
             async with s.get(url, params=params) as r:
                 if r.status != 200:
                     log.warning(f"[NITRADO] seek_file({path}): HTTP {r.status}")
+                    self.consecutive_failures += 1
+                    self.last_error = f"HTTP {r.status} bei seek_file({path})"
                     return None
                 data = await r.json()
                 seek_url = data.get("data", {}).get("token", {}).get("url")
                 if not seek_url:
+                    self.consecutive_failures += 1
+                    self.last_error = f"Keine Abruf-URL bei seek_file({path})"
                     return None
                 async with s.get(seek_url) as sr:
                     if sr.status == 200:
+                        self.consecutive_failures = 0
+                        self.last_error = ""
                         return await sr.read()
                     log.warning(f"[NITRADO] seek_file({path}): Abruf-URL HTTP {sr.status}")
+                    self.consecutive_failures += 1
+                    self.last_error = f"HTTP {sr.status} bei Abruf-URL von seek_file({path})"
         except Exception as e:
             log.warning(f"[NITRADO] seek_file({path}): {e}")
+            self.consecutive_failures += 1
+            self.last_error = str(e)
         return None
 
     # ── Auto-Erkennung (Service-ID, FTP-Zugang, Karte) ────────────
@@ -6764,7 +6789,14 @@ class DayZBot(discord.Client):
         if conn is None or conn.ftp is None:
             return
         ftp = conn.ftp
-        fails     = ftp.consecutive_failures
+        # Ein Server, der Logs über die Nitrado-API statt FTP liest
+        # (_log_lesen_via_api), ruehrt ftp.consecutive_failures NIE an -
+        # ohne diesen zweiten Zaehler blieb ein dauerhaft fehlschlagender
+        # API-Zugang (z.B. veralteter ftp_user nach einer Server-Neuerstellung)
+        # fuer die Selbstheilung unsichtbar, egal wie oft HTTP 429/500 kam.
+        api_fails = conn.api.consecutive_failures if conn.api is not None else 0
+        fails     = max(ftp.consecutive_failures, api_fails)
+        letzter_fehler = ftp.last_error or (conn.api.last_error if conn.api is not None else "")
         threshold = max(1, int(conn.get("ftp_fail_warn_cycles", 10) or 10))
         now = time.time()
         if fails >= threshold:
@@ -6790,7 +6822,7 @@ class DayZBot(discord.Client):
                                  f"(Host `{conn.get('ftp_host') or '–'}`).\n"
                                  f"Log-Feeds und Shop-Lieferungen sind unterbrochen!\n"
                                  f"Mögliche Ursachen: FTP-Passwort geändert, Nitrado-Wartung.\n"
-                                 f"Letzter Fehler: `{ftp.last_error or 'unbekannt'}`"),
+                                 f"Letzter Fehler: `{letzter_fehler or 'unbekannt'}`"),
                     color=0xE74C3C)
                 await _post_feed(conn.guild_ids, "adminlog", embed,
                                  service_id=conn.service_id)
