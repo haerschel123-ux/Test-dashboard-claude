@@ -262,8 +262,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "ftp_fail_warn_cycles: Nach so vielen FTP-Fehlzyklen in Folge postet der Bot",
         "  eine Warnung in den Adminlog-Channel (/setup feeds adminlog).",
         "kill_reward: Betrag, den ein per /link verknüpfter Spieler pro PvP-Kill erhält.",
-        "playtime_reward: amount pro interval_minutes Spielzeit (500 pro 30 Min = 1000/Std)",
-        "  – wird nur verlinkten Spielern gutgeschrieben.",
+        "action_economy: Betrag je Aktion (Tode, Treffer, Bauen, Flaggen, Verbindung,",
+        "  Bewusstsein, Sonstiges) sowie playtime_per_hour (Waehrung pro Online-Stunde,",
+        "  ausgezahlt bei Disconnect) – wird nur verlinkten Spielern gutgeschrieben.",
         "status_update_interval_seconds: Aktualisierungs-Intervall des Auto-Status-Embeds",
         "  (/setup feeds status #channel).",
         "auto_restart_schedule: Wird über /auto restart im Discord gesetzt (Startzeit +",
@@ -293,7 +294,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_events_per_cycle":           30,
     "ftp_fail_warn_cycles":           10,
     "kill_reward":                    100,
-    "playtime_reward":                {"amount": 500, "interval_minutes": 30},
+    "action_economy":                 {},
     "status_update_interval_seconds": 180,
     "auto_restart_schedule":          {"enabled": False, "first_time": "04:00", "interval_hours": 4},
     "economy_backup_keep":            7,
@@ -1032,6 +1033,29 @@ _BAU_VERBEN = {
     "dug in": "bury", "dug out": "unbury",
     "raised": "flag_raise", "lowered": "flag_lower",
 }
+
+# Aktions-Economy: EIN Zahlenfeld je hier gelisteter _feed_key()-Kategorie
+# (positiv = Gutschrift, negativ = Abzug, 0 = Default/wirkungslos). Nutzt
+# bewusst dieselben Schluessel wie _feed_key() zurueckgibt statt einer neuen
+# Benennung - so bleibt die Zuordnung Log-Zeile -> Kategorie an einer Stelle
+# (siehe _feed_key). "kill"/"long_range_kill" fehlen bewusst: die laufen
+# weiterhin ueber das bestehende kill_reward-Feld (siehe _process_event_
+# rewards), sonst wuerde ein PvP-Kill doppelt ausgezahlt. Combat Log, Rage
+# Quit, Spawn Kill, Player Teleport und Zombie Hit fehlen bewusst - der Bot
+# kann sie aus den ADM-Logs (noch) nicht erkennen (siehe Planungsnotiz).
+_AKTIONS_ECONOMY_SCHLUESSEL = (
+    "suicide_death", "zombie_death", "wolf_death", "bear_death", "fall_death",
+    "fire_death", "explosion_death", "trap_death", "barbed_wire_death",
+    "vehicle_death", "bleed_out_death", "unknown_death",
+    "trap_hit", "barbed_wire_hit", "animal_hit", "fall_damage_hit",
+    "fire_hit", "explosion_hit", "vehicle_hit", "player_hit",
+    "build", "dismantle", "place", "pack", "fold", "repair",
+    "mount", "unmount", "bury", "unbury",
+    "flag_raise", "flag_lower",
+    "connect", "disconnect",
+    "unconscious", "conscious",
+    "emote",
+)
 
 
 def _stichwort(text: Any, tabelle) -> Optional[str]:
@@ -3477,7 +3501,7 @@ class ServerConnection:
         "economy_enabled", "wipe_money_on_leave", "prepend_currency_symbol",
         "max_balance_bank", "max_balance_cash",
         "check_other_balances", "check_other_balances_bypass_role_ids",
-        "kill_reward", "playtime_reward",
+        "kill_reward", "action_economy",
         "shop_default_price", "shop_category_prices", "shop_categories_custom",
         "default_radius", "default_pos_y",
         "delivery_grace_seconds", "delivery_cleanup_delay_seconds",
@@ -5372,8 +5396,9 @@ class DayZBot(discord.Client):
 
             # Zonen-Pings: frisch getrackte Positionen gegen /zone-Zonen prüfen
             await self._check_zones(conn)
-            # Spielzeit-Belohnung für offene Sitzungen gutschreiben
-            await self._credit_playtime(conn)
+            # Spielzeit wird seit dem Aktions-Economy-Umbau nicht mehr hier
+            # periodisch gutgeschrieben, sondern bei jedem Disconnect direkt
+            # in _process_event_rewards (siehe _spielzeit_auszahlen).
             await self._check_ftp_health(conn)
             await _poll_zustand_melden(conn, None)
         except Exception as e:
@@ -6911,13 +6936,53 @@ class DayZBot(discord.Client):
                 pid = ev.get("player_id")
                 pid = pid if pid and pid != "Unbekannt" else None
                 await loop.run_in_executor(None, db.open_session, sid, ev["player"], pid)
-                if pid:
-                    for gid_ev in gids_ev:
+                for gid_ev in gids_ev:
+                    if gid_ev is not None:
+                        # Spieler-Seite: JEDER Connect traegt den Namen ein,
+                        # unabhaengig von /link (siehe player_roster).
+                        await loop.run_in_executor(None, db.roster_upsert_login,
+                                                   gid_ev, sid, ev["player"])
+                    if pid:
                         await loop.run_in_executor(None, db.update_link_id,
                                                    ev["player"], pid, gid_ev)
+                await self._aktion_auszahlen(conn, gids_ev, ev["player"], "connect")
 
             elif t == "disconnect":
-                await loop.run_in_executor(None, db.close_session, sid, ev["player"])
+                dauer_s = await loop.run_in_executor(None, db.close_session, sid, ev["player"])
+                for gid_ev in gids_ev:
+                    if gid_ev is not None:
+                        await loop.run_in_executor(None, db.roster_add_playtime,
+                                                   gid_ev, sid, ev["player"], dauer_s)
+                await self._aktion_auszahlen(conn, gids_ev, ev["player"], "disconnect")
+                await self._spielzeit_auszahlen(conn, gids_ev, ev["player"], dauer_s)
+
+            elif t in ("unconscious", "conscious", "emote"):
+                await self._aktion_auszahlen(conn, gids_ev, ev.get("player") or "", t)
+
+            elif t == "kill_env":
+                ursache = (_stichwort(ev.get("cause"), _URSACHE_TODE)
+                          or _stichwort(ev.get("raw"), _TODESVERBEN)
+                          or "unknown_death")
+                await self._aktion_auszahlen(conn, gids_ev, ev.get("player") or "", ursache)
+
+            elif t == "suicide":
+                await self._aktion_auszahlen(conn, gids_ev, ev.get("player") or "", "suicide_death")
+
+            elif t == "damage":
+                treffer = (_stichwort(ev.get("ammo"), _AMMO_TREFFER)
+                          or _stichwort(ev.get("weapon"), _URSACHE_TREFFER)
+                          or _stichwort(ev.get("attacker"), _URSACHE_TREFFER)
+                          or "player_hit")
+                await self._aktion_auszahlen(conn, gids_ev, ev.get("victim") or "", treffer)
+
+            elif t == "basebuild":
+                aktion = str(ev.get("aktion") or "").lower()
+                schluessel = _BAU_VERBEN.get(aktion)
+                if schluessel in ("flag_raise", "flag_lower") and "flag" not in str(
+                        ev.get("item") or "").lower():
+                    schluessel = "build"
+                await self._aktion_auszahlen(conn, gids_ev, ev.get("player") or "",
+                                             schluessel or "build")
 
             elif t == "kill_pvp":
                 killer = ev.get("killer") or ""
@@ -6955,44 +7020,62 @@ class DayZBot(discord.Client):
             log.error(f"[REWARD] Event-Verarbeitung fehlgeschlagen: {e}")
         return out
 
-    async def _credit_playtime(self, conn: Optional[ServerConnection] = None):
-        """Schreibt verlinkten Spielern volle Spielzeit-Blöcke gut
-        (playtime_reward: amount pro interval_minutes, z.B. 500 pro 30 Min)."""
-        if conn is not None and not conn.guild_ids:
-            return          # kein Discord-Server → keine Auszahlung
-        conf = ((conn.get("playtime_reward") if conn is not None
-                 else cfg.config.get("playtime_reward")) or {})
-        amount = max(0, int(conf.get("amount", 0)))
-        if amount <= 0:
+    async def _aktion_auszahlen(self, conn: Optional[ServerConnection],
+                                gids_ev: List[Optional[int]], name: str,
+                                schluessel: str) -> None:
+        """Bucht den in action_economy hinterlegten Betrag fuer EINE Aktion
+        (siehe _AKTIONS_ECONOMY_SCHLUESSEL) beim betroffenen Spieler - nur
+        wenn er in der jeweiligen Guild verlinkt ist, genau wie beim
+        bestehenden kill_reward. Negative Betraege sind ein Abzug;
+        add_wallet() deckelt selbst nach unten bei 0, kein eigener Schutz
+        noetig. Betrag 0 (Default) tut nichts, kein DB-Zugriff."""
+        if not name:
             return
-        interval = max(1, int(conf.get("interval_minutes", 30))) * 60
-        loop = asyncio.get_running_loop()
+        aktionen = (conn.get("action_economy", {}) if conn is not None
+                   else cfg.config.get("action_economy", {})) or {}
         try:
-            # Verpasste Connect-Events abfangen: verlinkte Spieler, die laut Log
-            # gerade aktiv sind, aber keine offene Sitzung haben → Sitzung öffnen
-            # NUR der Parser DIESES Servers: ein Rueckfall auf self.parser
-            # wuerde Spieler eines fremden Kunden Spielzeit gutschreiben.
-            positions = dict((conn.parser.player_positions if conn.parser else {})
-                             if conn is not None else self.parser.player_positions)
-            sid = conn.service_id if conn is not None else ""
-            # Wie bei _process_event_rewards: mehrere Guilds je Server bedeuten
-            # mehrere unabhaengige Verknuepfungen desselben Spielers.
-            gids_conn: List[Optional[int]] = list(conn.guild_ids) if conn is not None else [None]
-            for gid_conn in gids_conn:
-                await loop.run_in_executor(None, db.sync_sessions_from_positions,
-                                           sid, positions, 300, gid_conn)
-            due = await loop.run_in_executor(None, db.playtime_credits_due, sid, interval)
-            for entry in due:
-                for gid_conn in gids_conn:
-                    links = await loop.run_in_executor(None, db.links_for_name,
-                                                       entry["name"], gid_conn)
-                    for lk in links:
-                        gid, uid = int(lk["guild_id"]), int(lk["user_id"])
-                        credit = amount * int(entry["blocks"])
-                        await loop.run_in_executor(None, db.add_wallet, gid, uid, credit)
-                        log.info(f"[PLAYTIME] {entry['name']}: +{credit} für <@{uid}> (Guild {gid})")
-        except Exception as e:
-            log.error(f"[PLAYTIME] Gutschrift fehlgeschlagen: {e}")
+            betrag = int(aktionen.get(schluessel, 0) or 0)
+        except (TypeError, ValueError):
+            betrag = 0
+        if betrag == 0:
+            return
+        loop = asyncio.get_running_loop()
+        for gid_ev in gids_ev:
+            links = await loop.run_in_executor(None, db.links_for_name, name, gid_ev)
+            for lk in links:
+                gid, uid = int(lk["guild_id"]), int(lk["user_id"])
+                await loop.run_in_executor(None, db.add_wallet, gid, uid, betrag)
+
+    async def _spielzeit_auszahlen(self, conn: Optional[ServerConnection],
+                                   gids_ev: List[Optional[int]], name: str,
+                                   dauer_sekunden: float) -> None:
+        """Zahlt beim Disconnect die in dieser EINEN Sitzung verdiente
+        Spielzeit-Verguetung aus (action_economy.playtime_per_hour, in
+        Waehrung pro Stunde - wird hier in Waehrung pro Sekunde umgerechnet).
+        Ausgezahlt wird nur, wenn der abgerundete Betrag mindestens 1 ganze
+        Einheit ergibt - Bruchteile darunter verfallen, OHNE Uebertrag in die
+        naechste Sitzung (ausdrueckliche Vorgabe)."""
+        if not name or dauer_sekunden <= 0:
+            return
+        aktionen = (conn.get("action_economy", {}) if conn is not None
+                   else cfg.config.get("action_economy", {})) or {}
+        try:
+            pro_stunde = float(aktionen.get("playtime_per_hour", 0) or 0)
+        except (TypeError, ValueError):
+            pro_stunde = 0.0
+        if pro_stunde == 0:
+            return
+        verdient = math.floor(dauer_sekunden * (pro_stunde / 3600.0))
+        if verdient == 0:
+            return
+        loop = asyncio.get_running_loop()
+        for gid_ev in gids_ev:
+            links = await loop.run_in_executor(None, db.links_for_name, name, gid_ev)
+            for lk in links:
+                gid, uid = int(lk["guild_id"]), int(lk["user_id"])
+                await loop.run_in_executor(None, db.add_wallet, gid, uid, verdient)
+                log.info(f"[PLAYTIME] {name}: {verdient} für <@{uid}> (Guild {gid}, "
+                        f"{dauer_sekunden:.0f}s)")
 
 
 bot = DayZBot()
@@ -18060,6 +18143,22 @@ class EconomyDB:
                 account_id TEXT NOT NULL,
                 last_seen  REAL NOT NULL,
                 PRIMARY KEY (service_id, account_id))""")
+            # Spieler-Seite im Dashboard: JEDER jemals per Connect gesehene
+            # Ingame-Name, unabhaengig von /link - guild_id Teil des
+            # Schluessels, weil derselbe Server mehreren Guilds gehoeren kann
+            # (siehe Mehrfach-Guild-Umbau) und jede ihre eigene Sicht auf
+            # "wer hat sich hier schon verbunden" braucht. Die Discord-ID
+            # kommt nicht hier rein, sondern wird beim Lesen aus der
+            # links-Tabelle dazugejoint - sonst liefen beide Tabellen
+            # auseinander, sobald jemand /unlink macht.
+            c.execute("""CREATE TABLE IF NOT EXISTS player_roster (
+                guild_id     INTEGER NOT NULL,
+                service_id   TEXT    NOT NULL DEFAULT '',
+                ingame_name  TEXT    NOT NULL COLLATE NOCASE,
+                first_seen   REAL,
+                last_login   REAL,
+                total_playtime_seconds INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, service_id, ingame_name))""")
             self._migriere_serverspalten(c)
             c.commit()
 
@@ -18837,6 +18936,93 @@ class EconomyDB:
                 "SELECT * FROM links WHERE guild_id=? ORDER BY ingame_name COLLATE NOCASE",
                 (guild_id,)).fetchall())
 
+    # ── Spieler-Seite (player_roster) ─────────────────────────
+    def roster_upsert_login(self, guild_id: int, service_id: str, ingame_name: str) -> None:
+        """Connect-Event: Zeile anlegen (first_seen=jetzt) oder nur last_login
+        auffrischen, falls schon vorhanden."""
+        now = time.time()
+        sid = str(service_id or "")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO player_roster (guild_id, service_id, ingame_name, "
+                "first_seen, last_login, total_playtime_seconds) VALUES (?,?,?,?,?,0) "
+                "ON CONFLICT(guild_id, service_id, ingame_name) "
+                "DO UPDATE SET last_login=excluded.last_login",
+                (guild_id, sid, ingame_name, now, now))
+            self._conn.commit()
+
+    def roster_add_playtime(self, guild_id: int, service_id: str,
+                            ingame_name: str, seconds: float) -> None:
+        """Disconnect-Event: verstrichene Sitzungsdauer der Gesamt-Spielzeit
+        zuschlagen. Legt die Zeile an, falls sie (z.B. durch Bot-Neustart
+        waehrend der Sitzung) noch fehlt."""
+        if seconds <= 0:
+            return
+        sid = str(service_id or "")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO player_roster (guild_id, service_id, ingame_name, "
+                "first_seen, last_login, total_playtime_seconds) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(guild_id, service_id, ingame_name) "
+                "DO UPDATE SET total_playtime_seconds = total_playtime_seconds + excluded.total_playtime_seconds",
+                (guild_id, sid, ingame_name, time.time(), time.time(), int(seconds)))
+            self._conn.commit()
+
+    def roster_hat_namen(self, guild_id: int, service_id: str, ingame_name: str) -> bool:
+        """True, wenn dieser Ingame-Name schon einmal auf DIESEM Server (in
+        dieser Guild) per Connect gesehen wurde - Vorbedingung fuer /link."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM player_roster WHERE guild_id=? AND service_id=? "
+                "AND ingame_name=? COLLATE NOCASE",
+                (guild_id, str(service_id or ""), ingame_name)).fetchone()
+        return row is not None
+
+    def roster_list(self, guild_id: int, service_id: str, suche: str = "",
+                    limit: int = 10, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
+        """Spieler-Seite: Zeilen dieses Servers, mit Discord-ID (falls verlinkt)
+        und Online-Status dazugejoint. Gibt (zeilen, gesamtzahl) zurueck."""
+        sid = str(service_id or "")
+        like = f"%{suche}%" if suche else "%"
+        with self._lock:
+            gesamt = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM player_roster "
+                "WHERE guild_id=? AND service_id=? AND ingame_name LIKE ? COLLATE NOCASE",
+                (guild_id, sid, like)).fetchone()["n"]
+            rows = self._conn.execute(
+                "SELECT r.ingame_name AS ingame_name, r.first_seen AS first_seen, "
+                "r.last_login AS last_login, r.total_playtime_seconds AS total_playtime_seconds, "
+                "l.user_id AS user_id, "
+                "EXISTS(SELECT 1 FROM sessions s WHERE s.service_id=r.service_id "
+                "  AND s.ingame_name=r.ingame_name COLLATE NOCASE) AS online "
+                "FROM player_roster r "
+                "LEFT JOIN links l ON l.guild_id=r.guild_id "
+                "  AND l.ingame_name=r.ingame_name COLLATE NOCASE "
+                "WHERE r.guild_id=? AND r.service_id=? AND r.ingame_name LIKE ? COLLATE NOCASE "
+                "ORDER BY r.last_login DESC LIMIT ? OFFSET ?",
+                (guild_id, sid, like, limit, offset)).fetchall()
+        return [dict(r) for r in rows], int(gesamt)
+
+    def roster_delete(self, guild_id: int, service_id: str, ingame_name: str) -> bool:
+        """Loescht eine Spieler-Zeile und entlinkt sie zuvor, falls verknuepft
+        - ein spaeterer erneuter Connect legt den Namen frisch UND unverlinkt
+        wieder an."""
+        sid = str(service_id or "")
+        with self._lock:
+            link = self._conn.execute(
+                "SELECT user_id FROM links WHERE guild_id=? AND ingame_name=? COLLATE NOCASE",
+                (guild_id, ingame_name)).fetchone()
+            if link:
+                self._conn.execute(
+                    "DELETE FROM links WHERE guild_id=? AND user_id=?",
+                    (guild_id, int(link["user_id"])))
+            cur = self._conn.execute(
+                "DELETE FROM player_roster WHERE guild_id=? AND service_id=? "
+                "AND ingame_name=? COLLATE NOCASE",
+                (guild_id, sid, ingame_name))
+            self._conn.commit()
+        return cur.rowcount > 0
+
     def has_session(self, service_id: str, ingame_name: str) -> bool:
         """True, wenn für den Spieler auf DIESEM Server eine Sitzung offen ist."""
         with self._lock:
@@ -18935,12 +19121,22 @@ class EconomyDB:
                 (str(service_id or ""), ingame_name, ingame_id, now, now))
             self._conn.commit()
 
-    def close_session(self, service_id: str, ingame_name: str):
+    def close_session(self, service_id: str, ingame_name: str) -> float:
+        """Beendet die Sitzung und gibt ihre Dauer in Sekunden zurueck (0.0,
+        wenn keine offene Sitzung gefunden wurde) - Grundlage fuer die
+        Spielzeit-Vergütung bei Disconnect."""
+        sid = str(service_id or "")
         with self._lock:
+            row = self._conn.execute(
+                "SELECT connect_ts FROM sessions WHERE service_id=? AND ingame_name=? COLLATE NOCASE",
+                (sid, ingame_name)).fetchone()
             self._conn.execute(
                 "DELETE FROM sessions WHERE service_id=? AND ingame_name=? COLLATE NOCASE",
-                (str(service_id or ""), ingame_name))
+                (sid, ingame_name))
             self._conn.commit()
+        if not row:
+            return 0.0
+        return max(0.0, time.time() - float(row["connect_ts"]))
 
     def close_all_sessions(self, service_id: str):
         """Alle offenen Sitzungen EINES Servers beenden (Server-Neustart).
@@ -18952,28 +19148,6 @@ class EconomyDB:
             self._conn.execute("DELETE FROM sessions WHERE service_id=?",
                                (str(service_id or ""),))
             self._conn.commit()
-
-    def playtime_credits_due(self, service_id: str, interval_seconds: int) -> List[Dict]:
-        """Berechnet pro offener Sitzung dieses Servers neu fällige Spielzeit-
-        Blöcke und schreibt credited_blocks fort. Gibt [{name, blocks}] zurück."""
-        now = time.time()
-        sid = str(service_id or "")
-        out: List[Dict] = []
-        with self._lock:
-            rows = self._conn.execute("SELECT * FROM sessions WHERE service_id=?",
-                                      (sid,)).fetchall()
-            for r in rows:
-                total = int((now - float(r["connect_ts"])) // max(60, interval_seconds))
-                due = total - int(r["credited_blocks"])
-                if due > 0:
-                    self._conn.execute(
-                        "UPDATE sessions SET credited_blocks=?, last_seen_ts=? "
-                        "WHERE service_id=? AND ingame_name=?",
-                        (total, now, sid, r["ingame_name"]))
-                    out.append({"name": r["ingame_name"], "blocks": due})
-            if out:
-                self._conn.commit()
-        return out
 
     # ── Backup ────────────────────────────────────────────────
     def backup(self, keep: int = 7) -> Optional[str]:
@@ -20252,6 +20426,18 @@ async def cmd_link(interaction: discord.Interaction, playstation_name: str):
             f"um den Namen zu wechseln.",
             f"❌ You are already linked to **{old_name}** – use `/unlink` first "
             f"to change the name."), ephemeral=True)
+    _conn = _conn_of(interaction)
+    _sid_check = _conn.service_id if _conn is not None else ""
+    if not db.roster_hat_namen(interaction.guild_id, _sid_check, name):
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Der Name **{name}** existiert nicht oder du hast dich noch nicht "
+            f"mit dem Server verbunden und mindestens fünf Minuten gewartet. Er muss "
+            f"exakt so geschrieben sein wie oben rechts im DayZ-Hauptmenü.",
+            f"❌ The name **{name}** does not exist, or you haven't connected to the "
+            f"server and waited at least five minutes yet. It must be spelled exactly "
+            f"the way it appears in the top right corner of the DayZ main menu."),
+            ephemeral=True)
     ok, _why = db.link_user(interaction.guild_id, interaction.user.id, name)
     if not ok:
         return await interaction.response.send_message(_t(
@@ -20262,7 +20448,6 @@ async def cmd_link(interaction: discord.Interaction, playstation_name: str):
             f"An admin can fix this with `/forcelink`."), ephemeral=True)
     # Logs nach dem PSN-Namen prüfen: Ist der Spieler gerade auf dem Server,
     # startet der Spielzeit-Zähler sofort (kein neues Connect-Event nötig)
-    _conn = _conn_of(interaction)
     seen = _seen_in_logs(name, positions=(_conn.parser.player_positions
                                           if _conn is not None and _conn.parser else {}))
     _sid = _conn.service_id if _conn is not None else ""
@@ -20284,14 +20469,13 @@ async def cmd_link(interaction: discord.Interaction, playstation_name: str):
             "starts on your next connect.")
     reward   = int((_conn.get("kill_reward", 0) if _conn is not None
                     else cfg.config.get("kill_reward", 0)) or 0)
-    pt       = ((_conn.get("playtime_reward") if _conn is not None
-                 else cfg.config.get("playtime_reward")) or {})
+    aktionen = ((_conn.get("action_economy") if _conn is not None
+                else cfg.config.get("action_economy")) or {})
+    pro_stunde = int(aktionen.get("playtime_per_hour", 0) or 0)
     pt_line  = (_t(interaction,
-                   f"\n⏱️ Spielzeit: **{_fmt_money(int(pt.get('amount', 0)))}** pro "
-                   f"**{int(pt.get('interval_minutes', 30))} Min** auf dem Server",
-                   f"\n⏱️ Playtime: **{_fmt_money(int(pt.get('amount', 0)))}** per "
-                   f"**{int(pt.get('interval_minutes', 30))} min** on the server")
-                if int(pt.get("amount", 0)) > 0 else "")
+                   f"\n⏱️ Spielzeit: **{_fmt_money(pro_stunde)}** pro Stunde auf dem Server",
+                   f"\n⏱️ Playtime: **{_fmt_money(pro_stunde)}** per hour on the server")
+                if pro_stunde != 0 else "")
     e = discord.Embed(
         title=_t(interaction, "🔗 Account verknüpft", "🔗 Account linked"),
         description=_t(
@@ -25230,6 +25414,7 @@ _DASH_PERM_CATS: Tuple[Tuple[str, str, str, Tuple[str, ...]], ...] = (
     ("bans", "Bans", "Bans", ("view", "create", "delete")),
     ("whitelist", "Whitelist", "Whitelist", ("view", "create", "delete")),
     ("economy", "Economy", "Economy", ("view", "edit")),
+    ("players", "Spieler", "Players", ("view", "delete")),
     ("announce", "Ankündigungen", "Announcements", ("view", "create", "delete")),
     ("server", "Server", "Server", ("view", "edit")),
     ("events", "Event Vorlagen", "Event Templates", ("view", "create", "edit", "delete")),
@@ -31391,6 +31576,124 @@ async def api_economy_set_config(request: web.Request) -> web.Response:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+#  Spieler-Seite (player_roster) – automatisch aus connect-Events befuellte
+#  Liste aller je gesehenen Ingame-Namen, Grundlage fuer die verschaerfte
+#  /link-Pruefung. Bei mehreren zugeordneten Guilds (Mehrfach-Guild-Umbau)
+#  wird serverweit ueber die ERSTE zugeordnete Guild aufgeloest - dieselbe
+#  Vereinfachung wie bei den Zonen (_zonen_ziel).
+# ──────────────────────────────────────────────────────────────────────────
+async def api_players_list(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "players", "view")
+    if denied is not None:
+        return denied
+    if not conn.guild_ids:
+        return ok({"players": [], "total": 0})
+    gid = int(conn.guild_ids[0])
+    suche = str(request.query.get("search") or "")
+    try:
+        limit = max(1, min(200, int(request.query.get("limit") or 50)))
+        offset = max(0, int(request.query.get("offset") or 0))
+    except (TypeError, ValueError):
+        return err("limit/offset müssen Zahlen sein.")
+    rows, gesamt = await _dash_run(db.roster_list, gid, conn.service_id, suche, limit, offset)
+    return ok({
+        "players": [{
+            "ingame_name": r["ingame_name"],
+            "user_id": str(r["user_id"]) if r["user_id"] else None,
+            "online": bool(r["online"]),
+            "total_playtime_seconds": int(r["total_playtime_seconds"] or 0),
+            "first_seen": r["first_seen"],
+            "last_login": r["last_login"],
+        } for r in rows],
+        "total": gesamt,
+    })
+
+
+async def api_players_delete(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "players", "delete")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "players.delete", 5)
+    if denied is not None:
+        return denied
+    if not conn.guild_ids:
+        return err("Kein Discord-Server zugeordnet.")
+    name = request.match_info.get("name", "")
+    gid = int(conn.guild_ids[0])
+    geloescht = await _dash_run(db.roster_delete, gid, conn.service_id, name)
+    if not geloescht:
+        return err("Spieler nicht gefunden.", 404)
+    return ok()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Aktions-Economy – ein Zahlenfeld je Aktion (siehe _AKTIONS_ECONOMY_
+#  SCHLUESSEL). Bewusst eigenständig statt in /api/economy/config
+#  eingebaut: klarer Schnitt, negative Werte statt Spannen erlaubt.
+# ──────────────────────────────────────────────────────────────────────────
+async def api_economy_actions_get(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "economy", "view")
+    if denied is not None:
+        return denied
+    aktionen = conn.get("action_economy") or {}
+    return ok({
+        "action_economy": {k: int(aktionen.get(k, 0) or 0) for k in _AKTIONS_ECONOMY_SCHLUESSEL},
+        "playtime_per_hour": int(aktionen.get("playtime_per_hour", 0) or 0),
+        "kill_reward": int(conn.get("kill_reward", 0) or 0),
+    })
+
+
+async def api_economy_actions_set(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "economy", "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "economy.actions", 5)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    aktionen = dict(conn.get("action_economy") or {})
+    erlaubte_schluessel = set(_AKTIONS_ECONOMY_SCHLUESSEL) | {"playtime_per_hour"}
+    eingaben = data.get("action_economy")
+    if eingaben is not None:
+        if not isinstance(eingaben, dict):
+            return err("action_economy muss ein Objekt sein.")
+        for schluessel, wert in eingaben.items():
+            if schluessel not in erlaubte_schluessel:
+                return err(f"Unbekannte Aktion: {schluessel}")
+            if wert is None:
+                continue  # leeres Feld = nicht aendern
+            try:
+                zahl = int(wert)
+            except (TypeError, ValueError):
+                return err(f"{schluessel} muss eine Zahl sein.")
+            if not -_SQLITE_INT_MAX <= zahl <= _SQLITE_INT_MAX:
+                return err(f"{schluessel} ist zu groß.")
+            aktionen[schluessel] = zahl
+    _conn_store(conn, "action_economy", aktionen)
+    if "kill_reward" in data and data["kill_reward"] is not None:
+        try:
+            reward = int(data["kill_reward"])
+        except (TypeError, ValueError):
+            return err("kill_reward muss eine Zahl sein.")
+        if not 0 <= reward <= _SQLITE_INT_MAX:
+            return err("kill_reward darf nicht negativ oder zu groß sein.")
+        _conn_store(conn, "kill_reward", reward)
+    return ok()
+
+
+# ──────────────────────────────────────────────────────────────────────────
 #  Wiederkehrende Ankündigungen verwalten (announcements.json).
 #
 #  Schema je Eintrag: ``{day, time, message, channel_id, repeat, last_sent}``.
@@ -32409,6 +32712,12 @@ def build_app() -> web.Application:
     r.add_post("/api/economy/money", api_economy_money)
     r.add_get("/api/economy/config", api_economy_get_config)
     r.add_post("/api/economy/config", api_economy_set_config)
+    r.add_get("/api/economy/actions", api_economy_actions_get)
+    r.add_post("/api/economy/actions", api_economy_actions_set)
+
+    # ── Extras: Spieler-Seite ──
+    r.add_get("/api/players", api_players_list)
+    r.add_delete("/api/players/{name}", api_players_delete)
 
     # ── Extras: Ankündigungen ──
     r.add_get("/api/announcements", list_announcements)
@@ -33025,6 +33334,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "763bc500eebafb4cfa32dc062e73a6281a2bb39dbd291776276c9cdd2c658e07",
         "fe8ea19f77ec1994e9c96ec6a75492af6237b92ef2214ce3d1e97aa5a147c1d7",
         "152129e7f2a553f94e03a5c2b733c21172c083ae9f64582f86efc56b5b6c63fb",
+        "11a47d40ec27a3ad0e50ffac10130e3c10cb774cc3287979f6a1c89efee6728a",
     ),
     "styles.css": (
         "0dcb70fa1bee603d45b9b0dca4a0b8437f1b7ae65182c15d242f9eb625a3cfee",
@@ -33252,6 +33562,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "aca029422e2780b263e70d4e8ac69704814894d47acd829abd7ae7657eb93f4f",
         "1eeffa7f5de28ebe32fc885dc8a5c5e9317e00a167ca97459fb6190ebce36c4d",
         "66a8cced120d446e3fdbb016c00e08a1b0a9401b0d56cf45b574ca71c4ebbd4a",
+        "9b92dbf482bccaa106187aa84be254ff499f285c76c013b7901e478a8f5659ee",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
