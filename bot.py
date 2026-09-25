@@ -2139,6 +2139,31 @@ SIZE_FEHLER_GRENZE = 3
 # nicht sofort eine volle Verzeichnissuche ausloesen.
 _ADM_LEER_GRENZE = 5
 
+
+def _session_dauer_aus_log_zeitstempeln(connect_ts: Optional[str],
+                                        disconnect_ts: Optional[str]) -> Optional[float]:
+    """Sitzungsdauer aus den ADM-Zeitstempeln (``HH:MM:SS``) von Connect und
+    Disconnect - genauer als die WANDUHRZEIT des Bots (siehe EconomyDB.
+    close_session): verarbeitet der Bot beide Zeilen im selben Poll-Zyklus
+    oder in einem Rueckstand-Aufholvorgang nach einer Downtime, liegen
+    Connect und Disconnect fuer die WANDUHR nur Millisekunden auseinander,
+    obwohl im Log echte Minuten oder Stunden dazwischen liegen - genau das
+    hat Brigarde gemeldet ("0h 0m" trotz sichtbar laengerer Sitzung im Log).
+
+    Nimmt an, dass ``disconnect_ts`` zeitlich NACH ``connect_ts`` liegt und
+    hoechstens EINMAL Mitternacht ueberschritten wurde (fuer laengere
+    Sitzungen als 24h liefert das kein korrektes Ergebnis mehr - dort bleibt
+    die Wanduhr-Abschaetzung der Aufrufer die einzige Option). ``None`` bei
+    unlesbaren Zeitstempeln, damit der Aufrufer auf die Wanduhr zurueckfallen
+    kann statt eine falsche Zahl zu speichern."""
+    m1 = re.match(r'^(\d{2}):(\d{2}):(\d{2})$', connect_ts or "")
+    m2 = re.match(r'^(\d{2}):(\d{2}):(\d{2})$', disconnect_ts or "")
+    if not m1 or not m2:
+        return None
+    s1 = int(m1.group(1)) * 3600 + int(m1.group(2)) * 60 + int(m1.group(3))
+    s2 = int(m2.group(1)) * 3600 + int(m2.group(2)) * 60 + int(m2.group(3))
+    return float(s2 - s1) if s2 >= s1 else float(86400 - s1 + s2)
+
 # Wie oft je Server auf eine neue .RPT (= Serverneustart) geprueft wird.
 # Nicht in jedem Poll-Zyklus: die Abfrage kostet eine eigene FTP-Runde, aber
 # Neustarts kommen nur ein paar Mal am Tag vor. Siehe _pruefe_neustart.
@@ -7043,7 +7068,8 @@ class DayZBot(discord.Client):
             if t == "connect":
                 pid = ev.get("player_id")
                 pid = pid if pid and pid != "Unbekannt" else None
-                await loop.run_in_executor(None, db.open_session, sid, ev["player"], pid)
+                await loop.run_in_executor(None, db.open_session, sid, ev["player"], pid,
+                                           ev.get("timestamp"))
                 for gid_ev in gids_ev:
                     if gid_ev is not None:
                         # Spieler-Seite: JEDER Connect traegt den Namen ein,
@@ -7056,7 +7082,8 @@ class DayZBot(discord.Client):
                 await self._aktion_auszahlen(conn, gids_ev, ev["player"], "connect")
 
             elif t == "disconnect":
-                dauer_s = await loop.run_in_executor(None, db.close_session, sid, ev["player"])
+                dauer_s = await loop.run_in_executor(None, db.close_session, sid, ev["player"],
+                                                     ev.get("timestamp"))
                 for gid_ev in gids_ev:
                     if gid_ev is not None:
                         await loop.run_in_executor(None, db.roster_add_playtime,
@@ -18211,6 +18238,7 @@ class EconomyDB:
                 connect_ts      REAL NOT NULL,
                 last_seen_ts    REAL NOT NULL,
                 credited_blocks INTEGER NOT NULL DEFAULT 0,
+                connect_log_ts  TEXT,
                 PRIMARY KEY (service_id, ingame_name))""")
             # Alt Account Finder: welche Gamertags wurden je Server unter
             # welcher DayZ-Account-ID gesehen. service_id IMMER Teil des
@@ -18312,6 +18340,13 @@ class EconomyDB:
             c.execute("DROP TABLE links_alt")
             log.info("[ECON] Tabelle 'links' auf Mehrfach-Accounts umgestellt "
                      "(Bestand → jeweils Hauptaccount).")
+        spalten_sessions = {r["name"] for r in c.execute("PRAGMA table_info(sessions)")}
+        if spalten_sessions and "connect_log_ts" not in spalten_sessions:
+            # Nur eine neue, NULL-faehige Spalte - der Primaerschluessel bleibt
+            # unveraendert, deshalb reicht ADD COLUMN ohne Tabellen-Neubau.
+            c.execute("ALTER TABLE sessions ADD COLUMN connect_log_ts TEXT")
+            log.info("[ECON] Tabelle 'sessions' um connect_log_ts ergänzt "
+                     "(genauere Spielzeit-Berechnung aus den ADM-Zeitstempeln).")
         for tabelle in ("kills", "sessions", "purchases"):
             spalten = {r["name"] for r in c.execute(f"PRAGMA table_info({tabelle})")}
             if not spalten or "service_id" in spalten:
@@ -19318,25 +19353,43 @@ class EconomyDB:
         return total
 
     # ── Spielzeit-Sitzungen ───────────────────────────────────
-    def open_session(self, service_id: str, ingame_name: str, ingame_id: Optional[str]):
-        """Connect-Event: neue Sitzung (Reconnect setzt den Zähler zurück)."""
+    def open_session(self, service_id: str, ingame_name: str, ingame_id: Optional[str],
+                     connect_log_ts: Optional[str] = None):
+        """Connect-Event: neue Sitzung (Reconnect setzt den Zähler zurück).
+
+        ``connect_log_ts`` ist der ADM-Zeitstempel (``HH:MM:SS``) der
+        Connect-Zeile, falls bekannt - Grundlage fuer die genauere
+        Dauer-Berechnung in close_session (siehe dort)."""
         now = time.time()
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO sessions "
-                "(service_id, ingame_name, ingame_id, connect_ts, last_seen_ts, credited_blocks) "
-                "VALUES (?,?,?,?,?,0)",
-                (str(service_id or ""), ingame_name, ingame_id, now, now))
+                "(service_id, ingame_name, ingame_id, connect_ts, last_seen_ts, "
+                "credited_blocks, connect_log_ts) VALUES (?,?,?,?,?,0,?)",
+                (str(service_id or ""), ingame_name, ingame_id, now, now, connect_log_ts))
             self._conn.commit()
 
-    def close_session(self, service_id: str, ingame_name: str) -> float:
+    def close_session(self, service_id: str, ingame_name: str,
+                      disconnect_log_ts: Optional[str] = None) -> float:
         """Beendet die Sitzung und gibt ihre Dauer in Sekunden zurueck (0.0,
         wenn keine offene Sitzung gefunden wurde) - Grundlage fuer die
-        Spielzeit-Vergütung bei Disconnect."""
+        Spielzeit-Vergütung bei Disconnect.
+
+        Wird ``disconnect_log_ts`` mitgegeben UND wurde beim Connect
+        ebenfalls ein ADM-Zeitstempel gespeichert, berechnet sich die Dauer
+        aus DIESEN beiden Log-Zeitstempeln statt aus der Wanduhr des Bots
+        (_session_dauer_aus_log_zeitstempeln). Das behebt einen echten Fehler:
+        verarbeitet der Bot Connect und Disconnect im selben Poll-Zyklus oder
+        beim Aufholen eines Rueckstands nach Downtime, liegen beide fuer die
+        Wanduhr nur Millisekunden auseinander, obwohl im Log echte Minuten
+        oder Stunden dazwischen liegen - die Sitzung wurde dann faelschlich
+        mit ~0 Sekunden Dauer gezaehlt. Ohne brauchbare Zeitstempel bleibt die
+        Wanduhr der Rueckfall (besser als gar keine Zahl)."""
         sid = str(service_id or "")
         with self._lock:
             row = self._conn.execute(
-                "SELECT connect_ts FROM sessions WHERE service_id=? AND ingame_name=? COLLATE NOCASE",
+                "SELECT connect_ts, connect_log_ts FROM sessions "
+                "WHERE service_id=? AND ingame_name=? COLLATE NOCASE",
                 (sid, ingame_name)).fetchone()
             self._conn.execute(
                 "DELETE FROM sessions WHERE service_id=? AND ingame_name=? COLLATE NOCASE",
@@ -19344,6 +19397,9 @@ class EconomyDB:
             self._conn.commit()
         if not row:
             return 0.0
+        aus_log = _session_dauer_aus_log_zeitstempeln(row["connect_log_ts"], disconnect_log_ts)
+        if aus_log is not None:
+            return aus_log
         return max(0.0, time.time() - float(row["connect_ts"]))
 
     def close_all_sessions(self, service_id: str):
@@ -33856,6 +33912,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "66a8cced120d446e3fdbb016c00e08a1b0a9401b0d56cf45b574ca71c4ebbd4a",
         "9b92dbf482bccaa106187aa84be254ff499f285c76c013b7901e478a8f5659ee",
         "9644668e5481d94af80b959a1131de882b92db1b76a3b3891b4aedccb21c6ecc",
+        "b12926671fd9df53b9d277b8903403fdc4202d633db02d2a170afa7f1f8b13c7",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
