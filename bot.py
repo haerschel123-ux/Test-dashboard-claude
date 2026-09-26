@@ -11992,6 +11992,13 @@ async def _tools_datei_schreiben(conn: ServerConnection, dateiname: str,
     return await loop.run_in_executor(None, conn.ftp.write_file, pfad, inhalt)
 
 
+async def _tools_datei_loeschen(conn: ServerConnection, dateiname: str, loop) -> bool:
+    pfad = _mission_datei_pfad(conn, dateiname)
+    if not pfad or conn.ftp is None:
+        return False
+    return await loop.run_in_executor(None, conn.ftp.delete_file, pfad)
+
+
 async def _tools_datei_schreiben_wenn(commit: bool, conn: ServerConnection, dateiname: str,
                                       inhalt: str, loop) -> bool:
     """Wie _tools_datei_schreiben, aber nur wenn commit=True - sonst tut es so,
@@ -13397,6 +13404,165 @@ async def api_tools_custombuildmap_get(request: web.Request) -> web.Response:
         objekte = await _custom_build_objekte(conn, name, loop)
         ausgabe.append({"filename": name, "count": len(objekte), "points": objekte})
     return ok({"files": ausgabe, "status": status})
+
+
+def _custom_spawner_pfad_normalisieren(pfad: str) -> str:
+    """Vergleichs-Form eines objectSpawnersArr-Eintrags: fuehrendes "./" weg,
+    Backslashes zu Slash - "custom/x.json" und "./custom/x.json" gelten damit
+    als DERSELBE Eintrag (Brigardes ausdrueckliche Vorgabe: beide Schreib-
+    weisen sind in freier Wildbahn im Umlauf)."""
+    p = str(pfad or "").strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+_CUSTOM_BUILD_MAX_BYTES = 5_000_000  # 5 MB - grosszuegig fuer eine Objektliste, aber begrenzt
+
+
+async def api_tools_custombuildmap_import(request: web.Request) -> web.Response:
+    """Importiert eine Object-Spawner-JSON-Datei: schreibt sie nach
+    custom/<dateiname>.json und traegt sie in cfggameplay.json →
+    WorldsData.objectSpawnersArr ein, falls (normalisiert) noch nicht
+    vorhanden. Existiert die Datei bereits und wurde kein ``overwrite``
+    mitgeschickt, meldet die Antwort einen Konflikt statt zu schreiben -
+    das Dashboard zeigt dann eine Bestaetigung und ruft mit
+    ``overwrite: true`` erneut auf (Brigardes ausdrueckliche Vorgabe)."""
+    conn, fehler = _session_conn(request, "tools.custombuildmap")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.custombuildmap", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.custombuildmap.import", 10)
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    dateiname = str(data.get("filename") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}\.json", dateiname):
+        return err("Der Dateiname darf nur Buchstaben, Ziffern, . _ - enthalten "
+                   "und muss auf .json enden (kein Pfad, nur der reine Dateiname).")
+    inhalt = data.get("content")
+    if not isinstance(inhalt, str) or not inhalt.strip():
+        return err("Bitte den JSON-Inhalt der Spawner-Datei einfügen.")
+    if len(inhalt.encode("utf-8", errors="ignore")) > _CUSTOM_BUILD_MAX_BYTES:
+        return err(f"Die Datei ist zu groß (höchstens "
+                   f"{_CUSTOM_BUILD_MAX_BYTES // 1_000_000} MB).")
+    try:
+        geparst = json.loads(inhalt)
+    except (TypeError, ValueError) as e:
+        return err(f"Das ist kein gültiges JSON: {e}")
+    if not isinstance(geparst, dict):
+        return err("Die Object-Spawner-Datei muss ein JSON-Objekt sein.")
+    if not isinstance(geparst.get("Objects"), list):
+        return err("Die Object-Spawner-Datei braucht ein Feld „Objects“ (Liste).")
+    if not _mission_dir_of(conn):
+        return err("Kein Mission-Ordner für diesen Server bekannt – "
+                   "Auto-Erkennung noch nicht gelaufen?", 409)
+
+    loop = asyncio.get_running_loop()
+    ziel = f"custom/{dateiname}"
+    _vorhanden, lese_status = await _tools_datei_lesen(conn, ziel, loop)
+    if lese_status == "error":
+        return err("Konnte nicht prüfen, ob die Datei schon existiert (FTP-Fehler).", 502)
+    if lese_status == "ok" and not bool(data.get("overwrite")):
+        return ok({"konflikt": True, "filename": ziel})
+
+    if not await _tools_datei_schreiben(conn, ziel, inhalt, loop):
+        return err("Die Datei konnte nicht auf dem Server gespeichert werden.", 502)
+
+    gameplay, status = await _tools_json_lesen(conn, "cfggameplay.json", loop)
+    if status != "ok" or not isinstance(gameplay, dict):
+        return err(f"Die Datei `{ziel}` wurde gespeichert, aber die "
+                   f"cfggameplay.json ist nicht lesbar – bitte den Eintrag in "
+                   f"objectSpawnersArr von Hand ergänzen.", 502)
+    liste = _json_wert_finden(gameplay, "objectSpawnersArr")
+    if not isinstance(liste, list):
+        worldsdata = gameplay.setdefault("WorldsData", {})
+        if not isinstance(worldsdata, dict):
+            return err(f"Die Datei `{ziel}` wurde gespeichert, aber in der "
+                       f"cfggameplay.json gibt es keinen Abschnitt für "
+                       f"objectSpawnersArr – bitte von Hand ergänzen.", 502)
+        liste = []
+        worldsdata["objectSpawnersArr"] = liste
+    ziel_norm = _custom_spawner_pfad_normalisieren(ziel)
+    bereits_drin = any(_custom_spawner_pfad_normalisieren(e) == ziel_norm
+                       for e in liste if isinstance(e, str))
+    if not bereits_drin:
+        liste.append(ziel)
+        if not await _tools_datei_schreiben(
+                conn, "cfggameplay.json",
+                json.dumps(gameplay, indent=4, ensure_ascii=False) + "\n", loop):
+            return err(f"Die Datei `{ziel}` wurde gespeichert, aber der Eintrag in "
+                       f"der cfggameplay.json ist fehlgeschlagen – bitte von Hand "
+                       f"ergänzen.", 502)
+
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+              "Tool: Custom-Build-Spawner importiert",
+              f"{ziel} ({len(geparst.get('Objects') or [])} Objekte) · {conn.name}")
+    dateien, dateien_status = await _custom_build_dateien(conn, loop)
+    ausgabe = []
+    for name in dateien:
+        objekte = await _custom_build_objekte(conn, name, loop)
+        ausgabe.append({"filename": name, "count": len(objekte), "points": objekte})
+    return ok({"geschrieben": True, "eingetragen": True, "filename": ziel,
+              "files": ausgabe, "status": dateien_status})
+
+
+async def api_tools_custombuildmap_remove(request: web.Request) -> web.Response:
+    """Entfernt einen custom/*.json-Eintrag aus objectSpawnersArr UND
+    versucht, die Datei selbst vom Server zu löschen (best effort - schlägt
+    das Löschen fehl, bleibt der Array-Eintrag trotzdem entfernt, damit der
+    Object Spawner die Datei beim nächsten Neustart nicht mehr lädt)."""
+    conn, fehler = _session_conn(request, "tools.custombuildmap")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.custombuildmap", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.custombuildmap.remove", 10)
+    if fehler is not None:
+        return fehler
+    basisname = str(request.match_info.get("filename", "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}\.json", basisname):
+        return err("Ungültiger Dateiname.")
+    ziel = f"custom/{basisname}"
+    if not _mission_dir_of(conn):
+        return err("Kein Mission-Ordner für diesen Server bekannt.", 409)
+    loop = asyncio.get_running_loop()
+    gameplay, status = await _tools_json_lesen(conn, "cfggameplay.json", loop)
+    if status != "ok" or not isinstance(gameplay, dict):
+        return err("Die cfggameplay.json ist nicht lesbar.", 502)
+    liste = _json_wert_finden(gameplay, "objectSpawnersArr")
+    if not isinstance(liste, list):
+        return err("Kein objectSpawnersArr in der cfggameplay.json gefunden.", 404)
+    ziel_norm = _custom_spawner_pfad_normalisieren(ziel)
+    neue_liste = [e for e in liste if not (isinstance(e, str)
+                 and _custom_spawner_pfad_normalisieren(e) == ziel_norm)]
+    if len(neue_liste) == len(liste):
+        return err(f"`{ziel}` steht nicht in objectSpawnersArr.", 404)
+    liste[:] = neue_liste
+    if not await _tools_datei_schreiben(
+            conn, "cfggameplay.json",
+            json.dumps(gameplay, indent=4, ensure_ascii=False) + "\n", loop):
+        return err("Der Eintrag konnte nicht aus der cfggameplay.json entfernt werden.", 502)
+    datei_geloescht = await _tools_datei_loeschen(conn, ziel, loop)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+              "Tool: Custom-Build-Spawner entfernt",
+              f"{ziel} (Datei gelöscht: {datei_geloescht}) · {conn.name}")
+    dateien, dateien_status = await _custom_build_dateien(conn, loop)
+    ausgabe = []
+    for name in dateien:
+        objekte = await _custom_build_objekte(conn, name, loop)
+        ausgabe.append({"filename": name, "count": len(objekte), "points": objekte})
+    return ok({"entfernt": True, "datei_geloescht": datei_geloescht,
+              "files": ausgabe, "status": dateien_status})
 
 
 # ── 2b. Sky Message Generator ─────────────────────────────────────────────
@@ -32993,6 +33159,8 @@ def build_app() -> web.Application:
     r.add_get("/api/tools/lootexclusion", api_tools_lootexclusion_get)
     r.add_post("/api/tools/lootexclusion", api_tools_lootexclusion_post)
     r.add_get("/api/tools/custombuildmap", api_tools_custombuildmap_get)
+    r.add_post("/api/tools/custombuildmap/import", api_tools_custombuildmap_import)
+    r.add_delete("/api/tools/custombuildmap/{filename}", api_tools_custombuildmap_remove)
     r.add_get("/api/tools/skymessage", api_tools_skymessage_get)
     r.add_post("/api/tools/skymessage", api_tools_skymessage_post)
     r.add_get("/api/tools/typesmanager", api_tools_typesmanager_get)
@@ -33913,6 +34081,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "9b92dbf482bccaa106187aa84be254ff499f285c76c013b7901e478a8f5659ee",
         "9644668e5481d94af80b959a1131de882b92db1b76a3b3891b4aedccb21c6ecc",
         "b12926671fd9df53b9d277b8903403fdc4202d633db02d2a170afa7f1f8b13c7",
+        "391ff9f9dad38e7fa6e74efb6968d754e84251df3a41f30cebeddfd65d8c08eb",
     ),
     "map.js": (
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
