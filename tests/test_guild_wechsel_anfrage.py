@@ -130,32 +130,47 @@ def test_gleiche_guild_erneut_ausgewaehlt_loest_keine_unnoetige_anfrage_aus(monk
     bot._SESS_STORE.pop(sid, None)
 
 
-def test_login_vorauswahl_bei_nur_einer_eigenen_guild_ueberspringt_auswahl():
-    # Klassischer Fall: der Server ist genau einer Guild zugeordnet, das Konto
-    # besitzt keine weitere eigene Guild - der Auswahlschritt darf entfallen.
+def test_login_vorauswahl_eigentuemer_zeigt_immer_auswahl():
+    # Brigardes ausdrueckliche Vorgabe: Eigentuemer-Konten sehen bei JEDEM
+    # Login die Kachel-Auswahl, auch wenn nur eine eigene Guild vorhanden und
+    # der Server bereits zugeordnet ist - kein automatisches Ueberspringen
+    # mehr, egal wie eindeutig der Fall ist.
     conn = bot.connections.upsert("srv-login-1", nitrado_token="fake", owner_discord_id="777")
     bot.connections.assign_guild("srv-login-1", 111)
     eigene = [{"id": "111"}]
-    assert bot._login_guild_vorauswahl("777", eigene, conn) == "111"
+    assert bot._login_guild_vorauswahl("777", eigene, conn, False) is None
 
 
-def test_login_vorauswahl_bei_weiterer_unverbundener_guild_zeigt_auswahl():
-    # Brigardes gemeldeter Fall: derselbe Nitrado Server 1 ist bereits mit
-    # Discord Server 1 verbunden, das Konto besitzt zusaetzlich Discord
-    # Server 2, an dem noch KEIN eigener Server haengt - hier darf die
-    # Guild-Auswahl beim Login nicht automatisch uebersprungen werden, sonst
-    # kommt der Kunde nie mehr bis zur Anfrage fuer Discord Server 2.
+def test_login_vorauswahl_gast_ueberspringt_auswahl_wenn_eindeutig():
+    # Gast-Zugaenge haben keine eigene Server-Auswahl - fuer sie bleibt die
+    # bisherige automatische Vorbelegung bestehen, wenn es nichts zu
+    # entscheiden gibt.
+    conn = bot.connections.upsert("srv-login-1g", nitrado_token="fake", owner_discord_id="777g")
+    bot.connections.assign_guild("srv-login-1g", 111)
+    eigene = [{"id": "111"}]
+    assert bot._login_guild_vorauswahl("777g", eigene, conn, True) == "111"
+
+
+def test_login_vorauswahl_gast_bei_weiterer_unverbundener_guild_zeigt_auswahl():
+    # Brigardes gemeldeter Fall (fuer Gast-Zugaenge weiterhin relevant):
+    # derselbe Nitrado Server 1 ist bereits mit Discord Server 1 verbunden,
+    # das Konto besitzt zusaetzlich Discord Server 2, an dem noch KEIN
+    # eigener Server haengt - hier darf die Guild-Auswahl beim Login nicht
+    # automatisch uebersprungen werden, sonst kommt der Kunde nie mehr bis
+    # zur Anfrage fuer Discord Server 2.
     conn = bot.connections.upsert("srv-login-2", nitrado_token="fake", owner_discord_id="778")
     bot.connections.assign_guild("srv-login-2", 111)
     eigene = [{"id": "111"}, {"id": "222"}]
-    assert bot._login_guild_vorauswahl("778", eigene, conn) is None
+    assert bot._login_guild_vorauswahl("778", eigene, conn, True) is None
 
 
 def test_login_vorauswahl_ohne_verbindung_zeigt_auswahl():
-    assert bot._login_guild_vorauswahl("779", [{"id": "111"}], None) is None
+    assert bot._login_guild_vorauswahl("779", [{"id": "111"}], None, False) is None
+    assert bot._login_guild_vorauswahl("779", [{"id": "111"}], None, True) is None
 
 
 def test_login_vorauswahl_ohne_zugeordnete_guild_zeigt_auswahl():
     conn = bot.connections.upsert("srv-login-3", nitrado_token="fake", owner_discord_id="780")
     assert conn.guild_id is None
-    assert bot._login_guild_vorauswahl("780", [{"id": "111"}], conn) is None
+    assert bot._login_guild_vorauswahl("780", [{"id": "111"}], conn, False) is None
+    assert bot._login_guild_vorauswahl("780", [{"id": "111"}], conn, True) is None

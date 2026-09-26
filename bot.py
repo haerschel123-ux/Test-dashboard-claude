@@ -24525,21 +24525,25 @@ async def api_discord_start(request: web.Request) -> web.Response:
 
 
 def _login_guild_vorauswahl(discord_id: str, eigene: List[Dict[str, Any]],
-                            conn: Optional[ServerConnection]) -> Optional[str]:
+                            conn: Optional[ServerConnection],
+                            is_guest: bool) -> Optional[str]:
     """Welche Guild-ID soll die neue Session vorbelegen (oder None, damit das
     Frontend die Guild-Auswahl zeigt)?
 
-    Wiedererkannt: die Guild des eigenen Servers gilt als vorausgewaehlt, der
-    Auswahlschritt entfaellt - ABER nur, wenn es dabei nichts zu entscheiden
-    gibt. Besitzt das Konto noch eine WEITERE eigene Guild ohne eigenen
-    Server (z.B. eine zweite Community), wuerde ein festes Vorbelegen die
-    Guild-Auswahl im Frontend komplett ueberspringen (siehe
-    showOnboarding()) - ein Kunde, der denselben Nitrado-Server zusaetzlich
-    bei einem ANDEREN Discord anfragen will, kaeme so nie mehr bis zu
-    /api/auth/guild bzw. /api/auth/select-server, egal wie oft er sich neu
-    anmeldet (gemeldeter Fehler: die Anfrage tauchte nie in der Serverliste
-    auf). Nur ueberspringen, wenn es keine solche unverbundene Guild gibt.
+    Eigentuemer-Konten (nicht Gast): IMMER None - jeder Login zeigt zwingend
+    die Kachel-Auswahl (Brigardes ausdrueckliche Vorgabe: "immer, egal ob neu
+    oder schon registriert"), kein automatisches Ueberspringen mehr, auch
+    nicht bei nur einer eigenen Guild.
+
+    Gast-Zugaenge bleiben wie bisher automatisch vorbelegt - fuer sie gibt es
+    keine eigene Server-Auswahl (ihr Zugriff kommt ueber eine fremde Guild),
+    aber nur, wenn es dabei nichts zu entscheiden gibt: besitzt das Konto
+    zusaetzlich eine eigene, noch unverbundene Guild, muss die Auswahl
+    trotzdem erscheinen (siehe frueherer Fehler: eine zweite Anfrage tauchte
+    sonst nie in der Serverliste auf).
     """
+    if not is_guest:
+        return None
     if conn is None or not conn.guild_ids:
         return None
     verbundene: Set[int] = set()
@@ -24606,7 +24610,8 @@ async def api_discord_callback(request: web.Request) -> web.Response:
                        token_invalid=token_invalid,
                        owned_guilds=eigene,
                        is_guest=is_guest,
-                       guild_id=_login_guild_vorauswahl(view["id"], eigene, conn))
+                       guild_id=_login_guild_vorauswahl(view["id"], eigene, conn,
+                                                        is_guest))
     if conn is not None:
         _SESS_STORE[sid]["map_name"] = conn.get("map_name")
 
@@ -33851,6 +33856,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "fe8ea19f77ec1994e9c96ec6a75492af6237b92ef2214ce3d1e97aa5a147c1d7",
         "152129e7f2a553f94e03a5c2b733c21172c083ae9f64582f86efc56b5b6c63fb",
         "11a47d40ec27a3ad0e50ffac10130e3c10cb774cc3287979f6a1c89efee6728a",
+        "ed353c1afacead0c5c54291a1665ec5078ab0dfc09b2bbe0e1977784f100a214",
     ),
     "styles.css": (
         "0dcb70fa1bee603d45b9b0dca4a0b8437f1b7ae65182c15d242f9eb625a3cfee",
@@ -33897,6 +33903,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "e357e9c21274733dfa3bc5ddc38012aa3ec286b5e909390c1f980cb6d2c18885",
         "359d2cdb30fd6ac926159f944d03f50fb2dae2c4db25eaa40b969c489edf6e45",
         "9b92dbf482bccaa106187aa84be254ff499f285c76c013b7901e478a8f5659ee",
         "47d22532d8398efcc9d6ad0ca1016b5b46913fd6f1345d512078347f91fb6280",
