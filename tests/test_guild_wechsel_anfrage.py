@@ -216,3 +216,34 @@ def test_optionen_ignorieren_fremde_gewaehlte_guild():
     d = _options_json(_run(bot.api_options(req)))
     assert d["guild_id"] == "1515972218708824186"
     bot._SESS_STORE.pop(sid, None)
+
+
+def _feeds_guild_ids(sess_daten):
+    sid = f"test-sid-{time.time_ns()}"
+    bot._SESS_STORE[sid] = dict(sess_daten, seen=time.time())
+    req = make_mocked_request("GET", "/api/feeds",
+                              headers={"Cookie": f"{bot._SESS_COOKIE}={sid}"})
+    d = _options_json(_run(bot.get_feeds(req)))
+    bot._SESS_STORE.pop(sid, None)
+    return [g["id"] for g in d["guilds"]]
+
+
+def test_feeds_zeigen_nur_gewaehlte_guild_bei_mehreren_zuordnungen():
+    # Brigardes Fall: gewaehlt ist die zweite Guild - die Feed-Seite darf
+    # nicht die Feeds der zuerst zugeordneten zeigen.
+    bot.connections.upsert("srv-feed-1", nitrado_token="fake", owner_discord_id="903")
+    bot.connections.add_guild("srv-feed-1", 1515972218708824187)
+    bot.connections.add_guild("srv-feed-1", 1447490390486941738)
+    ids = _feeds_guild_ids({"token": "fake", "discord": {"id": "903"},
+                            "service_id": "srv-feed-1",
+                            "guild_id": "1447490390486941738"})
+    assert [str(i) for i in ids] == ["1447490390486941738"]
+
+
+def test_feeds_ohne_passende_wahl_zeigen_alle_zuordnungen():
+    bot.connections.upsert("srv-feed-2", nitrado_token="fake", owner_discord_id="904")
+    bot.connections.add_guild("srv-feed-2", 1515972218708824188)
+    bot.connections.add_guild("srv-feed-2", 1447490390486941739)
+    ids = _feeds_guild_ids({"token": "fake", "discord": {"id": "904"},
+                            "service_id": "srv-feed-2", "guild_id": None})
+    assert [str(i) for i in ids] == ["1515972218708824188", "1447490390486941739"]

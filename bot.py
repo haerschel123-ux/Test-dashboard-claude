@@ -27935,6 +27935,12 @@ async def get_feeds(request: web.Request) -> web.Response:
         return denied
     sid = conn.service_id if conn is not None else None
     guild_ids = list(conn.guild_ids) if conn is not None else []
+    # Haengt der Server an mehreren Guilds, nur die in DIESER Sitzung
+    # gewaehlte - sonst zeigt die Seite (und state.gid im Frontend) die
+    # Feeds der zuerst zugeordneten Guild.
+    _gewaehlt = str((sess or {}).get("guild_id") or "")
+    if _gewaehlt.isdigit() and int(_gewaehlt) in guild_ids:
+        guild_ids = [int(_gewaehlt)]
     # Nicht freigeschaltete "beta"/"premium"-Module bleiben unsichtbar, damit
     # ein Kunde sie nicht ueber die API sieht, obwohl set_feed sie ohnehin
     # ablehnt. "under_review" ist die Ausnahme: sichtbar, aber mit
