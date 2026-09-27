@@ -174,3 +174,45 @@ def test_login_vorauswahl_ohne_zugeordnete_guild_zeigt_auswahl():
     assert conn.guild_id is None
     assert bot._login_guild_vorauswahl("780", [{"id": "111"}], conn, False) is None
     assert bot._login_guild_vorauswahl("780", [{"id": "111"}], conn, True) is None
+
+
+def _options_request(sess_daten):
+    sid = f"test-sid-{time.time_ns()}"
+    bot._SESS_STORE[sid] = dict(sess_daten, seen=time.time())
+    req = make_mocked_request("GET", "/api/options",
+                              headers={"Cookie": f"{bot._SESS_COOKIE}={sid}"})
+    return req, sid
+
+
+def _options_json(resp):
+    import json
+    return json.loads(resp.text)["data"]
+
+
+def test_optionen_zeigen_gewaehlte_guild_bei_mehreren_zuordnungen():
+    # Brigardes Fall: Server haengt an "Bot test 2" (zuerst zugeordnet) UND
+    # "After The Outbreak PvP/PvE". Gewaehlt ist Letztere - die Optionen
+    # duerfen nicht stur die erste Zuordnung zeigen.
+    conn = bot.connections.upsert("srv-opt-1", nitrado_token="fake", owner_discord_id="901")
+    bot.connections.add_guild("srv-opt-1", 1515972218708824185)
+    bot.connections.add_guild("srv-opt-1", 1400000000000000001)
+    assert conn.guild_ids[0] == 1515972218708824185
+    req, sid = _options_request({"token": "fake", "discord": {"id": "901"},
+                                 "service_id": "srv-opt-1",
+                                 "guild_id": "1400000000000000001"})
+    d = _options_json(_run(bot.api_options(req)))
+    assert d["guild_id"] == "1400000000000000001"
+    bot._SESS_STORE.pop(sid, None)
+
+
+def test_optionen_ignorieren_fremde_gewaehlte_guild():
+    # Gehoert die gewaehlte Guild NICHT zu diesem Server, bleibt es bei der
+    # ersten echten Zuordnung - keine fremde ID anzeigen.
+    bot.connections.upsert("srv-opt-2", nitrado_token="fake", owner_discord_id="902")
+    bot.connections.add_guild("srv-opt-2", 1515972218708824186)
+    req, sid = _options_request({"token": "fake", "discord": {"id": "902"},
+                                 "service_id": "srv-opt-2",
+                                 "guild_id": "1999999999999999999"})
+    d = _options_json(_run(bot.api_options(req)))
+    assert d["guild_id"] == "1515972218708824186"
+    bot._SESS_STORE.pop(sid, None)

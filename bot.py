@@ -26928,14 +26928,20 @@ async def api_options(request: web.Request) -> web.Response:
     _uid = str((sess.get("discord") or {}).get("id") or "")
     if _fremder_besitzer(sess, conn) and not _dash_guest_actions(_uid, conn):
         return err(_BESITZER_GEWECHSELT, 403)
-    guild = (bot.get_guild(conn.guild_id)
-             if (bot is not None and conn.guild_id) else None)
+    # Haengt der Server an mehreren Guilds, die in DIESER Sitzung gewaehlte
+    # zeigen - nicht stur die erste zugeordnete.
+    anzeige_gid = conn.guild_id
+    _gewaehlt = str(sess.get("guild_id") or "")
+    if _gewaehlt.isdigit() and int(_gewaehlt) in conn.guild_ids:
+        anzeige_gid = int(_gewaehlt)
+    guild = (bot.get_guild(anzeige_gid)
+             if (bot is not None and anzeige_gid) else None)
     token_sichtbar = _token_sichtbar(sess, conn)
     out = {
         "connected": True,
         "service_id": conn.service_id,
         "name": conn.name,
-        "guild_id": (str(conn.guild_id) if conn.guild_id else None),
+        "guild_id": (str(anzeige_gid) if anzeige_gid else None),
         "guild_name": (guild.name if guild is not None else None),
         "is_admin": bool(sess.get("is_admin")),
         "is_guest": not token_sichtbar,
