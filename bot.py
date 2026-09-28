@@ -891,6 +891,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.typesmanager":                 {"label": "Erweiterter Types Manager", "gruppe": "Tools"},
     "tools.effectgenerator":              {"label": "Effekt-Generator", "gruppe": "Tools"},
     "tools.altaccountfinder":             {"label": "Alt Account Finder", "gruppe": "Tools"},
+    "tools.daynight":                     {"label": "Day/Night Config", "gruppe": "Tools"},
     "backup":                             {"label": "Backup der Server-Dateien",
                                            "gruppe": "Verbindung"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
@@ -12734,6 +12735,7 @@ _TOOL_LISTE = (
     ("typesmanager", "📦", "Erweiterter Types Manager"),
     ("effectgenerator", "✨", "Effekt-Generator"),
     ("altaccountfinder", "🔎", "Alt Account Finder"),
+    ("daynight", "🌗", "Day/Night Config"),
 )
 
 
@@ -33915,6 +33917,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "a1c80942906ab7609ff119b8f9652210dc21f9f8da3e14c2cb96b7205bea0788",
         "0d6908e6f9277fd43c46cca9293d7e2e3f31a7cc62bc8f0a777de4e689ded479",
         "e357e9c21274733dfa3bc5ddc38012aa3ec286b5e909390c1f980cb6d2c18885",
         "359d2cdb30fd6ac926159f944d03f50fb2dae2c4db25eaa40b969c489edf6e45",
