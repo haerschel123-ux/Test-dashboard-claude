@@ -892,6 +892,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.effectgenerator":              {"label": "Effekt-Generator", "gruppe": "Tools"},
     "tools.altaccountfinder":             {"label": "Alt Account Finder", "gruppe": "Tools"},
     "tools.daynight":                     {"label": "Day/Night Config", "gruppe": "Tools"},
+    "tools.deployment":                   {"label": "NPC + Vehicle Deployment", "gruppe": "Tools"},
     "backup":                             {"label": "Backup der Server-Dateien",
                                            "gruppe": "Verbindung"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
@@ -11828,6 +11829,39 @@ TOOL_VEHICLES = {
                 "kein_inventar": True, "parts": [["SparkPlug", 1]]},
 }
 
+# NPC + Vehicle Deployment: nur Klassen, die in Bohemias offiziellen CE-Dateien
+# als Event-Kind UND als cfgspawnabletypes-<type> belegt sind (Codex-Analyse
+# 28.09.2026 gegen BohemiaInteractive/DayZ-Central-Economy). Unbelegte
+# Varianten des Vorbilds (Sedan_02_Yellow, Truck_01_Covered_Brun,
+# OffroadHatchback_Green, CivilianSedan_White, Hatchback_02_Red) fehlen bewusst.
+# "karten": None = alle drei Vanilla-Karten, sonst nur die genannten.
+TOOL_DEPLOY_VEHICLES: Dict[str, Dict[str, Any]] = {
+    "ada_blue":      {"label": "Blaue ADA", "klasse": "OffroadHatchback_Blue",
+                      "bild": "OffroadHatchback", "karten": None},
+    "ada_white":     {"label": "Weiße ADA", "klasse": "OffroadHatchback_White",
+                      "bild": "OffroadHatchback", "karten": None},
+    "gunter_blue":   {"label": "Blauer Gunter", "klasse": "Hatchback_02_Blue",
+                      "bild": "Hatchback_02", "karten": None},
+    "gunter_black":  {"label": "Schwarzer Gunter", "klasse": "Hatchback_02_Black",
+                      "bild": "Hatchback_02", "karten": ["ChernarusPlus", "Livonia"]},
+    "olga_black":    {"label": "Schwarze Olga", "klasse": "CivilianSedan_Black",
+                      "bild": "CivilianSedan", "karten": None},
+    "olga_wine":     {"label": "Rote Olga", "klasse": "CivilianSedan_Wine",
+                      "bild": "CivilianSedan", "karten": None},
+    "sarka_red":     {"label": "Rote Sarka", "klasse": "Sedan_02_Red",
+                      "bild": "Sedan_02", "karten": None},
+    "sarka_grey":    {"label": "Graue Sarka", "klasse": "Sedan_02_Grey",
+                      "bild": "Sedan_02", "karten": None},
+    "truck_blue":    {"label": "Blauer Truck", "klasse": "Truck_01_Covered_Blue",
+                      "bild": "Truck_01_Covered", "karten": None},
+    "truck_orange":  {"label": "Oranger Truck", "klasse": "Truck_01_Covered_Orange",
+                      "bild": "Truck_01_Covered", "karten": None},
+    "humvee":        {"label": "Humvee", "klasse": "Offroad_02",
+                      "bild": "Offroad_02", "karten": ["ChernarusPlus", "Livonia"]},
+    "boat_black":    {"label": "Schwarzes Boot", "klasse": "Boat_01_Black",
+                      "bild": None, "karten": None},
+}
+
 # Rucksack-Builder ("Inhalte & Aufsaetze") - Taschen-Classnames, Kategorie und
 # Slot-Zahl stammen bevorzugt aus Brigardes eigenen Screenshots von
 # https://doordiehub.com/BuildABag (Alice/Army, Assault, Ghillie, Dry Bags,
@@ -12070,9 +12104,127 @@ def _tool_in_root_einfuegen(text: str, root_tag: str, snippet: str) -> str:
     return head + "    " + snippet.replace("\n", nl) + nl + close_indent + text[idx:]
 
 
+# ── NPC + Vehicle Deployment: eigene Segmente zwischen DAYZCODE-Markern ──
+_DAYZCODE_MARKER_RE = re.compile(r'<!-- DAYZCODE:(START|END) ([A-Za-z0-9_]+) -->')
+
+
+def _dayzcode_segmente(text: str, streng: bool = True) -> List[Dict[str, Any]]:
+    """Alle START/END-Paare als {id, start, end} - start am Zeilenanfang des
+    START-Markers, end hinter dem END-Marker samt Zeilenende. streng=True wirft
+    ValueError bei ungepaarten, verschachtelten oder doppelten IDs; streng=False
+    liefert nur die sauber gepaarten (fuer den Schutz fremder Tools, die an
+    kaputten Markern nicht scheitern sollen)."""
+    segmente: List[Dict[str, Any]] = []
+    offen_id: Optional[str] = None
+    offen_start = 0
+    gesehen: Set[str] = set()
+    for m in _DAYZCODE_MARKER_RE.finditer(text):
+        art, dep_id = m.group(1), m.group(2)
+        if art == "START":
+            if offen_id is not None or dep_id in gesehen:
+                if streng:
+                    raise ValueError(f"DAYZCODE-Marker für „{dep_id}“ sind verschachtelt "
+                                     f"oder doppelt – bitte die Datei prüfen.")
+                offen_id = None
+                continue
+            zeilenanfang = text.rfind("\n", 0, m.start()) + 1
+            if text[zeilenanfang:m.start()].strip():
+                zeilenanfang = m.start()
+            offen_id, offen_start = dep_id, zeilenanfang
+        else:
+            if offen_id is None or offen_id != dep_id:
+                if streng:
+                    raise ValueError(f"DAYZCODE-Ende für „{dep_id}“ ohne passenden Anfang.")
+                offen_id = None
+                continue
+            ende = m.end()
+            nl = re.match(r'\r?\n', text[ende:])
+            if nl:
+                ende += nl.end()
+            segmente.append({"id": dep_id, "start": offen_start, "end": ende})
+            gesehen.add(dep_id)
+            offen_id = None
+    if offen_id is not None and streng:
+        raise ValueError(f"DAYZCODE-Anfang für „{offen_id}“ ohne Ende.")
+    return segmente
+
+
+def _dayzcode_pruefe_fremdzugriff(text: str, pos: int) -> None:
+    """Bricht ab, wenn ein anderes Tool einen Block innerhalb eines
+    Deployment-Segments aendern oder loeschen will."""
+    for seg in _dayzcode_segmente(text, streng=False):
+        if seg["start"] <= pos < seg["end"]:
+            raise ValueError("Dieser Eintrag gehört zu „NPC + Vehicle Deployment“ – "
+                             "bitte dort bearbeiten oder entfernen.")
+
+
+def _dayzcode_einfuegen(text: str, root_tag: str, dep_id: str, block_xml: str) -> str:
+    """Fuegt Marker + Block direkt vor </root_tag> ein. Alles andere bleibt Byte
+    fuer Byte erhalten - nachgewiesen ueber die Invariante am Ende."""
+    idx = text.rfind("</" + root_tag)
+    if idx == -1:
+        raise ValueError(f"Kein schließendes </{root_tag}> in der Datei gefunden – "
+                         f"ist das die richtige Datei?")
+    nl = _tool_eol(text)
+    zeilenanfang = text.rfind("\n", 0, idx) + 1
+    am_zeilenanfang = not text[zeilenanfang:idx].strip()
+    zeilen = [f"<!-- DAYZCODE:START {dep_id} -->"]
+    zeilen += block_xml.strip("\n").split("\n")
+    zeilen.append(f"<!-- DAYZCODE:END {dep_id} -->")
+    segment = "".join("    " + z + nl for z in zeilen)
+    if am_zeilenanfang:
+        ergebnis = text[:zeilenanfang] + segment + text[zeilenanfang:]
+    else:
+        segment = nl + segment
+        ergebnis = text[:idx] + segment + text[idx:]
+    if ergebnis.replace(segment, "", 1) != text:
+        raise ValueError("Interner Fehler: Einfügen hätte Inhalt außerhalb der Marker verändert.")
+    return ergebnis
+
+
+def _dayzcode_entfernen(text: str, dep_id: str) -> Tuple[str, bool]:
+    for seg in _dayzcode_segmente(text):
+        if seg["id"] == dep_id:
+            return text[:seg["start"]] + text[seg["end"]:], True
+    return text, False
+
+
+def _dayzcode_event_xml(name: str, klasse: str, anzahl: int) -> str:
+    n = int(anzahl)
+    return (f'<event name="{_tool_esc_xml(name)}">\n'
+            f'    <nominal>{n}</nominal>\n'
+            f'    <min>{n}</min>\n'
+            f'    <max>{n}</max>\n'
+            f'    <lifetime>300</lifetime>\n'
+            f'    <restock>0</restock>\n'
+            f'    <saferadius>500</saferadius>\n'
+            f'    <distanceradius>500</distanceradius>\n'
+            f'    <cleanupradius>200</cleanupradius>\n'
+            f'    <flags deletable="0" init_random="0" remove_damaged="1"/>\n'
+            f'    <position>fixed</position>\n'
+            f'    <limit>mixed</limit>\n'
+            f'    <active>1</active>\n'
+            f'    <children>\n'
+            f'        <child lootmax="0" lootmin="0" max="{n}" min="{n}" '
+            f'type="{_tool_esc_xml(klasse)}"/>\n'
+            f'    </children>\n'
+            f'</event>')
+
+
+def _dayzcode_spawn_xml(name: str, punkte: List[Dict[str, float]]) -> str:
+    zeilen = [f'<event name="{_tool_esc_xml(name)}">']
+    for p in punkte:
+        zeilen.append(f'    <pos x="{_tool_fmt_zahl(p["x"])}" z="{_tool_fmt_zahl(p["z"])}" '
+                      f'a="{_tool_fmt_zahl(p["a"])}"/>')
+    zeilen.append('</event>')
+    return "\n".join(zeilen)
+
+
 def _tool_benannten_block_ersetzen(text: str, root_tag: str, tag: str, name: str,
                                    snippet: str) -> str:
     found = _tool_finde_benannten_block(text, tag, name)
+    if found:
+        _dayzcode_pruefe_fremdzugriff(text, found["start"])
     if not found:
         return _tool_in_root_einfuegen(text, root_tag, snippet)
     indent_m = re.match(r'^[ \t]*', found["block"])
@@ -12116,6 +12268,7 @@ def _tool_entferne_benannten_block(text: str, tag: str, name: str) -> Tuple[str,
     found = _tool_finde_benannten_block(text, tag, name)
     if not found:
         return text, False
+    _dayzcode_pruefe_fremdzugriff(text, found["start"])
     start, end = found["start"], found["end"]
     m = re.match(r'\r?\n', text[end:])
     if m:
@@ -12224,6 +12377,7 @@ def _tool_update_event_counts(text: str, name: str, values: Dict[str, Any]) -> s
     found = _tool_finde_benannten_block(text, "event", name)
     if not found:
         raise ValueError(f'Event "{name}" nicht in events.xml gefunden.')
+    _dayzcode_pruefe_fremdzugriff(text, found["start"])
     block = found["block"]
     nl = _tool_eol(text)
     for feld, wert in values.items():
@@ -12239,6 +12393,8 @@ def _tool_update_event_counts(text: str, name: str, values: Dict[str, Any]) -> s
 
 def _tool_ensure_spawn_event_block(text: str, name: str):
     found = _tool_finde_benannten_block(text, "event", name)
+    if found:
+        _dayzcode_pruefe_fremdzugriff(text, found["start"])
     if not found:
         text = _tool_in_root_einfuegen(text, "eventposdef",
                                        f'<event name="{_tool_esc_xml(name)}">\n    </event>')
@@ -12736,6 +12892,7 @@ _TOOL_LISTE = (
     ("effectgenerator", "✨", "Effekt-Generator"),
     ("altaccountfinder", "🔎", "Alt Account Finder"),
     ("daynight", "🌗", "Day/Night Config"),
+    ("deployment", "🚚", "NPC + Vehicle Deployment"),
 )
 
 
@@ -14136,12 +14293,16 @@ async def api_tools_skymessage_post(request: web.Request) -> web.Response:
 
 # ── 3. Zombie-Horden Generator ────────────────────────────────────────────
 def _tool_events_liste(root: Optional[ET.Element], nur_zombies: bool = False,
-                       nur_fahrzeuge_von: Optional[Dict[str, Any]] = None) -> List[str]:
+                       nur_fahrzeuge_von: Optional[Dict[str, Any]] = None,
+                       ausblenden: Optional[Set[str]] = None) -> List[str]:
     namen = []
     if root is None:
         return namen
     for ev in root.findall("event"):
         name = ev.get("name")
+        if ausblenden and name in ausblenden:
+            # Gehoert zu "NPC + Vehicle Deployment" - dort verwaltet.
+            continue
         if not name or name.startswith(_RENTAL_EVENT_PREFIX):
             # Miet-Events gehoeren dem Rental-System (eigene Ablauf-Logik ueber
             # Neustarts) - hier auftauchend liesse sie ein Admin versehentlich
@@ -14558,7 +14719,8 @@ async def api_tools_vehicle_get(request: web.Request) -> web.Response:
     ev_root, _s1 = await _tools_xml_lesen(conn, "db/events.xml", loop)
     sp_root, _s2 = await _tools_xml_lesen(conn, "cfgeventspawns.xml", loop)
     st_root, _s3 = await _tools_xml_lesen(conn, "cfgspawnabletypes.xml", loop)
-    namen = _tool_events_liste(ev_root, nur_fahrzeuge_von=TOOL_VEHICLES)
+    namen = _tool_events_liste(ev_root, nur_fahrzeuge_von=TOOL_VEHICLES,
+                               ausblenden=_deployment_eventnamen(conn))
     events = []
     for n in namen:
         detail = _tool_event_details(ev_root, n) or {}
@@ -14716,6 +14878,207 @@ async def api_tools_vehicle_post(request: web.Request) -> web.Response:
     return ok({"name": event_name, "positions_added": added, "generated": generated})
 
 
+# ── NPC + Vehicle Deployment (erste Version: nur Fahrzeuge) ──────────────
+# Schreibt NUR eigene Segmente zwischen DAYZCODE-Markern in db/events.xml und
+# cfgeventspawns.xml. cfgspawnabletypes.xml wird nur gelesen: die Klasse muss
+# dort schon definiert sein (Vanilla-Ausstattung gilt), ein zweiter <type>
+# derselben Klasse waere ein Duplikat. Kein eigenes Backup - dafuer gibt es das
+# Modul "Backup der Server-Dateien".
+_DEPLOY_SUFFIX_RE = re.compile(r"[A-Za-z0-9_]{1,24}")
+_DEPLOY_MAX_PUNKTE = 20
+
+
+def _deployments(conn: ServerConnection) -> List[Dict[str, Any]]:
+    return [d for d in (conn.get("deployments") or []) if isinstance(d, dict)]
+
+
+def _deployment_eventnamen(conn: ServerConnection) -> Set[str]:
+    return {str(d.get("event_name")) for d in _deployments(conn) if d.get("event_name")}
+
+
+def _deploy_presets_fuer(conn: ServerConnection) -> Dict[str, Dict[str, Any]]:
+    karte = _canonical_map_name(str(conn.get("map_name") or ""))
+    return {k: v for k, v in TOOL_DEPLOY_VEHICLES.items()
+            if v["karten"] is None or karte is None or karte in v["karten"]}
+
+
+def _deploy_punkte_pruefen(roh: Any) -> List[Dict[str, float]]:
+    if not isinstance(roh, list) or not roh:
+        raise ValueError("Bitte mindestens einen Spawnpunkt auf der Karte setzen.")
+    if len(roh) > _DEPLOY_MAX_PUNKTE:
+        raise ValueError(f"Höchstens {_DEPLOY_MAX_PUNKTE} Spawnpunkte pro Einsatz.")
+    punkte = []
+    for p in roh:
+        try:
+            x, z, a = float(p["x"]), float(p["z"]), float(p.get("a", 0) or 0)
+        except (TypeError, ValueError, KeyError):
+            raise ValueError("Ungültiger Spawnpunkt.") from None
+        if not all(math.isfinite(v) for v in (x, z, a)):
+            raise ValueError("Ungültiger Spawnpunkt.")
+        if not (0 <= x <= 20000 and 0 <= z <= 20000):
+            raise ValueError("Ein Spawnpunkt liegt außerhalb der Karte.")
+        if not 0 <= a < 360:
+            raise ValueError("Der Winkel muss zwischen 0 und 359 liegen.")
+        punkte.append({"x": round(x, 1), "z": round(z, 1), "a": round(a, 1)})
+    return punkte
+
+
+def _deploy_status(dep_id: str, ev_text: Optional[str], sp_text: Optional[str]) -> str:
+    def hat(text: Optional[str]) -> bool:
+        if text is None:
+            return False
+        return any(s["id"] == dep_id for s in _dayzcode_segmente(text, streng=False))
+    ev, sp = hat(ev_text), hat(sp_text)
+    if ev and sp:
+        return "ok"
+    return "teilweise" if (ev or sp) else "fehlt"
+
+
+async def _deploy_vorbereiten(request: web.Request, aktion: str):
+    conn, fehler = _session_conn(request, "tools.deployment")
+    if fehler is not None:
+        return None, fehler
+    fehler = await _modul_pruefen("tools.deployment", request, conn)
+    if fehler is not None:
+        return None, fehler
+    fehler = await _dash_gate(request, conn, "tools", aktion)
+    if fehler is not None:
+        return None, fehler
+    return conn, None
+
+
+async def api_tools_deployment_get(request: web.Request) -> web.Response:
+    conn, fehler = await _deploy_vorbereiten(request, "view")
+    if fehler is not None:
+        return fehler
+    presets = [{"key": k, "label": v["label"], "klasse": v["klasse"],
+                "image": (f"/static/vehicles/{v['bild']}.png"
+                          if v["bild"] and f"vehicles/{v['bild']}.png" in _EMBEDDED_ASSETS
+                          else None)}
+               for k, v in _deploy_presets_fuer(conn).items()]
+    if not _mission_dir_of(conn):
+        return ok({"presets": presets, "deployments": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    ev_text, ev_s = await _tools_datei_lesen(conn, "db/events.xml", loop)
+    sp_text, sp_s = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
+    liste = []
+    for d in _deployments(conn):
+        eintrag = {k: d.get(k) for k in ("id", "event_name", "preset", "klasse",
+                                         "punkte", "erstellt")}
+        eintrag["status"] = _deploy_status(str(d.get("id")),
+                                           ev_text if ev_s == "ok" else None,
+                                           sp_text if sp_s == "ok" else None)
+        liste.append(eintrag)
+    return ok({"presets": presets, "deployments": liste})
+
+
+async def api_tools_deployment_deploy(request: web.Request) -> web.Response:
+    conn, fehler = await _deploy_vorbereiten(request, "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    commit = bool(data.get("commit"))
+    preset = _deploy_presets_fuer(conn).get(str(data.get("preset") or ""))
+    if preset is None:
+        return err("Diese Vorlage gibt es für die Karte dieses Servers nicht.", 422)
+    try:
+        punkte = _deploy_punkte_pruefen(data.get("positions"))
+    except ValueError as e:
+        return err(str(e))
+    dep_id = f"dv_{uuid.uuid4().hex[:10]}"
+    suffix = str(data.get("suffix") or "").strip()
+    if suffix and not _DEPLOY_SUFFIX_RE.fullmatch(suffix):
+        return err("Der eigene Name darf nur Buchstaben, Ziffern und _ enthalten "
+                   "(höchstens 24 Zeichen).")
+    klasse = preset["klasse"]
+    event_name = f"Vehicle{klasse}_{suffix or dep_id[3:7].upper()}"
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.deployment", 10)
+        if fehler is not None:
+            return fehler
+    loop = asyncio.get_running_loop()
+    ev_text, ev_s = await _tools_datei_lesen(conn, "db/events.xml", loop)
+    sp_text, sp_s = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
+    st_text, st_s = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
+    if ev_s != "ok" or sp_s != "ok" or st_s != "ok":
+        return err("db/events.xml, cfgeventspawns.xml oder cfgspawnabletypes.xml "
+                   "nicht lesbar.", 502)
+    if _tool_finde_benannten_block(st_text, "type", klasse) is None:
+        return err(f"In der cfgspawnabletypes.xml fehlt der Eintrag „{klasse}“ – "
+                   f"das Fahrzeug würde ohne Ausstattung spawnen.", 422)
+    for text in (ev_text, sp_text):
+        if _tool_finde_benannten_block(text, "event", event_name) is not None:
+            return err(f"Ein Event „{event_name}“ gibt es schon – bitte einen "
+                       f"anderen eigenen Namen wählen.", 409)
+    try:
+        ev_block = _dayzcode_event_xml(event_name, klasse, len(punkte))
+        sp_block = _dayzcode_spawn_xml(event_name, punkte)
+        neu_ev = _dayzcode_einfuegen(ev_text, "events", dep_id, ev_block)
+        neu_sp = _dayzcode_einfuegen(sp_text, "eventposdef", dep_id, sp_block)
+        _dayzcode_segmente(neu_ev)
+        _dayzcode_segmente(neu_sp)
+        ET.fromstring(neu_ev)
+        ET.fromstring(neu_sp)
+    except ET.ParseError as e:
+        return err(f"Die Server-Datei ist danach kein gültiges XML ({e}) – nichts geschrieben.")
+    except ValueError as e:
+        return err(str(e))
+    generated = [{"filename": "db/events.xml", "content": ev_block},
+                 {"filename": "cfgeventspawns.xml", "content": sp_block}]
+    if not commit:
+        return ok({"event_name": event_name, "generated": generated})
+    if not await _tools_datei_schreiben(conn, "db/events.xml", neu_ev, loop):
+        return err("db/events.xml konnte nicht gespeichert werden – nichts geändert.", 502)
+    if not await _tools_datei_schreiben(conn, "cfgeventspawns.xml", neu_sp, loop):
+        # Rollback: das eben eingefuegte Event-Segment wieder heraus - sonst
+        # bliebe ein Event ohne Spawnpunkte zurueck.
+        zurueck = await _tools_datei_schreiben(conn, "db/events.xml", ev_text, loop)
+        return err("cfgeventspawns.xml konnte nicht gespeichert werden – "
+                   + ("events.xml wurde zurückgesetzt." if zurueck
+                      else "ACHTUNG: events.xml konnte nicht zurückgesetzt werden, "
+                           "bitte den Eintrag im Tool entfernen."), 502)
+    eintraege = _deployments(conn)
+    eintraege.append({"id": dep_id, "event_name": event_name, "preset": data.get("preset"),
+                      "klasse": klasse, "punkte": punkte, "erstellt": time.time()})
+    _conn_store(conn, "deployments", eintraege)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Fahrzeug eingesetzt",
+               f"{event_name} ({len(punkte)} Punkt(e)) · {conn.name}")
+    return ok({"event_name": event_name, "id": dep_id, "generated": generated})
+
+
+async def api_tools_deployment_remove(request: web.Request) -> web.Response:
+    conn, fehler = await _deploy_vorbereiten(request, "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    dep_id = str(data.get("id") or "")
+    eintrag = next((d for d in _deployments(conn) if d.get("id") == dep_id), None)
+    if eintrag is None:
+        return err("Diesen Einsatz gibt es nicht (mehr).", 404)
+    fehler = _dash_rate_limited(request, "tools.deployment", 10)
+    if fehler is not None:
+        return fehler
+    loop = asyncio.get_running_loop()
+    for datei in ("db/events.xml", "cfgeventspawns.xml"):
+        text, status = await _tools_datei_lesen(conn, datei, loop)
+        if status != "ok":
+            return err(f"{datei} nicht lesbar.", 502)
+        try:
+            neu, gefunden = _dayzcode_entfernen(text, dep_id)
+        except ValueError as e:
+            return err(f"{datei}: {e}")
+        if gefunden and not await _tools_datei_schreiben(conn, datei, neu, loop):
+            return err(f"{datei} konnte nicht gespeichert werden.", 502)
+    _conn_store(conn, "deployments", [d for d in _deployments(conn) if d.get("id") != dep_id])
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Einsatz entfernt",
+               f"{eintrag.get('event_name')} · {conn.name}")
+    return ok({"entfernt": dep_id})
+
+
 # ── 6. Rucksack-Builder (Inhalte & Aufsätze) ──────────────────────────────
 def _tool_upsert_bag_cargo(text: str, name: str, items: List[Dict[str, Any]]) -> str:
     """Wie ``_tool_upsert_spawnable_type``, aber mit EINEM gemeinsamen
@@ -14842,7 +15205,7 @@ async def api_tools_event_get(request: web.Request) -> web.Response:
     loop = asyncio.get_running_loop()
     ev_root, _s1 = await _tools_xml_lesen(conn, "db/events.xml", loop)
     sp_root, _s2 = await _tools_xml_lesen(conn, "cfgeventspawns.xml", loop)
-    namen = _tool_events_liste(ev_root)
+    namen = _tool_events_liste(ev_root, ausblenden=_deployment_eventnamen(conn))
     events = []
     for n in namen:
         detail = _tool_event_details(ev_root, n) or {}
@@ -33202,6 +33565,9 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/heliloot", api_tools_heliloot_post)
     r.add_get("/api/tools/vehicle", api_tools_vehicle_get)
     r.add_post("/api/tools/vehicle", api_tools_vehicle_post)
+    r.add_get("/api/tools/deployment", api_tools_deployment_get)
+    r.add_post("/api/tools/deployment/deploy", api_tools_deployment_deploy)
+    r.add_post("/api/tools/deployment/remove", api_tools_deployment_remove)
     r.add_get("/api/tools/spawnable", api_tools_bag_get)
     r.add_post("/api/tools/spawnable", api_tools_bag_post)
     r.add_get("/api/tools/event", api_tools_event_get)
@@ -33917,6 +34283,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "40c83ee5609817015f8ca61761ec4715f578183e7756cc281b3fa601717dd12d",
         "a1c80942906ab7609ff119b8f9652210dc21f9f8da3e14c2cb96b7205bea0788",
         "0d6908e6f9277fd43c46cca9293d7e2e3f31a7cc62bc8f0a777de4e689ded479",
         "e357e9c21274733dfa3bc5ddc38012aa3ec286b5e909390c1f980cb6d2c18885",
