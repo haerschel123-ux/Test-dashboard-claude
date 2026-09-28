@@ -1,4 +1,4 @@
-"""NPC + Vehicle Deployment (erste Version: nur Fahrzeuge).
+"""NPC + Vehicle Deployment (Fahrzeuge und NPCs).
 
 Kern: eigene Bloecke zwischen <!-- DAYZCODE:START id --> / END-Markern in
 db/events.xml und cfgeventspawns.xml - alles ausserhalb bleibt Byte fuer Byte
@@ -261,3 +261,62 @@ def test_kunde_b_kann_einsatz_von_a_nicht_entfernen(monkeypatch):
     status, _ = _json(_run(bot.api_tools_deployment_remove(req)))
     assert status == 404
     assert len(a.data["deployments"]) == 1
+
+
+# ── NPCs ─────────────────────────────────────────────────────────────────
+def _npc(monkeypatch, conn, commit, koerper="SurvivorM_Mirek", suffix="Bau1", preset="bauarbeiter"):
+    req = _request(monkeypatch, conn, "POST", "/api/tools/deployment/deploy",
+                   {"art": "npc", "preset": preset, "koerper": koerper, "suffix": suffix,
+                    "commit": commit, "positions": [{"x": 6290, "z": 10405, "a": 0}]})
+    return _json(_run(bot.api_tools_deployment_deploy(req)))
+
+
+def test_npc_schreibt_drei_segmente_und_entfernen_stellt_alles_her(monkeypatch):
+    conn = _server()
+    status, j = _npc(monkeypatch, conn, commit=True)
+    assert status == 200, j
+    ev = conn.ftp.dateien["/mission/db/events.xml"]
+    st = conn.ftp.dateien["/mission/cfgspawnabletypes.xml"]
+    assert 'type="SurvivorM_Mirek"' in ev and "<lifetime>3600</lifetime>" in ev
+    assert '<type name="SurvivorM_Mirek">' in st and "ConstructionHelmet" in st
+    for pfad in ("/mission/db/events.xml", "/mission/cfgeventspawns.xml",
+                 "/mission/cfgspawnabletypes.xml"):
+        ET.fromstring(conn.ftp.dateien[pfad].encode("utf-8"))
+    dep_id = conn.data["deployments"][0]["id"]
+    req = _request(monkeypatch, conn, "POST", "/api/tools/deployment/remove", {"id": dep_id})
+    assert _json(_run(bot.api_tools_deployment_remove(req)))[0] == 200
+    assert conn.ftp.dateien["/mission/db/events.xml"] == EVENTS
+    assert conn.ftp.dateien["/mission/cfgeventspawns.xml"] == SPAWNS
+    assert conn.ftp.dateien["/mission/cfgspawnabletypes.xml"] == TYPES
+
+
+def test_npc_belegter_koerper_ergibt_409(monkeypatch):
+    conn = _server()
+    assert _npc(monkeypatch, conn, commit=True)[0] == 200
+    assert _npc(monkeypatch, conn, commit=True, suffix="Bau2")[0] == 409
+    req = _request(monkeypatch, conn, "GET", "/api/tools/deployment")
+    frei = _json(_run(bot.api_tools_deployment_get(req)))[1]["data"]["freie_koerper"]
+    assert "SurvivorM_Mirek" not in frei and "SurvivorM_Boris" in frei
+
+
+def test_npc_fremder_type_derselben_klasse_wird_abgelehnt(monkeypatch):
+    conn = _server(types=TYPES.replace("OffroadHatchback_Blue", "SurvivorM_Mirek"))
+    assert _npc(monkeypatch, conn, commit=True)[0] == 409
+    assert _npc(monkeypatch, conn, commit=False, koerper="Gibtsnicht")[0] in (400, 409, 422)
+
+
+def test_npc_fehler_bei_dritter_datei_rollt_zurueck(monkeypatch):
+    conn = _server(fehler_bei="cfgspawnabletypes.xml")
+    assert _npc(monkeypatch, conn, commit=True)[0] == 502
+    assert conn.ftp.dateien["/mission/db/events.xml"] == EVENTS
+    assert conn.ftp.dateien["/mission/cfgeventspawns.xml"] == SPAWNS
+    assert conn.data["deployments"] == []
+
+
+def test_npc_ausruestung_nur_bekannte_classnames():
+    bekannt = {n[len("items/"):-len(".avif")] for n in bot._EMBEDDED_ASSETS
+               if n.startswith("items/") and n.endswith(".avif")}
+    teile = {str(t[0]).lower() for v in bot.TOOL_VEHICLES.values() for t in v["parts"]}
+    fehlend = [i for v in bot.TOOL_DEPLOY_NPCS.values() for _a, i in v["items"]
+               if i.lower() not in bekannt and i.lower() not in teile]
+    assert not fehlend, fehlend

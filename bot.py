@@ -11862,6 +11862,80 @@ TOOL_DEPLOY_VEHICLES: Dict[str, Dict[str, Any]] = {
                       "bild": None, "karten": None},
 }
 
+# NPC-Koerper: Vanilla-Ueberlebende, von Brigarde vorgegeben (28.09.2026). Die
+# Ausruestung haengt in cfgspawnabletypes.xml an der KLASSE - deshalb belegt
+# jeder NPC-Einsatz eine eigene, noch freie Klasse.
+TOOL_DEPLOY_SURVIVORS: Tuple[str, ...] = (
+    "SurvivorM_Mirek", "SurvivorM_Boris", "SurvivorM_Cyril", "SurvivorM_Denis",
+    "SurvivorM_Elias", "SurvivorM_Francis", "SurvivorM_Guo", "SurvivorM_Hassan",
+    "SurvivorM_Indar", "SurvivorM_Jose", "SurvivorM_Kaito", "SurvivorM_Lewis",
+    "SurvivorM_Manua", "SurvivorM_Niki", "SurvivorM_Oliver", "SurvivorM_Peter",
+    "SurvivorM_Quinn", "SurvivorM_Rolf", "SurvivorM_Seth", "SurvivorM_Taiki",
+    "SurvivorF_Eva", "SurvivorF_Frida", "SurvivorF_Gabi", "SurvivorF_Helga",
+    "SurvivorF_Irena", "SurvivorF_Judy", "SurvivorF_Keiko", "SurvivorF_Linda",
+    "SurvivorF_Maria", "SurvivorF_Naomi", "SurvivorF_Baty",
+)
+
+# NPC-Vorlagen: jede Item-Klasse ist im eingebetteten Vanilla-Bildkatalog
+# (items/*.avif) oder als Fahrzeugteil in TOOL_VEHICLES belegt - geprueft in
+# tests/test_deployment.py. "attachments" = am Koerper, "cargo" = im Inventar.
+TOOL_DEPLOY_NPCS: Dict[str, Dict[str, Any]] = {
+    "bauarbeiter": {"label": "Bauarbeiter", "event": "NpcBauarbeiter", "items": [
+        ("attachments", "ConstructionHelmet_Red"), ("attachments", "ReflexVest"),
+        ("attachments", "Shirt_BlueCheck"), ("attachments", "Jeans_BlueDark"),
+        ("attachments", "WorkingBoots_Brown"), ("attachments", "WorkingGloves_Yellow"),
+        ("attachments", "MountainBag_Blue"), ("attachments", "Shovel"),
+        ("cargo", "Pickaxe"), ("cargo", "SledgeHammer"), ("cargo", "Hammer"),
+        ("cargo", "Nail")]},
+    "feuerwehr": {"label": "Feuerwehr", "event": "NpcFeuerwehr", "items": [
+        ("attachments", "FirefightersHelmet_Red"), ("attachments", "FirefighterJacket_Black"),
+        ("attachments", "FirefightersPants_Black"), ("attachments", "MilitaryBoots_Black"),
+        ("attachments", "WorkingGloves_Black"), ("attachments", "FirefighterAxe")]},
+    "abc_gelb": {"label": "ABC-Schutz gelb", "event": "NpcAbcGelb", "items": [
+        ("attachments", "NBCHoodYellow"), ("attachments", "NBCJacketYellow"),
+        ("attachments", "NBCPantsYellow"), ("attachments", "NBCBootsYellow"),
+        ("attachments", "NBCGlovesYellow"), ("attachments", "AirborneMask"),
+        ("cargo", "GasMask_Filter"), ("cargo", "GasMask_Filter")]},
+    "abc_grau": {"label": "ABC-Schutz grau", "event": "NpcAbcGrau", "items": [
+        ("attachments", "NBCHoodGray"), ("attachments", "NBCJacketGray"),
+        ("attachments", "NBCPantsGray"), ("attachments", "NBCBootsGray"),
+        ("attachments", "NBCGlovesGray"), ("attachments", "AirborneMask"),
+        ("cargo", "GasMask_Filter"), ("cargo", "GasMask_Filter")]},
+    "sanitaeter": {"label": "Sanitäter", "event": "NpcSanitaeter", "items": [
+        ("attachments", "MedicalScrubsHat_Blue"), ("attachments", "SurgicalMask"),
+        ("attachments", "MedicalScrubsShirt_Green"), ("attachments", "MedicalScrubsPants_Green"),
+        ("attachments", "Sneakers_Green"), ("attachments", "SurgicalGloves_Blue"),
+        ("cargo", "BandageDressing"), ("cargo", "Morphine"), ("cargo", "Epinephrine"),
+        ("cargo", "SalineBagIV")]},
+    "mechaniker": {"label": "Mechaniker", "event": "NpcMechaniker", "items": [
+        ("attachments", "MotoHelmet_Red"), ("attachments", "QuiltedJacket_Red"),
+        ("attachments", "Jeans_Black"), ("attachments", "WorkingBoots_Yellow"),
+        ("attachments", "WorkingGloves_Black"), ("cargo", "CarRadiator"),
+        ("cargo", "SparkPlug"), ("cargo", "CarBattery"), ("cargo", "TireRepairKit"),
+        ("cargo", "Pliers"), ("cargo", "Screwdriver")]},
+    "mechaniker_gunter": {"label": "Mechaniker + Gunter-Räder", "event": "NpcMechanikerGunter",
+                          "items": [
+        ("attachments", "MotoHelmet_Black"), ("attachments", "QuiltedJacket_Grey"),
+        ("attachments", "Jeans_Grey"), ("attachments", "WorkingBoots_Yellow"),
+        ("attachments", "AliceBag_Black"), ("cargo", "Hatchback_02_Wheel"),
+        ("cargo", "Hatchback_02_Wheel")]},
+    "polizei": {"label": "Polizei", "event": "NpcPolizei", "items": [
+        ("attachments", "PoliceCap"), ("attachments", "PoliceJacket"),
+        ("attachments", "PolicePants"), ("attachments", "CombatBoots_Black"),
+        ("attachments", "PoliceVest"), ("attachments", "CivilianBelt"),
+        ("attachments", "Mp133Shotgun"), ("cargo", "Canteen")]},
+    "militaer": {"label": "Soldat (M4A1)", "event": "NpcSoldat", "items": [
+        ("attachments", "BallisticHelmet_Green"), ("attachments", "TTsKOJacket_Camo"),
+        ("attachments", "TTsKOPants"), ("attachments", "TTSKOBoots"),
+        ("attachments", "PlateCarrierVest"), ("attachments", "MilitaryBelt"),
+        ("attachments", "M4A1"), ("cargo", "Mag_STANAG_30Rnd"), ("cargo", "CombatKnife"),
+        ("cargo", "Canteen")]},
+    "jaeger": {"label": "Jäger", "event": "NpcJaeger", "items": [
+        ("attachments", "HuntingJacket_Brown"), ("attachments", "HunterPants_Brown"),
+        ("attachments", "CombatBoots_Brown"), ("attachments", "HuntingVest"),
+        ("attachments", "HuntingBag"), ("cargo", "CombatKnife"), ("cargo", "Canteen")]},
+}
+
 # Rucksack-Builder ("Inhalte & Aufsaetze") - Taschen-Classnames, Kategorie und
 # Slot-Zahl stammen bevorzugt aus Brigardes eigenen Screenshots von
 # https://doordiehub.com/BuildABag (Alice/Army, Assault, Ghillie, Dry Bags,
@@ -12189,13 +12263,13 @@ def _dayzcode_entfernen(text: str, dep_id: str) -> Tuple[str, bool]:
     return text, False
 
 
-def _dayzcode_event_xml(name: str, klasse: str, anzahl: int) -> str:
+def _dayzcode_event_xml(name: str, klasse: str, anzahl: int, lifetime: int = 300) -> str:
     n = int(anzahl)
     return (f'<event name="{_tool_esc_xml(name)}">\n'
             f'    <nominal>{n}</nominal>\n'
             f'    <min>{n}</min>\n'
             f'    <max>{n}</max>\n'
-            f'    <lifetime>300</lifetime>\n'
+            f'    <lifetime>{int(lifetime)}</lifetime>\n'
             f'    <restock>0</restock>\n'
             f'    <saferadius>500</saferadius>\n'
             f'    <distanceradius>500</distanceradius>\n'
@@ -12217,6 +12291,16 @@ def _dayzcode_spawn_xml(name: str, punkte: List[Dict[str, float]]) -> str:
         zeilen.append(f'    <pos x="{_tool_fmt_zahl(p["x"])}" z="{_tool_fmt_zahl(p["z"])}" '
                       f'a="{_tool_fmt_zahl(p["a"])}"/>')
     zeilen.append('</event>')
+    return "\n".join(zeilen)
+
+
+def _dayzcode_type_xml(klasse: str, items: List[Tuple[str, str]]) -> str:
+    zeilen = [f'<type name="{_tool_esc_xml(klasse)}">']
+    for art, item in items:
+        zeilen.append(f'    <{art} chance="1.00">')
+        zeilen.append(f'        <item name="{_tool_esc_xml(item)}" chance="1.00"/>')
+        zeilen.append(f'    </{art}>')
+    zeilen.append('</type>')
     return "\n".join(zeilen)
 
 
@@ -14956,20 +15040,38 @@ async def api_tools_deployment_get(request: web.Request) -> web.Response:
                           if v["bild"] and f"vehicles/{v['bild']}.png" in _EMBEDDED_ASSETS
                           else None)}
                for k, v in _deploy_presets_fuer(conn).items()]
+    npc_presets = [{"key": k, "label": v["label"], "event": v["event"],
+                    "items": [i for _art, i in v["items"]],
+                    "slots": [[art, i] for art, i in v["items"]]}
+                   for k, v in TOOL_DEPLOY_NPCS.items()]
     if not _mission_dir_of(conn):
-        return ok({"presets": presets, "deployments": [], "kein_mission_ordner": True})
+        return ok({"presets": presets, "npc_presets": npc_presets, "freie_koerper": [],
+                   "deployments": [], "kein_mission_ordner": True})
     loop = asyncio.get_running_loop()
     ev_text, ev_s = await _tools_datei_lesen(conn, "db/events.xml", loop)
     sp_text, sp_s = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
+    st_text, st_s = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
     liste = []
     for d in _deployments(conn):
-        eintrag = {k: d.get(k) for k in ("id", "event_name", "preset", "klasse",
+        eintrag = {k: d.get(k) for k in ("id", "event_name", "preset", "klasse", "art",
                                          "punkte", "erstellt")}
         eintrag["status"] = _deploy_status(str(d.get("id")),
                                            ev_text if ev_s == "ok" else None,
                                            sp_text if sp_s == "ok" else None)
         liste.append(eintrag)
-    return ok({"presets": presets, "deployments": liste})
+    return ok({"presets": presets, "npc_presets": npc_presets,
+               "freie_koerper": _deploy_freie_koerper(conn, st_text if st_s == "ok" else None),
+               "deployments": liste})
+
+
+def _deploy_freie_koerper(conn: ServerConnection, st_text: Optional[str]) -> List[str]:
+    """Koerperklassen ohne eigenen <type> in cfgspawnabletypes.xml und ohne
+    anderen NPC-Einsatz - nur die bekommen eine eigene Ausruestung."""
+    if st_text is None:
+        return []
+    belegt = {str(d.get("klasse")) for d in _deployments(conn) if d.get("art") == "npc"}
+    return [k for k in TOOL_DEPLOY_SURVIVORS
+            if k not in belegt and _tool_finde_benannten_block(st_text, "type", k) is None]
 
 
 async def api_tools_deployment_deploy(request: web.Request) -> web.Response:
@@ -14980,9 +15082,19 @@ async def api_tools_deployment_deploy(request: web.Request) -> web.Response:
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     data = await body(request)
     commit = bool(data.get("commit"))
-    preset = _deploy_presets_fuer(conn).get(str(data.get("preset") or ""))
-    if preset is None:
-        return err("Diese Vorlage gibt es für die Karte dieses Servers nicht.", 422)
+    art = "npc" if data.get("art") == "npc" else "fahrzeug"
+    if art == "npc":
+        preset = TOOL_DEPLOY_NPCS.get(str(data.get("preset") or ""))
+        if preset is None:
+            return err("Diese NPC-Vorlage gibt es nicht.", 422)
+        klasse = str(data.get("koerper") or "")
+        if klasse not in TOOL_DEPLOY_SURVIVORS:
+            return err("Bitte einen gültigen Körper auswählen.", 422)
+    else:
+        preset = _deploy_presets_fuer(conn).get(str(data.get("preset") or ""))
+        if preset is None:
+            return err("Diese Vorlage gibt es für die Karte dieses Servers nicht.", 422)
+        klasse = preset["klasse"]
     try:
         punkte = _deploy_punkte_pruefen(data.get("positions"))
     except ValueError as e:
@@ -14992,8 +15104,8 @@ async def api_tools_deployment_deploy(request: web.Request) -> web.Response:
     if suffix and not _DEPLOY_SUFFIX_RE.fullmatch(suffix):
         return err("Der eigene Name darf nur Buchstaben, Ziffern und _ enthalten "
                    "(höchstens 24 Zeichen).")
-    klasse = preset["klasse"]
-    event_name = f"Vehicle{klasse}_{suffix or dep_id[3:7].upper()}"
+    praefix = preset["event"] if art == "npc" else f"Vehicle{klasse}"
+    event_name = f"{praefix}_{suffix or dep_id[3:7].upper()}"
     if commit:
         fehler = _dash_rate_limited(request, "tools.deployment", 10)
         if fehler is not None:
@@ -15005,7 +15117,10 @@ async def api_tools_deployment_deploy(request: web.Request) -> web.Response:
     if ev_s != "ok" or sp_s != "ok" or st_s != "ok":
         return err("db/events.xml, cfgeventspawns.xml oder cfgspawnabletypes.xml "
                    "nicht lesbar.", 502)
-    if _tool_finde_benannten_block(st_text, "type", klasse) is None:
+    if art == "npc":
+        if klasse not in _deploy_freie_koerper(conn, st_text):
+            return err(f"Der Körper „{klasse}“ ist schon belegt – bitte einen anderen wählen.", 409)
+    elif _tool_finde_benannten_block(st_text, "type", klasse) is None:
         return err(f"In der cfgspawnabletypes.xml fehlt der Eintrag „{klasse}“ – "
                    f"das Fahrzeug würde ohne Ausstattung spawnen.", 422)
     for text in (ev_text, sp_text):
@@ -15013,37 +15128,50 @@ async def api_tools_deployment_deploy(request: web.Request) -> web.Response:
             return err(f"Ein Event „{event_name}“ gibt es schon – bitte einen "
                        f"anderen eigenen Namen wählen.", 409)
     try:
-        ev_block = _dayzcode_event_xml(event_name, klasse, len(punkte))
+        ev_block = _dayzcode_event_xml(event_name, klasse, len(punkte),
+                                       lifetime=3600 if art == "npc" else 300)
         sp_block = _dayzcode_spawn_xml(event_name, punkte)
-        neu_ev = _dayzcode_einfuegen(ev_text, "events", dep_id, ev_block)
-        neu_sp = _dayzcode_einfuegen(sp_text, "eventposdef", dep_id, sp_block)
-        _dayzcode_segmente(neu_ev)
-        _dayzcode_segmente(neu_sp)
-        ET.fromstring(neu_ev)
-        ET.fromstring(neu_sp)
+        dateien = [("db/events.xml", ev_text,
+                    _dayzcode_einfuegen(ev_text, "events", dep_id, ev_block), ev_block),
+                   ("cfgeventspawns.xml", sp_text,
+                    _dayzcode_einfuegen(sp_text, "eventposdef", dep_id, sp_block), sp_block)]
+        if art == "npc":
+            st_block = _dayzcode_type_xml(klasse, preset["items"])
+            dateien.append(("cfgspawnabletypes.xml", st_text,
+                            _dayzcode_einfuegen(st_text, "spawnabletypes", dep_id, st_block),
+                            st_block))
+        for _name, _alt, neu, _block in dateien:
+            _dayzcode_segmente(neu)
+            ET.fromstring(neu)
     except ET.ParseError as e:
         return err(f"Die Server-Datei ist danach kein gültiges XML ({e}) – nichts geschrieben.")
     except ValueError as e:
         return err(str(e))
-    generated = [{"filename": "db/events.xml", "content": ev_block},
-                 {"filename": "cfgeventspawns.xml", "content": sp_block}]
+    generated = [{"filename": name, "content": block} for name, _alt, _neu, block in dateien]
     if not commit:
         return ok({"event_name": event_name, "generated": generated})
-    if not await _tools_datei_schreiben(conn, "db/events.xml", neu_ev, loop):
-        return err("db/events.xml konnte nicht gespeichert werden – nichts geändert.", 502)
-    if not await _tools_datei_schreiben(conn, "cfgeventspawns.xml", neu_sp, loop):
-        # Rollback: das eben eingefuegte Event-Segment wieder heraus - sonst
-        # bliebe ein Event ohne Spawnpunkte zurueck.
-        zurueck = await _tools_datei_schreiben(conn, "db/events.xml", ev_text, loop)
-        return err("cfgeventspawns.xml konnte nicht gespeichert werden – "
-                   + ("events.xml wurde zurückgesetzt." if zurueck
-                      else "ACHTUNG: events.xml konnte nicht zurückgesetzt werden, "
-                           "bitte den Eintrag im Tool entfernen."), 502)
+    geschrieben = []
+    for name, alt, neu, _block in dateien:
+        if await _tools_datei_schreiben(conn, name, neu, loop):
+            geschrieben.append((name, alt))
+            continue
+        # Rollback: bereits geschriebene Dateien zuruecksetzen - sonst bliebe
+        # z. B. ein Event ohne Spawnpunkte zurueck.
+        fehlgeschlagen = [n for n, a in geschrieben
+                          if not await _tools_datei_schreiben(conn, n, a, loop)]
+        if not geschrieben:
+            return err(f"{name} konnte nicht gespeichert werden – nichts geändert.", 502)
+        return err(f"{name} konnte nicht gespeichert werden – "
+                   + ("die übrigen Dateien wurden zurückgesetzt." if not fehlgeschlagen
+                      else "ACHTUNG: " + ", ".join(fehlgeschlagen)
+                           + " konnte nicht zurückgesetzt werden, bitte prüfen."), 502)
     eintraege = _deployments(conn)
     eintraege.append({"id": dep_id, "event_name": event_name, "preset": data.get("preset"),
-                      "klasse": klasse, "punkte": punkte, "erstellt": time.time()})
+                      "klasse": klasse, "art": art, "punkte": punkte,
+                      "erstellt": time.time()})
     _conn_store(conn, "deployments", eintraege)
-    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Fahrzeug eingesetzt",
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+               "Tool: NPC eingesetzt" if art == "npc" else "Tool: Fahrzeug eingesetzt",
                f"{event_name} ({len(punkte)} Punkt(e)) · {conn.name}")
     return ok({"event_name": event_name, "id": dep_id, "generated": generated})
 
@@ -15063,7 +15191,10 @@ async def api_tools_deployment_remove(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     loop = asyncio.get_running_loop()
-    for datei in ("db/events.xml", "cfgeventspawns.xml"):
+    dateien = ["db/events.xml", "cfgeventspawns.xml"]
+    if eintrag.get("art") == "npc":
+        dateien.append("cfgspawnabletypes.xml")
+    for datei in dateien:
         text, status = await _tools_datei_lesen(conn, datei, loop)
         if status != "ok":
             return err(f"{datei} nicht lesbar.", 502)
@@ -34283,6 +34414,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "f80266f397a0589bac80dc6df9b234e29ec806fe981fa8d9028aa85810a97d88",
+        "6d6b0bc1f1ecb8a039d8b867c7258e5aa8a28b7891935be0c21f2803b0038569",
         "40c83ee5609817015f8ca61761ec4715f578183e7756cc281b3fa601717dd12d",
         "a1c80942906ab7609ff119b8f9652210dc21f9f8da3e14c2cb96b7205bea0788",
         "0d6908e6f9277fd43c46cca9293d7e2e3f31a7cc62bc8f0a777de4e689ded479",
