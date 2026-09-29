@@ -15421,7 +15421,18 @@ async def api_tools_teleports_post(request: web.Request) -> web.Response:
             if status == "ok" or any(_custom_spawner_pfad_normalisieren(p).lower() == path.lower() for p in refs):
                 return err("Dieser Teleport-Name ist bereits vorhanden.", 409)
         for path, _ in files:
-            worlds.setdefault(_teleport_key(path), []).append(path)
+            key = _teleport_key(path)
+            if key not in worlds:
+                # Neue Liste direkt hinter objectSpawnersArr (sonst ganz vorne)
+                # einsortieren statt ans Ende - sonst steht sie in der Vorschau
+                # hinter langen Listen wie environmentMinTemps und wird uebersehen.
+                vorher = list(worlds.items())
+                pos = next((i + 1 for i, (k, _v) in enumerate(vorher)
+                            if k == "objectSpawnersArr"), 0)
+                vorher.insert(pos, (key, []))
+                worlds.clear()
+                worlds.update(vorher)
+            worlds[key].append(path)
         updated = json.dumps(gameplay, indent=4, ensure_ascii=False) + "\n"
         generated = [{"filename": p, "content": content} for p, content in files]
         generated.append({"filename": "cfggameplay.json", "content": updated})

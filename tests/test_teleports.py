@@ -247,3 +247,20 @@ def test_concurrent_custom_import_preserves_both_registrations(monkeypatch, serv
     worlds = json.loads(conn.ftp.files["/mission/cfggameplay.json"])["WorldsData"]
     assert "custom/pra/Gate_A.json" in worlds["playerRestrictedAreaFiles"]
     assert set(worlds["objectSpawnersArr"]) == {"./custom/base.json", "custom/Gate_A_objects.json", "custom/other.json"}
+
+
+def test_new_pra_list_is_placed_after_object_spawners(monkeypatch, servers):
+    """Brigarde: fehlt playerRestrictedAreaFiles, muss die neue Liste in der
+    Vorschau sichtbar direkt hinter objectSpawnersArr stehen, nicht am Ende."""
+    conn, _ = servers
+    conn.ftp.files["/mission/cfggameplay.json"] = json.dumps({"WorldsData": {
+        "lightingConfig": 0, "objectSpawnersArr": ["custom/a.json"],
+        "environmentMinTemps": [1, 2]}})
+    data = payload(name="Name", commit=False)
+    data["boxes"][0]["object"] = ""
+    status, response = call(monkeypatch, conn, data)
+    assert status == 200, response
+    vorschau = next(g["content"] for g in response["data"]["generated"]
+                    if g["filename"] == "cfggameplay.json")
+    assert list(json.loads(vorschau)["WorldsData"]) == [
+        "lightingConfig", "objectSpawnersArr", "playerRestrictedAreaFiles", "environmentMinTemps"]
