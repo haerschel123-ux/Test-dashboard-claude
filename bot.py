@@ -893,6 +893,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.altaccountfinder":             {"label": "Alt Account Finder", "gruppe": "Tools"},
     "tools.daynight":                     {"label": "Day/Night Config", "gruppe": "Tools"},
     "tools.deployment":                   {"label": "NPC + Vehicle Deployment", "gruppe": "Tools"},
+    "tools.teleports":                    {"label": "Teleport Generator", "gruppe": "Tools"},
     "backup":                             {"label": "Backup der Server-Dateien",
                                            "gruppe": "Verbindung"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
@@ -3732,13 +3733,18 @@ class ConnectionRegistry:
         if not self._conns and self._migrate_from_config():
             self.save()
 
-    def save(self) -> None:
+    def save(self, *, strict: bool = False) -> None:
         try:
-            with open(CONNECTIONS_FILE, "w", encoding="utf-8") as f:
+            target = CONNECTIONS_FILE + ".tmp" if strict else CONNECTIONS_FILE
+            with open(target, "w", encoding="utf-8") as f:
                 json.dump({sid: c.data for sid, c in self._conns.items()},
                           f, ensure_ascii=False, indent=2)
+            if strict:
+                os.replace(target, CONNECTIONS_FILE)
         except OSError as e:
             log.error(f"[CONN] {CONNECTIONS_FILE} nicht schreibbar: {e}")
+            if strict:
+                raise
 
     def _migrate_from_config(self) -> bool:
         """Bestehende Einzelserver-Installation uebernehmen.
@@ -7523,14 +7529,17 @@ def _ac_conns(interaction: discord.Interaction) -> List[ServerConnection]:
     return alle
 
 
-def _conn_store(conn: ServerConnection, key: str, value: Any) -> None:
+def _conn_store(conn: ServerConnection, key: str, value: Any, *, strict: bool = False) -> None:
     """Serverspezifischen Wert in der Verbindung ablegen.
 
     Beim Hauptserver zusaetzlich in der config.json, solange Log-Abruf und
     Dashboard dort noch mitlesen – sonst liefen beide Seiten auseinander.
     """
     conn.set(key, value)
-    connections.save()
+    if strict:
+        connections.save(strict=True)
+    else:
+        connections.save()
     if connections.primary() is conn:
         cfg.config[key] = value
         cfg.save_config()
@@ -12954,6 +12963,17 @@ def _tool_vehicle_rows_lesen(node: Optional[ET.Element]) -> List[Dict[str, Any]]
 _TOOL_KEIN_MISSION_ORDNER = "Mission-Ordner unbekannt – FTP-Zugangsdaten prüfen."
 
 
+def _gameplay_tool_locked(handler):
+    """Share the damage-command lock across all gameplay read/modify/write tools."""
+    async def locked(request):
+        conn, error = _session_conn(request)
+        if error is not None:
+            return error
+        async with _schaden_lock(conn.service_id):
+            return await handler(request)
+    return locked
+
+
 _TOOL_LISTE = (
     ("loadout",   "🧍", "Loadout Generator"),
     ("gaszone",   "☣️", "Gas-Zonen Builder"),
@@ -12977,6 +12997,7 @@ _TOOL_LISTE = (
     ("altaccountfinder", "🔎", "Alt Account Finder"),
     ("daynight", "🌗", "Day/Night Config"),
     ("deployment", "🚚", "NPC + Vehicle Deployment"),
+    ("teleports", "🚚", "Teleport Generator"),
 )
 
 
@@ -13054,6 +13075,7 @@ async def api_tools_loadout_get(request: web.Request) -> web.Response:
     return ok({"files": files, "presets": presets})
 
 
+@_gameplay_tool_locked
 async def api_tools_loadout_post(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request, "tools.loadout")
     if fehler is not None:
@@ -13663,6 +13685,7 @@ def _custom_spawner_pfad_normalisieren(pfad: str) -> str:
 _CUSTOM_BUILD_MAX_BYTES = 5_000_000  # 5 MB - grosszuegig fuer eine Objektliste, aber begrenzt
 
 
+@_gameplay_tool_locked
 async def api_tools_custombuildmap_import(request: web.Request) -> web.Response:
     """Importiert eine Object-Spawner-JSON-Datei: schreibt sie nach
     custom/<dateiname>.json und traegt sie in cfggameplay.json →
@@ -13755,6 +13778,7 @@ async def api_tools_custombuildmap_import(request: web.Request) -> web.Response:
               "files": ausgabe, "status": dateien_status})
 
 
+@_gameplay_tool_locked
 async def api_tools_custombuildmap_remove(request: web.Request) -> web.Response:
     """Entfernt einen custom/*.json-Eintrag aus objectSpawnersArr UND
     versucht, die Datei selbst vom Server zu löschen (best effort - schlägt
@@ -14215,6 +14239,7 @@ async def api_tools_skymessage_get(request: web.Request) -> web.Response:
     return ok(antwort)
 
 
+@_gameplay_tool_locked
 async def api_tools_skymessage_post(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request, "tools.skymessage")
     if fehler is not None:
@@ -15208,6 +15233,268 @@ async def api_tools_deployment_remove(request: web.Request) -> web.Response:
     _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Einsatz entfernt",
                f"{eintrag.get('event_name')} · {conn.name}")
     return ok({"entfernt": dep_id})
+
+
+# PRA schema: BohemiaInteractive/DayZ-Script-Diff,
+# scripts/3_game/cfgplayerrestrictedareajsondata.c and
+# DayZ-Central-Economy/dayzOffline.sakhal/pra/warheadstorage.json.
+# PlayerBase.AfterStoreLoad checks these areas on loading a saved character.
+_TELEPORT_NAME = re.compile(r"[A-Za-z0-9_]{1,64}")
+
+
+def _teleports(conn: ServerConnection) -> List[Dict[str, Any]]:
+    # Never conn.get(): legacy configuration fallback could expose another tenant.
+    return [dict(item) for item in conn.data.get("teleports", []) if isinstance(item, dict)]
+
+
+def _teleport_files(data: Dict[str, Any], conn: ServerConnection):
+    name = data.get("name")
+    if not isinstance(name, str) or not _TELEPORT_NAME.fullmatch(name):
+        raise ValueError("Zonenname: 1–64 Buchstaben, Ziffern oder _ verwenden.")
+    map_name = _canonical_map_name(str(conn.data.get("map_name") or ""))
+    world_size = DEFAULT_MAP_SIZES.get(map_name)
+    if world_size is None:
+        raise ValueError("Karte unbekannt – zuerst die Serververbindung prüfen.")
+
+    def number(value, low, high):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("Alle Koordinaten, Größen und Winkel müssen Zahlen sein.")
+        if not low <= value <= high or not math.isfinite(value):
+            raise ValueError("Koordinate, Größe oder Winkel außerhalb des erlaubten Bereichs.")
+        return value
+
+    def position(item):
+        if not isinstance(item, dict):
+            raise ValueError("Ungültiger Punkt.")
+        return [number(item.get("x"), 0, world_size),
+                number(item.get("y"), -1000, 10000),
+                number(item.get("z"), 0, world_size)]
+
+    def rotation(item, keys):
+        return [number(item.get(key, 0), -360, 360) for key in keys]
+
+    boxes, targets = data.get("boxes"), data.get("targets")
+    if not isinstance(boxes, list) or not 1 <= len(boxes) <= 100:
+        raise ValueError("Bitte 1–100 Auslöse-Boxen angeben.")
+    if not isinstance(targets, list) or not 1 <= len(targets) <= 100:
+        raise ValueError("Bitte 1–100 Zielpunkte angeben.")
+    pra_boxes, objects = [], []
+    for box in boxes:
+        pos = position(box)
+        size = [number(box.get(key), 0.1, world_size) for key in ("width", "height", "depth")]
+        pra_boxes.append([size, rotation(box, ("yaw", "pitch", "roll")), pos])
+        classname = box.get("object", "")
+        if not isinstance(classname, str) or (classname and not re.fullmatch(r"[A-Za-z0-9_]{1,128}", classname)):
+            raise ValueError("Ungültiger Objekt-Classname.")
+        if classname:
+            objects.append({"name": classname, "pos": pos,
+                            "ypr": rotation(box, ("objectYaw", "objectPitch", "objectRoll")),
+                            "scale": 1, "enableCEPersistency": 0})
+    pra = {"areaName": name, "PRABoxes": pra_boxes,
+           "safePositions3D": [position(p) for p in targets]}
+    files = [(f"custom/pra/{name}.json", pra)]
+    if objects:
+        files.append((f"custom/{name}_objects.json", {"Objects": objects}))
+    return name, [(path, json.dumps(content, indent=4, ensure_ascii=False) + "\n")
+                  for path, content in files]
+
+
+async def _teleport_prepare(request, action):
+    conn, error = _session_conn(request, "tools.teleports")
+    if error is not None:
+        return None, error
+    error = await _modul_pruefen("tools.teleports", request, conn)
+    if error is None:
+        error = await _dash_gate(request, conn, "tools", action)
+    return conn, error
+
+
+async def api_tools_teleports_get(request: web.Request) -> web.Response:
+    conn, error = await _teleport_prepare(request, "view")
+    if error is not None:
+        return error
+    return ok({"teleports": [{k: item.get(k) for k in ("id", "name", "files", "created")}
+                             for item in _teleports(conn)],
+               "kein_mission_ordner": not bool(_mission_dir_of(conn))})
+
+
+async def _teleport_gameplay(conn, loop):
+    raw, status = await _tools_datei_lesen(conn, "cfggameplay.json", loop)
+    if status != "ok":
+        raise ValueError("Die cfggameplay.json ist nicht lesbar.")
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Die cfggameplay.json enthält ungültiges JSON.") from exc
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("WorldsData", {}), dict):
+        raise ValueError("WorldsData muss ein JSON-Objekt sein.")
+    for key in ("playerRestrictedAreaFiles", "objectSpawnersArr"):
+        value = parsed.get("WorldsData", {}).get(key, [])
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ValueError("PRA- und Object-Spawner-Einträge müssen Listen von Dateipfaden sein.")
+    return raw, parsed
+
+
+def _teleport_key(path):
+    return "playerRestrictedAreaFiles" if path.startswith("custom/pra/") else "objectSpawnersArr"
+
+
+async def _teleport_transaction(conn, changes, manifest, loop):
+    """Compensate every attempted mutation, including a failed partial write/delete."""
+    attempted = []
+    old_manifest = _teleports(conn)
+    had_manifest = "teleports" in conn.data
+    saving_manifest = False
+    try:
+        for path, before, after in changes:
+            attempted.append((path, before))
+            success = (await _tools_datei_loeschen(conn, path, loop) if after is None
+                       else await _tools_datei_schreiben(conn, path, after, loop))
+            if not success:
+                raise OSError(path)
+        saving_manifest = True
+        _conn_store(conn, "teleports", manifest, strict=True)
+    except Exception:
+        failed = []
+        for path, before in reversed(attempted):
+            try:
+                if before is None:
+                    _, status = await _tools_datei_lesen(conn, path, loop)
+                    restored = status == "missing" or await _tools_datei_loeschen(conn, path, loop)
+                else:
+                    restored = await _tools_datei_schreiben(conn, path, before, loop)
+                if not restored:
+                    failed.append(path)
+            except Exception:
+                failed.append(path)
+        if saving_manifest:
+            try:
+                _conn_store(conn, "teleports", old_manifest, strict=True)
+            except Exception:
+                failed.append("connections.json")
+            if not had_manifest:
+                conn.data.pop("teleports", None)
+        message = "Speichern fehlgeschlagen – Änderungen wurden zurückgesetzt."
+        if failed:
+            message = "Rollback unvollständig – folgende Dateien prüfen: " + ", ".join(failed)
+        return err(message, 502)
+    return None
+
+
+async def api_tools_teleports_post(request: web.Request) -> web.Response:
+    conn, error = await _teleport_prepare(request, "edit")
+    if error is not None:
+        return error
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    if not isinstance(data, dict) or type(data.get("commit", False)) is not bool:
+        return err("Ungültige Teleport-Anfrage.")
+    try:
+        name, files = _teleport_files(data, conn)
+    except ValueError as exc:
+        return err(str(exc))
+    commit = data.get("commit", False)
+    if commit:
+        error = _dash_rate_limited(request, "tools.teleports", 10)
+        if error is not None:
+            return error
+    async with _schaden_lock(conn.service_id):
+        loop = asyncio.get_running_loop()
+        entries = _teleports(conn)
+        if any(item.get("name", "").lower() == name.lower() for item in entries):
+            return err("Dieser Teleport-Name ist bereits vorhanden.", 409)
+        try:
+            raw, gameplay = await _teleport_gameplay(conn, loop)
+        except ValueError as exc:
+            return err(str(exc), 502)
+        worlds_created = "WorldsData" not in gameplay
+        worlds = gameplay.setdefault("WorldsData", {})
+        keys_created = [key for key in ("playerRestrictedAreaFiles", "objectSpawnersArr")
+                        if key not in worlds and any(_teleport_key(p) == key for p, _ in files)]
+        # Reserve both names, even if this deployment has no visible objects.
+        for path in (f"custom/pra/{name}.json", f"custom/{name}_objects.json"):
+            _, status = await _tools_datei_lesen(conn, path, loop)
+            if status not in ("ok", "missing"):
+                return err("Vorhandene Teleport-Dateien konnten nicht geprüft werden.", 502)
+            refs = worlds.get(_teleport_key(path), [])
+            if status == "ok" or any(_custom_spawner_pfad_normalisieren(p).lower() == path.lower() for p in refs):
+                return err("Dieser Teleport-Name ist bereits vorhanden.", 409)
+        for path, _ in files:
+            worlds.setdefault(_teleport_key(path), []).append(path)
+        updated = json.dumps(gameplay, indent=4, ensure_ascii=False) + "\n"
+        generated = [{"filename": p, "content": content} for p, content in files]
+        generated.append({"filename": "cfggameplay.json", "content": updated})
+        if not commit:
+            return ok({"name": name, "generated": generated})
+        # FTP does not create missing parent directories on STOR.
+        for folder in ("custom", "custom/pra"):
+            if not await loop.run_in_executor(None, conn.ftp.mkdir,
+                                             f"{_mission_dir_of(conn).rstrip('/')}/{folder}"):
+                return err("Der Teleport-Ordner konnte nicht angelegt werden.", 502)
+        entry = {"id": uuid.uuid4().hex, "name": name, "files": [p for p, _ in files],
+                 "created": time.time(), "gameplay_before": raw, "gameplay_after": updated,
+                 "keys_created": keys_created, "worlds_created": worlds_created}
+        changes = [(p, None, content) for p, content in files] + [("cfggameplay.json", raw, updated)]
+        error = await _teleport_transaction(conn, changes, entries + [entry], loop)
+        if error is not None:
+            return error
+        return ok({"id": entry["id"], "name": name, "generated": generated})
+
+
+async def api_tools_teleports_remove(request: web.Request) -> web.Response:
+    conn, error = await _teleport_prepare(request, "edit")
+    if error is not None:
+        return error
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    if not isinstance(data, dict):
+        return err("Ungültige Teleport-Anfrage.")
+    error = _dash_rate_limited(request, "tools.teleports.remove", 10)
+    if error is not None:
+        return error
+    async with _schaden_lock(conn.service_id):
+        entries = _teleports(conn)
+        entry = next((item for item in entries if item.get("id") == data.get("id")), None)
+        if entry is None:
+            return err("Diesen Teleport gibt es nicht (mehr).", 404)
+        loop = asyncio.get_running_loop()
+        try:
+            raw, gameplay = await _teleport_gameplay(conn, loop)
+        except ValueError as exc:
+            return err(str(exc), 502)
+        worlds = gameplay.get("WorldsData", {})
+        file_changes = []
+        for path in entry["files"]:
+            before, status = await _tools_datei_lesen(conn, path, loop)
+            if status not in ("ok", "missing"):
+                return err("Vorhandene Teleport-Dateien konnten nicht geprüft werden.", 502)
+            if status == "ok":
+                file_changes.append((path, before, None))
+            key = _teleport_key(path)
+            if key in worlds:
+                worlds[key] = [p for p in worlds[key]
+                               if _custom_spawner_pfad_normalisieren(p) != path]
+        for key in entry.get("keys_created", []):
+            if worlds.get(key) == []:
+                worlds.pop(key)
+        if entry.get("worlds_created") and not worlds:
+            gameplay.pop("WorldsData", None)
+        updated = json.dumps(gameplay, indent=4, ensure_ascii=False) + "\n"
+        if raw == entry.get("gameplay_after"):
+            updated = entry["gameplay_before"]
+        remaining = [item for item in entries if item["id"] != entry["id"]]
+        # Removing out of order must not resurrect an older deployment via its snapshot.
+        for item in remaining:
+            item.pop("gameplay_after", None)
+            item["keys_created"] = list(set(item.get("keys_created", []) + entry.get("keys_created", [])))
+            item["worlds_created"] = item.get("worlds_created", False) or entry.get("worlds_created", False)
+        error = await _teleport_transaction(conn, [("cfggameplay.json", raw, updated)] + file_changes,
+                                            remaining, loop)
+        if error is not None:
+            return error
+        return ok({"entfernt": entry["id"]})
 
 
 # ── 6. Rucksack-Builder (Inhalte & Aufsätze) ──────────────────────────────
@@ -33699,6 +33986,9 @@ def build_app() -> web.Application:
     r.add_get("/api/tools/deployment", api_tools_deployment_get)
     r.add_post("/api/tools/deployment/deploy", api_tools_deployment_deploy)
     r.add_post("/api/tools/deployment/remove", api_tools_deployment_remove)
+    r.add_get("/api/tools/teleports", api_tools_teleports_get)
+    r.add_post("/api/tools/teleports", api_tools_teleports_post)
+    r.add_post("/api/tools/teleports/remove", api_tools_teleports_remove)
     r.add_get("/api/tools/spawnable", api_tools_bag_get)
     r.add_post("/api/tools/spawnable", api_tools_bag_post)
     r.add_get("/api/tools/event", api_tools_event_get)
@@ -34414,6 +34704,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "db102d189889fd5c5abbd40682b0a8b92eff3f6ef8714bf062197bc5b8c0daa3",
         "5426b0e6ebb4187939cc274a66a4df1888ff89a23e51ff714f22c358c98d2814",
         "f80266f397a0589bac80dc6df9b234e29ec806fe981fa8d9028aa85810a97d88",
         "6d6b0bc1f1ecb8a039d8b867c7258e5aa8a28b7891935be0c21f2803b0038569",
@@ -34608,6 +34899,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "391ff9f9dad38e7fa6e74efb6968d754e84251df3a41f30cebeddfd65d8c08eb",
     ),
     "map.js": (
+        "4599bc6a735552954b49f115b39748b418553d44ec8d3bbe3ea67c5beb3ac0da",
         "13052daa06af52e48146d9683438088ff94f759ff72c414b78104e0be4e4abc3",
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
         "899976659bd4cff34be4fa6b08e2c8bb54863f65fbdecafb4aa00c0913b05e84",
