@@ -320,3 +320,23 @@ def test_npc_ausruestung_nur_bekannte_classnames():
     fehlend = [i for v in bot.TOOL_DEPLOY_NPCS.values() for _a, i in v["items"]
                if i.lower() not in bekannt and i.lower() not in teile]
     assert not fehlend, fehlend
+
+
+# ── Fahrzeugliste 29.09.2026 ─────────────────────────────────────────────
+def test_motorrad_ist_gesperrt(monkeypatch):
+    conn = _server()
+    status, _ = _deploy(monkeypatch, conn, commit=False, preset="jana_blue")
+    assert status == 422
+    assert conn.ftp.dateien["/mission/db/events.xml"] == EVENTS
+
+
+def test_jede_farbvariante_hat_eigenes_bild(monkeypatch):
+    conn = _server()
+    req = _request(monkeypatch, conn, "GET", "/api/tools/deployment")
+    presets = _json(_run(bot.api_tools_deployment_get(req)))[1]["data"]["presets"]
+    ohne = [p["key"] for p in presets if p["key"] != "boat_black"
+            and p["image"] != f"/static/vehicles/{p['klasse']}.webp"]
+    assert not ohne, ohne
+    assert {p["key"] for p in presets if p["bald"]} == {
+        "jana_blue", "jana_red", "jana_yellow",
+        "bitrak_blue", "bitrak_green", "bitrak_red", "bitrak_yellow"}

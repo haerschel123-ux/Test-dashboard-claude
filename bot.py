@@ -11869,7 +11869,45 @@ TOOL_DEPLOY_VEHICLES: Dict[str, Dict[str, Any]] = {
                       "bild": "Offroad_02", "karten": ["ChernarusPlus", "Livonia"]},
     "boat_black":    {"label": "Schwarzes Boot", "klasse": "Boat_01_Black",
                       "bild": None, "karten": None},
+    # Ergaenzt aus Brigardes Fahrzeugliste (29.09.2026, Classnames aus Bohemias
+    # DayZ-Central-Economy). Ob der Server die Klasse kennt, prueft der Einsatz
+    # ohnehin an cfgspawnabletypes.xml.
+    "ada_green":     {"label": "Grüne ADA", "klasse": "OffroadHatchback",
+                      "bild": "OffroadHatchback", "karten": None},
+    "olga_grey":     {"label": "Hellgraue Olga", "klasse": "CivilianSedan",
+                      "bild": "CivilianSedan", "karten": None},
+    "gunter_red":    {"label": "Roter Gunter", "klasse": "Hatchback_02",
+                      "bild": "Hatchback_02", "karten": None},
+    "sarka_yellow":  {"label": "Gelbe Sarka", "klasse": "Sedan_02",
+                      "bild": "Sedan_02", "karten": None},
+    "truck_green":   {"label": "Grüner Truck", "klasse": "Truck_01_Covered",
+                      "bild": "Truck_01_Covered", "karten": None},
+    # Motorraeder kommen erst mit DayZ 1.30 (angekuendigt 15.10.2026) - bis
+    # dahin nur angezeigt, Einsetzen gesperrt ("bald").
+    "jana_blue":     {"label": "Jana 50 blau", "klasse": "Motorbike_01_Blue",
+                      "bild": None, "karten": None, "bald": True},
+    "jana_red":      {"label": "Jana 50 rot", "klasse": "Motorbike_01_Red",
+                      "bild": None, "karten": None, "bald": True},
+    "jana_yellow":   {"label": "Jana 50 gelb", "klasse": "Motorbike_01_Yellow",
+                      "bild": None, "karten": None, "bald": True},
+    "bitrak_blue":   {"label": "Bitrak 682 blau", "klasse": "Motorbike_02_Blue",
+                      "bild": None, "karten": None, "bald": True},
+    "bitrak_green":  {"label": "Bitrak 682 grün", "klasse": "Motorbike_02_Green",
+                      "bild": None, "karten": None, "bald": True},
+    "bitrak_red":    {"label": "Bitrak 682 rot", "klasse": "Motorbike_02_Red",
+                      "bild": None, "karten": None, "bald": True},
+    "bitrak_yellow": {"label": "Bitrak 682 gelb", "klasse": "Motorbike_02_Yellow",
+                      "bild": None, "karten": None, "bald": True},
 }
+
+
+def _deploy_bild(v: Dict[str, Any]) -> Optional[str]:
+    """Bild je Farbvariante (vehicles/<Klasse>.webp), sonst das Modellbild."""
+    if f"vehicles/{v['klasse']}.webp" in _EMBEDDED_ASSETS:
+        return f"/static/vehicles/{v['klasse']}.webp"
+    if v["bild"] and f"vehicles/{v['bild']}.png" in _EMBEDDED_ASSETS:
+        return f"/static/vehicles/{v['bild']}.png"
+    return None
 
 # NPC-Koerper: Vanilla-Ueberlebende, von Brigarde vorgegeben (28.09.2026). Die
 # Ausruestung haengt in cfgspawnabletypes.xml an der KLASSE - deshalb belegt
@@ -15061,9 +15099,7 @@ async def api_tools_deployment_get(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     presets = [{"key": k, "label": v["label"], "klasse": v["klasse"],
-                "image": (f"/static/vehicles/{v['bild']}.png"
-                          if v["bild"] and f"vehicles/{v['bild']}.png" in _EMBEDDED_ASSETS
-                          else None)}
+                "image": _deploy_bild(v), "bald": bool(v.get("bald"))}
                for k, v in _deploy_presets_fuer(conn).items()]
     npc_presets = [{"key": k, "label": v["label"], "event": v["event"],
                     "items": [i for _art, i in v["items"]],
@@ -15119,6 +15155,8 @@ async def api_tools_deployment_deploy(request: web.Request) -> web.Response:
         preset = _deploy_presets_fuer(conn).get(str(data.get("preset") or ""))
         if preset is None:
             return err("Diese Vorlage gibt es für die Karte dieses Servers nicht.", 422)
+        if preset.get("bald"):
+            return err("Dieses Fahrzeug kommt erst mit DayZ 1.30 – Einsetzen noch gesperrt.", 422)
         klasse = preset["klasse"]
     try:
         punkte = _deploy_punkte_pruefen(data.get("positions"))
@@ -34715,6 +34753,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "e2e59818c4288f6e591c6ffc52f285f519da46ba72029a1f6e42c60294269a48",
         "db102d189889fd5c5abbd40682b0a8b92eff3f6ef8714bf062197bc5b8c0daa3",
         "5426b0e6ebb4187939cc274a66a4df1888ff89a23e51ff714f22c358c98d2814",
         "f80266f397a0589bac80dc6df9b234e29ec806fe981fa8d9028aa85810a97d88",
