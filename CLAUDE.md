@@ -154,3 +154,14 @@ Für die Oberfläche Playwright mit dem vorinstallierten Chromium unter
 **`connections.json` ist eine flache Zuordnung** `{"1000": {...}, "2000": {...}}` – nicht
 verschachtelt. Ein falsches Testformat hat hier schon einmal eine Prüfung wertlos gemacht,
 weil unbemerkt ein ganz anderer Code-Pfad lief.
+
+## Änderungsprotokoll für Übergaben
+
+Wenn `Arbeitsprotokoll.md` im Repository liegt, lies es vor Arbeiten an den dort
+dokumentierten Änderungen. Ergänze es nach jeder neuen Änderung mit Ursache,
+betroffenen Dateien, Verhalten, Tests, Einschränkungen sowie Commit-/Push-Status.
+Brigarde verwendet es als separate Übergabedatei für Claude. Nach vollständigem Lesen
+und Übernehmen der Informationen in die angeforderte Zusammenfassung oder eigene
+Arbeitsnotizen darf Claude `Arbeitsprotokoll.md` löschen, damit es nicht dauerhaft
+erneut eingelesen wird. Bei späteren Änderungen wird das Protokoll bei Bedarf neu
+angelegt.
