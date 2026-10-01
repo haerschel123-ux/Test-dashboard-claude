@@ -70,6 +70,38 @@ def test_roster_getrennt_nach_guild_und_server(edb):
     assert not edb.roster_hat_namen(111, "2000", "SpielerA")
 
 
+def test_link_verlangt_fuenf_minuten_pro_guild_und_server(edb):
+    edb.roster_upsert_login(111, "1000", "SpielerA")
+    assert not edb.roster_hat_fuenf_minuten(111, "1000", "SpielerA")
+    edb.roster_add_playtime(111, "1000", "SpielerA", 299)
+    assert not edb.roster_hat_fuenf_minuten(111, "1000", "SpielerA")
+    edb.roster_add_playtime(111, "1000", "SpielerA", 1)
+    assert edb.roster_hat_fuenf_minuten(111, "1000", "SpielerA")
+    assert not edb.roster_hat_fuenf_minuten(222, "1000", "SpielerA")
+    assert not edb.roster_hat_fuenf_minuten(111, "2000", "SpielerA")
+
+
+def test_link_zaehlt_laufende_sitzung_und_spaetere_connects(monkeypatch, edb):
+    clock = [1000.0]
+    monkeypatch.setattr(bot.time, "time", lambda: clock[0])
+    edb.roster_upsert_login(111, "1000", "SpielerA")
+    edb.open_session("1000", "SpielerA", None)
+    clock[0] = 1299.0
+    assert not edb.roster_hat_fuenf_minuten(111, "1000", "SpielerA")
+    clock[0] = 1300.0
+    assert edb.roster_hat_fuenf_minuten(111, "1000", "SpielerA")
+    assert not edb.roster_hat_fuenf_minuten(222, "1000", "SpielerA")
+    assert not edb.roster_hat_fuenf_minuten(111, "2000", "SpielerA")
+    edb.close_session("1000", "SpielerA")
+    edb.roster_add_playtime(111, "1000", "SpielerA", 200)
+    clock[0] = 1400.0
+    edb.open_session("1000", "SpielerA", None)
+    clock[0] = 1499.0
+    assert not edb.roster_hat_fuenf_minuten(111, "1000", "SpielerA")
+    clock[0] = 1500.0
+    assert edb.roster_hat_fuenf_minuten(111, "1000", "SpielerA")
+
+
 def test_roster_delete_entfernt_zeile(edb):
     edb.roster_upsert_login(111, "1000", "SpielerA")
     assert edb.roster_delete(111, "1000", "SpielerA")
