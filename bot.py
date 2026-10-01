@@ -9870,9 +9870,14059 @@ async def cmd_unban(interaction: discord.Interaction, spieler: str,
                     server: Optional[str] = None):
     if not _subcmd_allowed(interaction, "ban_entfernen"):
         return await _deny_subcmd(interaction)
-    conn = await _require_
-... 714492 bytes omitted ...
-if not ok:
+    conn = await _require_conn(interaction, server=server)
+    if conn is None:
+        return
+    await interaction.response.defer()
+
+    names = _split_names(spieler)
+    if not names:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Keinen gültigen Namen angegeben.", "❌ No valid name given."))
+
+    try:
+        current, category, key = await _read_banlist(conn)
+    except Exception as e:
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ Nitrado-Banliste konnte nicht gelesen werden – nichts geändert.\n`{e}`",
+            f"❌ Could not read the Nitrado ban list – nothing changed.\n`{e}`"))
+
+    wanted_lower = {n.lower() for n in names}
+    new_list  = [n for n in current if n.lower() not in wanted_lower]
+    removed   = [n for n in current if n.lower() in wanted_lower]
+    not_found = [n for n in names if n.lower() not in {r.lower() for r in removed}]
+
+    sv = _t(interaction, "ℹ️ Keiner der Namen stand auf der Banliste",
+           "ℹ️ None of the names were on the ban list")
+    if removed:
+        ok, msg = await _write_banlist(conn, new_list, category, key)
+        if not ok:
+            return await interaction.followup.send(_t(
+                interaction,
+                f"❌ Nitrado-Banliste konnte nicht gespeichert werden – nichts geändert.\n`{msg}`",
+                f"❌ Could not save the Nitrado ban list – nothing changed.\n`{msg}`"))
+        sv = _t(interaction, "✅ Von der Nitrado-Banliste entfernt",
+               "✅ Removed from the Nitrado ban list")
+        # Lokale Metadaten aufräumen (case-insensitive)
+        _eimer = _bans_of(conn)
+        for local_key in [k for k in _eimer if k.lower() in wanted_lower]:
+            _eimer.pop(local_key, None)
+        cfg.save_bans()
+
+    embed = discord.Embed(title=_t(interaction, "✅ Ban aufgehoben", "✅ Ban Removed"), color=0x2ECC71)
+    embed.add_field(name=_t(interaction, "Entfernt", "Removed"),
+                    value="\n".join(f"`{n}`" for n in removed) or "–", inline=True)
+    if not_found:
+        embed.add_field(name=_t(interaction, "Nicht auf der Liste", "Not on the list"),
+                        value="\n".join(f"`{n}`" for n in not_found), inline=True)
+    embed.add_field(name="Nitrado", value=sv, inline=False)
+    embed.set_footer(text=_t(interaction, "Änderung greift ggf. erst nach einem Server-Neustart.",
+                             "The change may only take effect after a server restart."))
+    await interaction.followup.send(embed=embed)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /banlist – Alle gesperrten Spieler
+# ══════════════════════════════════════════════════════════════
+@bot.tree.command(name="banlist",
+                  description=app_commands.locale_str("📋 Zeigt die Banliste aus den Nitrado-Servereinstellungen"))
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_banlist(interaction: discord.Interaction, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "banlist"):
+        return await _deny_subcmd(interaction)
+    conn = await _require_conn(interaction, server=server)
+    if conn is None:
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        all_bans, _category, _key = await _read_banlist(conn)
+    except Exception as e:
+        return await interaction.followup.send(_t(
+            interaction, f"❌ Nitrado-Banliste konnte nicht gelesen werden.\n`{e}`",
+            f"❌ Could not read the Nitrado ban list.\n`{e}`"), ephemeral=True)
+
+    if not all_bans:
+        return await interaction.followup.send(_t(
+            interaction, "✅ Keine gesperrten Spieler.", "✅ No banned players."), ephemeral=True)
+
+    embed = discord.Embed(
+        title=_t(interaction, f"🚫 Banliste – {len(all_bans)} Spieler gesperrt",
+                 f"🚫 Ban List – {len(all_bans)} player(s) banned"),
+        color=0xE74C3C
+    )
+    # Metadaten (Grund/Datum/von) kommen aus der lokalen banlist.json, falls
+    # der Ban über /ban gesetzt wurde – Einträge direkt aus dem Nitrado-
+    # Webinterface haben keine Metadaten (case-insensitives Matching)
+    local = {k.lower(): v for k, v in _bans_of(conn).items()}
+    von_wort = _t(interaction, "von", "by")
+    lines = []
+    for entry in sorted(all_bans, key=str.lower):
+        info = local.get(entry.lower())
+        if info:
+            grund = info.get("reason", "–")
+            datum = (info.get("banned_at", "")[:10]) if info.get("banned_at") else "–"
+            von   = info.get("banned_by", "–")
+            lines.append(f"• `{entry}` — {grund} | {datum} | {von_wort} {von}")
+        else:
+            lines.append(f"• `{entry}`")
+
+    # Aufteilen bei > 1000 Zeichen
+    chunks, chunk = [], []
+    for line in lines:
+        if len("\n".join(chunk + [line])) > 1000:
+            chunks.append("\n".join(chunk))
+            chunk = [line]
+        else:
+            chunk.append(line)
+    if chunk:
+        chunks.append("\n".join(chunk))
+
+    spieler_wort = _t(interaction, "Spieler", "Players")
+    for i, c in enumerate(chunks[:25]):
+        embed.add_field(name=f"{spieler_wort} {i+1}" if len(chunks) > 1 else spieler_wort,
+                        value=c, inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Whitelist – Hilfsfunktionen (Whitelist in den Nitrado-
+#  Servereinstellungen, 1 Name pro Zeile – analog zur Banliste)
+# ══════════════════════════════════════════════════════════════
+def _find_whitelist_setting(conn: ServerConnection, settings: Dict) -> Tuple[str, str, str]:
+    """Sucht das Whitelist-Setting in den Nitrado-Settings.
+    Reihenfolge: Config-Override (nitrado_whitelist_category/-key) →
+    Auto-Erkennung (Key 'whitelist') → Fallback ('general', 'whitelist').
+    Gibt (category, key, aktueller_wert) zurück."""
+    ov_cat = str(conn.get("nitrado_whitelist_category") or "").strip()
+    ov_key = str(conn.get("nitrado_whitelist_key") or "").strip()
+    if ov_cat and ov_key:
+        val = ((settings.get(ov_cat) or {}).get(ov_key)
+               if isinstance(settings.get(ov_cat), dict) else None)
+        return ov_cat, ov_key, str(val or "")
+    for category, keys in settings.items():
+        if not isinstance(keys, dict):
+            continue
+        for key, val in keys.items():
+            if str(key).lower() == "whitelist":
+                return str(category), str(key), str(val or "")
+    return "general", "whitelist", ""
+
+async def _read_whitelist(conn: ServerConnection) -> Tuple[List[str], str, str]:
+    """Liest die Whitelist aus den Nitrado-Servereinstellungen.
+    Gibt (namen, category, key) zurück. Wirft RuntimeError bei API-Fehler –
+    Aufrufer dürfen dann NICHT schreiben (sonst würde die Liste überschrieben)."""
+    settings = await conn.api.get_settings()
+    if settings is None:
+        raise RuntimeError("Nitrado-API nicht erreichbar (Settings konnten nicht gelesen werden)")
+    category, key, raw = _find_whitelist_setting(conn, settings)
+    names = [l.strip() for l in raw.splitlines() if l.strip()]
+    return names, category, key
+
+async def _write_whitelist(conn: ServerConnection, names: List[str],
+                           category: str, key: str) -> Tuple[bool, str]:
+    """Schreibt die Whitelist in die Nitrado-Servereinstellungen (1 Name pro Zeile)."""
+    return await conn.api.set_setting(category, key, "\r\n".join(names))
+
+
+# ══════════════════════════════════════════════════════════════
+#  /whitelist add|remove|show – Whitelist verwalten (Admin)
+# ══════════════════════════════════════════════════════════════
+whitelist_group = app_commands.Group(
+    name="whitelist",
+    description=app_commands.locale_str("✅ Whitelist in den Nitrado-Servereinstellungen verwalten (Admin)"))
+
+
+@whitelist_group.command(
+    name="add",
+    description=app_commands.locale_str("✅ Spieler zur Whitelist hinzufügen (mehrere per Komma/Zeile)"))
+@app_commands.describe(spieler="PlayStation-Name(n) – mehrere per Komma getrennt",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def whitelist_add(interaction: discord.Interaction, spieler: str,
+                        server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "whitelist_add"):
+        return await _deny_subcmd(interaction)
+    conn = await _require_conn(interaction, server=server)
+    if conn is None:
+        return
+    await interaction.response.defer()
+
+    names = _split_names(spieler.replace("\n", ","))
+    if not names:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Keinen gültigen Namen angegeben.", "❌ No valid name given."))
+
+    try:
+        current, category, key = await _read_whitelist(conn)
+    except Exception as e:
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ Nitrado-Whitelist konnte nicht gelesen werden – nichts geändert.\n`{e}`",
+            f"❌ Could not read the Nitrado whitelist – nothing changed.\n`{e}`"))
+
+    existing_lower = {n.lower() for n in current}
+    added   = [n for n in names if n.lower() not in existing_lower]
+    already = [n for n in names if n.lower() in existing_lower]
+
+    sv = _t(interaction, "ℹ️ Alle Namen standen bereits auf der Whitelist",
+           "ℹ️ All names were already on the whitelist")
+    if added:
+        ok, msg = await _write_whitelist(conn, current + added, category, key)
+        if not ok:
+            return await interaction.followup.send(_t(
+                interaction,
+                f"❌ Nitrado-Whitelist konnte nicht gespeichert werden – nichts geändert.\n`{msg}`",
+                f"❌ Could not save the Nitrado whitelist – nothing changed.\n`{msg}`"))
+        sv = _t(interaction, "✅ In der Nitrado-Whitelist gespeichert",
+               "✅ Saved in the Nitrado whitelist")
+
+    embed = discord.Embed(title=_t(interaction, "✅ Whitelist aktualisiert", "✅ Whitelist Updated"),
+                          color=0x2ECC71)
+    embed.add_field(name=_t(interaction, "Hinzugefügt", "Added"),
+                    value="\n".join(f"`{n}`" for n in added) or "–", inline=True)
+    if already:
+        embed.add_field(name=_t(interaction, "Bereits auf der Whitelist", "Already on the whitelist"),
+                        value="\n".join(f"`{n}`" for n in already), inline=True)
+    embed.add_field(name=_t(interaction, "Hinzugefügt von", "Added by"),
+                    value=str(interaction.user), inline=True)
+    embed.add_field(name="Nitrado", value=sv, inline=False)
+    embed.set_footer(text=_t(interaction, "Änderung greift ggf. erst nach einem Server-Neustart.",
+                             "The change may only take effect after a server restart."))
+    await interaction.followup.send(embed=embed)
+
+
+@whitelist_group.command(
+    name="remove",
+    description=app_commands.locale_str("🗑️ Spieler von der Whitelist entfernen (mehrere per Komma/Zeile)"))
+@app_commands.describe(spieler="PlayStation-Name(n) – mehrere per Komma getrennt",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def whitelist_remove(interaction: discord.Interaction, spieler: str,
+                           server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "whitelist_remove"):
+        return await _deny_subcmd(interaction)
+    conn = await _require_conn(interaction, server=server)
+    if conn is None:
+        return
+    await interaction.response.defer()
+
+    names = _split_names(spieler.replace("\n", ","))
+    if not names:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Keinen gültigen Namen angegeben.", "❌ No valid name given."))
+
+    try:
+        current, category, key = await _read_whitelist(conn)
+    except Exception as e:
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ Nitrado-Whitelist konnte nicht gelesen werden – nichts geändert.\n`{e}`",
+            f"❌ Could not read the Nitrado whitelist – nothing changed.\n`{e}`"))
+
+    wanted_lower = {n.lower() for n in names}
+    new_list  = [n for n in current if n.lower() not in wanted_lower]
+    removed   = [n for n in current if n.lower() in wanted_lower]
+    not_found = [n for n in names if n.lower() not in {r.lower() for r in removed}]
+
+    sv = _t(interaction, "ℹ️ Keiner der Namen stand auf der Whitelist",
+           "ℹ️ None of the names were on the whitelist")
+    if removed:
+        ok, msg = await _write_whitelist(conn, new_list, category, key)
+        if not ok:
+            return await interaction.followup.send(_t(
+                interaction,
+                f"❌ Nitrado-Whitelist konnte nicht gespeichert werden – nichts geändert.\n`{msg}`",
+                f"❌ Could not save the Nitrado whitelist – nothing changed.\n`{msg}`"))
+        sv = _t(interaction, "✅ Von der Nitrado-Whitelist entfernt",
+               "✅ Removed from the Nitrado whitelist")
+
+    embed = discord.Embed(title=_t(interaction, "🗑️ Whitelist aktualisiert", "🗑️ Whitelist Updated"),
+                          color=0xE67E22)
+    embed.add_field(name=_t(interaction, "Entfernt", "Removed"),
+                    value="\n".join(f"`{n}`" for n in removed) or "–", inline=True)
+    if not_found:
+        embed.add_field(name=_t(interaction, "Nicht auf der Liste", "Not on the list"),
+                        value="\n".join(f"`{n}`" for n in not_found), inline=True)
+    embed.add_field(name="Nitrado", value=sv, inline=False)
+    embed.set_footer(text=_t(interaction, "Änderung greift ggf. erst nach einem Server-Neustart.",
+                             "The change may only take effect after a server restart."))
+    await interaction.followup.send(embed=embed)
+
+
+@whitelist_group.command(
+    name="show",
+    description=app_commands.locale_str("📋 Zeigt die aktuellen Spieler auf der Whitelist (Admin)"))
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def whitelist_show(interaction: discord.Interaction, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "whitelist_show"):
+        return await _deny_subcmd(interaction)
+    conn = await _require_conn(interaction, server=server)
+    if conn is None:
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        names, _category, _key = await _read_whitelist(conn)
+    except Exception as e:
+        return await interaction.followup.send(_t(
+            interaction, f"❌ Nitrado-Whitelist konnte nicht gelesen werden.\n`{e}`",
+            f"❌ Could not read the Nitrado whitelist.\n`{e}`"), ephemeral=True)
+
+    if not names:
+        return await interaction.followup.send(_t(
+            interaction, "ℹ️ Es stehen keine Spieler auf der Whitelist.",
+            "ℹ️ No players are on the whitelist."), ephemeral=True)
+
+    embed = discord.Embed(
+        title=_t(interaction, f"✅ Whitelist – {len(names)} Spieler",
+                 f"✅ Whitelist – {len(names)} player(s)"),
+        color=0x2ECC71)
+    lines = [f"• `{n}`" for n in sorted(names, key=str.lower)]
+    chunks, chunk = [], []
+    for line in lines:
+        if len("\n".join(chunk + [line])) > 1000:
+            chunks.append("\n".join(chunk))
+            chunk = [line]
+        else:
+            chunk.append(line)
+    if chunk:
+        chunks.append("\n".join(chunk))
+    spieler_wort = _t(interaction, "Spieler", "Players")
+    for i, c in enumerate(chunks[:25]):
+        embed.add_field(name=f"{spieler_wort} {i+1}" if len(chunks) > 1 else spieler_wort,
+                        value=c, inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+bot.tree.add_command(whitelist_group)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Whitelist-Anfrage-Panel (Spieler reichen ihren PSN-Namen ein,
+#  Admins geben per Button frei/ab). Persistente Views (timeout=None
+#  + feste custom_ids) → überleben einen Bot-Neustart.
+# ══════════════════════════════════════════════════════════════
+WHITELIST_PANEL_TEXT = ("Klick auf den Button und trage deinen PlayStation Namen ein "
+                        "um zur whitelist hinzugefügt werden zu können")
+WHITELIST_PANEL_TEXT_EN = ("Click the button and enter your PlayStation name "
+                           "to be added to the whitelist")
+
+
+def _whitelist_request_embed(requester_id: int, psn: str) -> discord.Embed:
+    embed = discord.Embed(
+        title="🎮 Neue Whitelist-Anfrage",
+        description="Ein Admin muss diese Anfrage prüfen.",
+        color=0x5865F2,
+        timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="Angefragt von", value=f"<@{requester_id}>", inline=True)
+    embed.add_field(name="PlayStation-Name", value=f"`{psn}`", inline=True)
+    return embed
+
+
+class WhitelistRequestModal(discord.ui.Modal, title="🎮 PSN Name eintragen"):
+    """Formular, in das der Spieler seinen PlayStation-Namen einträgt."""
+
+    def __init__(self, service_id: Optional[str] = None, sprache: str = "de"):
+        super().__init__()
+        self.service_id = str(service_id or "")
+        if sprache == "en":
+            self.title = "🎮 Enter PSN Name"
+        self.psn_in = discord.ui.TextInput(
+            label="Your PlayStation Name" if sprache == "en" else "Dein PlayStation Name",
+            placeholder="e.g. YourPSNName" if sprache == "en" else "z.B. DeinPSNName",
+            required=True, max_length=32)
+        self.add_item(self.psn_in)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = str(self.psn_in.value or "")
+        psn = (raw.splitlines()[0].strip() if raw.strip() else "")
+        if not psn:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Kein Name eingegeben.", "❌ No name entered."), ephemeral=True)
+        if "," in psn:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Bitte nur **einen** Namen eintragen (ohne Komma).",
+                "❌ Please enter only **one** name (no comma)."), ephemeral=True)
+
+        gid = interaction.guild_id
+        # Der Server steckt im Panel-Knopf; fehlt er (Alt-Panel), gilt der
+        # einzige Server der Guild – bei mehreren bricht die Anfrage ab.
+        sid = self.service_id
+        if not sid:
+            eigene = connections.all_for_guild(gid)
+            if len(eigene) == 1:
+                sid = eigene[0].service_id
+            elif len(eigene) > 1:
+                return await interaction.response.send_message(_t(
+                    interaction,
+                    "❌ Dieser Discord-Server verwaltet mehrere Nitrado-Server. "
+                    "Ein Admin muss das Whitelist-Panel mit `/send whitelist panel` "
+                    "neu senden, damit klar ist, für welchen Server es gilt.",
+                    "❌ This Discord server manages multiple Nitrado servers. "
+                    "An admin must re-send the whitelist panel with `/send whitelist panel` "
+                    "so it's clear which server it applies to."),
+                    ephemeral=True)
+        admin_ch_id = cfg.get_channel(gid, "whitelist_request", sid or None)
+        if not admin_ch_id:
+            return await interaction.response.send_message(_t(
+                interaction,
+                "❌ Das Whitelist-System ist noch nicht eingerichtet. "
+                "Bitte wende dich an einen Admin.",
+                "❌ The whitelist system is not set up yet. "
+                "Please contact an admin."), ephemeral=True)
+        admin_ch = bot.get_channel(int(admin_ch_id))
+        if admin_ch is None:
+            return await interaction.response.send_message(_t(
+                interaction,
+                "❌ Der Anfrage-Channel wurde nicht gefunden. "
+                "Bitte wende dich an einen Admin.",
+                "❌ The request channel was not found. "
+                "Please contact an admin."), ephemeral=True)
+
+        # Doppelte Anfrage für denselben PSN-Namen abwehren
+        for r in cfg.whitelist_reqs.values():
+            if (str(r.get("guild_id")) == str(gid)
+                    and str(r.get("psn", "")).lower() == psn.lower()):
+                return await interaction.response.send_message(_t(
+                    interaction,
+                    f"ℹ️ Für **{psn}** läuft bereits eine Anfrage. "
+                    "Bitte warte auf die Freigabe.",
+                    f"ℹ️ A request for **{psn}** is already pending. "
+                    "Please wait for approval."), ephemeral=True)
+
+        reqid = uuid.uuid4().hex[:12]
+        req = {
+            "requester_id":     interaction.user.id,
+            "requester_name":   str(interaction.user),
+            "psn":              psn,
+            "guild_id":         gid,
+            "service_id":       sid,
+            "admin_channel_id": int(admin_ch_id),
+            "message_id":       None,
+            "created_at":       datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            msg = await admin_ch.send(
+                embed=_whitelist_request_embed(interaction.user.id, psn),
+                view=WhitelistApprovalView(reqid))
+        except discord.Forbidden:
+            return await interaction.response.send_message(_t(
+                interaction,
+                "❌ Der Bot darf im Anfrage-Channel nicht schreiben. "
+                "Bitte informiere einen Admin.",
+                "❌ The bot is not allowed to post in the request channel. "
+                "Please inform an admin."), ephemeral=True)
+        req["message_id"] = msg.id
+        cfg.whitelist_reqs[reqid] = req
+        cfg.save_whitelist_reqs()
+
+        await interaction.response.send_message(_t(
+            interaction,
+            f"✅ Deine Anfrage für den PSN-Namen **{psn}** wurde eingereicht. "
+            "Ein Admin prüft sie in Kürze.",
+            f"✅ Your request for the PSN name **{psn}** has been submitted. "
+            "An admin will review it shortly."), ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.error(f"[WHITELIST] Anfrage-Modal-Fehler: {error}")
+        msg = _t(interaction, "❌ Etwas ist schiefgelaufen. Bitte versuche es erneut.",
+                 "❌ Something went wrong. Please try again.")
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+
+
+def _whitelist_conn(req: Dict[str, Any],
+                    interaction: discord.Interaction) -> Optional[ServerConnection]:
+    """Der Nitrado-Server, zu dem eine Whitelist-Anfrage gehoert.
+
+    Bevorzugt die in der Anfrage vermerkte Service-ID. Alt-Anfragen ohne das
+    Feld fallen auf den einzigen Server ihrer Guild zurueck; gibt es dort
+    mehrere, ist die Zuordnung nicht mehr rekonstruierbar und die Freigabe
+    wird abgelehnt, statt auf gut Glueck den falschen Server zu treffen.
+    """
+    sid = str((req or {}).get("service_id") or "")
+    if sid:
+        conn = connections.for_service(sid)
+        # Panels und offene Anfragen ueberdauern eine Neuzuordnung. Gehoert der
+        # Server inzwischen einem anderen Discord-Server, darf ein Admin aus
+        # dem alten hier nicht weiter dessen Nitrado-Whitelist aendern.
+        if conn is not None and conn.guild_ids and interaction.guild_id \
+                and int(interaction.guild_id) not in conn.guild_ids:
+            log.warning(f"[WHITELIST] Panel in Guild {interaction.guild_id} zeigt auf "
+                        f"{conn.name}, der inzwischen zu {conn.guild_ids} gehört – "
+                        f"abgelehnt.")
+            return None
+        return conn
+    eigene = connections.all_for_guild((req or {}).get("guild_id")
+                                       or interaction.guild_id)
+    return eigene[0] if len(eigene) == 1 else None
+
+
+_TICKET_CATEGORY_MAX = 20  # Discord erlaubt max. 25 Buttons je View - Puffer lassen
+
+
+class TicketPanelView(discord.ui.View):
+    """Persistentes Panel: EIN Knopf je Ticket-Kategorie (z. B. „Allgemeines
+    Ticket“, „Ban-Einspruch“) - Klick startet direkt die Ticket-Erstellung
+    fuer GENAU diese Kategorie, kein Zwischenschritt. custom_id traegt
+    Service-ID + Kategorie-ID, damit auch nach einem Bot-Neustart klar ist,
+    wofuer der Knopf steht (Vorbild: WhitelistPanelView weiter unten).
+    Aendert sich die Kategorienliste, muss das Panel neu gesendet werden
+    (`/send ticket panel`), damit die Knopf-Reihe aktualisiert wird."""
+
+    def __init__(self, service_id: Optional[str] = None):
+        super().__init__(timeout=None)
+        self.service_id = str(service_id or "")
+        conn = connections.for_service(self.service_id) if self.service_id else None
+        kategorien = _ticket_categories(conn) if conn is not None else []
+        for kategorie in kategorien[:_TICKET_CATEGORY_MAX]:
+            if not isinstance(kategorie, dict) or not kategorie.get("id"):
+                continue
+            label = str(kategorie.get("label") or f"Kategorie {kategorie['id']}")[:80]
+            knopf = discord.ui.Button(
+                label=label, emoji="🎫", style=discord.ButtonStyle.primary,
+                custom_id=f"ticket_open:{self.service_id}:{kategorie['id']}")
+            knopf.callback = self._erstellen_callback(int(kategorie["id"]))
+            self.add_item(knopf)
+
+    def _erstellen_callback(self, kategorie_id: int):
+        async def _callback(interaction: discord.Interaction):
+            conn = connections.for_service(self.service_id) if self.service_id else None
+            if conn is None or not conn.guild_ids or interaction.guild_id is None \
+                    or int(interaction.guild_id) not in conn.guild_ids:
+                return await interaction.response.send_message(_t(
+                    interaction, "❌ Für dieses Panel ist gerade kein Server zugeordnet.",
+                    "❌ No server is currently assigned to this panel."), ephemeral=True)
+            kategorie = next((k for k in _ticket_categories(conn)
+                              if int(k.get("id") or 0) == kategorie_id), None)
+            if kategorie is None:
+                return await interaction.response.send_message(_tt(
+                    _ticket_sprache(conn),
+                    "❌ Diese Kategorie gibt es nicht mehr. Bitte einen Admin bitten, "
+                    "das Panel neu zu senden (`/send ticket panel`).",
+                    "❌ This category no longer exists. Please ask an admin to re-send the panel "
+                    "(`/send ticket panel`)."), ephemeral=True)
+            await _ticket_erstellen(interaction, conn, kategorie)
+        return _callback
+
+
+class TicketChannelView(discord.ui.View):
+    """Persistente Close/Claim-Buttons in einem Ticket-Kanal. custom_ids
+    tragen die Ticket-ID, damit sie einen Neustart ueberleben (Vorbild:
+    WhitelistApprovalView weiter unten)."""
+
+    def __init__(self, service_id: str, ticket_id: int):
+        super().__init__(timeout=None)
+        self.service_id = str(service_id)
+        self.ticket_id = int(ticket_id)
+        sprache = _ticket_sprache(connections.for_service(self.service_id) if self.service_id else None)
+        claim = discord.ui.Button(
+            label=_tt(sprache, "Übernehmen", "Claim"), emoji="🙋", style=discord.ButtonStyle.secondary,
+            custom_id=f"ticket_claim:{self.service_id}:{self.ticket_id}")
+        close = discord.ui.Button(
+            label=_tt(sprache, "Schließen", "Close"), emoji="🔒", style=discord.ButtonStyle.danger,
+            custom_id=f"ticket_close:{self.service_id}:{self.ticket_id}")
+        claim.callback = self._claim
+        close.callback = self._close
+        self.add_item(claim)
+        self.add_item(close)
+
+    def _conn_und_ticket(self) -> Tuple[Optional[ServerConnection], Optional[Dict[str, Any]]]:
+        conn = connections.for_service(self.service_id) if self.service_id else None
+        if conn is None:
+            return None, None
+        ticket = next((t for t in _ticket_open(conn)
+                       if int(t.get("id") or 0) == self.ticket_id), None)
+        return conn, ticket
+
+    async def _claim(self, interaction: discord.Interaction):
+        conn, ticket = self._conn_und_ticket()
+        if conn is None or ticket is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
+                "❌ This ticket is no longer known."), ephemeral=True)
+        sprache = _ticket_sprache(conn)
+        kategorie = next((k for k in _ticket_categories(conn)
+                          if int(k.get("id") or 0) == int(ticket.get("category_id") or 0)), None)
+        support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
+        member = interaction.user
+        if not isinstance(member, discord.Member) or \
+                not any(r.id in {sr.id for sr in support_rollen} for r in member.roles):
+            return await interaction.response.send_message(_tt(
+                sprache, "❌ Nur Support-Rollen dieser Kategorie können ein Ticket übernehmen.",
+                "❌ Only support roles of this category can claim a ticket."), ephemeral=True)
+        ticket["status"] = "claimed"
+        ticket["claimed_by"] = str(member.id)
+        _conn_store(conn, "ticket_open", _ticket_open(conn))
+        await interaction.response.send_message(_tt(
+            sprache, f"🙋 {member.mention} hat dieses Ticket übernommen.",
+            f"🙋 {member.mention} has claimed this ticket."))
+
+    async def _close(self, interaction: discord.Interaction):
+        conn, ticket = self._conn_und_ticket()
+        if conn is None or ticket is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
+                "❌ This ticket is no longer known."), ephemeral=True)
+        sprache = _ticket_sprache(conn)
+        kategorie = next((k for k in _ticket_categories(conn)
+                          if int(k.get("id") or 0) == int(ticket.get("category_id") or 0)), None)
+        support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
+        member = interaction.user
+        ist_ersteller = str(member.id) == str(ticket.get("user_id"))
+        ist_support = isinstance(member, discord.Member) and \
+            any(r.id in {sr.id for sr in support_rollen} for r in member.roles)
+        if not (ist_ersteller or ist_support):
+            return await interaction.response.send_message(_tt(
+                sprache, "❌ Nur der Ersteller oder eine Support-Rolle kann dieses Ticket schließen.",
+                "❌ Only the creator or a support role can close this ticket."), ephemeral=True)
+        if ticket.get("status") == "archived":
+            return await interaction.response.send_message(_tt(
+                sprache, "ℹ️ Dieses Ticket ist bereits geschlossen.",
+                "ℹ️ This ticket is already closed."), ephemeral=True)
+        await interaction.response.defer()
+        kanal = interaction.channel
+        try:
+            nachrichten = [m async for m in kanal.history(limit=None, oldest_first=True)]
+        except Exception as e:  # noqa: BLE001
+            nachrichten = []
+            log.debug(f"[TICKET_TOOL] Verlauf konnte nicht gelesen werden: {e}")
+        transkript = _ticket_transkript_bauen(nachrichten)
+
+        ersteller = interaction.guild.get_member(int(ticket.get("user_id") or 0)) \
+            if interaction.guild else None
+        dm_gesendet = False
+        if ersteller is not None:
+            try:
+                await ersteller.send(
+                    content=_tt(sprache,
+                              f"📄 Transkript deines Tickets „{kanal.name}“ auf {interaction.guild.name}.",
+                              f"📄 Transcript of your ticket „{kanal.name}“ on {interaction.guild.name}."),
+                    file=discord.File(io.BytesIO(transkript), filename=f"transkript-{kanal.name}.txt"))
+                dm_gesendet = True
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log.debug(f"[TICKET_TOOL] Transkript-DM fehlgeschlagen: {e}")
+
+        try:
+            await kanal.set_permissions(discord.Object(id=int(ticket["user_id"])), overwrite=None)
+        except Exception as e:  # noqa: BLE001 – Archivieren darf daran nicht scheitern
+            log.debug(f"[TICKET_TOOL] Ersteller-Rechte beim Archivieren nicht entfernt: {e}")
+        try:
+            if not kanal.name.startswith("archiv-"):
+                await kanal.edit(name=f"archiv-{kanal.name}"[:100])
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"[TICKET_TOOL] Kanal beim Archivieren nicht umbenannt: {e}")
+
+        ticket["status"] = "archived"
+        _conn_store(conn, "ticket_open", _ticket_open(conn))
+        jetzt = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+        transkript_zeile = _tt(sprache, "📄 Das Transkript wurde per DM verschickt.",
+                              "📄 The transcript was sent by DM.") if dm_gesendet else _tt(
+            sprache,
+            "⚠️ Das Transkript konnte nicht per DM zugestellt werden "
+            "(DMs geschlossen oder Nutzer nicht mehr auf dem Server).",
+            "⚠️ The transcript could not be delivered by DM "
+            "(DMs closed or user no longer on the server).")
+        embed = discord.Embed(
+            title=_tt(sprache, "🔒 Ticket geschlossen", "🔒 Ticket closed"),
+            description=_tt(sprache, f"Geschlossen von {member.mention} am {jetzt}.\n{transkript_zeile}",
+                            f"Closed by {member.mention} on {jetzt}.\n{transkript_zeile}"),
+            color=0x99AAB5)
+        await interaction.followup.send(embed=embed,
+                                        view=TicketArchivedView(self.service_id, self.ticket_id))
+
+        protokoll_kanal_id = _ticket_transkript_kanal(conn)
+        if protokoll_kanal_id and interaction.guild:
+            protokoll_kanal = interaction.guild.get_channel(protokoll_kanal_id)
+            if isinstance(protokoll_kanal, discord.TextChannel):
+                protokoll_embed = discord.Embed(
+                    title=_tt(sprache, f"Ticket #{ticket.get('id')} geschlossen",
+                             f"Ticket #{ticket.get('id')} closed"),
+                    color=0x99AAB5)
+                protokoll_embed.add_field(name=_tt(sprache, "Typ", "Type"),
+                                          value=(kategorie or {}).get("label") or "–", inline=True)
+                protokoll_embed.add_field(
+                    name=_tt(sprache, "Erstellt von", "Opened by"),
+                    value=ersteller.mention if ersteller else f"<@{ticket.get('user_id')}>", inline=True)
+                protokoll_embed.add_field(name=_tt(sprache, "Geschlossen von", "Closed by"),
+                                          value=member.mention, inline=True)
+                protokoll_embed.timestamp = datetime.now(timezone.utc)
+                try:
+                    await protokoll_kanal.send(
+                        embed=protokoll_embed,
+                        file=discord.File(io.BytesIO(transkript), filename=f"ticket-{ticket.get('id')}.txt"))
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    log.debug(f"[TICKET_TOOL] Transkript-Post in Log-Channel fehlgeschlagen: {e}")
+
+
+class TicketDeleteConfirmView(discord.ui.View):
+    """Kurzlebige, NICHT-persistente Sicherheitsabfrage vor dem endgueltigen
+    Loeschen eines Ticket-Kanals - muss keinen Bot-Neustart ueberleben, ein
+    normaler Timeout reicht (Vorbild fuer nicht-persistente Views:
+    _FeedTranslateView, siehe Kommentar dort)."""
+
+    def __init__(self, service_id: str, ticket_id: int):
+        super().__init__(timeout=60)
+        self.service_id = service_id
+        self.ticket_id = ticket_id
+        sprache = _ticket_sprache(connections.for_service(service_id) if service_id else None)
+        knopf = discord.ui.Button(label=_tt(sprache, "Ja, endgültig löschen", "Yes, delete permanently"),
+                                  emoji="✅", style=discord.ButtonStyle.danger)
+        knopf.callback = self._bestaetigt
+        self.add_item(knopf)
+
+    async def _bestaetigt(self, interaction: discord.Interaction):
+        conn = connections.for_service(self.service_id) if self.service_id else None
+        ticket = next((t for t in _ticket_open(conn)
+                       if int(t.get("id") or 0) == self.ticket_id), None) if conn else None
+        if conn is None or ticket is None:
+            return await interaction.response.edit_message(content=_t(
+                interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
+                "❌ This ticket is no longer known."), view=None)
+        sprache = _ticket_sprache(conn)
+        eintraege = _ticket_open(conn)
+        eintraege.remove(ticket)
+        _conn_store(conn, "ticket_open", eintraege)
+        kanal = interaction.channel
+        await interaction.response.edit_message(content=_tt(
+            sprache, "🗑️ Ticket-Kanal wird gelöscht …", "🗑️ Deleting the ticket channel …"),
+            view=None)
+        try:
+            await kanal.delete(reason="Ticket Tool: endgültig gelöscht")
+        except (discord.Forbidden, discord.NotFound) as e:
+            log.debug(f"[TICKET_TOOL] Kanal beim Löschen nicht entfernt: {e}")
+
+
+class TicketArchivedView(discord.ui.View):
+    """Persistente Öffnen-/Löschen-Buttons fuer ein archiviertes Ticket.
+    Ersetzt die Übernehmen-/Schließen-Buttons von TicketChannelView, sobald
+    ein Ticket geschlossen wurde."""
+
+    def __init__(self, service_id: str, ticket_id: int):
+        super().__init__(timeout=None)
+        self.service_id = str(service_id)
+        self.ticket_id = int(ticket_id)
+        sprache = _ticket_sprache(connections.for_service(self.service_id) if self.service_id else None)
+        reopen = discord.ui.Button(
+            label=_tt(sprache, "Öffnen", "Reopen"), emoji="↩️", style=discord.ButtonStyle.secondary,
+            custom_id=f"ticket_reopen:{self.service_id}:{self.ticket_id}")
+        delete = discord.ui.Button(
+            label=_tt(sprache, "Löschen", "Delete"), emoji="🗑️", style=discord.ButtonStyle.danger,
+            custom_id=f"ticket_delete:{self.service_id}:{self.ticket_id}")
+        reopen.callback = self._reopen
+        delete.callback = self._delete
+        self.add_item(reopen)
+        self.add_item(delete)
+
+    def _conn_und_ticket(self) -> Tuple[Optional[ServerConnection], Optional[Dict[str, Any]]]:
+        conn = connections.for_service(self.service_id) if self.service_id else None
+        if conn is None:
+            return None, None
+        ticket = next((t for t in _ticket_open(conn)
+                       if int(t.get("id") or 0) == self.ticket_id), None)
+        return conn, ticket
+
+    def _support_pruefen(self, conn: ServerConnection, ticket: Dict[str, Any],
+                         member: Any) -> bool:
+        kategorie = next((k for k in _ticket_categories(conn)
+                          if int(k.get("id") or 0) == int(ticket.get("category_id") or 0)), None)
+        support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
+        return isinstance(member, discord.Member) and \
+            any(r.id in {sr.id for sr in support_rollen} for r in member.roles)
+
+    async def _reopen(self, interaction: discord.Interaction):
+        conn, ticket = self._conn_und_ticket()
+        if conn is None or ticket is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
+                "❌ This ticket is no longer known."), ephemeral=True)
+        sprache = _ticket_sprache(conn)
+        if not self._support_pruefen(conn, ticket, interaction.user):
+            return await interaction.response.send_message(_tt(
+                sprache, "❌ Nur Support-Rollen dieser Kategorie können ein Ticket öffnen.",
+                "❌ Only support roles of this category can reopen a ticket."), ephemeral=True)
+        if ticket.get("status") != "archived":
+            return await interaction.response.send_message(_tt(
+                sprache, "ℹ️ Dieses Ticket ist bereits offen.",
+                "ℹ️ This ticket is already open."), ephemeral=True)
+        await interaction.response.defer()
+        kanal = interaction.channel
+        guild = interaction.guild
+        ersteller = guild.get_member(int(ticket.get("user_id") or 0)) if guild else None
+        if ersteller is not None:
+            try:
+                await kanal.set_permissions(ersteller, view_channel=True, send_messages=True,
+                                            read_message_history=True)
+            except Exception as e:  # noqa: BLE001 – Öffnen darf daran nicht scheitern
+                log.debug(f"[TICKET_TOOL] Ersteller-Rechte beim Öffnen nicht wiederhergestellt: {e}")
+        try:
+            if kanal.name.startswith("archiv-"):
+                await kanal.edit(name=kanal.name[len("archiv-"):][:100])
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"[TICKET_TOOL] Kanal beim Öffnen nicht umbenannt: {e}")
+
+        ticket["status"] = "open"
+        _conn_store(conn, "ticket_open", _ticket_open(conn))
+        await interaction.followup.send(_tt(
+            sprache, "↩️ Ticket wieder geöffnet.", "↩️ Ticket reopened."),
+            view=TicketChannelView(self.service_id, self.ticket_id))
+
+    async def _delete(self, interaction: discord.Interaction):
+        conn, ticket = self._conn_und_ticket()
+        if conn is None or ticket is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
+                "❌ This ticket is no longer known."), ephemeral=True)
+        sprache = _ticket_sprache(conn)
+        if not self._support_pruefen(conn, ticket, interaction.user):
+            return await interaction.response.send_message(_tt(
+                sprache, "❌ Nur Support-Rollen dieser Kategorie können ein Ticket löschen.",
+                "❌ Only support roles of this category can delete a ticket."), ephemeral=True)
+        await interaction.response.send_message(_tt(
+            sprache, "⚠️ Der Kanal wird dabei unwiderruflich gelöscht. Sicher?",
+            "⚠️ This will permanently delete the channel. Are you sure?"),
+            view=TicketDeleteConfirmView(self.service_id, self.ticket_id), ephemeral=True)
+
+
+async def _ticket_erstellen(interaction: discord.Interaction, conn: ServerConnection,
+                            kategorie: Dict[str, Any]) -> None:
+    """Legt fuer interaction.user einen privaten Ticket-Kanal an: nur
+    Ersteller + Support-Rollen der Kategorie + Bot sehen ihn."""
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Tickets können nur auf einem Discord-Server erstellt werden.",
+            "❌ Tickets can only be created on a Discord server."), ephemeral=True)
+
+    sprache = _ticket_sprache(conn)
+    offene = [t for t in _ticket_open(conn)
+             if str(t.get("user_id")) == str(interaction.user.id) and t.get("status") != "archived"]
+    if offene:
+        bestehender = guild.get_channel(int(offene[0].get("channel_id") or 0))
+        if bestehender is None:
+            # Der Kanal wurde ausserhalb des Ticket Tools geloescht (z. B. von
+            # Hand) - der Eintrag bliebe sonst fuer immer "offen" haengen und
+            # der Ersteller koennte nie wieder ein Ticket eroeffnen.
+            offene[0]["status"] = "archived"
+            _conn_store(conn, "ticket_open", _ticket_open(conn))
+        else:
+            return await interaction.response.send_message(_tt(
+                sprache, f"❌ Du hast bereits ein offenes Ticket: {bestehender.mention}",
+                f"❌ You already have an open ticket: {bestehender.mention}"), ephemeral=True)
+
+    support_rollen = _ticket_support_rollen(conn, kategorie)
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                       read_message_history=True),
+        guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                              manage_channels=True, read_message_history=True),
+    }
+    for rolle in support_rollen:
+        overwrites[rolle] = discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                         read_message_history=True)
+
+    await interaction.response.defer(ephemeral=True)
+    kanal_name = f"ticket-{interaction.user.name}"[:100]
+    try:
+        kanal = await guild.create_text_channel(
+            kanal_name, overwrites=overwrites, reason=f"Ticket Tool: {kategorie.get('label')}")
+    except discord.Forbidden:
+        return await interaction.followup.send(_tt(
+            sprache, "❌ Der Bot darf hier keinen Kanal erstellen (Berechtigung „Kanäle "
+            "verwalten“ fehlt).",
+            "❌ The bot isn't allowed to create a channel here (missing „Manage Channels“ "
+            "permission)."), ephemeral=True)
+    except discord.HTTPException as e:
+        return await interaction.followup.send(_tt(
+            sprache, f"❌ Ticket-Kanal konnte nicht erstellt werden: {e}",
+            f"❌ Could not create the ticket channel: {e}"), ephemeral=True)
+
+    eintraege = _ticket_open(conn)
+    if len(eintraege) >= _TICKET_OPEN_MAX:
+        # Aelteste archivierte Eintraege zuerst raeumen, damit die Liste
+        # nicht unbegrenzt waechst - offene/uebernommene Tickets bleiben.
+        archiviert = [e for e in eintraege if e.get("status") == "archived"]
+        for e in archiviert[:max(1, len(eintraege) - _TICKET_OPEN_MAX + 1)]:
+            eintraege.remove(e)
+    neu = {"id": None, "channel_id": str(kanal.id), "user_id": str(interaction.user.id),
+          "category_id": kategorie.get("id"), "status": "open", "claimed_by": None,
+          "created_at": datetime.now(timezone.utc).isoformat()}
+    eintraege.append(neu)
+    _ensure_ticket_ids(eintraege)
+    _conn_store(conn, "ticket_open", eintraege)
+
+    erwaehnung = " ".join(r.mention for r in support_rollen) or _tt(
+        sprache, "*(keine Support-Rolle hinterlegt)*", "*(no support role configured)*")
+    embed = discord.Embed(
+        title=_tt(sprache, f"🎫 Ticket – {kategorie.get('label')}",
+                 f"🎫 Ticket – {kategorie.get('label')}"),
+        description=_tt(
+            sprache,
+            f"Hallo {interaction.user.mention}! 🔔 Der Support wird sich in Kürze bei dir melden.",
+            f"Hello {interaction.user.mention}! 🔔 Support will be with you shortly."),
+        color=0x5865F2)
+    try:
+        await kanal.send(content=erwaehnung, embed=embed,
+                         view=TicketChannelView(conn.service_id, neu["id"]))
+    except discord.Forbidden as e:
+        log.debug(f"[TICKET_TOOL] Panel-Nachricht im neuen Ticket-Kanal fehlgeschlagen: {e}")
+
+    await interaction.followup.send(_tt(
+        sprache, f"✅ Dein Ticket wurde erstellt: {kanal.mention}",
+        f"✅ Your ticket was created: {kanal.mention}"), ephemeral=True)
+
+
+class WhitelistPanelView(discord.ui.View):
+    """Persistentes Panel mit dem Button, der das PSN-Eingabe-Modal öffnet.
+
+    Die ``custom_id`` traegt die Service-ID, damit eine Anfrage auch nach einem
+    Bot-Neustart noch weiss, fuer WELCHEN Nitrado-Server sie gilt. Panels aus
+    der Zeit davor haben keine Endung und werden weiter bedient.
+    """
+
+    def __init__(self, service_id: Optional[str] = None, sprache: str = "de"):
+        super().__init__(timeout=None)
+        self.service_id = str(service_id or "")
+        cid = f"wl_panel_open:{self.service_id}" if self.service_id else "wl_panel_open"
+        # Nur der Button-TEXT haengt an der Sprache des Admins, der /send
+        # whitelist panel ausgefuehrt hat – das Modal danach richtet sich wie
+        # bisher nach der Sprache des jeweiligen Spielers (_sprache(interaction)
+        # in _open_modal), nicht nach der hier gespeicherten.
+        label = "Enter PSN Name" if sprache == "en" else "PSN Name eintragen"
+        knopf = discord.ui.Button(label=label, emoji="🎮",
+                                  style=discord.ButtonStyle.primary, custom_id=cid)
+        knopf.callback = self._open_modal
+        self.add_item(knopf)
+
+    async def _open_modal(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(
+            WhitelistRequestModal(self.service_id or None, _sprache(interaction)))
+
+
+class WhitelistApprovalView(discord.ui.View):
+    """Persistente Freigabe-Buttons (Akzeptieren/Ablehnen) für eine Anfrage.
+    custom_ids tragen die reqid, damit sie einen Neustart überleben."""
+
+    def __init__(self, reqid: str):
+        super().__init__(timeout=None)
+        self.reqid = reqid
+        approve = discord.ui.Button(
+            label="Akzeptieren", emoji="✅",
+            style=discord.ButtonStyle.success, custom_id=f"wl_approve:{reqid}")
+        reject = discord.ui.Button(
+            label="Ablehnen", emoji="❌",
+            style=discord.ButtonStyle.danger, custom_id=f"wl_reject:{reqid}")
+        approve.callback = self._approve
+        reject.callback  = self._reject
+        self.add_item(approve)
+        self.add_item(reject)
+
+    async def _approve(self, interaction: discord.Interaction):
+        if not _subcmd_allowed(interaction, "whitelist_approve"):
+            return await _deny_subcmd(interaction)
+        req = cfg.whitelist_reqs.pop(self.reqid, None)
+        cfg.save_whitelist_reqs()
+        if not req:
+            return await interaction.response.send_message(_t(
+                interaction, "ℹ️ Diese Anfrage wurde bereits bearbeitet.",
+                "ℹ️ This request has already been handled."), ephemeral=True)
+
+        # Der Server steht in der Anfrage – die Buttons ueberleben Neustarts,
+        # und bei mehreren Servern derselben Guild waere _conn_of geraten.
+        conn = _whitelist_conn(req, interaction)
+        if conn is None or conn.api is None:
+            cfg.whitelist_reqs[self.reqid] = req
+            cfg.save_whitelist_reqs()
+            return await interaction.response.send_message(_t(
+                interaction,
+                "❌ Für diese Anfrage ist kein Nitrado-Server eingerichtet – "
+                "sie bleibt offen. Ein Admin kann das Whitelist-Panel mit "
+                "`/send whitelist panel` neu senden.",
+                "❌ No Nitrado server is set up for this request – "
+                "it stays open. An admin can re-send the whitelist panel with "
+                "`/send whitelist panel`."), ephemeral=True)
+
+        await interaction.response.defer()
+        try:
+            current, category, key = await _read_whitelist(conn)
+        except Exception as e:
+            cfg.whitelist_reqs[self.reqid] = req
+            cfg.save_whitelist_reqs()
+            return await interaction.followup.send(_t(
+                interaction,
+                f"❌ Whitelist konnte nicht gelesen werden – nichts geändert. "
+                f"Anfrage bleibt offen.\n`{e}`",
+                f"❌ Could not read the whitelist – nothing changed. "
+                f"Request stays open.\n`{e}`"), ephemeral=True)
+
+        psn = req["psn"]
+        if psn.lower() not in {n.lower() for n in current}:
+            ok, msg = await _write_whitelist(conn, current + [psn], category, key)
+            if not ok:
+                cfg.whitelist_reqs[self.reqid] = req
+                cfg.save_whitelist_reqs()
+                return await interaction.followup.send(_t(
+                    interaction,
+                    f"❌ Whitelist konnte nicht gespeichert werden – nichts geändert. "
+                    f"Anfrage bleibt offen.\n`{msg}`",
+                    f"❌ Could not save the whitelist – nothing changed. "
+                    f"Request stays open.\n`{msg}`"), ephemeral=True)
+            nitrado_note = _t(interaction, "✅ Zur Nitrado-Whitelist hinzugefügt",
+                             "✅ Added to the Nitrado whitelist")
+        else:
+            nitrado_note = _t(interaction, "ℹ️ Stand bereits auf der Whitelist",
+                             "ℹ️ Was already on the whitelist")
+
+        embed = discord.Embed(
+            title=_t(interaction, "✅ Whitelist-Anfrage angenommen", "✅ Whitelist Request Approved"),
+            color=0x2ECC71, timestamp=datetime.now(timezone.utc))
+        embed.add_field(name=_t(interaction, "Spieler", "Player"),
+                        value=f"<@{req['requester_id']}>", inline=True)
+        embed.add_field(name="PlayStation-Name", value=f"`{psn}`", inline=True)
+        embed.add_field(name="Status", value=nitrado_note, inline=False)
+        embed.add_field(name=_t(interaction, "Bearbeitet von", "Handled by"),
+                        value=interaction.user.mention, inline=False)
+        embed.set_footer(text=_t(interaction, "Änderung greift ggf. erst nach einem Server-Neustart.",
+                                 "The change may only take effect after a server restart."))
+        await interaction.edit_original_response(embed=embed, view=None)
+
+    async def _reject(self, interaction: discord.Interaction):
+        if not _subcmd_allowed(interaction, "whitelist_reject"):
+            return await _deny_subcmd(interaction)
+        req = cfg.whitelist_reqs.pop(self.reqid, None)
+        cfg.save_whitelist_reqs()
+        if not req:
+            return await interaction.response.send_message(_t(
+                interaction, "ℹ️ Diese Anfrage wurde bereits bearbeitet.",
+                "ℹ️ This request has already been handled."), ephemeral=True)
+
+        embed = discord.Embed(
+            title=_t(interaction, "❌ Whitelist-Anfrage abgelehnt", "❌ Whitelist Request Rejected"),
+            color=0xE74C3C, timestamp=datetime.now(timezone.utc))
+        embed.add_field(name=_t(interaction, "Spieler", "Player"),
+                        value=f"<@{req['requester_id']}>", inline=True)
+        embed.add_field(name="PlayStation-Name", value=f"`{req['psn']}`", inline=True)
+        embed.add_field(name=_t(interaction, "Status", "Status"),
+                        value=_t(interaction, "❌ Nicht zur Whitelist hinzugefügt",
+                                "❌ Not added to the whitelist"), inline=False)
+        embed.add_field(name=_t(interaction, "Bearbeitet von", "Handled by"),
+                        value=interaction.user.mention, inline=False)
+        await interaction.response.edit_message(embed=embed, view=None)
+
+
+# ── /send whitelist panel – Panel in einen Channel senden (Admin) ──
+send_group = app_commands.Group(name="send", description=app_commands.locale_str("📨 Panels/Embeds senden (Admin)"))
+send_whitelist_group = app_commands.Group(
+    name="whitelist", description=app_commands.locale_str("✅ Whitelist-Panel senden"), parent=send_group)
+
+
+@send_whitelist_group.command(
+    name="panel",
+    description=app_commands.locale_str("📩 Whitelist-Anfrage-Panel in einen Channel senden (Admin)"))
+@app_commands.describe(
+    panel_channel="Channel, in dem das Panel für die Spieler erscheint",
+    admin_channel="Staff-Channel, in dem die Anfragen zur Freigabe landen",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def send_whitelist_panel(interaction: discord.Interaction,
+                               panel_channel: discord.TextChannel,
+                               admin_channel: discord.TextChannel,
+                               server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "send_whitelist_panel"):
+        return await _deny_subcmd(interaction)
+
+    _conn, _fehler = _conn_waehlen(interaction, server)
+    if _conn is None:
+        return await interaction.response.send_message(
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
+    # Anfrage-Channel je Server merken (das Modal liest ihn beim Absenden aus)
+    cfg.set_channel(interaction.guild_id, "whitelist_request", admin_channel.id,
+                    service_id=_conn.service_id)
+
+    panel_embed = discord.Embed(
+        title=_t(interaction, "✅ Whitelist-Anmeldung", "✅ Whitelist Signup"),
+        description=_t(interaction, WHITELIST_PANEL_TEXT, WHITELIST_PANEL_TEXT_EN),
+        color=0x5865F2)
+    try:
+        await panel_channel.send(
+            embed=panel_embed,
+            view=WhitelistPanelView(_conn.service_id, _sprache(interaction)))
+    except discord.Forbidden:
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Ich darf in {panel_channel.mention} nicht schreiben. "
+            "Bitte Kanal-Rechte prüfen.",
+            f"❌ I'm not allowed to post in {panel_channel.mention}. "
+            "Please check the channel permissions."), ephemeral=True)
+
+    await interaction.response.send_message(_t(
+        interaction,
+        f"✅ Whitelist-Panel in {panel_channel.mention} gesendet.\n"
+        f"Anfragen zur Freigabe erscheinen in {admin_channel.mention}.",
+        f"✅ Whitelist panel sent to {panel_channel.mention}.\n"
+        f"Requests for approval will appear in {admin_channel.mention}."),
+        ephemeral=True)
+
+
+send_ticket_group = app_commands.Group(
+    name="ticket", description=app_commands.locale_str("🎫 Ticket-Panel senden"), parent=send_group)
+
+
+@send_ticket_group.command(
+    name="panel",
+    description=app_commands.locale_str("🎫 Ticket-Panel in einen Channel senden (Admin)"))
+@app_commands.describe(
+    panel_channel="Channel, in dem das Ticket-Panel für die Spieler erscheint",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def send_ticket_panel(interaction: discord.Interaction,
+                            panel_channel: discord.TextChannel,
+                            server: Optional[str] = None):
+    # Standardmaessig fuer jede Rolle mit Discord-Administrator erlaubt (wie
+    # die eigene Befehlsbeschreibung "(Admin)" verspricht) - zusaetzlich ueber
+    # die Permissions-Seite auf einzelne Rollen/Personen erweiterbar, ohne
+    # Administrator dafuer auszuschalten.
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "send_ticket_panel")):
+        return await _deny_subcmd(interaction)
+
+    _conn, _fehler = _conn_waehlen(interaction, server)
+    if _conn is None:
+        return await interaction.response.send_message(
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
+    if not _ticket_categories(_conn):
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Es ist noch keine Ticket-Kategorie eingerichtet. Im Dashboard unter "
+            "„Discord Management → Ticket Tool“ zuerst mindestens eine Kategorie anlegen.",
+            "❌ No ticket category is set up yet. Add at least one category in the dashboard "
+            "under „Discord Management → Ticket Tool“ first."), ephemeral=True)
+
+    panel_embed = discord.Embed(
+        title=_t(interaction, "🎫 Support-Ticket erstellen", "🎫 Create a support ticket"),
+        description=_t(
+            interaction,
+            "Klicke unten auf die passende Kategorie – es entsteht automatisch ein privater "
+            "Ticket-Kanal, den nur du und der zuständige Support sehen können.",
+            "Click the matching category below – a private ticket channel will be created "
+            "automatically that only you and the responsible support team can see."),
+        color=0x5865F2)
+    try:
+        await panel_channel.send(embed=panel_embed, view=TicketPanelView(_conn.service_id))
+    except discord.Forbidden:
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Ich darf in {panel_channel.mention} nicht schreiben. "
+            "Bitte Kanal-Rechte prüfen.",
+            f"❌ I'm not allowed to post in {panel_channel.mention}. "
+            "Please check the channel permissions."), ephemeral=True)
+
+    await interaction.response.send_message(_t(
+        interaction, f"✅ Ticket-Panel in {panel_channel.mention} gesendet.",
+        f"✅ Ticket panel sent to {panel_channel.mention}."), ephemeral=True)
+
+
+bot.tree.add_command(send_group)
+
+
+def _ticket_conn_und_eintrag(interaction: discord.Interaction, channel: discord.TextChannel
+                             ) -> Tuple[Optional[ServerConnection], Optional[Dict[str, Any]]]:
+    """Sucht unter allen Verbindungen DIESER Guild den Ticket-Eintrag zu
+    einem Kanal (analog _reaction_role_anwenden - eine Guild kann mehrere
+    Nitrado-Server verwalten, das Ticket kann zu jedem davon gehoeren)."""
+    for conn in _conns_of(interaction):
+        eintrag = _ticket_eintrag_von_channel(conn, channel.id)
+        if eintrag is not None:
+            return conn, eintrag
+    return None, None
+
+
+ticket_group = app_commands.Group(
+    name="ticket", description=app_commands.locale_str("🎫 Ticket-Kanal verwalten (Support)"))
+
+
+@ticket_group.command(
+    name="add", description=app_commands.locale_str("➕ Person zu einem Ticket hinzufügen (Support)"))
+@app_commands.describe(channel="Der Ticket-Kanal", member="Wer hinzugefügt werden soll")
+async def ticket_add_member(interaction: discord.Interaction,
+                            channel: discord.TextChannel, member: discord.Member):
+    conn, eintrag = _ticket_conn_und_eintrag(interaction, channel)
+    if conn is None or eintrag is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Das ist kein Ticket-Kanal.",
+            "❌ That is not a ticket channel."), ephemeral=True)
+    sprache = _ticket_sprache(conn)
+    kategorie = next((k for k in _ticket_categories(conn)
+                      if int(k.get("id") or 0) == int(eintrag.get("category_id") or 0)), None)
+    support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
+    if not isinstance(interaction.user, discord.Member) or \
+            not any(r.id in {sr.id for sr in support_rollen} for r in interaction.user.roles):
+        return await interaction.response.send_message(_tt(
+            sprache, "❌ Nur Support-Rollen dieser Kategorie dürfen Personen hinzufügen.",
+            "❌ Only support roles of this category can add people."), ephemeral=True)
+    try:
+        await channel.set_permissions(member, view_channel=True, send_messages=True,
+                                      read_message_history=True)
+    except discord.Forbidden:
+        return await interaction.response.send_message(_tt(
+            sprache, "❌ Dem Bot fehlen die Rechte, um die Kanal-Berechtigungen zu ändern.",
+            "❌ The bot lacks permission to change the channel's permissions."), ephemeral=True)
+    await interaction.response.send_message(_tt(
+        sprache, f"✅ {member.mention} wurde zu diesem Ticket hinzugefügt.",
+        f"✅ {member.mention} was added to this ticket."))
+
+
+@ticket_group.command(
+    name="remove", description=app_commands.locale_str("➖ Person aus einem Ticket entfernen (Support)"))
+@app_commands.describe(channel="Der Ticket-Kanal", member="Wer entfernt werden soll")
+async def ticket_remove_member(interaction: discord.Interaction,
+                               channel: discord.TextChannel, member: discord.Member):
+    conn, eintrag = _ticket_conn_und_eintrag(interaction, channel)
+    if conn is None or eintrag is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Das ist kein Ticket-Kanal.",
+            "❌ That is not a ticket channel."), ephemeral=True)
+    sprache = _ticket_sprache(conn)
+    kategorie = next((k for k in _ticket_categories(conn)
+                      if int(k.get("id") or 0) == int(eintrag.get("category_id") or 0)), None)
+    support_rollen = _ticket_support_rollen(conn, kategorie) if kategorie else []
+    if not isinstance(interaction.user, discord.Member) or \
+            not any(r.id in {sr.id for sr in support_rollen} for r in interaction.user.roles):
+        return await interaction.response.send_message(_tt(
+            sprache, "❌ Nur Support-Rollen dieser Kategorie dürfen Personen entfernen.",
+            "❌ Only support roles of this category can remove people."), ephemeral=True)
+    if str(member.id) == str(eintrag.get("user_id")):
+        return await interaction.response.send_message(_tt(
+            sprache, "❌ Der Ticket-Ersteller kann nicht entfernt werden – dafür gibt es den "
+            "Schließen-Knopf im Ticket.",
+            "❌ The ticket creator can't be removed – use the close button in the ticket instead."),
+            ephemeral=True)
+    try:
+        await channel.set_permissions(member, overwrite=None)
+    except discord.Forbidden:
+        return await interaction.response.send_message(_tt(
+            sprache, "❌ Dem Bot fehlen die Rechte, um die Kanal-Berechtigungen zu ändern.",
+            "❌ The bot lacks permission to change the channel's permissions."), ephemeral=True)
+    await interaction.response.send_message(_tt(
+        sprache, f"✅ {member.mention} wurde aus diesem Ticket entfernt.",
+        f"✅ {member.mention} was removed from this ticket."))
+
+
+@ticket_group.command(
+    name="clear_stale", description=app_commands.locale_str(
+        "🧹 Verwaiste Ticket-Sperren aufräumen, deren Kanal gelöscht wurde (Admin)"))
+async def ticket_clear_stale(interaction: discord.Interaction):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "ticket_clear_stale")):
+        return await _deny_subcmd(interaction)
+    guild = interaction.guild
+    if guild is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Das geht nur auf einem Discord-Server.",
+            "❌ This only works on a Discord server."), ephemeral=True)
+    geraeumt = 0
+    for conn in _conns_of(interaction):
+        eintraege = _ticket_open(conn)
+        geaendert = False
+        for t in eintraege:
+            if t.get("status") == "archived":
+                continue
+            if guild.get_channel(int(t.get("channel_id") or 0)) is None:
+                t["status"] = "archived"
+                geaendert = True
+                geraeumt += 1
+        if geaendert:
+            _conn_store(conn, "ticket_open", eintraege)
+    await interaction.response.send_message(_t(
+        interaction, f"🧹 {geraeumt} verwaiste Ticket-Sperre(n) aufgeräumt "
+        "(Kanal existierte nicht mehr) – Betroffene können jetzt wieder ein Ticket öffnen.",
+        f"🧹 Cleared {geraeumt} stale ticket lock(s) whose channel no longer existed – "
+        "affected users can open a new ticket again."), ephemeral=True)
+
+
+bot.tree.add_command(ticket_group)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /admin_position – Letzte bekannte Spieler-Positionen
+# ══════════════════════════════════════════════════════════════
+@bot.tree.command(name="admin_position",
+                  description=app_commands.locale_str("📍 Letzte bekannte Positionen aller Spieler aus den Logs"))
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_positions(interaction: discord.Interaction, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "admin_position"):
+        return await _deny_subcmd(interaction)
+
+    _conn = await _require_conn(interaction, server=server)
+    if _conn is None:
+        return
+    positions = (_conn.parser.player_positions if _conn.parser else {})
+    if not positions:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "⚠️ Noch keine Positions-Daten verfügbar.\n"
+            "Positionen werden aus Kill/Death-Events automatisch gesammelt. "
+            "Warte bis der erste Log-Zyklus gelaufen ist.",
+            "⚠️ No position data available yet.\n"
+            "Positions are collected automatically from kill/death events. "
+            "Wait until the first log cycle has run."),
+            ephemeral=True
+        )
+
+    embed = discord.Embed(
+        title=_t(interaction, f"📍 Spieler-Positionen ({len(positions)} bekannt)",
+                 f"📍 Player Positions ({len(positions)} known)"),
+        description=_t(interaction, "Letzte bekannte Koordinaten aus Server-Logs (nicht live)",
+                       "Last known coordinates from server logs (not live)"),
+        color=0x3498DB
+    )
+
+    zuletzt_wort = _t(interaction, "zuletzt", "last seen")
+    lines = []
+    for name, data in sorted(positions.items()):
+        ts = data.get("last_seen", "")
+        ts_fmt = ts[:16].replace("T", " ") if ts else "?"
+        lines.append(f"**{name}** → `{data['position']}` *({zuletzt_wort}: {ts_fmt} UTC)*")
+
+    spieler_wort = _t(interaction, "Spieler", "Players")
+    chunk, fc = [], 0
+    for line in lines:
+        if len("\n".join(chunk + [line])) > 1000:
+            embed.add_field(name=spieler_wort, value="\n".join(chunk), inline=False)
+            chunk = [line]
+            fc += 1
+            if fc >= 24:
+                chunk.append(_t(interaction, f"... und {len(lines)-fc*10} weitere",
+                               f"... and {len(lines)-fc*10} more"))
+                break
+        else:
+            chunk.append(line)
+    if chunk:
+        embed.add_field(name=spieler_wort, value="\n".join(chunk), inline=False)
+
+    embed.set_footer(text=_t(
+        interaction, "⚠️ Positionen stammen aus Log-Events – nicht live in Echtzeit",
+        "⚠️ Positions come from log events – not real-time"))
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /spieler_suche – Spieler in Logs suchen
+# ══════════════════════════════════════════════════════════════
+@bot.tree.command(name=app_commands.locale_str("spieler_suche"),
+                  description=app_commands.locale_str("🔍 Sucht einen Spieler in den aktuellen Logs"))
+@app_commands.describe(name="Ingame-Name oder Steam64-ID",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_search(interaction: discord.Interaction, name: str,
+                     server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "spieler_suche"):
+        return await _deny_subcmd(interaction)
+    conn = await _require_conn(interaction, need_ftp=True, server=server)
+    if conn is None:
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    log_dir = conn.get("ftp_log_dir")
+    if not log_dir:
+        return await interaction.followup.send(_t(
+            interaction,
+            "❌ Log-Verzeichnis nicht konfiguriert. Wende dich an den Bot-Betreiber.",
+            "❌ Log directory not configured. Please contact the bot operator."),
+            ephemeral=True
+        )
+
+    loop = asyncio.get_running_loop()
+    adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
+    if not adm_files:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Keine Log-Dateien gefunden.", "❌ No log files found."), ephemeral=True)
+
+    content = await loop.run_in_executor(None, conn.ftp.read_file, adm_files[-1])
+    if not content:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Log-Datei konnte nicht gelesen werden.",
+            "❌ Could not read the log file."), ephemeral=True)
+
+    hits = [l.strip() for l in content.splitlines() if name.lower() in l.lower()][:25]
+    if not hits:
+        return await interaction.followup.send(_t(
+            interaction, f"❌ Keine Einträge für **{name}** gefunden.",
+            f"❌ No entries found for **{name}**."), ephemeral=True)
+
+    result = "\n".join(f"`{h[:120]}`" for h in hits)
+    if len(result) > 3900:
+        result = result[:3900] + "\n..."
+
+    embed = discord.Embed(title=_t(interaction, f"🔍 Suche: {name}", f"🔍 Search: {name}"),
+                          description=result, color=0x5865F2)
+    embed.set_footer(text=_t(interaction, f"Datei: {adm_files[-1]} | {len(hits)} Treffer (max. 25)",
+                             f"File: {adm_files[-1]} | {len(hits)} hit(s) (max. 25)"))
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+cmd_ban.autocomplete("server")(_server_autocomplete)
+cmd_unban.autocomplete("server")(_server_autocomplete)
+cmd_banlist.autocomplete("server")(_server_autocomplete)
+whitelist_add.autocomplete("server")(_server_autocomplete)
+whitelist_remove.autocomplete("server")(_server_autocomplete)
+whitelist_show.autocomplete("server")(_server_autocomplete)
+send_whitelist_panel.autocomplete("server")(_server_autocomplete)
+cmd_positions.autocomplete("server")(_server_autocomplete)
+cmd_search.autocomplete("server")(_server_autocomplete)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /ftp_scan – FTP-Verzeichnisse neu scannen
+# ══════════════════════════════════════════════════════════════
+@bot.tree.command(name="ftp_scan", description=app_commands.locale_str(
+    "🔎 (Nur Bot-Eigentümer) Scannt FTP-Server erneut nach Log-Verzeichnissen"))
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_ftp_scan(interaction: discord.Interaction, server: Optional[str] = None):
+    # ZUERST bestaetigen, dann erst pruefen: siehe betreiber_alarm_channel -
+    # application_info() beim ersten Aufruf kann laenger als 3s dauern.
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ist_eigentuemer = await _ist_bot_eigentuemer(interaction.user)
+    except Exception as e:  # noqa: BLE001
+        log.error(f"[FTP_SCAN] Eigentümer-Prüfung fehlgeschlagen: {e}")
+        return await interaction.followup.send(_t(
+            interaction, f"❌ Eigentümer-Prüfung bei Discord fehlgeschlagen: `{e}`",
+            f"❌ Owner check with Discord failed: `{e}`"), ephemeral=True)
+    if not ist_eigentuemer:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Nur der Bot-Eigentümer darf das ausführen.",
+            "❌ Only the bot owner can run this."), ephemeral=True)
+    conn = await _require_conn(interaction, need_ftp=True, server=server)
+    if conn is None:
+        return
+
+    # Pfade zurücksetzen damit discover_paths nicht überspringt
+    for key in ("ftp_log_dir", "ftp_ban_file", "ftp_mission_dir",
+                "cfg_effect_area_path"):
+        _conn_store(conn, key, "")
+    conn.data["log_state"] = {}
+    connections.save()
+    if connections.primary() is conn:
+        cfg.log_state = {}
+        cfg.save_log_state()
+
+    await bot._auto_discover(conn)
+
+    nicht_gefunden = _t(interaction, "Nicht gefunden", "Not found")
+    log_dir  = conn.get("ftp_log_dir")          or nicht_gefunden
+    ban_file = conn.get("ftp_ban_file")         or nicht_gefunden
+    mission  = conn.get("ftp_mission_dir")      or nicht_gefunden
+    effect   = conn.get("cfg_effect_area_path") or nicht_gefunden
+
+    embed = discord.Embed(title=_t(interaction, "🔎 FTP-Scan abgeschlossen", "🔎 FTP Scan Completed"),
+                          color=0x2ECC71)
+    embed.add_field(name=_t(interaction, "Log-Verzeichnis", "Log Directory"),
+                    value=f"`{log_dir}`",  inline=False)
+    embed.add_field(name=_t(interaction, "Ban-Datei", "Ban File"),
+                    value=f"`{ban_file}`", inline=False)
+    embed.add_field(name=_t(interaction, "Mission-Ordner", "Mission Folder"),
+                    value=f"`{mission}`",  inline=False)
+    embed.add_field(name="cfgEffectArea",   value=f"`{effect}`",   inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /raw_log – Letzte N Zeilen des ADM-Logs anzeigen (Debug)
+#  Hilft herauszufinden warum manche Events (damage, loot)
+#  nicht gepostet werden – zeigt das exakte Log-Format.
+# ══════════════════════════════════════════════════════════════
+@bot.tree.command(name="raw_log", description=app_commands.locale_str("🔍 Zeigt die letzten Zeilen des ADM-Logs (Debug)"))
+@app_commands.describe(zeilen="Anzahl der Zeilen (Standard: 20, max. 40)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_raw_log(interaction: discord.Interaction, zeilen: int = 20,
+                      server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "raw_log"):
+        return await _deny_subcmd(interaction)
+    conn = await _require_conn(interaction, need_ftp=True, server=server)
+    if conn is None:
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    log_dir = conn.get("ftp_log_dir")
+    if not log_dir:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Log-Verzeichnis nicht konfiguriert. Wende dich an den Bot-Betreiber.",
+            "❌ Log directory not configured. Please contact the bot operator."), ephemeral=True
+        )
+
+    loop = asyncio.get_running_loop()
+    adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
+    if not adm_files:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Keine ADM-Dateien gefunden.", "❌ No ADM files found."), ephemeral=True)
+
+    content = await loop.run_in_executor(None, conn.ftp.read_file, adm_files[-1])
+    if not content:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Log-Datei konnte nicht gelesen werden.",
+            "❌ Could not read the log file."), ephemeral=True)
+
+    zeilen = max(5, min(zeilen, 40))
+    lines  = [l for l in content.splitlines() if l.strip()][-zeilen:]
+    result = "\n".join(f"`{l[:110]}`" for l in lines)
+    if len(result) > 3900:
+        result = result[:3900] + "\n..."
+
+    embed = discord.Embed(
+        title=_t(interaction, f"🔍 Raw Log – letzte {len(lines)} Zeilen",
+                 f"🔍 Raw Log – last {len(lines)} lines"),
+        description=result,
+        color=0x7F8C8D
+    )
+    embed.set_footer(text=_t(
+        interaction,
+        f"Datei: {adm_files[-1].split('/')[-1]}  •  "
+        f"Tipp: Damage/Loot erscheinen nur wenn der Server diese Events loggt",
+        f"File: {adm_files[-1].split('/')[-1]}  •  "
+        f"Tip: Damage/loot only appear if the server logs these events"))
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /change_damage_settings – Base-/Container-Schaden umschalten
+#
+#  Geaendert wird die cfggameplay.json im Mission-Ordner des jeweiligen
+#  Kunden-Servers (mpmissions/dayzOffline.<karte>/cfggameplay.json).
+#  ACHTUNG Umkehrung: die Datei speichert das VERBOT, nicht die Erlaubnis –
+#  Schaden AN heisst disableXxxDamage = false.
+# ══════════════════════════════════════════════════════════════
+_SCHADEN_SCHLUESSEL = {
+    "base":      "disableBaseDamage",
+    "container": "disableContainerDamage",
+}
+
+# Ein Lock pro Server: ohne das wuerden zwei gleichzeitige Aufrufe (z. B. Base-
+# und Container-Damage in zwei Discord-Nachrichten kurz hintereinander) beide
+# dieselbe alte Fassung lesen – wer zuletzt schreibt, wirft dann die Aenderung
+# des anderen komplett weg (Lost-Update). Ein einfaches Dict statt eines
+# festen Locks pro ServerConnection, weil cfggameplay.json keinen eigenen
+# Manager wie der Shop (ShopManager.lock) hat.
+_SCHADEN_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def _schaden_lock(service_id: str) -> asyncio.Lock:
+    return _SCHADEN_LOCKS.setdefault(service_id, asyncio.Lock())
+
+
+def _cfggameplay_pfad(conn: ServerConnection) -> Optional[str]:
+    """Pfad der cfggameplay.json – sie liegt im selben Mission-Ordner wie die
+    cfgEffectArea.json, die /ftp_scan bereits findet."""
+    mission = str(conn.get("ftp_mission_dir") or "")
+    if mission:
+        return f"{mission.rstrip('/')}/cfggameplay.json"
+    # Rueckfall: aus dem cfgEffectArea-Pfad ableiten (gleicher Ordner)
+    effect = str(conn.get("cfg_effect_area_path") or "")
+    if effect and "/" in effect:
+        return effect.rsplit("/", 1)[0] + "/cfggameplay.json"
+    return None
+
+
+def _json_schluessel_finden(daten: Any, schluessel: str,
+                            pfad: str = "") -> Optional[str]:
+    """Sucht ``schluessel`` rekursiv in verschachtelten Dicts und gibt den
+    Fundort als Punktpfad zurueck ("GeneralData" bzw. "" fuer die Wurzel),
+    sonst ``None``.
+
+    Bewusst gesucht statt "GeneralData" fest verdrahtet: Bohemia hat die
+    Abschnitte der cfggameplay.json schon mehrfach umsortiert – wird der
+    Schluessel nicht gefunden, meldet der Befehl das, statt an falscher
+    Stelle einen wirkungslosen neuen Eintrag anzulegen.
+    """
+    if not isinstance(daten, dict):
+        return None
+    if schluessel in daten and not isinstance(daten[schluessel], (dict, list)):
+        return pfad
+    for k, v in daten.items():
+        if isinstance(v, dict):
+            treffer = _json_schluessel_finden(v, schluessel, f"{pfad}.{k}" if pfad else k)
+            if treffer is not None:
+                return treffer
+    return None
+
+
+def _json_wert_finden(daten: Any, schluessel: str) -> Any:
+    """Sucht ``schluessel`` rekursiv in verschachtelten Dicts und gibt den
+    ERSTEN gefundenen Wert direkt zurueck (jeder Typ, auch Listen) - anders
+    als ``_json_schluessel_finden``, das Listen-/Dict-Werte bewusst ausspart
+    und nur den Fundort fuer skalare Einstellungen wie ``disableBaseDamage``
+    liefert. Fuer ``objectSpawnersArr`` (eine Liste) wird dieser Helfer
+    gebraucht."""
+    if not isinstance(daten, dict):
+        return None
+    if schluessel in daten:
+        return daten[schluessel]
+    for v in daten.values():
+        if isinstance(v, dict):
+            treffer = _json_wert_finden(v, schluessel)
+            if treffer is not None:
+                return treffer
+    return None
+
+
+def _json_unterobjekt(daten: Dict, pfad: str) -> Dict:
+    """Folgt einem Punktpfad aus _json_schluessel_finden ("" = Wurzel)."""
+    ziel = daten
+    for teil in [t for t in pfad.split(".") if t]:
+        ziel = ziel[teil]
+    return ziel
+
+
+async def _schaden_datei_setzen(conn: ServerConnection, schluessel: str,
+                                neuer_wert: bool) -> Tuple[str, Dict[str, Any]]:
+    """Setzt ``disableBaseDamage``/``disableContainerDamage`` in der
+    cfggameplay.json dieses Servers.
+
+    Gemeinsamer Kern von ``/change_damage_settings`` und den vier
+    Auto-Aufgaben – beide muessen durch DASSELBE Lock laufen, sonst
+    ueberschreiben ein Befehl und eine gleichzeitig faellige Aufgabe
+    einander (Lost-Update).
+
+    Rueckgabe ``(code, infos)``. Der Aufrufer formuliert die Meldung selbst:
+    der Befehl uebersetzt sie (``_t``), die Auto-Aufgabe bleibt deutsch, weil
+    es dort keinen ausloesenden Nutzer mit eigener Sprache gibt.
+
+    Codes: ``ok`` · ``unveraendert`` · ``kein_ftp`` · ``kein_pfad`` ·
+    ``lesefehler`` · ``fehlt`` · ``kaputt`` · ``kein_abschnitt`` ·
+    ``schreibfehler``. ``infos`` enthaelt ``pfad``, ``alter_wert`` und
+    bei Fehlern ``fehler``.
+    """
+    infos: Dict[str, Any] = {"pfad": None, "alter_wert": None, "fehler": ""}
+    if conn.ftp is None:
+        return "kein_ftp", infos
+    pfad = _cfggameplay_pfad(conn)
+    infos["pfad"] = pfad
+    if not pfad:
+        return "kein_pfad", infos
+
+    loop = asyncio.get_running_loop()
+    async with _schaden_lock(conn.service_id):
+        roh, status = await loop.run_in_executor(None, conn.ftp.read_file_ex, pfad)
+        if status == "error":
+            # Inhalt UNBEKANNT – niemals blind ueberschreiben, sonst ist die
+            # komplette Gameplay-Konfiguration des Kunden weg.
+            return "lesefehler", infos
+        if status == "missing":
+            return "fehlt", infos
+
+        try:
+            daten = json.loads(roh or "")
+            if not isinstance(daten, dict):
+                raise ValueError("Wurzel-Element ist kein JSON-Objekt")
+        except Exception as e:  # noqa: BLE001
+            infos["fehler"] = str(e)
+            return "kaputt", infos
+
+        fundort = _json_schluessel_finden(daten, schluessel)
+        if fundort is None:
+            # Nicht vorhanden: nur dort ergaenzen, wo DayZ ihn erwartet.
+            if isinstance(daten.get("GeneralData"), dict):
+                fundort = "GeneralData"
+            else:
+                return "kein_abschnitt", infos
+
+        ziel = _json_unterobjekt(daten, fundort)
+        infos["alter_wert"] = ziel.get(schluessel)
+        if infos["alter_wert"] is neuer_wert:
+            return "unveraendert", infos
+
+        ziel[schluessel] = neuer_wert
+        inhalt = json.dumps(daten, ensure_ascii=False, indent=4)
+        ok = await loop.run_in_executor(None, conn.ftp.write_file, pfad, inhalt)
+        if not ok:
+            return "schreibfehler", infos
+    return "ok", infos
+
+
+@bot.tree.command(
+    name="change_damage_settings",
+    description=app_commands.locale_str(
+        "🧱 Schaltet Base- oder Container-Schaden an/aus (cfggameplay.json)")
+)
+@app_commands.describe(
+    bereich="Was soll umgestellt werden?",
+    zustand="Schaden erlauben (an) oder verbieten (aus)?",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+@app_commands.choices(
+    bereich=[
+        app_commands.Choice(name="Base Damage", value="base"),
+        app_commands.Choice(name="Container Damage", value="container"),
+    ],
+    zustand=[
+        app_commands.Choice(name="enable (Schaden an)", value="enable"),
+        app_commands.Choice(name="disable (Schaden aus)", value="disable"),
+    ])
+async def cmd_change_damage_settings(interaction: discord.Interaction,
+                                     bereich: app_commands.Choice[str],
+                                     zustand: app_commands.Choice[str],
+                                     server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "change_damage_settings"):
+        return await _deny_subcmd(interaction)
+    conn = await _require_conn(interaction, need_ftp=True, server=server)
+    if conn is None:
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    schluessel = _SCHADEN_SCHLUESSEL[bereich.value]
+    # Umkehrung: "enable" (Schaden an) = disableXxxDamage FALSE
+    neuer_wert = (zustand.value == "disable")
+    an_aus = _t(interaction, "AN", "ON") if not neuer_wert else _t(interaction, "AUS", "OFF")
+
+    code, infos = await _schaden_datei_setzen(conn, schluessel, neuer_wert)
+    pfad, alter_wert = infos["pfad"], infos["alter_wert"]
+
+    if code == "kein_ftp" or code == "kein_pfad":
+        return await interaction.followup.send(_t(
+            interaction,
+            "❌ Der Mission-Ordner dieses Servers ist nicht bekannt. "
+            "Wende dich an den Bot-Betreiber.",
+            "❌ The mission folder of this server is unknown. "
+            "Please contact the bot operator."), ephemeral=True)
+    if code == "lesefehler":
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ `cfggameplay.json` konnte nicht gelesen werden (FTP-Fehler). "
+            f"Es wurde **nichts** geändert. Bitte gleich nochmal versuchen.\n"
+            f"Pfad: `{pfad}`",
+            f"❌ Could not read `cfggameplay.json` (FTP error). **Nothing** was "
+            f"changed. Please try again in a moment.\nPath: `{pfad}`"), ephemeral=True)
+    if code == "fehlt":
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ Es gibt keine `cfggameplay.json` in diesem Mission-Ordner.\n"
+            f"Pfad: `{pfad}`\n\nLege sie im Nitrado-Dateimanager an und setze in "
+            f"der `serverDZ.cfg` zusätzlich `enableCfgGameplayFile = 1;` – sonst "
+            f"liest DayZ die Datei gar nicht ein.",
+            f"❌ There is no `cfggameplay.json` in this mission folder.\n"
+            f"Path: `{pfad}`\n\nCreate it via the Nitrado file manager and also set "
+            f"`enableCfgGameplayFile = 1;` in `serverDZ.cfg` – otherwise DayZ will "
+            f"not read the file at all."), ephemeral=True)
+    if code == "kaputt":
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ `cfggameplay.json` ist kein gültiges JSON: `{infos['fehler']}`\n"
+            f"Es wurde nichts geändert.",
+            f"❌ `cfggameplay.json` is not valid JSON: `{infos['fehler']}`\n"
+            f"Nothing was changed."), ephemeral=True)
+    if code == "kein_abschnitt":
+        return await interaction.followup.send(_t(
+            interaction,
+            f"❌ `{schluessel}` steht nicht in dieser `cfggameplay.json`, und es "
+            f"gibt auch keinen Abschnitt `GeneralData`, in den er gehören würde. "
+            f"Es wurde nichts geändert – bitte schick mir den Inhalt der Datei.",
+            f"❌ `{schluessel}` is not in this `cfggameplay.json`, and there is no "
+            f"`GeneralData` section it would belong to. Nothing was changed – "
+            f"please send me the contents of the file."), ephemeral=True)
+    if code == "unveraendert":
+        return await interaction.followup.send(_t(
+            interaction,
+            f"ℹ️ **{bereich.name}** steht auf **{an_aus}** – das ist bereits so "
+            f"eingestellt (`{schluessel}: {str(neuer_wert).lower()}`). "
+            f"Die Datei wurde nicht angefasst.",
+            f"ℹ️ **{bereich.name}** is **{an_aus}** – it is already set that way "
+            f"(`{schluessel}: {str(neuer_wert).lower()}`). The file was left "
+            f"untouched."), ephemeral=True)
+    if code == "schreibfehler":
+        return await interaction.followup.send(_t(
+            interaction,
+            "❌ Schreiben per FTP fehlgeschlagen – die Datei ist unverändert.",
+            "❌ FTP write failed – the file is unchanged."), ephemeral=True)
+
+    log.info(f"[GAMEPLAY] {conn.name}: {schluessel} = {str(neuer_wert).lower()} "
+             f"(durch {interaction.user})")
+    embed = discord.Embed(
+        title=_t(interaction, f"🧱 {bereich.name} ist jetzt {an_aus}",
+                 f"🧱 {bereich.name} is now {an_aus}"),
+        color=0x2ECC71 if not neuer_wert else 0xE67E22)
+    embed.add_field(name=_t(interaction, "Geändert", "Changed"),
+                    value=f"`{schluessel}: {str(alter_wert).lower()} → "
+                          f"{str(neuer_wert).lower()}`", inline=False)
+    embed.add_field(name=_t(interaction, "Datei", "File"),
+                    value=f"`{pfad}`", inline=False)
+    embed.set_footer(text=_t(
+        interaction,
+        "⚠️ Wirkt erst nach einem Server-Neustart (/neustart).",
+        "⚠️ Takes effect only after a server restart (/neustart)."))
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════
+#  TOOLS – DayZ-Mission-Editor (Loadout, Gaszonen, Zombie-Horden,
+#  Heli-Crash-Loot, Fahrzeuge, Spawnable-Inhalte, Event-Vorlagen).
+#
+#  Arbeitet direkt auf den Mission-Dateien des jeweiligen Kundenservers per
+#  FTP (ftp_mission_dir, von /ftp_scan bereits gefunden - dieselbe
+#  Infrastruktur wie die Shop-Auslieferung ueber cfgEffectArea.json, siehe
+#  ITEM-AUSLIEFERUNG weiter oben). Jede Datei wird "chirurgisch" per
+#  Text-Ersetzung geschrieben (nur der betroffene <event>/<type>-Block),
+#  nicht als komplettes XML neu serialisiert - der Rest der Datei bleibt
+#  byte-fuer-byte erhalten, ein Fehler an anderer Stelle der Datei stoert
+#  nicht. Gelesen wird zum Vorbelegen dagegen bequem per ElementTree -
+#  Lesen veraendert nichts, Schreiben bleibt ausschliesslich chirurgisch.
+#  Portiert aus einem eigenstaendigen Vorgaenger-Projekt (Browser-Tool),
+#  dort dieselbe Technik in JavaScript.
+# ══════════════════════════════════════════════════════════════
+
+TOOL_SLOTS = [
+    ("Headgear", "Kopfbedeckung"), ("Mask", "Maske"), ("Eyewear", "Brille"),
+    ("Body", "Oberteil"), ("Vest", "Weste"), ("Gloves", "Handschuhe"),
+    ("Armband", "Armband"), ("Hands", "Hände (Waffe)"),
+    ("shoulderL", "Schulter L"), ("shoulderR", "Schulter R"),
+    ("Back", "Rucksack"), ("Hips", "Gürtel"), ("Legs", "Hose"), ("Feet", "Schuhe"),
+]
+
+TOOL_GAS_PARTICLES = [
+    ("graphics/particles/contaminated_area_gas_bigass", "Groß (Standard)"),
+    ("graphics/particles/contaminated_area_gas", "Mittel"),
+    ("graphics/particles/contaminated_area_gas_small", "Klein"),
+]
+
+# ── Effekt-Generator: nur bestaetigte Namen (aus dem echten DayZ-Partikel-/
+# PPE-/Trigger-Katalog), keine unbestaetigten Presets einer fremden Webseite.
+TOOL_EFFECT_TRIGGERS = [
+    "BarbedwireTrigger", "ContaminatedTrigger", "CylinderTrigger", "EffectTrigger",
+    "ManTrigger", "SphereTrigger", "SpookyTrigger", "TrapTrigger", "Trigger",
+    "TriggerEffectmanager", "TriggerEvents",
+]
+
+TOOL_EFFECT_PARTICLES = [
+    "blood_bleeding_01", "blood_bleeding_02", "blood_surface_chunks", "blood_surface_drops",
+    "breath_vapour_heavy", "breath_vapour_light", "breath_vapour_medium",
+    "character_vomit_01", "character_vomit_puddle", "character_vomitblood_01",
+    "contaminated_area_gas_around", "contaminated_area_gas_around_tiny",
+    "contaminated_area_gas_bigass", "contaminated_area_gas_ground", "contaminated_area_gas_shell",
+    "cooking_baking_done", "cooking_baking_start", "cooking_boiling_done", "cooking_boiling_empty",
+    "cooking_boiling_start", "cooking_burning_done", "cooking_drying_done", "cooking_drying_start",
+    "digging_ground", "electro_shortc2", "env_fly_swarm_01",
+    "explosion_landmine_01", "explosion_m67_01", "explosion_m84_01", "explosion_rgd5_01",
+    "fire_bonfire", "fire_extinguish_wind", "fire_medium_barrel_01", "fire_medium_camp_01",
+    "fire_medium_house_01", "fire_medium_oven_01", "fire_small_barrel_01", "fire_small_camp_01",
+    "fire_small_flare_blue_01", "fire_small_flare_green_01", "fire_small_flare_red_01",
+    "fire_small_flare_yellow_01", "fire_small_house_01", "fire_small_oven_01",
+    "fire_small_roadflare_red_01", "fire_small_roadflare_red_02", "fire_small_roadflare_red_03",
+    "fire_small_roadflare_red_04", "fire_small_stove_01", "fire_small_torch_01",
+    "fire_small_torch_02", "fire_small_torch_03", "fire_small_torch_yellow_01",
+    "hatchback_coolant_overheated", "hatchback_coolant_overheating", "hatchback_engine_failing",
+    "hatchback_engine_failure", "hatchback_exhaust", "menu_engine_fire", "menu_evaporation",
+    "smoke_bonfire", "smoke_generic_wreck", "smoke_heli_wreck_01",
+    "smoke_m18_green_01", "smoke_m18_green_02", "smoke_m18_green_03",
+    "smoke_m18_purple_01", "smoke_m18_purple_02", "smoke_m18_purple_03",
+    "smoke_m18_red_01", "smoke_m18_red_02", "smoke_m18_red_03",
+    "smoke_m18_white_01", "smoke_m18_white_02", "smoke_m18_white_03",
+    "smoke_m18_yellow_01", "smoke_m18_yellow_02", "smoke_m18_yellow_03",
+    "smoke_m7a2_white_01", "smoke_m7a2_white_02", "smoke_m7a2_white_03",
+    "smoke_medium_barrel_01", "smoke_medium_camp_01", "smoke_medium_house_01",
+    "smoke_rdg2_black_01", "smoke_rdg2_black_02", "smoke_rdg2_black_03",
+    "smoke_rdg2_white_01", "smoke_rdg2_white_02", "smoke_rdg2_white_03",
+    "smoke_small_barrel_01", "smoke_small_camp_01", "smoke_small_generator_01", "smoke_small_house_01",
+    "smoking_barrel", "smoking_barrel_heavy", "smoking_barrel_small",
+    "smoking_barrel_steam", "smoking_barrel_steam_small",
+    "steam_medium_camp_2end", "steam_medium_house_2end", "toxic_cloud",
+]
+
+TOOL_EFFECT_PPE = [
+    "PPERequester_InventoryBlur", "PPERequester_ControllerDisconnectBlur",
+    "PPERequester_GlassesSportBlack", "PPERequester_GlassesSportBlue",
+    "PPERequester_GlassesSportGreen", "PPERequester_GlassesSportOrange",
+    "PPERequester_GlassesAviator", "PPERequester_GlassesDesignerBlack",
+    "PPERequester_TacticalGoggles", "PPERequester_MotoHelmetBlack", "PPERequester_WeldingMask",
+    "PPERequester_CameraNV", "PPERequester_CameraADS", "PPERequester_BloodLoss",
+    "PPERequester_DeathDarkening", "PPERequester_UnconEffects", "PPERequester_TunnelVisionEffects",
+    "PPERequester_BurlapSackEffects", "PPERequester_IntroChromAbb", "PPERequester_FeverEffects",
+    "PPERequester_FlashbangEffects", "PPERequester_ShockHitReaction", "PPERequester_HealthHitReaction",
+    "PPERequester_MenuEffects", "PPERequester_ControlsBlur", "PPERequester_ServerBrowserBlur",
+    "PPERequester_TutorialMenu", "PPERequester_ContaminatedAr",
+]
+
+TOOL_EFFECT_TYPES = ["SpookyArea", "EffectArea"]
+TOOL_EFFECT_PREFIX = "FX_"
+
+TOOL_HORDE_MOVEMENT = {
+    "stationary": {"label": "Stehend (bleibt am Ort)", "smin": 0, "smax": 0, "dmin": 30, "dmax": 30},
+    "patrol":     {"label": "Patrouille (läuft umher)", "smin": 2, "smax": 5, "dmin": 10, "dmax": 50},
+    "dynamic":    {"label": "Aggressiv (verfolgt weit)", "smin": 5, "smax": 10, "dmin": 5, "dmax": 20},
+}
+
+TOOL_ZOMBIE_DATA = {
+    "InfectedArmy": ["ZmbM_PatrolNormal_Autumn", "ZmbM_PatrolNormal_Flat", "ZmbM_PatrolNormal_PautRev", "ZmbM_PatrolNormal_Summer", "ZmbM_SoldierNormal", "ZmbM_usSoldier_normal_Desert", "ZmbM_usSoldier_normal_Woodland"],
+    "InfectedArmyHard": ["ZmbM_PatrolNormal_Autumn", "ZmbM_PatrolNormal_Flat", "ZmbM_PatrolNormal_PautRev", "ZmbM_PatrolNormal_Summer", "ZmbM_SoldierNormal", "ZmbM_usSoldier_Heavy_Woodland", "ZmbM_usSoldier_Officer_Desert", "ZmbM_usSoldier_normal_Desert", "ZmbM_usSoldier_normal_Woodland"],
+    "InfectedCity": ["ZmbF_CitizenANormal_Blue", "ZmbF_CitizenBSkinny", "ZmbF_Clerk_Normal_Blue", "ZmbF_JournalistNormal_Blue", "ZmbF_ShortSkirt_beige", "ZmbF_SkaterYoung_Brown", "ZmbF_SurvivorNormal_Blue", "ZmbM_CitizenASkinny_Blue", "ZmbM_CitizenBFat_Blue", "ZmbM_ClerkFat_Grey", "ZmbM_CommercialPilotOld_Blue", "ZmbM_Gamedev_Black", "ZmbM_JournalistSkinny", "ZmbM_SkaterYoung_Brown"],
+    "InfectedFirefighter": ["ZmbM_FirefighterNormal", "ZmbM_NBC_Yellow"],
+    "InfectedIndustrial": ["ZmbF_BlueCollarFat_Blue", "ZmbF_MechanicNormal_Beige", "ZmbM_ConstrWorkerNormal_Beige", "ZmbM_HandymanNormal_Beige", "ZmbM_HeavyIndustryWorker", "ZmbM_MechanicSkinny_Blue", "ZmbM_OffshoreWorker_Green"],
+    "InfectedMedic": ["ZmbF_DoctorSkinny", "ZmbF_NurseFat", "ZmbF_ParamedicNormal_Blue", "ZmbM_DoctorFat", "ZmbM_ParamedicNormal_Black", "ZmbM_PatientSkinny"],
+    "InfectedNBC": ["ZmbM_NBC_Grey", "ZmbM_NBC_Yellow"],
+    "InfectedPolice": ["ZmbF_PoliceWomanNormal", "ZmbM_PolicemanFat", "ZmbM_PolicemanSpecForce", "ZmbM_PolicemanSpecForce_Heavy"],
+    "InfectedPrisoner": ["ZmbM_PrisonerSkinny"],
+    "InfectedReligious": ["ZmbM_priestPopSkinny"],
+    "InfectedSanta": ["ZmbM_Santa"],
+    "InfectedSolitude": ["ZmbF_HikerSkinny_Blue", "ZmbM_FishermanOld_Blue", "ZmbM_HermitSkinny_Beige", "ZmbM_HikerSkinny_Blue", "ZmbM_HunterOld_Autumn"],
+    "InfectedVillage": ["ZmbF_JoggerSkinny_Blue", "ZmbF_MilkMaidOld_Beige", "ZmbF_VillagerOld_Green", "ZmbM_FarmerFat_Blue", "ZmbM_Jacket_beige", "ZmbM_JoggerSkinny_Blue", "ZmbM_VillagerOld_Blue"],
+}
+
+TOOL_VEHICLES = {
+    # "farben": Farbvarianten-Suffixe fuer den cfgspawnabletypes.xml-Classname
+    # (z. B. Hatchback_02_Blue). Nur Werte, die in echten .ADM-Dateien von
+    # Brigardes Servern belegt sind - siehe bot.py:774-777 (Hatchback_02_Blue,
+    # CivilianSedan_Wine) sowie eine gezielte Nachsuche ueber die Nitrado-API
+    # am 02.09.2026 (weitere Funde: OffroadHatchback_White, Hatchback_02_Black,
+    # CivilianSedan_Black, Sedan_02_Red). Fuer Offroad_02/Truck_01_Covered kein
+    # einziger Farb-Fund trotz Suche - deshalb bewusst keine Liste, statt eine
+    # zu raten.
+    # Farbabhaengige Tuer-/Karosserie-Classnames (z. B. HatchbackDoors_Driver_Blue)
+    # stammen NICHT aus Brigardes eigenen Server-Logs, sondern aus der Codex-
+    # Analyse der Referenzseite doordiehub.com/VehicleBuilder (02.09.2026) -
+    # von Brigarde ausdruecklich zur Uebernahme freigegeben ("Ja, uebernehmen").
+    # Anders als die "farben"-Liste oben (die den Fahrzeug-Classname selbst
+    # bestimmt und deshalb streng belegt sein muss) sind das nur zusaetzliche,
+    # optionale Ausstattungs-Checkboxen innerhalb des <type>-Blocks.
+    "OffroadHatchback": {"label": "ADA 4x4 (Lada)", "farben": ["White"], "parts": [
+        ["HatchbackWheel", 4], ["HatchbackHood", 1], ["HatchbackTrunk", 1],
+        ["HatchbackDoors_Driver", 1], ["HatchbackDoors_CoDriver", 1],
+        ["HatchbackDoors_Driver_Blue", 1], ["HatchbackDoors_CoDriver_Blue", 1],
+        ["HatchbackDoors_Driver_White", 1], ["HatchbackDoors_CoDriver_White", 1],
+        ["HatchbackHood_Blue", 1], ["HatchbackTrunk_Blue", 1],
+        ["HatchbackHood_White", 1], ["HatchbackTrunk_White", 1],
+        ["CarBattery", 1], ["SparkPlug", 1], ["CarRadiator", 1], ["HeadlightH7", 2]]},
+    "Hatchback_02": {"label": "Gunter 2 (Golf)", "farben": ["Black", "Blue"], "parts": [
+        ["Hatchback_02_Wheel", 4], ["Hatchback_02_Hood", 1], ["Hatchback_02_Trunk", 1],
+        ["Hatchback_02_Door_1_1", 1], ["Hatchback_02_Door_1_2", 1],
+        ["Hatchback_02_Door_2_1", 1], ["Hatchback_02_Door_2_2", 1],
+        ["Hatchback_02_Door_1_1_Black", 1], ["Hatchback_02_Door_1_2_Black", 1],
+        ["Hatchback_02_Door_2_1_Black", 1], ["Hatchback_02_Door_2_2_Black", 1],
+        ["Hatchback_02_Door_1_1_Blue", 1], ["Hatchback_02_Door_1_2_Blue", 1],
+        ["Hatchback_02_Door_2_1_Blue", 1], ["Hatchback_02_Door_2_2_Blue", 1],
+        ["Hatchback_02_Hood_Black", 1], ["Hatchback_02_Trunk_Black", 1],
+        ["Hatchback_02_Hood_Blue", 1], ["Hatchback_02_Trunk_Blue", 1],
+        ["CarBattery", 1], ["SparkPlug", 1], ["CarRadiator", 1], ["HeadlightH7", 2]]},
+    "CivilianSedan": {"label": "Olga 24 (Wolga)", "farben": ["Black", "Wine"], "parts": [
+        ["CivSedanWheel", 4], ["CivSedanHood", 1], ["CivSedanTrunk", 1],
+        ["CivSedanDoors_Driver", 1], ["CivSedanDoors_CoDriver", 1],
+        ["CivSedanDoors_BackLeft", 1], ["CivSedanDoors_BackRight", 1],
+        ["CivSedanDoors_Driver_Wine", 1], ["CivSedanDoors_CoDriver_Wine", 1],
+        ["CivSedanDoors_BackLeft_Wine", 1], ["CivSedanDoors_BackRight_Wine", 1],
+        ["CivSedanDoors_Driver_Black", 1], ["CivSedanDoors_CoDriver_Black", 1],
+        ["CivSedanDoors_BackLeft_Black", 1], ["CivSedanDoors_BackRight_Black", 1],
+        ["CivSedanHood_Wine", 1], ["CivSedanTrunk_Wine", 1],
+        ["CivSedanHood_Black", 1], ["CivSedanTrunk_Black", 1],
+        ["CarBattery", 1], ["SparkPlug", 1], ["CarRadiator", 1], ["HeadlightH7", 2]]},
+    "Sedan_02": {"label": "Sarka 120 (Skoda)", "farben": ["Red"], "parts": [
+        ["Sedan_02_Wheel", 4], ["Sedan_02_Hood", 1], ["Sedan_02_Trunk", 1],
+        ["Sedan_02_Door_1_1", 1], ["Sedan_02_Door_1_2", 1],
+        ["Sedan_02_Door_2_1", 1], ["Sedan_02_Door_2_2", 1],
+        ["Sedan_02_Door_1_1_Red", 1], ["Sedan_02_Door_1_2_Red", 1],
+        ["Sedan_02_Door_2_1_Red", 1], ["Sedan_02_Door_2_2_Red", 1],
+        ["Sedan_02_Door_1_1_Grey", 1], ["Sedan_02_Door_1_2_Grey", 1],
+        ["Sedan_02_Door_2_1_Grey", 1], ["Sedan_02_Door_2_2_Grey", 1],
+        ["Sedan_02_Hood_Red", 1], ["Sedan_02_Trunk_Red", 1],
+        ["Sedan_02_Hood_Grey", 1], ["Sedan_02_Trunk_Grey", 1],
+        ["CarBattery", 1], ["SparkPlug", 1], ["CarRadiator", 1], ["HeadlightH7", 2]]},
+    "Truck_01_Covered": {"label": "M3S Truck (V3S)", "farben": [], "parts": [
+        ["Truck_01_Wheel", 2], ["Truck_01_WheelDouble", 4], ["Truck_01_Hood", 1],
+        ["Truck_01_Door_1_1", 1], ["Truck_01_Door_2_1", 1],
+        ["Truck_01_Door_1_1_Blue", 1], ["Truck_01_Door_2_1_Blue", 1],
+        ["Truck_01_Door_1_1_Orange", 1], ["Truck_01_Door_2_1_Orange", 1],
+        ["Truck_01_Hood_Blue", 1], ["Truck_01_Hood_Orange", 1],
+        ["TruckBattery", 1], ["GlowPlug", 1], ["HeadlightH7", 2]]},
+    "Offroad_02": {"label": "M1025 Humvee", "farben": [], "parts": [
+        ["Offroad_02_Wheel", 4], ["Offroad_02_Hood", 1], ["Offroad_02_Trunk", 1],
+        ["Offroad_02_Door_1_1", 1], ["Offroad_02_Door_1_2", 1],
+        ["Offroad_02_Door_2_1", 1], ["Offroad_02_Door_2_2", 1],
+        ["CarBattery", 1], ["GlowPlug", 1], ["HeadlightH7", 2]]},
+    # Boot: nur Pflichtteil, keine Wheels/Lights/Doors/Body Parts und kein
+    # Kofferraum-Inhalt (siehe "kein_inventar" - Referenzseite zeigt dort
+    # "Inventory not available for boats"). Kein eigenes Bild vorhanden.
+    "Boat_01": {"label": "Boot", "farben": ["Blue", "Camo", "Orange"],
+                "kein_inventar": True, "parts": [["SparkPlug", 1]]},
+}
+
+# NPC + Vehicle Deployment: nur Klassen, die in Bohemias offiziellen CE-Dateien
+# als Event-Kind UND als cfgspawnabletypes-<type> belegt sind (Codex-Analyse
+# 28.09.2026 gegen BohemiaInteractive/DayZ-Central-Economy). Unbelegte
+# Varianten des Vorbilds (Sedan_02_Yellow, Truck_01_Covered_Brun,
+# OffroadHatchback_Green, CivilianSedan_White, Hatchback_02_Red) fehlen bewusst.
+# "karten": None = alle drei Vanilla-Karten, sonst nur die genannten.
+TOOL_DEPLOY_VEHICLES: Dict[str, Dict[str, Any]] = {
+    "ada_blue":      {"label": "Blaue ADA", "klasse": "OffroadHatchback_Blue",
+                      "bild": "OffroadHatchback", "karten": None},
+    "ada_white":     {"label": "Weiße ADA", "klasse": "OffroadHatchback_White",
+                      "bild": "OffroadHatchback", "karten": None},
+    "gunter_blue":   {"label": "Blauer Gunter", "klasse": "Hatchback_02_Blue",
+                      "bild": "Hatchback_02", "karten": None},
+    "gunter_black":  {"label": "Schwarzer Gunter", "klasse": "Hatchback_02_Black",
+                      "bild": "Hatchback_02", "karten": ["ChernarusPlus", "Livonia"]},
+    "olga_black":    {"label": "Schwarze Olga", "klasse": "CivilianSedan_Black",
+                      "bild": "CivilianSedan", "karten": None},
+    "olga_wine":     {"label": "Rote Olga", "klasse": "CivilianSedan_Wine",
+                      "bild": "CivilianSedan", "karten": None},
+    "sarka_red":     {"label": "Rote Sarka", "klasse": "Sedan_02_Red",
+                      "bild": "Sedan_02", "karten": None},
+    "sarka_grey":    {"label": "Graue Sarka", "klasse": "Sedan_02_Grey",
+                      "bild": "Sedan_02", "karten": None},
+    "truck_blue":    {"label": "Blauer Truck", "klasse": "Truck_01_Covered_Blue",
+                      "bild": "Truck_01_Covered", "karten": None},
+    "truck_orange":  {"label": "Oranger Truck", "klasse": "Truck_01_Covered_Orange",
+                      "bild": "Truck_01_Covered", "karten": None},
+    "humvee":        {"label": "Humvee", "klasse": "Offroad_02",
+                      "bild": "Offroad_02", "karten": ["ChernarusPlus", "Livonia"]},
+    "boat_black":    {"label": "Schwarzes Boot", "klasse": "Boat_01_Black",
+                      "bild": None, "karten": None},
+    # Ergaenzt aus Brigardes Fahrzeugliste (29.09.2026, Classnames aus Bohemias
+    # DayZ-Central-Economy). Ob der Server die Klasse kennt, prueft der Einsatz
+    # ohnehin an cfgspawnabletypes.xml.
+    "ada_green":     {"label": "Grüne ADA", "klasse": "OffroadHatchback",
+                      "bild": "OffroadHatchback", "karten": None},
+    "olga_grey":     {"label": "Hellgraue Olga", "klasse": "CivilianSedan",
+                      "bild": "CivilianSedan", "karten": None},
+    "gunter_red":    {"label": "Roter Gunter", "klasse": "Hatchback_02",
+                      "bild": "Hatchback_02", "karten": None},
+    "sarka_yellow":  {"label": "Gelbe Sarka", "klasse": "Sedan_02",
+                      "bild": "Sedan_02", "karten": None},
+    "truck_green":   {"label": "Grüner Truck", "klasse": "Truck_01_Covered",
+                      "bild": "Truck_01_Covered", "karten": None},
+    # Motorraeder kommen erst mit DayZ 1.30 (angekuendigt 15.10.2026) - bis
+    # dahin nur angezeigt, Einsetzen gesperrt ("bald").
+    "jana_blue":     {"label": "Jana 50 blau", "klasse": "Motorbike_01_Blue",
+                      "bild": None, "karten": None, "bald": True},
+    "jana_red":      {"label": "Jana 50 rot", "klasse": "Motorbike_01_Red",
+                      "bild": None, "karten": None, "bald": True},
+    "jana_yellow":   {"label": "Jana 50 gelb", "klasse": "Motorbike_01_Yellow",
+                      "bild": None, "karten": None, "bald": True},
+    "bitrak_blue":   {"label": "Bitrak 682 blau", "klasse": "Motorbike_02_Blue",
+                      "bild": None, "karten": None, "bald": True},
+    "bitrak_green":  {"label": "Bitrak 682 grün", "klasse": "Motorbike_02_Green",
+                      "bild": None, "karten": None, "bald": True},
+    "bitrak_red":    {"label": "Bitrak 682 rot", "klasse": "Motorbike_02_Red",
+                      "bild": None, "karten": None, "bald": True},
+    "bitrak_yellow": {"label": "Bitrak 682 gelb", "klasse": "Motorbike_02_Yellow",
+                      "bild": None, "karten": None, "bald": True},
+}
+
+
+def _deploy_bild(v: Dict[str, Any]) -> Optional[str]:
+    """Bild je Farbvariante (vehicles/<Klasse>.webp), sonst das Modellbild."""
+    if f"vehicles/{v['klasse']}.webp" in _EMBEDDED_ASSETS:
+        return f"/static/vehicles/{v['klasse']}.webp"
+    if v["bild"] and f"vehicles/{v['bild']}.png" in _EMBEDDED_ASSETS:
+        return f"/static/vehicles/{v['bild']}.png"
+    return None
+
+# NPC-Koerper: Vanilla-Ueberlebende, von Brigarde vorgegeben (28.09.2026). Die
+# Ausruestung haengt in cfgspawnabletypes.xml an der KLASSE - deshalb belegt
+# jeder NPC-Einsatz eine eigene, noch freie Klasse.
+TOOL_DEPLOY_SURVIVORS: Tuple[str, ...] = (
+    "SurvivorM_Mirek", "SurvivorM_Boris", "SurvivorM_Cyril", "SurvivorM_Denis",
+    "SurvivorM_Elias", "SurvivorM_Francis", "SurvivorM_Guo", "SurvivorM_Hassan",
+    "SurvivorM_Indar", "SurvivorM_Jose", "SurvivorM_Kaito", "SurvivorM_Lewis",
+    "SurvivorM_Manua", "SurvivorM_Niki", "SurvivorM_Oliver", "SurvivorM_Peter",
+    "SurvivorM_Quinn", "SurvivorM_Rolf", "SurvivorM_Seth", "SurvivorM_Taiki",
+    "SurvivorF_Eva", "SurvivorF_Frida", "SurvivorF_Gabi", "SurvivorF_Helga",
+    "SurvivorF_Irena", "SurvivorF_Judy", "SurvivorF_Keiko", "SurvivorF_Linda",
+    "SurvivorF_Maria", "SurvivorF_Naomi", "SurvivorF_Baty",
+)
+
+# NPC-Vorlagen: jede Item-Klasse ist im eingebetteten Vanilla-Bildkatalog
+# (items/*.avif) oder als Fahrzeugteil in TOOL_VEHICLES belegt - geprueft in
+# tests/test_deployment.py. "attachments" = am Koerper, "cargo" = im Inventar.
+TOOL_DEPLOY_NPCS: Dict[str, Dict[str, Any]] = {
+    "bauarbeiter": {"label": "Bauarbeiter", "event": "NpcBauarbeiter", "items": [
+        ("attachments", "ConstructionHelmet_Red"), ("attachments", "ReflexVest"),
+        ("attachments", "Shirt_BlueCheck"), ("attachments", "Jeans_BlueDark"),
+        ("attachments", "WorkingBoots_Brown"), ("attachments", "WorkingGloves_Yellow"),
+        ("attachments", "MountainBag_Blue"), ("attachments", "Shovel"),
+        ("cargo", "Pickaxe"), ("cargo", "SledgeHammer"), ("cargo", "Hammer"),
+        ("cargo", "Nail")]},
+    "feuerwehr": {"label": "Feuerwehr", "event": "NpcFeuerwehr", "items": [
+        ("attachments", "FirefightersHelmet_Red"), ("attachments", "FirefighterJacket_Black"),
+        ("attachments", "FirefightersPants_Black"), ("attachments", "MilitaryBoots_Black"),
+        ("attachments", "WorkingGloves_Black"), ("attachments", "FirefighterAxe")]},
+    "abc_gelb": {"label": "ABC-Schutz gelb", "event": "NpcAbcGelb", "items": [
+        ("attachments", "NBCHoodYellow"), ("attachments", "NBCJacketYellow"),
+        ("attachments", "NBCPantsYellow"), ("attachments", "NBCBootsYellow"),
+        ("attachments", "NBCGlovesYellow"), ("attachments", "AirborneMask"),
+        ("cargo", "GasMask_Filter"), ("cargo", "GasMask_Filter")]},
+    "abc_grau": {"label": "ABC-Schutz grau", "event": "NpcAbcGrau", "items": [
+        ("attachments", "NBCHoodGray"), ("attachments", "NBCJacketGray"),
+        ("attachments", "NBCPantsGray"), ("attachments", "NBCBootsGray"),
+        ("attachments", "NBCGlovesGray"), ("attachments", "AirborneMask"),
+        ("cargo", "GasMask_Filter"), ("cargo", "GasMask_Filter")]},
+    "sanitaeter": {"label": "Sanitäter", "event": "NpcSanitaeter", "items": [
+        ("attachments", "MedicalScrubsHat_Blue"), ("attachments", "SurgicalMask"),
+        ("attachments", "MedicalScrubsShirt_Green"), ("attachments", "MedicalScrubsPants_Green"),
+        ("attachments", "Sneakers_Green"), ("attachments", "SurgicalGloves_Blue"),
+        ("cargo", "BandageDressing"), ("cargo", "Morphine"), ("cargo", "Epinephrine"),
+        ("cargo", "SalineBagIV")]},
+    "mechaniker": {"label": "Mechaniker", "event": "NpcMechaniker", "items": [
+        ("attachments", "MotoHelmet_Red"), ("attachments", "QuiltedJacket_Red"),
+        ("attachments", "Jeans_Black"), ("attachments", "WorkingBoots_Yellow"),
+        ("attachments", "WorkingGloves_Black"), ("cargo", "CarRadiator"),
+        ("cargo", "SparkPlug"), ("cargo", "CarBattery"), ("cargo", "TireRepairKit"),
+        ("cargo", "Pliers"), ("cargo", "Screwdriver")]},
+    "mechaniker_gunter": {"label": "Mechaniker + Gunter-Räder", "event": "NpcMechanikerGunter",
+                          "items": [
+        ("attachments", "MotoHelmet_Black"), ("attachments", "QuiltedJacket_Grey"),
+        ("attachments", "Jeans_Grey"), ("attachments", "WorkingBoots_Yellow"),
+        ("attachments", "AliceBag_Black"), ("cargo", "Hatchback_02_Wheel"),
+        ("cargo", "Hatchback_02_Wheel")]},
+    "polizei": {"label": "Polizei", "event": "NpcPolizei", "items": [
+        ("attachments", "PoliceCap"), ("attachments", "PoliceJacket"),
+        ("attachments", "PolicePants"), ("attachments", "CombatBoots_Black"),
+        ("attachments", "PoliceVest"), ("attachments", "CivilianBelt"),
+        ("attachments", "Mp133Shotgun"), ("cargo", "Canteen")]},
+    "militaer": {"label": "Soldat (M4A1)", "event": "NpcSoldat", "items": [
+        ("attachments", "BallisticHelmet_Green"), ("attachments", "TTsKOJacket_Camo"),
+        ("attachments", "TTsKOPants"), ("attachments", "TTSKOBoots"),
+        ("attachments", "PlateCarrierVest"), ("attachments", "MilitaryBelt"),
+        ("attachments", "M4A1"), ("cargo", "Mag_STANAG_30Rnd"), ("cargo", "CombatKnife"),
+        ("cargo", "Canteen")]},
+    "jaeger": {"label": "Jäger", "event": "NpcJaeger", "items": [
+        ("attachments", "HuntingJacket_Brown"), ("attachments", "HunterPants_Brown"),
+        ("attachments", "CombatBoots_Brown"), ("attachments", "HuntingVest"),
+        ("attachments", "HuntingBag"), ("cargo", "CombatKnife"), ("cargo", "Canteen")]},
+}
+
+# Rucksack-Builder ("Inhalte & Aufsaetze") - Taschen-Classnames, Kategorie und
+# Slot-Zahl stammen bevorzugt aus Brigardes eigenen Screenshots von
+# https://doordiehub.com/BuildABag (Alice/Army, Assault, Ghillie, Dry Bags,
+# Sling, Leather Sacks, Mountain, Canvas/Duffel inkl. Duffel-Baggs, Hunting/
+# Outdoor - Stand 03.09.2026). Fuer Kategorien, die dort nur als zugeklappte
+# Ueberschrift sichtbar waren (Attack2, Child/Courier, Coyote, Improvised,
+# Smersh/Taloon), stammen Classnames/Slots aus einer DayZ-Wiki-Nachrecherche
+# - von Brigarde nachtraeglich als korrekt bestaetigt (03.09.2026), obwohl
+# das Mountain-Beispiel zuvor gezeigt hatte, dass diese Referenzseite auch
+# eigene, vom Wiki abweichende Classnames/Slot-Zahlen verwenden kann.
+# "Leather Duffel Bag" blieb ohne bestaetigten Classname und wurde bewusst
+# ausgelassen statt geraten. Anders als bei TOOL_VEHICLES ist jede Farbe hier
+# ein eigener, vollstaendiger Classname (kein Suffix) - deshalb kein
+# "farben"-Feld.
+TOOL_BAGS = {
+    "AliceBag_Black": {"label": "Alice Bag (Black)", "kategorie": "Alice / Army", "slots": 64},
+    "AliceBag_Camo": {"label": "Alice Bag (Camo)", "kategorie": "Alice / Army", "slots": 64},
+    "AliceBag_Green": {"label": "Alice Bag (Green)", "kategorie": "Alice / Army", "slots": 64},
+    "ArmyPouch_Beige": {"label": "Army Pouch (Beige)", "kategorie": "Alice / Army", "slots": 20},
+    "ArmyPouch_Black": {"label": "Army Pouch (Black)", "kategorie": "Alice / Army", "slots": 20},
+    "ArmyPouch_Camo": {"label": "Army Pouch (Camo)", "kategorie": "Alice / Army", "slots": 20},
+    "AssaultBag_Black": {"label": "Assault Bag (Black)", "kategorie": "Assault", "slots": 30},
+    "AssaultBag_Green": {"label": "Assault Bag (Green)", "kategorie": "Assault", "slots": 30},
+    "AssaultBag_Ttsko": {"label": "Assault Bag (TTsKO)", "kategorie": "Assault", "slots": 30},
+    "AssaultBag_Winter": {"label": "Assault Bag (Winter)", "kategorie": "Assault", "slots": 30},
+    "GhillieBushrag_Mossy": {"label": "Ghillie Bushrag (Mossy)", "kategorie": "Ghillie", "slots": 0},
+    "GhillieBushrag_Tan": {"label": "Ghillie Bushrag (Tan)", "kategorie": "Ghillie", "slots": 0},
+    "GhillieBushrag_Winter": {"label": "Ghillie Bushrag (Winter)", "kategorie": "Ghillie", "slots": 0},
+    "GhillieBushrag_Woodland": {"label": "Ghillie Bushrag (Woodland)", "kategorie": "Ghillie", "slots": 0},
+    "DryBag_Black": {"label": "Dry Bag (Black)", "kategorie": "Dry Bags", "slots": 20},
+    "DryBag_Blue": {"label": "Dry Bag (Blue)", "kategorie": "Dry Bags", "slots": 20},
+    "DryBag_Green": {"label": "Dry Bag (Green)", "kategorie": "Dry Bags", "slots": 20},
+    "Slingbag_Black": {"label": "Slingbag (Black)", "kategorie": "Sling", "slots": 12},
+    "Slingbag_Brown": {"label": "Slingbag (Brown)", "kategorie": "Sling", "slots": 12},
+    "Slingbag_Gray": {"label": "Slingbag (Gray)", "kategorie": "Sling", "slots": 12},
+    "Attack2Bag_Black": {"label": "Long Haul Backpack (Black)", "kategorie": "Attack2", "slots": 42},
+    "Attack2Bag_Green": {"label": "Long Haul Backpack (Green)", "kategorie": "Attack2", "slots": 42},
+    "Attack2Bag_Ttsko": {"label": "Long Haul Backpack (TTsKO)", "kategorie": "Attack2", "slots": 42},
+    "Attack2Bag_Yeger": {"label": "Long Haul Backpack (Yeger)", "kategorie": "Attack2", "slots": 42},
+    "CanvasBag_Medical": {"label": "Canvas Bag (Medical)", "kategorie": "Canvas / Duffel", "slots": 20},
+    "CanvasBag_Olive": {"label": "Canvas Bag (Olive)", "kategorie": "Canvas / Duffel", "slots": 25},
+    "CourierBag": {"label": "Burlap Courier Bag", "kategorie": "Child / Courier", "slots": 48},
+    "FurCourierBag": {"label": "Fur Courier Bag", "kategorie": "Child / Courier", "slots": 48},
+    "CoyoteBag_Brown": {"label": "Tactical Backpack (Brown)", "kategorie": "Coyote", "slots": 56},
+    "CoyoteBag_Green": {"label": "Tactical Backpack (Green)", "kategorie": "Coyote", "slots": 56},
+    "CoyoteBag_Winter": {"label": "Tactical Backpack (Winter)", "kategorie": "Coyote", "slots": 56},
+    "ImprovisedBag": {"label": "Burlap Backpack", "kategorie": "Improvised", "slots": 20},
+    "FurImprovisedBag": {"label": "Fur Backpack", "kategorie": "Improvised", "slots": 35},
+    "LeatherSack_Natural": {"label": "Leather Backpack (Natural)", "kategorie": "Leather Sacks", "slots": 42},
+    "LeatherSack_Black": {"label": "Leather Backpack (Black)", "kategorie": "Leather Sacks", "slots": 42},
+    "LeatherSack_Beige": {"label": "Leather Backpack (Beige)", "kategorie": "Leather Sacks", "slots": 42},
+    "LeatherSack_Brown": {"label": "Leather Backpack (Brown)", "kategorie": "Leather Sacks", "slots": 42},
+    "MountainBag_Blue": {"label": "Mountain Bag (Blue)", "kategorie": "Mountain", "slots": 42},
+    "MountainBag_Green": {"label": "Mountain Bag (Green)", "kategorie": "Mountain", "slots": 42},
+    "MountainBag_Orange": {"label": "Mountain Bag (Orange)", "kategorie": "Mountain", "slots": 42},
+    "MountainBag_Red": {"label": "Mountain Bag (Red)", "kategorie": "Mountain", "slots": 42},
+    "TaloonBag_Blue": {"label": "Hiking Backpack (Blue)", "kategorie": "Mountain", "slots": 30},
+    "TaloonBag_Green": {"label": "Hiking Backpack (Green)", "kategorie": "Mountain", "slots": 30},
+    "TaloonBag_Orange": {"label": "Hiking Backpack (Orange)", "kategorie": "Mountain", "slots": 30},
+    "TaloonBag_Violet": {"label": "Hiking Backpack (Violet)", "kategorie": "Mountain", "slots": 30},
+    "DuffelBagSmall_Camo": {"label": "Duffel Bag Small (Camo)", "kategorie": "Canvas / Duffel", "slots": 25},
+    "DuffelBagSmall_Green": {"label": "Duffel Bag Small (Green)", "kategorie": "Canvas / Duffel", "slots": 25},
+    "DuffelBagSmall_Medical": {"label": "Duffel Bag Small (Medical)", "kategorie": "Canvas / Duffel", "slots": 25},
+    "HuntingBag": {"label": "Hunting Bag", "kategorie": "Hunting / Outdoor", "slots": 42},
+    "HuntingBag_Hannah": {"label": "Hunting Bag (Hannah)", "kategorie": "Hunting / Outdoor", "slots": 42},
+    "SmershBag": {"label": "Smersh Bag", "kategorie": "Smersh / Taloon", "slots": 16},
+    "TortillaBag": {"label": "Combat Backpack", "kategorie": "Smersh / Taloon", "slots": 56},
+}
+
+# Rein optische Gruppierung der immer gleichen Fahrzeug-Teile-Classnames in
+# Kategorien-Tabs (Required Parts/Wheels/Lights/Doors/Body Parts) - erfindet
+# keine neuen Daten, ordnet nur TOOL_VEHICLES[...]["parts"] ein.
+_VEHICLE_PART_KATEGORIEN = (
+    ("Wheel", "wheels"),
+    ("Headlight", "lights"),
+    ("Door", "doors"),
+    ("Battery", "required"), ("SparkPlug", "required"),
+    ("GlowPlug", "required"), ("Radiator", "required"),
+)
+
+
+def _vehicle_part_kategorie(classname: str) -> str:
+    for stichwort, kategorie in _VEHICLE_PART_KATEGORIEN:
+        if stichwort.lower() in classname.lower():
+            return kategorie
+    return "body"
+
+
+def _mission_dir_of(conn: ServerConnection) -> Optional[str]:
+    d = str(conn.get("ftp_mission_dir") or "").strip()
+    return d or None
+
+
+def _mission_datei_pfad(conn: ServerConnection, dateiname: str) -> Optional[str]:
+    """Case-insensitiv den echten Dateinamen im Mission-Ordner finden (FTP
+    kann case-sensitiv sein) - wie _effect_area_file_in, nur fuer beliebige
+    Dateien im selben Ordner."""
+    mission = _mission_dir_of(conn)
+    if not mission or conn.ftp is None:
+        return None
+    if "/" in dateiname:
+        return f"{mission.rstrip('/')}/{dateiname}"
+    for entry in conn.ftp.list_dir(mission):
+        if entry.split("/")[-1].lower() == dateiname.lower():
+            return entry
+    return f"{mission.rstrip('/')}/{dateiname}"
+
+
+async def _tools_datei_lesen(conn: ServerConnection, dateiname: str,
+                             loop) -> Tuple[Optional[str], str]:
+    """('ok'|'missing'|'error'|'kein_mission_ordner', Inhalt oder None)."""
+    pfad = _mission_datei_pfad(conn, dateiname)
+    if not pfad or conn.ftp is None:
+        return None, "kein_mission_ordner"
+    return await loop.run_in_executor(None, conn.ftp.read_file_ex, pfad)
+
+
+def _tool_datei_lesen_sync(conn: ServerConnection, dateiname: str) -> Tuple[Optional[str], str]:
+    """Wie _tools_datei_lesen, aber KOMPLETT synchron (Pfad-Aufloesung
+    eingeschlossen) - fuer den Aufruf ueber run_in_executor aus dem
+    10-Sekunden-Poll-Takt (siehe RentalManager.on_restart_detected). Ohne das
+    wuerde _mission_datei_pfad's list_dir-Aufruf bei Dateien ohne "/" im Namen
+    (z.B. cfgeventspawns.xml) den Event-Loop fuer ALLE Server blockieren."""
+    pfad = _mission_datei_pfad(conn, dateiname)
+    if not pfad or conn.ftp is None:
+        return None, "kein_mission_ordner"
+    return conn.ftp.read_file_ex(pfad)
+
+
+def _tool_datei_schreiben_sync(conn: ServerConnection, dateiname: str, inhalt: str) -> bool:
+    pfad = _mission_datei_pfad(conn, dateiname)
+    if not pfad or conn.ftp is None:
+        return False
+    return conn.ftp.write_file(pfad, inhalt)
+
+
+async def _tools_json_lesen(conn: ServerConnection, dateiname: str,
+                            loop) -> Tuple[Optional[Any], str]:
+    inhalt, status = await _tools_datei_lesen(conn, dateiname, loop)
+    if status != "ok":
+        return None, status
+    try:
+        return json.loads(inhalt), "ok"
+    except (TypeError, ValueError):
+        return None, "kaputt"
+
+
+async def _tools_xml_lesen(conn: ServerConnection, dateiname: str, loop):
+    inhalt, status = await _tools_datei_lesen(conn, dateiname, loop)
+    if status != "ok":
+        return None, status
+    try:
+        return ET.fromstring(inhalt), "ok"
+    except ET.ParseError:
+        return None, "kaputt"
+
+
+async def _tools_datei_schreiben(conn: ServerConnection, dateiname: str,
+                                 inhalt: str, loop) -> bool:
+    pfad = _mission_datei_pfad(conn, dateiname)
+    if not pfad or conn.ftp is None:
+        return False
+    return await loop.run_in_executor(None, conn.ftp.write_file, pfad, inhalt)
+
+
+async def _tools_datei_loeschen(conn: ServerConnection, dateiname: str, loop) -> bool:
+    pfad = _mission_datei_pfad(conn, dateiname)
+    if not pfad or conn.ftp is None:
+        return False
+    return await loop.run_in_executor(None, conn.ftp.delete_file, pfad)
+
+
+async def _tools_datei_schreiben_wenn(commit: bool, conn: ServerConnection, dateiname: str,
+                                      inhalt: str, loop) -> bool:
+    """Wie _tools_datei_schreiben, aber nur wenn commit=True - sonst tut es so,
+    als waere das Schreiben erfolgreich, ohne den Server anzufassen. Das ist die
+    Grundlage fuer den zweistufigen Ablauf aller Tools: „Speichern" berechnet nur
+    die Vorschau (commit=False), erst der eigene „Auf Nitrado hochladen"-Knopf im
+    Vorschau-Dialog schreibt wirklich (commit=True) - versehentliche Aenderungen
+    am Live-Server sind damit ausgeschlossen, ohne dass man das Formular ein
+    zweites Mal ausfuellen muesste."""
+    if not commit:
+        return True
+    return await _tools_datei_schreiben(conn, dateiname, inhalt, loop)
+
+
+# ── Chirurgische XML-Text-Edits ──────────────────────────────────────────
+# Statt die ganze Datei zu parsen und komplett neu zu schreiben, wird nur
+# der betroffene Block ersetzt bzw. eingefuegt - der Rest bleibt Byte fuer
+# Byte erhalten.
+
+def _tool_eol(text: str) -> str:
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def _tool_esc_xml(s: Any) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _tool_fmt_zahl(v: Any) -> str:
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        n = 0.0
+    return str(int(n)) if n == int(n) else f"{n:.1f}"
+
+
+def _tool_finde_einzigen_block(text: str, tag: str) -> Optional[Dict[str, Any]]:
+    """Wie _tool_finde_benannten_block, aber fuer Tags ohne name="..."-Attribut,
+    von denen es in der Datei nur genau einen gibt (z. B. <generator_posbubbles>)."""
+    muster = r'[ \t]*<' + tag + r'(?=[\s/>])[^>]*(?:/>|>[\s\S]*?</' + tag + r'\s*>)'
+    m = re.search(muster, text)
+    if not m:
+        return None
+    return {"start": m.start(), "end": m.end(), "block": m.group(0)}
+
+
+def _tool_finde_benannten_block(text: str, tag: str, name: str) -> Optional[Dict[str, Any]]:
+    muster = (r'[ \t]*<' + tag + r'(?=[\s/>])[^>]*\bname=(["\'])' + re.escape(name) + r'\1[^>]*'
+              r'(?:/>|>[\s\S]*?</' + tag + r'\s*>)')
+    m = re.search(muster, text)
+    if not m:
+        return None
+    return {"start": m.start(), "end": m.end(), "block": m.group(0)}
+
+
+def _tool_in_root_einfuegen(text: str, root_tag: str, snippet: str) -> str:
+    idx = text.rfind("</" + root_tag)
+    if idx == -1:
+        raise ValueError(f"Kein schließendes </{root_tag}> in der Datei gefunden – "
+                         f"ist das die richtige Datei?")
+    nl = _tool_eol(text)
+    head = text[:idx]
+    m = re.search(r'(?:^|\n)([ \t]*)$', head)
+    close_indent = m.group(1) if m else ""
+    head = head[:len(head) - len(close_indent)]
+    if head and not head.endswith("\n"):
+        head += nl
+    return head + "    " + snippet.replace("\n", nl) + nl + close_indent + text[idx:]
+
+
+# ── NPC + Vehicle Deployment: eigene Segmente zwischen DAYZCODE-Markern ──
+_DAYZCODE_MARKER_RE = re.compile(r'<!-- DAYZCODE:(START|END) ([A-Za-z0-9_]+) -->')
+
+
+def _dayzcode_segmente(text: str, streng: bool = True) -> List[Dict[str, Any]]:
+    """Alle START/END-Paare als {id, start, end} - start am Zeilenanfang des
+    START-Markers, end hinter dem END-Marker samt Zeilenende. streng=True wirft
+    ValueError bei ungepaarten, verschachtelten oder doppelten IDs; streng=False
+    liefert nur die sauber gepaarten (fuer den Schutz fremder Tools, die an
+    kaputten Markern nicht scheitern sollen)."""
+    segmente: List[Dict[str, Any]] = []
+    offen_id: Optional[str] = None
+    offen_start = 0
+    gesehen: Set[str] = set()
+    for m in _DAYZCODE_MARKER_RE.finditer(text):
+        art, dep_id = m.group(1), m.group(2)
+        if art == "START":
+            if offen_id is not None or dep_id in gesehen:
+                if streng:
+                    raise ValueError(f"DAYZCODE-Marker für „{dep_id}“ sind verschachtelt "
+                                     f"oder doppelt – bitte die Datei prüfen.")
+                offen_id = None
+                continue
+            zeilenanfang = text.rfind("\n", 0, m.start()) + 1
+            if text[zeilenanfang:m.start()].strip():
+                zeilenanfang = m.start()
+            offen_id, offen_start = dep_id, zeilenanfang
+        else:
+            if offen_id is None or offen_id != dep_id:
+                if streng:
+                    raise ValueError(f"DAYZCODE-Ende für „{dep_id}“ ohne passenden Anfang.")
+                offen_id = None
+                continue
+            ende = m.end()
+            nl = re.match(r'\r?\n', text[ende:])
+            if nl:
+                ende += nl.end()
+            segmente.append({"id": dep_id, "start": offen_start, "end": ende})
+            gesehen.add(dep_id)
+            offen_id = None
+    if offen_id is not None and streng:
+        raise ValueError(f"DAYZCODE-Anfang für „{offen_id}“ ohne Ende.")
+    return segmente
+
+
+def _dayzcode_pruefe_fremdzugriff(text: str, pos: int) -> None:
+    """Bricht ab, wenn ein anderes Tool einen Block innerhalb eines
+    Deployment-Segments aendern oder loeschen will."""
+    for seg in _dayzcode_segmente(text, streng=False):
+        if seg["start"] <= pos < seg["end"]:
+            raise ValueError("Dieser Eintrag gehört zu „NPC + Vehicle Deployment“ – "
+                             "bitte dort bearbeiten oder entfernen.")
+
+
+def _dayzcode_einfuegen(text: str, root_tag: str, dep_id: str, block_xml: str) -> str:
+    """Fuegt Marker + Block direkt vor </root_tag> ein. Alles andere bleibt Byte
+    fuer Byte erhalten - nachgewiesen ueber die Invariante am Ende."""
+    idx = text.rfind("</" + root_tag)
+    if idx == -1:
+        raise ValueError(f"Kein schließendes </{root_tag}> in der Datei gefunden – "
+                         f"ist das die richtige Datei?")
+    nl = _tool_eol(text)
+    zeilenanfang = text.rfind("\n", 0, idx) + 1
+    am_zeilenanfang = not text[zeilenanfang:idx].strip()
+    zeilen = [f"<!-- DAYZCODE:START {dep_id} -->"]
+    zeilen += block_xml.strip("\n").split("\n")
+    zeilen.append(f"<!-- DAYZCODE:END {dep_id} -->")
+    segment = "".join("    " + z + nl for z in zeilen)
+    if am_zeilenanfang:
+        ergebnis = text[:zeilenanfang] + segment + text[zeilenanfang:]
+    else:
+        segment = nl + segment
+        ergebnis = text[:idx] + segment + text[idx:]
+    if ergebnis.replace(segment, "", 1) != text:
+        raise ValueError("Interner Fehler: Einfügen hätte Inhalt außerhalb der Marker verändert.")
+    return ergebnis
+
+
+def _dayzcode_entfernen(text: str, dep_id: str) -> Tuple[str, bool]:
+    for seg in _dayzcode_segmente(text):
+        if seg["id"] == dep_id:
+            return text[:seg["start"]] + text[seg["end"]:], True
+    return text, False
+
+
+def _dayzcode_event_xml(name: str, klasse: str, anzahl: int, lifetime: int = 300) -> str:
+    n = int(anzahl)
+    return (f'<event name="{_tool_esc_xml(name)}">\n'
+            f'    <nominal>{n}</nominal>\n'
+            f'    <min>{n}</min>\n'
+            f'    <max>{n}</max>\n'
+            f'    <lifetime>{int(lifetime)}</lifetime>\n'
+            f'    <restock>0</restock>\n'
+            f'    <saferadius>500</saferadius>\n'
+            f'    <distanceradius>500</distanceradius>\n'
+            f'    <cleanupradius>200</cleanupradius>\n'
+            f'    <flags deletable="0" init_random="0" remove_damaged="1"/>\n'
+            f'    <position>fixed</position>\n'
+            f'    <limit>mixed</limit>\n'
+            f'    <active>1</active>\n'
+            f'    <children>\n'
+            f'        <child lootmax="0" lootmin="0" max="{n}" min="{n}" '
+            f'type="{_tool_esc_xml(klasse)}"/>\n'
+            f'    </children>\n'
+            f'</event>')
+
+
+def _dayzcode_spawn_xml(name: str, punkte: List[Dict[str, float]]) -> str:
+    zeilen = [f'<event name="{_tool_esc_xml(name)}">']
+    for p in punkte:
+        zeilen.append(f'    <pos x="{_tool_fmt_zahl(p["x"])}" z="{_tool_fmt_zahl(p["z"])}" '
+                      f'a="{_tool_fmt_zahl(p["a"])}"/>')
+    zeilen.append('</event>')
+    return "\n".join(zeilen)
+
+
+def _dayzcode_type_xml(klasse: str, items: List[Tuple[str, str]]) -> str:
+    zeilen = [f'<type name="{_tool_esc_xml(klasse)}">']
+    for art, item in items:
+        zeilen.append(f'    <{art} chance="1.00">')
+        zeilen.append(f'        <item name="{_tool_esc_xml(item)}" chance="1.00"/>')
+        zeilen.append(f'    </{art}>')
+    zeilen.append('</type>')
+    return "\n".join(zeilen)
+
+
+def _tool_benannten_block_ersetzen(text: str, root_tag: str, tag: str, name: str,
+                                   snippet: str) -> str:
+    found = _tool_finde_benannten_block(text, tag, name)
+    if found:
+        _dayzcode_pruefe_fremdzugriff(text, found["start"])
+    if not found:
+        return _tool_in_root_einfuegen(text, root_tag, snippet)
+    indent_m = re.match(r'^[ \t]*', found["block"])
+    indent = indent_m.group(0) if indent_m else ""
+    nl = _tool_eol(text)
+    return text[:found["start"]] + indent + snippet.replace("\n", nl) + text[found["end"]:]
+
+
+def _tool_upsert_event(text: str, definition: Dict[str, Any]) -> str:
+    flags = definition.get("flags") or {"deletable": 0, "init_random": 0, "remove_damaged": 1}
+    kids_lines = []
+    for c in definition.get("children") or []:
+        kids_lines.append(
+            f'        <child lootmax="{c.get("lootmax", 0)}" lootmin="{c.get("lootmin", 0)}" '
+            f'max="{c["max"]}" min="{c["min"]}" type="{_tool_esc_xml(c["type"])}"/>')
+    kids = "\n".join(kids_lines)
+    snippet = (
+        f'<event name="{_tool_esc_xml(definition["name"])}">\n'
+        f'        <nominal>{definition["nominal"]}</nominal>\n'
+        f'        <min>{definition["min"]}</min>\n'
+        f'        <max>{definition["max"]}</max>\n'
+        f'        <lifetime>{definition["lifetime"]}</lifetime>\n'
+        f'        <restock>{definition["restock"]}</restock>\n'
+        f'        <saferadius>{definition["saferadius"]}</saferadius>\n'
+        f'        <distanceradius>{definition["distanceradius"]}</distanceradius>\n'
+        f'        <cleanupradius>{definition["cleanupradius"]}</cleanupradius>\n'
+        f'        <flags deletable="{flags["deletable"]}" init_random="{flags["init_random"]}" '
+        f'remove_damaged="{flags["remove_damaged"]}"/>\n'
+        f'        <position>{definition.get("position") or "fixed"}</position>\n'
+        f'        <limit>{definition.get("limit") or "custom"}</limit>\n'
+        f'        <active>{definition.get("active", 1)}</active>\n'
+        f'        <children>\n{kids}\n        </children>\n'
+        f'    </event>')
+    return _tool_benannten_block_ersetzen(text, "events", "event", definition["name"], snippet)
+
+
+def _tool_entferne_benannten_block(text: str, tag: str, name: str) -> Tuple[str, bool]:
+    """Entfernt genau einen benannten Block (inkl. Einrückung und einer folgenden
+    Zeilenschaltung) - alles andere in der Datei bleibt Byte für Byte erhalten,
+    genau wie bei _tool_benannten_block_ersetzen."""
+    found = _tool_finde_benannten_block(text, tag, name)
+    if not found:
+        return text, False
+    _dayzcode_pruefe_fremdzugriff(text, found["start"])
+    start, end = found["start"], found["end"]
+    m = re.match(r'\r?\n', text[end:])
+    if m:
+        end += m.end()
+    return text[:start] + text[end:], True
+
+
+def _tool_delete_event(text: str, name: str) -> Tuple[str, bool]:
+    return _tool_entferne_benannten_block(text, "event", name)
+
+
+def _tool_delete_eventspawns(text: str, name: str) -> Tuple[str, bool]:
+    return _tool_entferne_benannten_block(text, "event", name)
+
+
+def _tool_event_definition_aus_payload(data_in: Dict[str, Any]) -> Dict[str, Any]:
+    """Baut eine vollstaendige Event-Definition aus einem Batch-Zeilen-Payload -
+    anders als beim bestehenden Einzel-Event-Endpunkt sind hier auch Events ganz
+    ohne Kinder erlaubt (naeher an der Referenzseite)."""
+    name = str(data_in.get("name") or "").strip()
+    if not name:
+        raise ValueError("Event-Name darf nicht leer sein.")
+    kinder = []
+    for c in (data_in.get("children") or []):
+        typ = str(c.get("type") or "").strip()
+        if not typ:
+            continue
+        try:
+            kmin = max(0, round(float(c.get("min", 1))))
+            kmax = max(kmin, round(float(c.get("max", kmin))))
+            lootmin = max(0, round(float(c.get("lootmin", 0))))
+            lootmax = max(lootmin, round(float(c.get("lootmax", 0))))
+        except (TypeError, ValueError):
+            kmin, kmax, lootmin, lootmax = 1, 1, 0, 0
+        kinder.append({"type": typ, "min": kmin, "max": kmax, "lootmin": lootmin, "lootmax": lootmax})
+    try:
+        return {
+            "name": name,
+            "nominal": int(float(data_in.get("nominal", 1))),
+            "min": int(float(data_in.get("min", 1))),
+            "max": int(float(data_in.get("max", 1))),
+            "lifetime": int(float(data_in.get("lifetime", 1800))),
+            "restock": int(float(data_in.get("restock", 0))),
+            "saferadius": int(float(data_in.get("saferadius", 500))),
+            "distanceradius": int(float(data_in.get("distanceradius", 500))),
+            "cleanupradius": int(float(data_in.get("cleanupradius", 1000))),
+            "flags": {"deletable": 1 if data_in.get("deletable") else 0,
+                     "init_random": 1 if data_in.get("init_random") else 0,
+                     "remove_damaged": 1 if data_in.get("remove_damaged") else 0},
+            "position": str(data_in.get("position") or "fixed"),
+            "limit": str(data_in.get("limit") or "custom"),
+            "active": 1 if data_in.get("active", True) else 0,
+            "children": kinder,
+        }
+    except (TypeError, ValueError) as e:
+        raise ValueError(f'Ungültige Zahl im Event „{name}".') from e
+
+
+def _tool_apply_event_batch(ev_text: str, sp_text: Optional[str],
+                            ops: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Wendet eine Liste von Event-Operationen (Loeschen/Anlegen/Aendern/Umbenennen)
+    einmal im Speicher an - reine Transformation, kein FTP-Zugriff. `ops`-Eintraege
+    fuer "upsert" sind vollstaendige Definitionen (siehe _tool_event_definition_aus_payload)
+    plus "original_name" (bei Umbenennung der bisherige Name) und optional "positions"."""
+    neu_ev = ev_text
+    neu_sp = sp_text
+    erstellt = geaendert = geloescht = 0
+    for op in ops:
+        original = op.get("original_name") or op.get("name")
+        if op.get("op") == "delete":
+            neu_ev, gefunden = _tool_delete_event(neu_ev, original)
+            if gefunden:
+                geloescht += 1
+            if neu_sp is not None:
+                neu_sp, _ = _tool_delete_eventspawns(neu_sp, original)
+            continue
+        name = op["name"]
+        vorhanden_vorher = _tool_finde_benannten_block(neu_ev, "event", original) is not None
+        if original != name and vorhanden_vorher:
+            neu_ev, _ = _tool_delete_event(neu_ev, original)
+            if neu_sp is not None:
+                neu_sp, _ = _tool_delete_eventspawns(neu_sp, original)
+            vorhanden_vorher = False
+        neu_ev = _tool_upsert_event(neu_ev, op)
+        if vorhanden_vorher:
+            geaendert += 1
+        else:
+            erstellt += 1
+        positions = op.get("positions")
+        if neu_sp is not None and positions is not None:
+            pts = []
+            for p in positions:
+                try:
+                    pts.append({"x": float(p["x"]), "z": float(p["z"]), "a": float(p.get("a", 0))})
+                except (TypeError, ValueError, KeyError):
+                    continue
+            if pts:
+                neu_sp, _added = _tool_upsert_eventspawns(neu_sp, name, pts, "replace")
+            else:
+                neu_sp, _ = _tool_delete_eventspawns(neu_sp, name)
+    return {"events_xml": neu_ev, "eventspawns_xml": neu_sp,
+            "erstellt": erstellt, "geaendert": geaendert, "geloescht": geloescht}
+
+
+def _tool_update_event_counts(text: str, name: str, values: Dict[str, Any]) -> str:
+    found = _tool_finde_benannten_block(text, "event", name)
+    if not found:
+        raise ValueError(f'Event "{name}" nicht in events.xml gefunden.')
+    _dayzcode_pruefe_fremdzugriff(text, found["start"])
+    block = found["block"]
+    nl = _tool_eol(text)
+    for feld, wert in values.items():
+        muster = r'(<' + feld + r'\s*>)[^<]*(</' + feld + r'\s*>)'
+        if re.search(muster, block):
+            block = re.sub(muster, lambda m: m.group(1) + str(wert) + m.group(2), block, count=1)
+        else:
+            block = re.sub(r'(<event[^>]*>)',
+                           lambda m: m.group(1) + nl + f'        <{feld}>{wert}</{feld}>',
+                           block, count=1)
+    return text[:found["start"]] + block + text[found["end"]:]
+
+
+def _tool_ensure_spawn_event_block(text: str, name: str):
+    found = _tool_finde_benannten_block(text, "event", name)
+    if found:
+        _dayzcode_pruefe_fremdzugriff(text, found["start"])
+    if not found:
+        text = _tool_in_root_einfuegen(text, "eventposdef",
+                                       f'<event name="{_tool_esc_xml(name)}">\n    </event>')
+        found = _tool_finde_benannten_block(text, "event", name)
+    block = found["block"]
+    nl = _tool_eol(text)
+    if re.search(r'/>\s*$', block):
+        block = re.sub(r'\s*/>\s*$', ">" + nl + "    </event>", block)
+    return text, found, block
+
+
+def _tool_upsert_eventspawns(text: str, name: str, positions: List[Dict[str, Any]],
+                             mode: str) -> Tuple[str, int]:
+    text, found, block = _tool_ensure_spawn_event_block(text, name)
+    nl = _tool_eol(text)
+    existing = set()
+    if mode == "replace":
+        block = re.sub(r'[ \t]*<pos\b[^>]*/>[ \t]*\r?\n?', "", block)
+    else:
+        for m in re.finditer(r'<pos\b[^>]*?\bx="([^"]+)"[^>]*?\bz="([^"]+)"', block):
+            existing.add(f"{round(float(m.group(1)))}/{round(float(m.group(2)))}")
+    added = 0
+    lines = ""
+    for p in positions:
+        key = f"{round(float(p['x']))}/{round(float(p['z']))}"
+        if key in existing:
+            continue
+        existing.add(key)
+        lines += (f'        <pos x="{_tool_fmt_zahl(p["x"])}" z="{_tool_fmt_zahl(p["z"])}" '
+                  f'a="{_tool_fmt_zahl(p.get("a", 0))}"/>' + nl)
+        added += 1
+    block = re.sub(r'([ \t]*)</event\s*>$', lambda m: lines + m.group(1) + "</event>", block)
+    return text[:found["start"]] + block + text[found["end"]:], added
+
+
+def _tool_write_event_zones(text: str, name: str, zones: List[Dict[str, Any]]) -> str:
+    text, found, block = _tool_ensure_spawn_event_block(text, name)
+    nl = _tool_eol(text)
+    block = re.sub(r'[ \t]*<(?:zone|pos)\b[^>]*/>[ \t]*\r?\n?', "", block)
+    lines = ""
+    for z in zones:
+        lines += (f'        <zone smin="{z["smin"]}" smax="{z["smax"]}" '
+                  f'dmin="{z["dmin"]}" dmax="{z["dmax"]}" r="{z["r"]}" '
+                  f'x="{_tool_fmt_zahl(z["x"])}" y="{_tool_fmt_zahl(z.get("y", 0))}" '
+                  f'z="{_tool_fmt_zahl(z["z"])}"/>' + nl)
+    block = re.sub(r'([ \t]*)</event\s*>$', lambda m: lines + m.group(1) + "</event>", block)
+    return text[:found["start"]] + block + text[found["end"]:]
+
+
+# ── Shop-Rentals: eigene, schlanke Event-Helfer ──────────────────────────
+# Bewusst KEINE Erweiterung von _tool_upsert_eventspawns/_tool_write_event_zones:
+# beide bauen ihre <pos>/<zone>-Zeilen aus festen, eigenen Feldern und werden
+# von Event-Vorlagen/Vehicle-Builder/Zombie-Horden wiederverwendet - ein Umbau
+# dort haette y/group (bzw. rohen Zonen-Text) beim naechsten Speichern in
+# diesen Tools stillschweigend wieder entfernt. Rentals bekommen deshalb eigene
+# Schreibfunktionen; Loeschen laeuft weiterhin ueber die vorhandenen generischen
+# _tool_delete_event/_tool_delete_eventspawns (entfernen den ganzen Block).
+_RENTAL_EVENT_PREFIX = "RENT_"
+_RENTAL_MAX_EVENT_XML = 1000
+
+
+def _tool_rental_event_name() -> str:
+    return f"{_RENTAL_EVENT_PREFIX}{uuid.uuid4().hex[:10]}"
+
+
+def _tool_rental_xml_validieren(roh: str, erwartetes_tag: str) -> Tuple[Optional[str], Optional[str]]:
+    """Prüft einen vom Admin eingegebenen XML-Ausschnitt (Event- oder
+    Zonen-Vorlage): muss genau EIN Element mit dem erwarteten Tag sein, ohne
+    DTD/Kommentar/Processing-Instruction/CDATA (schützt vor XXE und kaputten
+    Dateien - gleiche Regel wie beim Referenz-Dashboard, an dem sich dieses
+    Formular orientiert). Gibt (bereinigter_text, None) oder (None,
+    fehlermeldung) zurück."""
+    text = (roh or "").strip()
+    if not text:
+        return None, "Darf nicht leer sein."
+    if len(text) > _RENTAL_MAX_EVENT_XML:
+        return None, f"Höchstens {_RENTAL_MAX_EVENT_XML} Zeichen erlaubt."
+    for muster in ("<!--", "<![CDATA[", "<!DOCTYPE", "<?"):
+        if muster in text:
+            return None, "Keine Kommentare, CDATA, DTD oder Processing Instructions erlaubt."
+    if not text.startswith(f"<{erwartetes_tag}"):
+        return None, f'Muss mit "<{erwartetes_tag}" beginnen.'
+    try:
+        el = ET.fromstring(text)
+    except ET.ParseError as e:
+        return None, f"Kein gültiges XML: {e}"
+    if el.tag != erwartetes_tag:
+        return None, f'Das Wurzel-Element muss "{erwartetes_tag}" heißen.'
+    return text, None
+
+
+def _tool_rental_event_umbenennen(event_xml: str, neuer_name: str) -> str:
+    """Schreibt den name="..."-Wert des Wurzel-<event> auf die neu erzeugte
+    Instanz-ID um - VOR dem Einfügen, sonst findet _tool_finde_benannten_block
+    den Block beim Ablauf unter dem alten Vorlagen-Namen nicht mehr wieder
+    (und mehrere Käufe derselben Vorlage würden sich gegenseitig überschreiben)."""
+    return re.sub(r'(<event\b[^>]*\bname=)(["\'])[^"\']*\2',
+                  lambda m: m.group(1) + m.group(2) + neuer_name + m.group(2),
+                  event_xml, count=1)
+
+
+def _tool_rental_event_einfuegen(text: str, name: str, event_xml: str) -> str:
+    """Fügt die (bereits umbenannte) Event-Vorlage in db/events.xml ein. Wirft
+    ValueError, wenn kein </events> gefunden wird (falsche Datei) - vom
+    Aufrufer abzufangen."""
+    return _tool_benannten_block_ersetzen(text, "events", "event", name, event_xml)
+
+
+def _tool_rental_pos_schreiben(text: str, name: str, x: float, z: float,
+                               y: Optional[float] = None, a: Optional[float] = None,
+                               gruppe: Optional[str] = None,
+                               zone_xml: Optional[str] = None) -> str:
+    """Schreibt genau EINE <pos>-Zeile (+ optional eine rohe <zone>-Zeile aus
+    der Vorlage) in den <event name="...">-Block von cfgeventspawns.xml.
+    y/gruppe/zone_xml nur, wenn gesetzt - _tool_fmt_zahl(0) liefert "0", ein
+    unbedingtes Mitschreiben würde also y="0" auf Positionen erzeugen, die das
+    nie hatten. `a` wird immer geschrieben (Default 0) - in allen echten
+    cfgeventspawns.xml-Beispielen, die für dieses Projekt geprüft wurden, war
+    "a" nie weggelassen."""
+    text, found, block = _tool_ensure_spawn_event_block(text, name)
+    nl = _tool_eol(text)
+    teile = [f'x="{_tool_fmt_zahl(x)}"']
+    if y is not None:
+        teile.append(f'y="{_tool_fmt_zahl(y)}"')
+    teile.append(f'z="{_tool_fmt_zahl(z)}"')
+    teile.append(f'a="{_tool_fmt_zahl(a if a is not None else 0)}"')
+    if gruppe:
+        teile.append(f'group="{_tool_esc_xml(gruppe)}"')
+    zeile = f'        <pos {" ".join(teile)}/>' + nl
+    if zone_xml:
+        zeile += "        " + zone_xml.strip() + nl
+    block = re.sub(r'([ \t]*)</event\s*>$', lambda m: zeile + m.group(1) + "</event>", block)
+    return text[:found["start"]] + block + text[found["end"]:]
+
+
+def _tool_rental_lifetime_kuerzen(text: str, name: str, sekunden: int = 30) -> str:
+    """Stufe 1 des zweistufigen Ablaufs: <lifetime> in db/events.xml auf einen
+    kurzen Wert setzen und flags deletable="1" erzwingen, statt den Block
+    sofort zu löschen - DayZs eigene Aufräum-Logik soll das bereits gespawnte
+    Objekt in dieser Zeit als abgelaufen einstufen und entfernen. Wirft
+    ValueError, wenn der Event-Block nicht (mehr) existiert."""
+    found = _tool_finde_benannten_block(text, "event", name)
+    if not found:
+        raise ValueError(f'Event "{name}" nicht in events.xml gefunden.')
+    block = found["block"]
+    block = re.sub(r'(<lifetime\s*>)[^<]*(</lifetime\s*>)',
+                   lambda m: f"{m.group(1)}{sekunden}{m.group(2)}", block, count=1)
+    if re.search(r'<flags\b', block):
+        block = re.sub(r'(<flags\b[^>]*\bdeletable=)(["\'])[^"\']*\2',
+                       lambda m: f'{m.group(1)}{m.group(2)}1{m.group(2)}', block, count=1)
+    return text[:found["start"]] + block + text[found["end"]:]
+
+
+_TOOL_LEERE_ZOMBIE_TERRITORIES = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<territory-type>\n'
+    '    <territory color="1">\n'
+    '    </territory>\n'
+    '</territory-type>\n'
+)
+
+
+def _tool_zombie_zonen_lesen(root: Optional[ET.Element]) -> Dict[str, List[Dict[str, Any]]]:
+    """Liest alle <zone name="..."/> aus env/zombie_territories.xml, gruppiert
+    nach Name - anders als bei Events kommt hier derselbe Name mehrfach vor
+    (mehrere Zonen je Horde), auch über mehrere <territory>-Bloecke verteilt."""
+    zonen: Dict[str, List[Dict[str, Any]]] = {}
+    if root is None:
+        return zonen
+    for t in root.findall("territory"):
+        for z in t.findall("zone"):
+            name = z.get("name")
+            if not name:
+                continue
+            zonen.setdefault(name, []).append({
+                "x": z.get("x"), "z": z.get("z"), "r": z.get("r"),
+                "smin": z.get("smin"), "smax": z.get("smax"),
+                "dmin": z.get("dmin"), "dmax": z.get("dmax")})
+    return zonen
+
+
+def _tool_zombie_zonen_ersetzen(text: str, name: str, zonen: List[Dict[str, Any]]) -> str:
+    """Ersetzt alle <zone name="..."/>-Eintraege mit diesem Namen durch die neue
+    Liste. Ein Name kann hier - anders als bei benannten Bloecken wie <event> -
+    mehrfach vorkommen; deshalb werden alle Fundstellen entfernt und geschlossen
+    an der ersten Fundstelle wieder eingefuegt. Gibt es noch keine, werden sie
+    vor dem letzten </territory> angehängt (bzw. ein Grundgerüst angelegt, falls
+    die Datei noch leer ist)."""
+    muster = re.compile(r'[ \t]*<zone\b[^>]*\bname=(["\'])' + re.escape(name) + r'\1[^>]*/>[ \t]*\r?\n?')
+    funde = list(muster.finditer(text))
+    nl = _tool_eol(text)
+    zeilen = "".join(
+        f'        <zone name="{_tool_esc_xml(name)}" smin="{z["smin"]}" smax="{z["smax"]}" '
+        f'dmin="{z["dmin"]}" dmax="{z["dmax"]}" x="{_tool_fmt_zahl(z["x"])}" '
+        f'z="{_tool_fmt_zahl(z["z"])}" r="{_tool_fmt_zahl(z["r"])}"/>' + nl
+        for z in zonen)
+    if funde:
+        start = funde[0].start()
+        neu = text
+        for m in reversed(funde):
+            neu = neu[:m.start()] + neu[m.end():]
+        return neu[:start] + zeilen + neu[start:]
+    if not zonen:
+        return text
+    if "<territory" not in text:
+        text = _TOOL_LEERE_ZOMBIE_TERRITORIES
+    idx = text.rfind("</territory>")
+    if idx == -1:
+        return text
+    head = text[:idx]
+    m = re.search(r'(?:^|\n)([ \t]*)$', head)
+    einzug = m.group(1) if m else ""
+    head = head[:len(head) - len(einzug)]
+    if head and not head.endswith("\n"):
+        head += nl
+    return head + zeilen + einzug + text[idx:]
+
+
+def _tool_horde_definition_aus_payload(op: Dict[str, Any]) -> Dict[str, Any]:
+    """Baut Event-Definition + Zonenliste aus einer Batch-Zeile fuer eine Horde.
+    Nominal/Min/Max ergeben sich - wie beim bisherigen Einzel-Endpunkt - aus der
+    Anzahl Zonen, nicht aus der Zombie-Anzahl."""
+    name = str(op.get("name") or "").strip()
+    if not name:
+        raise ValueError("Horden-Name darf nicht leer sein.")
+    zonen_in = op.get("zones") or []
+    if not zonen_in:
+        raise ValueError(f'Horde „{name}" braucht mindestens eine Zone.')
+    try:
+        lootmin = float(op.get("lootmin", 0))
+        lootmax = float(op.get("lootmax", 0))
+        lifetime = int(float(op.get("lifetime", 300)))
+        cleanup = int(float(op.get("cleanup", 400)))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f'Ungültige Zahl in Horde „{name}".') from e
+    kinder = []
+    for z in (op.get("zombies") or []):
+        typ = str(z.get("item") or "").strip()
+        if not typ:
+            continue
+        try:
+            n = max(1, round(float(z.get("num", 1))))
+        except (TypeError, ValueError):
+            n = 1
+        kinder.append({"type": typ, "min": n, "max": n, "lootmin": lootmin, "lootmax": lootmax})
+    if not kinder:
+        raise ValueError(f'Horde „{name}" braucht mindestens einen gültigen Zombie-Typ.')
+    zonen = []
+    for z in zonen_in:
+        try:
+            zonen.append({
+                "x": float(z["x"]), "z": float(z["z"]), "r": float(z.get("r") or 25),
+                "smin": int(float(z.get("smin") or 0)), "smax": int(float(z.get("smax") or 0)),
+                "dmin": int(float(z.get("dmin") or 0)), "dmax": int(float(z.get("dmax") or 0)),
+            })
+        except (TypeError, ValueError, KeyError) as e:
+            raise ValueError(f'Ungültige Zone in Horde „{name}".') from e
+    anzahl = len(zonen)
+    definition = {
+        "name": name, "nominal": anzahl, "min": anzahl, "max": anzahl, "lifetime": lifetime,
+        "restock": 0, "saferadius": 10, "distanceradius": 300, "cleanupradius": cleanup,
+        "flags": {"deletable": 0, "init_random": 0, "remove_damaged": 1},
+        "position": "fixed", "limit": "custom", "active": 1, "children": kinder,
+    }
+    return {"definition": definition, "zones": zonen, "gesamt": sum(k["max"] for k in kinder)}
+
+
+def _tool_apply_horde_batch(ev_text: str, zt_text: str, ops: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Wendet eine Liste von Horden-Operationen (Loeschen/Anlegen/Aendern/
+    Umbenennen) einmal im Speicher an - reine Transformation, kein FTP-Zugriff.
+    `ops`-Eintraege fuer "upsert" sind bereits vollstaendige, in
+    _tool_horde_definition_aus_payload gebaute Definitionen plus "zones" und
+    "original_name"."""
+    neu_ev = ev_text
+    neu_zt = zt_text
+    erstellt = geaendert = geloescht = 0
+    for op in ops:
+        original = op.get("original_name") or op.get("name")
+        if op.get("op") == "delete":
+            neu_ev, gefunden = _tool_delete_event(neu_ev, original)
+            if gefunden:
+                geloescht += 1
+            neu_zt = _tool_zombie_zonen_ersetzen(neu_zt, original, [])
+            continue
+        name = op["name"]
+        vorhanden_vorher = _tool_finde_benannten_block(neu_ev, "event", original) is not None
+        if original != name and vorhanden_vorher:
+            neu_ev, _ = _tool_delete_event(neu_ev, original)
+            neu_zt = _tool_zombie_zonen_ersetzen(neu_zt, original, [])
+            vorhanden_vorher = False
+        neu_ev = _tool_upsert_event(neu_ev, op)
+        neu_zt = _tool_zombie_zonen_ersetzen(neu_zt, name, op["zones"])
+        if vorhanden_vorher:
+            geaendert += 1
+        else:
+            erstellt += 1
+    return {"events_xml": neu_ev, "zombie_territories_xml": neu_zt,
+           "erstellt": erstellt, "geaendert": geaendert, "geloescht": geloescht}
+
+
+def _tool_upsert_spawnable_type(text: str, name: str, rows: List[Dict[str, Any]]) -> str:
+    blocks = []
+    for r in rows:
+        try:
+            chance = float(r.get("chance") or 0)
+        except (TypeError, ValueError):
+            chance = 0.0
+        try:
+            item_chance = float(r.get("item_chance", 1.0))
+        except (TypeError, ValueError):
+            item_chance = 1.0
+        blocks.append(
+            f'        <{r["kind"]} chance="{chance:.2f}">\n'
+            f'            <item name="{_tool_esc_xml(r["item"])}" chance="{item_chance:.2f}"/>\n'
+            f'        </{r["kind"]}>')
+    snippet = f'<type name="{_tool_esc_xml(name)}">\n' + "\n".join(blocks) + "\n    </type>"
+    return _tool_benannten_block_ersetzen(text, "spawnabletypes", "type", name, snippet)
+
+
+_TOOL_LEERE_SPAWNABLETYPES = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+                              '<spawnabletypes>\n</spawnabletypes>\n')
+
+
+_TOOL_LEERE_SPAWNPOINTS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    '<playerspawnpoints>\n'
+    '\n'
+    '    <fresh>\n'
+    '        <spawn_params>\n'
+    '            <min_dist_infected>30.0</min_dist_infected>\n'
+    '            <max_dist_infected>70.0</max_dist_infected>\n'
+    '            <min_dist_player>25.0</min_dist_player>\n'
+    '            <max_dist_player>70.0</max_dist_player>\n'
+    '            <min_dist_static>0.5</min_dist_static>\n'
+    '            <max_dist_static>2.0</max_dist_static>\n'
+    '        </spawn_params>\n'
+    '\n'
+    '        <generator_params>\n'
+    '            <grid_density>8</grid_density>\n'
+    '            <grid_width>40.0</grid_width>\n'
+    '            <grid_height>40.0</grid_height>\n'
+    '            <min_dist_static>0.5</min_dist_static>\n'
+    '            <max_dist_static>2.0</max_dist_static>\n'
+    '            <min_steepness>-45</min_steepness>\n'
+    '            <max_steepness>45</max_steepness>\n'
+    '            <allow_in_water>false</allow_in_water>\n'
+    '        </generator_params>\n'
+    '\n'
+    '        <generator_posbubbles>\n'
+    '            <!-- Please note; these coordinates are for map: chernarus -->\n'
+    '        </generator_posbubbles>\n'
+    '    </fresh>\n'
+    '    <hop></hop>\n'
+    '    <travel></travel>\n'
+    '</playerspawnpoints>\n'
+)
+
+
+def _tool_spawnpoint_positionen_lesen(root: Optional[ET.Element]) -> List[Dict[str, Any]]:
+    """Liest <fresh><generator_posbubbles><pos x=".." z=".."/> - das echte
+    DayZ-Format kennt weder Namen/Gruppen noch y/dir je Punkt."""
+    if root is None:
+        return []
+    bubbles = root.find("fresh/generator_posbubbles")
+    if bubbles is None:
+        return []
+    return [{"x": p.get("x"), "z": p.get("z")} for p in bubbles.findall("pos")
+           if p.get("x") is not None and p.get("z") is not None]
+
+
+def _tool_spawnpoint_allow_in_water_lesen(root: Optional[ET.Element]) -> bool:
+    if root is None:
+        return False
+    el = root.find("fresh/generator_params/allow_in_water")
+    return (el is not None) and (el.text or "").strip().lower() == "true"
+
+
+def _tool_spawnpoint_allow_in_water_schreiben(text: str, allow_in_water: bool) -> str:
+    """Setzt <fresh><generator_params><allow_in_water> auf true/false - chirurgisch,
+    der Rest von generator_params bleibt unangetastet."""
+    wert = "true" if allow_in_water else "false"
+    neu, anzahl = re.subn(r'(<allow_in_water>)[^<]*(</allow_in_water>)',
+                          lambda m: m.group(1) + wert + m.group(2), text, count=1)
+    if anzahl == 0:
+        raise ValueError("Kein <allow_in_water> in cfgplayerspawnpoints.xml gefunden – "
+                         "ist das die richtige Datei?")
+    return neu
+
+
+def _tool_spawnpoint_positionen_schreiben(text: str, positions: List[Dict[str, Any]],
+                                          mode: str) -> str:
+    """Ersetzt den Inhalt von <fresh><generator_posbubbles>...</generator_posbubbles>
+    chirurgisch - spawn_params/generator_params und der Hinweis-Kommentar bleiben
+    unangetastet. mode="append" haengt an, statt zu ersetzen (Duplikate nach x/z
+    werden dabei uebersprungen, wie bei _tool_upsert_eventspawns)."""
+    found = _tool_finde_einzigen_block(text, "generator_posbubbles")
+    if not found:
+        raise ValueError("Kein <generator_posbubbles> in cfgplayerspawnpoints.xml gefunden – "
+                         "ist das die richtige Datei?")
+    block = found["block"]
+    nl = _tool_eol(text)
+    existing = set()
+    if mode == "replace":
+        block = re.sub(r'[ \t]*<pos\b[^>]*/>[ \t]*\r?\n?', "", block)
+    else:
+        for m in re.finditer(r'<pos\b[^>]*?\bx="([^"]+)"[^>]*?\bz="([^"]+)"', block):
+            existing.add(f"{round(float(m.group(1)))}/{round(float(m.group(2)))}")
+    lines = ""
+    for p in positions:
+        key = f"{round(float(p['x']))}/{round(float(p['z']))}"
+        if key in existing:
+            continue
+        existing.add(key)
+        lines += f'            <pos x="{_tool_fmt_zahl(p["x"])}" z="{_tool_fmt_zahl(p["z"])}" />' + nl
+    block = re.sub(r'([ \t]*)</generator_posbubbles\s*>$',
+                   lambda m: lines + m.group(1) + "</generator_posbubbles>", block)
+    return text[:found["start"]] + block + text[found["end"]:]
+
+
+def _tool_spawnable_rows_lesen(node: Optional[ET.Element]) -> List[Dict[str, Any]]:
+    """Attachments/Cargo-Zeilen eines <type>-Knotens fuers Vorbelegen."""
+    if node is None:
+        return []
+    rows = []
+    for kind in ("attachments", "cargo"):
+        for b in node.findall(kind):
+            item = b.find("item")
+            if item is None or not item.get("name"):
+                continue
+            try:
+                chance = round((float(b.get("chance") or 0)) * 100)
+            except (TypeError, ValueError):
+                chance = 0
+            rows.append({"kind": kind, "item": item.get("name"), "chance": chance})
+    return rows
+
+
+def _tool_vehicle_rows_lesen(node: Optional[ET.Element]) -> List[Dict[str, Any]]:
+    """Wie ``_tool_spawnable_rows_lesen``, aber fuers Fahrzeug-Builder-Nachladen:
+    liefert zusaetzlich die Item-Chance (fuer die pro-Teil-Regler in
+    toolVehicleModal) und haelt beide Chancen als 0..1-Bruch statt Prozent -
+    Cargo-Zeilen bleiben unveraendert in Prozent (eigenes UI-Feld)."""
+    if node is None:
+        return []
+    rows = []
+    for b in node.findall("attachments"):
+        item = b.find("item")
+        if item is None or not item.get("name"):
+            continue
+        try:
+            chance = max(0.0, min(1.0, float(b.get("chance") or 0)))
+        except (TypeError, ValueError):
+            chance = 0.0
+        try:
+            item_chance = max(0.0, min(1.0, float(item.get("chance") or 0)))
+        except (TypeError, ValueError):
+            item_chance = 0.0
+        rows.append({"kind": "attachments", "item": item.get("name"),
+                     "chance": chance, "item_chance": item_chance})
+    for b in node.findall("cargo"):
+        item = b.find("item")
+        if item is None or not item.get("name"):
+            continue
+        try:
+            chance = round(max(0.0, min(1.0, float(b.get("chance") or 0))) * 100)
+        except (TypeError, ValueError):
+            chance = 0
+        rows.append({"kind": "cargo", "item": item.get("name"), "chance": chance})
+    return rows
+
+
+# ── Dashboard-Routen: Tools ───────────────────────────────────────────────
+_TOOL_KEIN_MISSION_ORDNER = "Mission-Ordner unbekannt – FTP-Zugangsdaten prüfen."
+
+
+def _gameplay_tool_locked(handler):
+    """Share the damage-command lock across all gameplay read/modify/write tools."""
+    async def locked(request):
+        conn, error = _session_conn(request)
+        if error is not None:
+            return error
+        async with _schaden_lock(conn.service_id):
+            return await handler(request)
+    return locked
+
+
+_TOOL_LISTE = (
+    ("loadout",   "🧍", "Loadout Generator"),
+    ("gaszone",   "☣️", "Gas-Zonen Builder"),
+    ("horde",     "🧟", "Zombie-Horden Generator"),
+    ("heliloot",  "🚁", "Heli-Crash Loot"),
+    ("vehicle",   "🚗", "Fahrzeug-Builder"),
+    ("spawnable", "🎒", "Rucksack-Builder"),
+    ("event",     "📅", "Event-Vorlagen"),
+    ("spawnpoint", "📍", "Spawn Point Generator"),
+    ("typesbooster", "📈", "Types Booster"),
+    ("typesreducer", "📉", "Types Reducer"),
+    ("typesorganizer", "🗂️", "Types Organizer"),
+    ("randompresets", "🎲", "Random Presets Generator"),
+    ("dzejson", "🧩", "DZE → JSON Converter"),
+    ("messages", "🔔", "Messages Generator"),
+    ("lootexclusion", "🚫", "Loot-Ausschlusszonen"),
+    ("custombuildmap", "🗺️", "Custom Build Mapping"),
+    ("skymessage", "☁️", "Sky Message Generator"),
+    ("typesmanager", "📦", "Erweiterter Types Manager"),
+    ("effectgenerator", "✨", "Effekt-Generator"),
+    ("altaccountfinder", "🔎", "Alt Account Finder"),
+    ("daynight", "🌗", "Day/Night Config"),
+    ("deployment", "🚚", "NPC + Vehicle Deployment"),
+    ("teleports", "🚚", "Teleport Generator"),
+)
+
+
+async def api_tools_meta(request: web.Request) -> web.Response:
+    """Statische Auswahllisten fuer alle Tools, plus welche Tools diese
+    Sitzung laut Modul Manager gerade nutzen darf - keine FTP-Anfrage noetig."""
+    conn, fehler = _session_conn(request, "tools")
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    sess = _sess_get(request)
+    tools = []
+    for key, emoji, label in _TOOL_LISTE:
+        modul_key = f"tools.{key}"
+        erlaubt = await _module_erlaubt(modul_key, sess, conn)
+        tier = _module_tier(modul_key)
+        # "under_review" UND "beta" bleiben sichtbar, aber nicht auswaehlbar -
+        # so sieht ein Kunde ohne Beta-Rolle, DASS es das Tool gibt und WARUM
+        # es gerade nicht geht, statt dass es kommentarlos fehlt.
+        if not erlaubt and tier not in ("under_review", "beta"):
+            continue
+        tools.append({"key": key, "emoji": emoji, "label": label,
+                     "tier": tier, "selectable": erlaubt})
+    return ok({
+        "tools": tools,
+        "kategorie_stufe": _module_tier("tools"),
+        "slots": [{"key": k, "label": l} for k, l in TOOL_SLOTS],
+        "gas_particles": [{"value": v, "label": l} for v, l in TOOL_GAS_PARTICLES],
+        "horde_movement": {k: v for k, v in TOOL_HORDE_MOVEMENT.items()},
+        "zombie_data": TOOL_ZOMBIE_DATA,
+        "vehicles": {k: {"label": v["label"], "parts": v["parts"],
+                         "farben": v.get("farben", []),
+                         "kein_inventar": v.get("kein_inventar", False),
+                         "image": (f"/static/vehicles/{k}.png"
+                                  if f"vehicles/{k}.png" in _EMBEDDED_ASSETS else None),
+                         "parts_kategorisiert": [
+                             {"classname": cn, "anzahl": anzahl,
+                              "kategorie": _vehicle_part_kategorie(cn)}
+                             for cn, anzahl in v["parts"]]}
+                    for k, v in TOOL_VEHICLES.items()},
+        "bags": {k: {"label": v["label"], "kategorie": v["kategorie"], "slots": v["slots"],
+                     "image": (f"/static/items/{k.lower()}.avif"
+                              if f"items/{k.lower()}.avif" in _EMBEDDED_ASSETS else None)}
+                for k, v in TOOL_BAGS.items()},
+    })
+
+
+# ── 1. Loadout Generator ──────────────────────────────────────────────────
+async def api_tools_loadout_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.loadout")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.loadout", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"files": [], "presets": {}, "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    gameplay, status = await _tools_json_lesen(conn, "cfggameplay.json", loop)
+    files: List[str] = []
+    presets: Dict[str, Any] = {}
+    if status == "ok" and isinstance(gameplay, dict):
+        files = list((gameplay.get("PlayerData") or {}).get("spawnGearPresetFiles") or [])
+        for f in files:
+            if not isinstance(f, str):
+                continue
+            preset, pstatus = await _tools_json_lesen(conn, f, loop)
+            if pstatus == "ok":
+                presets[f] = preset
+    return ok({"files": files, "presets": presets})
+
+
+@_gameplay_tool_locked
+async def api_tools_loadout_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.loadout")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.loadout", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    commit = bool(data.get("commit"))
+    # Erst ab dem echten Speichern (commit) limitieren, nicht schon bei der
+    # Vorschau - sonst wuerde die Vorschau den direkt folgenden Speichern-Klick
+    # selbst blockieren.
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.loadout", 10)
+        if fehler is not None:
+            return fehler
+    name = str(data.get("name") or "").strip() or "MeinLoadout"
+    preset = data.get("preset")
+    if not isinstance(preset, dict):
+        return err("Kein gültiges Preset übergeben.")
+    file_name = str(data.get("file") or "").strip()
+    if not file_name:
+        basis = re.sub(r"[^a-z0-9_-]+", "_", name.lower()).strip("_") or "loadout"
+        file_name = f"custom/{basis}.json"
+    preset.setdefault("name", name)
+    preset.setdefault("spawnWeight", 1)
+    preset.setdefault("characterTypes", [])
+    preset.setdefault("attachmentSlotItemSets", [])
+    preset.setdefault("discreteUnsortedItemSets", [])
+    if not preset["attachmentSlotItemSets"] and not preset["discreteUnsortedItemSets"]:
+        return err("Bitte mindestens ein Kleidungsstück oder Item angeben.")
+    loop = asyncio.get_running_loop()
+    if not await _tools_datei_schreiben_wenn(commit, conn, file_name,
+            json.dumps(preset, indent=4, ensure_ascii=False) + "\n", loop):
+        return err("Preset konnte nicht per FTP gespeichert werden.", 502)
+    gameplay, status = await _tools_json_lesen(conn, "cfggameplay.json", loop)
+    if status != "ok" or not isinstance(gameplay, dict):
+        return err("cfggameplay.json nicht lesbar – bitte manuell eintragen.", 502)
+    pdata = gameplay.setdefault("PlayerData", {})
+    files_list = pdata.get("spawnGearPresetFiles")
+    if not isinstance(files_list, list):
+        files_list = []
+        pdata["spawnGearPresetFiles"] = files_list
+    if file_name not in files_list:
+        files_list.append(file_name)
+        if not await _tools_datei_schreiben_wenn(commit, conn, "cfggameplay.json",
+                json.dumps(gameplay, indent=4, ensure_ascii=False) + "\n", loop):
+            return err("Preset gespeichert, aber Eintrag in cfggameplay.json "
+                       "fehlgeschlagen.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Loadout gespeichert",
+                  f"{name} ({file_name}) · {conn.name}")
+    return ok({"file": file_name, "slots": len(preset["attachmentSlotItemSets"]),
+              "items": len(preset["discreteUnsortedItemSets"])})
+
+
+# ── 2. Gas-Zonen Builder (teilt sich cfgEffectArea.json mit dem Shop) ────
+async def api_tools_gaszone_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.gaszone")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.gaszone", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if conn.shop is None:
+        return ok({"areas": [], "safe_positions": [], "kein_mission_ordner": True})
+    pfad = conn.shop.effect_area_path()
+    if not pfad:
+        return ok({"areas": [], "safe_positions": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    roh, status = await loop.run_in_executor(None, conn.ftp.read_file_ex, pfad)
+    if status == "error":
+        return err("cfgEffectArea.json per FTP nicht lesbar.", 502)
+    try:
+        data, areas_key = ShopManager._parse_effect_area(roh if status == "ok" else None)
+    except (ValueError, json.JSONDecodeError):
+        return err("cfgEffectArea.json ist kein gültiges JSON.", 502)
+    areas = []
+    for a in data.get(areas_key) or []:
+        if not isinstance(a, dict):
+            continue
+        name = str(a.get("AreaName") or "")
+        if not name or name.startswith(ShopManager.AREA_PREFIX) or name.startswith(TOOL_EFFECT_PREFIX):
+            continue   # Shop-Ausliefer-Eintraege und Effekt-Generator-Bereiche hier nicht anzeigen
+        d = a.get("Data") or {}
+        pos = d.get("Pos") or [0, 0, 0]
+        areas.append({
+            "name": name, "x": pos[0] if len(pos) > 0 else 0,
+            "z": pos[2] if len(pos) > 2 else 0,
+            "radius": d.get("Radius", 150), "pos_height": d.get("PosHeight", 20),
+            "neg_height": d.get("NegHeight", 3), "inner_part": d.get("InnerPartDist", 100),
+            "outer_offset": d.get("OuterOffset", 20),
+            "particle": d.get("ParticleName", TOOL_GAS_PARTICLES[0][0]),
+        })
+    safe = []
+    for p in data.get("SafePositions") or []:
+        if isinstance(p, list) and len(p) >= 2:
+            safe.append({"x": p[0], "z": p[1]})
+    return ok({"areas": areas, "safe_positions": safe})
+
+
+async def api_tools_gaszone_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.gaszone")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.gaszone", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if conn.shop is None:
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    pfad = conn.shop.effect_area_path()
+    if not pfad:
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.gaszone", 10)
+        if fehler is not None:
+            return fehler
+    name = str(data_in.get("name") or "").strip() or "MeineGasZone"
+    if name.startswith(ShopManager.AREA_PREFIX):
+        return err(f"Der Name darf nicht mit „{ShopManager.AREA_PREFIX}“ beginnen "
+                  f"(reserviert für den Shop).")
+    if name.startswith(TOOL_EFFECT_PREFIX):
+        return err(f"Der Name darf nicht mit „{TOOL_EFFECT_PREFIX}“ beginnen "
+                  f"(reserviert für den Effekt-Generator).")
+    try:
+        # DayZ erwartet fuer diese Felder ganze Zahlen (ContaminatedAreaLoader
+        # lehnt z.B. "InnerPartDist": 15.0 mit "Expecting int" ab) - float()
+        # zuerst, damit "12.7" nicht crasht, dann auf int runden.
+        radius = round(float(data_in.get("radius", 150)))
+        pos_height = round(float(data_in.get("pos_height", 20)))
+        neg_height = round(float(data_in.get("neg_height", 3)))
+        inner_part = round(float(data_in.get("inner_part", 100)))
+        outer_offset = round(float(data_in.get("outer_offset", 20)))
+    except (TypeError, ValueError):
+        return err("Ungültige Zahl in den Zonen-Eigenschaften.")
+    particle = str(data_in.get("particle") or TOOL_GAS_PARTICLES[0][0])
+    positions = data_in.get("positions") or []
+    if not isinstance(positions, list) or not positions:
+        return err("Bitte mindestens eine Zonen-Position angeben.")
+    safe_in = data_in.get("safe_positions")
+    async with conn.shop.lock:
+        loop = asyncio.get_running_loop()
+        roh, status = await loop.run_in_executor(None, conn.ftp.read_file_ex, pfad)
+        if status == "error":
+            return err("cfgEffectArea.json per FTP nicht lesbar.", 502)
+        try:
+            data, areas_key = ShopManager._parse_effect_area(roh if status == "ok" else None)
+        except (ValueError, json.JSONDecodeError):
+            return err("cfgEffectArea.json ist kein gültiges JSON.", 502)
+        new_areas = []
+        for i, p in enumerate(positions):
+            try:
+                x, z = float(p["x"]), float(p["z"])
+            except (TypeError, ValueError, KeyError):
+                return err("Ungültige Zonen-Position.")
+            new_areas.append({
+                "AreaName": f"{name}_{i + 1}" if len(positions) > 1 else name,
+                "Type": "ContaminatedArea_Static", "TriggerType": "ContaminatedTrigger",
+                "Data": {"Pos": [x, 0, z], "Radius": radius, "PosHeight": pos_height,
+                        "NegHeight": neg_height, "InnerPartDist": inner_part,
+                        "OuterOffset": outer_offset, "ParticleName": particle},
+                "PlayerData": {
+                    "AroundPartName": "graphics/particles/contaminated_area_gas_around",
+                    "TinyPartName": "graphics/particles/contaminated_area_gas_around_tiny",
+                    "PPERequesterType": "PPERequester_ContaminatedAreaTint",
+                },
+            })
+        neue_namen = {a["AreaName"] for a in new_areas}
+        bestehend = data.get(areas_key) or []
+        data[areas_key] = [a for a in bestehend
+                           if not (isinstance(a, dict) and a.get("AreaName") in neue_namen)]
+        data[areas_key].extend(new_areas)
+        if isinstance(safe_in, list):
+            neu_safe = []
+            for p in safe_in:
+                try:
+                    neu_safe.append([float(p["x"]), float(p["z"])])
+                except (TypeError, ValueError, KeyError):
+                    continue
+            data["SafePositions"] = neu_safe
+        if commit and not await conn.shop._write_json(pfad, data):
+            return err("cfgEffectArea.json konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Gaszone gespeichert",
+                  f"{name} ({len(new_areas)} Zone(n)) · {conn.name}")
+    # Als vollstaendiges cfgEffectArea.json-Fragment anzeigen (Areas +
+    # SafePositions), nicht als nackte Liste - eine bare-Array-Vorschau
+    # entspricht keiner gueltigen cfgEffectArea.json und liess sich so nicht
+    # direkt als eigenstaendige Datei verwenden.
+    vorschau_ausgabe = {"Areas": new_areas, "SafePositions": data.get("SafePositions", [])}
+    generated = [{"filename": "cfgEffectArea.json (neue Zonen)",
+                 "content": json.dumps(vorschau_ausgabe, indent=2, ensure_ascii=False)}]
+    return ok({"areas": len(new_areas), "generated": generated})
+
+
+# ── 2a. Effekt-Generator (teilt sich cfgEffectArea.json mit Shop & Gaszonen) ──
+# Eigene sichtbare/PPE-Effektbereiche (SpookyArea/EffectArea) statt der
+# Kontaminationszonen des Gaszonen-Builders. Eigene Areas werden am Praefix
+# TOOL_EFFECT_PREFIX erkannt - beim Speichern werden NUR diese ersetzt, Shop-
+# Eintraege und Gaszonen bleiben unangetastet (gleiches Muster wie oben).
+async def api_tools_effectgenerator_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.effectgenerator")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.effectgenerator", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    antwort: Dict[str, Any] = {
+        "typen": TOOL_EFFECT_TYPES,
+        "trigger": TOOL_EFFECT_TRIGGERS,
+        "partikel": TOOL_EFFECT_PARTICLES,
+        "ppe": TOOL_EFFECT_PPE,
+        "areas": [],
+        "kein_mission_ordner": True,
+    }
+    if conn.shop is not None:
+        pfad = conn.shop.effect_area_path()
+        if pfad:
+            antwort["kein_mission_ordner"] = False
+            loop = asyncio.get_running_loop()
+            roh, status = await loop.run_in_executor(None, conn.ftp.read_file_ex, pfad)
+            if status == "error":
+                return err("cfgEffectArea.json per FTP nicht lesbar.", 502)
+            try:
+                data, areas_key = ShopManager._parse_effect_area(roh if status == "ok" else None)
+            except (ValueError, json.JSONDecodeError):
+                return err("cfgEffectArea.json ist kein gültiges JSON.", 502)
+            for a in data.get(areas_key) or []:
+                if not isinstance(a, dict):
+                    continue
+                name = str(a.get("AreaName") or "")
+                if not name.startswith(TOOL_EFFECT_PREFIX):
+                    continue   # Shop-/Gaszonen-Eintraege hier nicht anzeigen
+                d = a.get("Data") or {}
+                pd = a.get("PlayerData") or {}
+                pos = d.get("Pos") or [0, 0, 0]
+                antwort["areas"].append({
+                    "name": name, "typ": a.get("Type", "SpookyArea"),
+                    "trigger": a.get("TriggerType", "EffectTrigger"),
+                    "x": pos[0] if len(pos) > 0 else 0, "z": pos[2] if len(pos) > 2 else 0,
+                    "radius": d.get("Radius", 20), "pos_height": d.get("PosHeight", 10),
+                    "neg_height": d.get("NegHeight", 10),
+                    "inner_ring_count": d.get("InnerRingCount", 1),
+                    "inner_part": d.get("InnerPartDist", 15),
+                    "outer_ring": bool(d.get("OuterRingToggle", True)),
+                    "outer_part": d.get("OuterPartDist", 25),
+                    "outer_offset": d.get("OuterOffset", 0),
+                    "vertical_layers": d.get("VerticalLayers", 0),
+                    "vertical_offset": d.get("VerticalOffset", 0),
+                    "particle": d.get("ParticleName", TOOL_EFFECT_PARTICLES[0]),
+                    "around": pd.get("AroundPartName", ""),
+                    "tiny": pd.get("TinyPartName", ""),
+                    "ppe": pd.get("PPERequesterType", TOOL_EFFECT_PPE[0]),
+                })
+    return ok(antwort)
+
+
+async def api_tools_effectgenerator_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.effectgenerator")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.effectgenerator", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if conn.shop is None:
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    pfad = conn.shop.effect_area_path()
+    if not pfad:
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.effectgenerator", 10)
+        if fehler is not None:
+            return fehler
+
+    name = str(data_in.get("name") or "").strip()
+    if not name:
+        return err("Bitte einen Bereichsnamen angeben.")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,48}", name):
+        return err("Der Name darf nur Buchstaben, Ziffern, „_“ und „-“ enthalten "
+                   "(höchstens 48 Zeichen).")
+    voller_name = name if name.startswith(TOOL_EFFECT_PREFIX) else f"{TOOL_EFFECT_PREFIX}{name}"
+
+    typ = str(data_in.get("typ") or TOOL_EFFECT_TYPES[0])
+    if typ not in TOOL_EFFECT_TYPES:
+        return err("Unbekannter Bereichstyp.")
+    trigger = str(data_in.get("trigger") or "EffectTrigger")
+    if trigger not in TOOL_EFFECT_TRIGGERS:
+        return err("Unbekannter Trigger-Typ.")
+    partikel = str(data_in.get("particle") or TOOL_EFFECT_PARTICLES[0])
+    if partikel not in TOOL_EFFECT_PARTICLES:
+        return err("Unbekannter Partikelname.")
+    around = str(data_in.get("around") or "")
+    if around and around not in TOOL_EFFECT_PARTICLES:
+        return err("Unbekannter Partikelname (Umgebung).")
+    tiny = str(data_in.get("tiny") or "")
+    if tiny and tiny not in TOOL_EFFECT_PARTICLES:
+        return err("Unbekannter Partikelname (Nahbereich).")
+    ppe = str(data_in.get("ppe") or TOOL_EFFECT_PPE[0])
+    if ppe not in TOOL_EFFECT_PPE:
+        return err("Unbekannter PPE-Effekt.")
+
+    try:
+        # Pos bleibt float (echte Weltkoordinaten), alle anderen Data-Felder
+        # erwartet DayZ als ganze Zahl - der ContaminatedAreaLoader lehnt z.B.
+        # "InnerPartDist": 15.0 mit "Expecting int" ab (Server-Crashloop,
+        # per RPT-Log bestaetigt). float() zuerst, damit "12.7" nicht crasht.
+        x = float(data_in.get("x", 0))
+        z = float(data_in.get("z", 0))
+        radius = round(float(data_in.get("radius", 20)))
+        pos_height = round(float(data_in.get("pos_height", 10)))
+        neg_height = round(float(data_in.get("neg_height", 10)))
+        inner_ring_count = int(data_in.get("inner_ring_count", 1))
+        inner_part = round(float(data_in.get("inner_part", 15)))
+        outer_part = round(float(data_in.get("outer_part", 25)))
+        outer_offset = round(float(data_in.get("outer_offset", 0)))
+        vertical_layers = int(data_in.get("vertical_layers", 0))
+        vertical_offset = round(float(data_in.get("vertical_offset", 0)))
+    except (TypeError, ValueError):
+        return err("Ungültige Zahl in den Bereichs-Eigenschaften.")
+    if radius <= 0:
+        return err("Der Radius muss größer als 0 sein.")
+    outer_ring = bool(data_in.get("outer_ring", True))
+
+    neue_area = {
+        "AreaName": voller_name, "Type": typ, "TriggerType": trigger,
+        "Data": {
+            "Pos": [x, 0, z], "Radius": radius, "PosHeight": pos_height,
+            "NegHeight": neg_height, "InnerRingCount": inner_ring_count,
+            "InnerPartDist": inner_part, "OuterRingToggle": outer_ring,
+            "OuterPartDist": outer_part, "OuterOffset": outer_offset,
+            "VerticalLayers": vertical_layers, "VerticalOffset": vertical_offset,
+            "ParticleName": f"graphics/particles/{partikel}",
+        },
+        "PlayerData": {
+            "AroundPartName": f"graphics/particles/{around}" if around else "",
+            "TinyPartName": f"graphics/particles/{tiny}" if tiny else "",
+            "PPERequesterType": ppe,
+        },
+    }
+
+    async with conn.shop.lock:
+        loop = asyncio.get_running_loop()
+        roh, status = await loop.run_in_executor(None, conn.ftp.read_file_ex, pfad)
+        if status == "error":
+            return err("cfgEffectArea.json per FTP nicht lesbar.", 502)
+        try:
+            data, areas_key = ShopManager._parse_effect_area(roh if status == "ok" else None)
+        except (ValueError, json.JSONDecodeError):
+            return err("cfgEffectArea.json ist kein gültiges JSON.", 502)
+        bestehend = data.get(areas_key) or []
+        data[areas_key] = [a for a in bestehend
+                           if not (isinstance(a, dict) and a.get("AreaName") == voller_name)]
+        data[areas_key].append(neue_area)
+        if commit and not await conn.shop._write_json(pfad, data):
+            return err("cfgEffectArea.json konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Effekt-Generator gespeichert",
+                  f"{voller_name} · {conn.name}")
+    # Wie beim Gaszonen-Builder: vollstaendiges Areas+SafePositions-Fragment
+    # zeigen statt eines nackten Objekts, das keiner gueltigen
+    # cfgEffectArea.json entspricht.
+    vorschau_ausgabe = {"Areas": [neue_area], "SafePositions": data.get("SafePositions", [])}
+    generated = [{"filename": "cfgEffectArea.json (neuer Bereich)",
+                 "content": json.dumps(vorschau_ausgabe, indent=2, ensure_ascii=False)}]
+    return ok({"generated": generated})
+
+
+# ── 2b. Loot-Ausschlusszonen (entfernt <group>-Eintraege aus mapgrouppos.xml) ──
+# Eigenstaendiges System, unabhaengig von den Dashboard-Zonen und dem
+# Gas-Zonen-Builder: mapgrouppos.xml listet platzierte Kartenobjektgruppen
+# (Gebaeude, Container u.a.) mit ihrer Weltposition. Ein Eintrag innerhalb
+# einer hier gezeichneten Kreiszone wird aus der Datei entfernt, sein
+# Loot-Container spawnt dann dort nicht mehr. Y wird ignoriert (reine
+# X/Z-Kreisgeometrie), genau wie beim Referenz-Tool.
+_TOOL_LOOTZONE_GROUP_RE = re.compile(
+    r'[ \t]*<group\b[^>]*?\bpos="([-\d.eE ]+)"[^>]*/>[ \t]*\r?\n?')
+
+
+def _lootzone_gruppen(text: str) -> List[Dict[str, Any]]:
+    """Findet alle <group ... pos="x y z" .../>-Eintraege in mapgrouppos.xml,
+    mit Position im Rohtext (fuer chirurgisches Entfernen) und Welt-X/Z."""
+    treffer = []
+    for m in _TOOL_LOOTZONE_GROUP_RE.finditer(text):
+        teile = m.group(1).split()
+        if len(teile) < 3:
+            continue
+        try:
+            x, z = float(teile[0]), float(teile[2])
+        except ValueError:
+            continue
+        treffer.append({"start": m.start(), "end": m.end(), "x": x, "z": z})
+    return treffer
+
+
+def _lootzone_treffer(gruppen: List[Dict[str, Any]],
+                      zonen: List[Dict[str, Any]]) -> Tuple[Set[int], List[int]]:
+    """Welche Gruppen-Indizes liegen in mindestens einer Zone, und wie viele
+    je Zone (fuer die Vorschau)."""
+    entfernen: Set[int] = set()
+    je_zone = [0] * len(zonen)
+    for i, g in enumerate(gruppen):
+        for zi, z in enumerate(zonen):
+            dx = g["x"] - z["x"]
+            dz = g["z"] - z["z"]
+            if dx * dx + dz * dz <= z["radius"] * z["radius"]:
+                entfernen.add(i)
+                je_zone[zi] += 1
+    return entfernen, je_zone
+
+
+def _lootzone_entfernen(text: str, gruppen: List[Dict[str, Any]], indices: Set[int]) -> str:
+    """Entfernt die angegebenen Gruppen-Zeilen - alles andere bleibt Byte fuer
+    Byte erhalten, wie bei den anderen chirurgischen Tool-Edits."""
+    stuecke = []
+    letzte = 0
+    for i in sorted(indices):
+        g = gruppen[i]
+        stuecke.append(text[letzte:g["start"]])
+        letzte = g["end"]
+    stuecke.append(text[letzte:])
+    return "".join(stuecke)
+
+
+async def api_tools_lootexclusion_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.lootexclusion")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.lootexclusion", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"gruppen": 0, "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "mapgrouppos.xml", loop)
+    if status != "ok":
+        return ok({"gruppen": 0, "nicht_lesbar": True})
+    gruppen = _lootzone_gruppen(text)
+    antwort = {"gruppen": len(gruppen)}
+    # Punkte nur auf Anfrage mitschicken (koennen zehntausende sein) - fuer
+    # die reine Anzeige beim Modal-Oeffnen reicht die Anzahl, die Punkte holt
+    # sich das Frontend erst per "Von Server importieren"-Knopf.
+    if request.query.get("points"):
+        antwort["points"] = [{"x": g["x"], "z": g["z"]} for g in gruppen]
+    return ok(antwort)
+
+
+async def api_tools_lootexclusion_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.lootexclusion")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.lootexclusion", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.lootexclusion", 10)
+        if fehler is not None:
+            return fehler
+    zonen_in = data_in.get("zones") or []
+    if not isinstance(zonen_in, list) or not zonen_in:
+        return err("Bitte mindestens eine Zone angeben.")
+    zonen = []
+    for z in zonen_in:
+        try:
+            x, zz, radius = float(z["x"]), float(z["z"]), float(z["radius"])
+        except (TypeError, ValueError, KeyError):
+            return err("Ungültige Zonen-Position oder -Radius.")
+        if radius <= 0:
+            return err("Radius muss größer als 0 sein.")
+        name = str(z.get("name") or "").strip() or f"Zone {len(zonen) + 1}"
+        zonen.append({"name": name, "x": x, "z": zz, "radius": radius})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "mapgrouppos.xml", loop)
+    if status != "ok":
+        return err("mapgrouppos.xml nicht lesbar – bitte per /ftp_scan prüfen lassen.", 502)
+    gruppen = _lootzone_gruppen(text)
+    entfernen, je_zone = _lootzone_treffer(gruppen, zonen)
+    neu_text = _lootzone_entfernen(text, gruppen, entfernen)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "mapgrouppos.xml", neu_text, loop):
+        return err("mapgrouppos.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Loot-Ausschlusszonen angewendet",
+                  f"{len(entfernen)} Eintrag/Einträge entfernt, {len(zonen)} Zone(n) · {conn.name}")
+    zeilen = [f"{z['name']}: {je_zone[i]} Eintrag/Einträge entfernt "
+              f"(X:{z['x']:.0f} Z:{z['z']:.0f} R:{z['radius']:.0f})"
+              for i, z in enumerate(zonen)]
+    zeilen.append("")
+    zeilen.append(f"Gesamt: {len(entfernen)} von {len(gruppen)} Einträgen entfernt, "
+                 f"{len(gruppen) - len(entfernen)} bleiben übrig.")
+    generated = [{"filename": "mapgrouppos.xml (Zusammenfassung)", "content": "\n".join(zeilen)}]
+    return ok({"removed": len(entfernen), "total": len(gruppen), "per_zone": je_zone,
+              "generated": generated})
+
+
+# ── Custom Build Mapping ──────────────────────────────────────────────────
+# Zeigt, wo jedes vom DayZ Object Spawner server-seitig platzierte Custom-
+# Objekt liegt (Wracks, Deko-Szenen usw.) - NICHT spielerbaute Fundamente,
+# die liessen sich nur unzuverlaessig aus ADM-Logs oder dem propietaeren
+# storage_1.db rekonstruieren. Reines Anzeige-Tool, kein Schreibzugriff.
+async def _custom_build_dateien(conn: ServerConnection, loop) -> Tuple[List[str], str]:
+    """Liest ``objectSpawnersArr`` aus der cfggameplay.json - die Liste der
+    custom/*.json-Dateien, die der Object Spawner beim Serverstart laedt.
+
+    Rueckgabe (Dateinamen, Status). Status ist "ok", "kein_eintrag" (Datei
+    gelesen, aber kein objectSpawnersArr drin - viele Server nutzen den
+    Object Spawner einfach nicht) oder ein _tools_json_lesen-Fehlercode
+    ("missing"/"error"/"kaputt"/"kein_mission_ordner")."""
+    daten, status = await _tools_json_lesen(conn, "cfggameplay.json", loop)
+    if status != "ok":
+        return [], status
+    dateien = _json_wert_finden(daten, "objectSpawnersArr")
+    if not isinstance(dateien, list):
+        return [], "kein_eintrag"
+    return [str(d) for d in dateien if isinstance(d, str) and d.strip()], "ok"
+
+
+async def _custom_build_objekte(conn: ServerConnection, dateiname: str,
+                                loop) -> List[Dict[str, Any]]:
+    """Objekte einer einzelnen custom/*.json-Datei mit Position. Fehlerhafte
+    oder unerwartete Eintraege werden uebersprungen statt die ganze Antwort
+    scheitern zu lassen - wie beim Rest der Tools-Parser."""
+    daten, status = await _tools_json_lesen(conn, dateiname, loop)
+    if status != "ok" or not isinstance(daten, dict):
+        return []
+    objekte = daten.get("Objects")
+    if not isinstance(objekte, list):
+        return []
+    ausgabe: List[Dict[str, Any]] = []
+    for obj in objekte:
+        if not isinstance(obj, dict):
+            continue
+        pos = obj.get("pos")
+        if not isinstance(pos, list) or len(pos) < 3:
+            continue
+        try:
+            # pos = [x, y(Hoehe), z] - fuer die Karte zaehlen nur x und z,
+            # wie bei mapgrouppos.xml ueberall sonst im Dashboard.
+            x, z = float(pos[0]), float(pos[2])
+        except (TypeError, ValueError):
+            continue
+        ausgabe.append({"name": str(obj.get("name") or "?"), "x": x, "z": z})
+    return ausgabe
+
+
+async def api_tools_custombuildmap_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.custombuildmap")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.custombuildmap", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"files": [], "status": "kein_mission_ordner"})
+    loop = asyncio.get_running_loop()
+    dateien, status = await _custom_build_dateien(conn, loop)
+    ausgabe = []
+    for name in dateien:
+        objekte = await _custom_build_objekte(conn, name, loop)
+        ausgabe.append({"filename": name, "count": len(objekte), "points": objekte})
+    return ok({"files": ausgabe, "status": status})
+
+
+def _custom_spawner_pfad_normalisieren(pfad: str) -> str:
+    """Vergleichs-Form eines objectSpawnersArr-Eintrags: fuehrendes "./" weg,
+    Backslashes zu Slash - "custom/x.json" und "./custom/x.json" gelten damit
+    als DERSELBE Eintrag (Brigardes ausdrueckliche Vorgabe: beide Schreib-
+    weisen sind in freier Wildbahn im Umlauf)."""
+    p = str(pfad or "").strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+_CUSTOM_BUILD_MAX_BYTES = 5_000_000  # 5 MB - grosszuegig fuer eine Objektliste, aber begrenzt
+
+
+@_gameplay_tool_locked
+async def api_tools_custombuildmap_import(request: web.Request) -> web.Response:
+    """Importiert eine Object-Spawner-JSON-Datei: schreibt sie nach
+    custom/<dateiname>.json und traegt sie in cfggameplay.json →
+    WorldsData.objectSpawnersArr ein, falls (normalisiert) noch nicht
+    vorhanden. Existiert die Datei bereits und wurde kein ``overwrite``
+    mitgeschickt, meldet die Antwort einen Konflikt statt zu schreiben -
+    das Dashboard zeigt dann eine Bestaetigung und ruft mit
+    ``overwrite: true`` erneut auf (Brigardes ausdrueckliche Vorgabe)."""
+    conn, fehler = _session_conn(request, "tools.custombuildmap")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.custombuildmap", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.custombuildmap.import", 10)
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    dateiname = str(data.get("filename") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}\.json", dateiname):
+        return err("Der Dateiname darf nur Buchstaben, Ziffern, . _ - enthalten "
+                   "und muss auf .json enden (kein Pfad, nur der reine Dateiname).")
+    inhalt = data.get("content")
+    if not isinstance(inhalt, str) or not inhalt.strip():
+        return err("Bitte den JSON-Inhalt der Spawner-Datei einfügen.")
+    if len(inhalt.encode("utf-8", errors="ignore")) > _CUSTOM_BUILD_MAX_BYTES:
+        return err(f"Die Datei ist zu groß (höchstens "
+                   f"{_CUSTOM_BUILD_MAX_BYTES // 1_000_000} MB).")
+    try:
+        geparst = json.loads(inhalt)
+    except (TypeError, ValueError) as e:
+        return err(f"Das ist kein gültiges JSON: {e}")
+    if not isinstance(geparst, dict):
+        return err("Die Object-Spawner-Datei muss ein JSON-Objekt sein.")
+    if not isinstance(geparst.get("Objects"), list):
+        return err("Die Object-Spawner-Datei braucht ein Feld „Objects“ (Liste).")
+    if not _mission_dir_of(conn):
+        return err("Kein Mission-Ordner für diesen Server bekannt – "
+                   "Auto-Erkennung noch nicht gelaufen?", 409)
+
+    loop = asyncio.get_running_loop()
+    ziel = f"custom/{dateiname}"
+    _vorhanden, lese_status = await _tools_datei_lesen(conn, ziel, loop)
+    if lese_status == "error":
+        return err("Konnte nicht prüfen, ob die Datei schon existiert (FTP-Fehler).", 502)
+    if lese_status == "ok" and not bool(data.get("overwrite")):
+        return ok({"konflikt": True, "filename": ziel})
+
+    if not await _tools_datei_schreiben(conn, ziel, inhalt, loop):
+        return err("Die Datei konnte nicht auf dem Server gespeichert werden.", 502)
+
+    gameplay, status = await _tools_json_lesen(conn, "cfggameplay.json", loop)
+    if status != "ok" or not isinstance(gameplay, dict):
+        return err(f"Die Datei `{ziel}` wurde gespeichert, aber die "
+                   f"cfggameplay.json ist nicht lesbar – bitte den Eintrag in "
+                   f"objectSpawnersArr von Hand ergänzen.", 502)
+    liste = _json_wert_finden(gameplay, "objectSpawnersArr")
+    if not isinstance(liste, list):
+        worldsdata = gameplay.setdefault("WorldsData", {})
+        if not isinstance(worldsdata, dict):
+            return err(f"Die Datei `{ziel}` wurde gespeichert, aber in der "
+                       f"cfggameplay.json gibt es keinen Abschnitt für "
+                       f"objectSpawnersArr – bitte von Hand ergänzen.", 502)
+        liste = []
+        worldsdata["objectSpawnersArr"] = liste
+    ziel_norm = _custom_spawner_pfad_normalisieren(ziel)
+    bereits_drin = any(_custom_spawner_pfad_normalisieren(e) == ziel_norm
+                       for e in liste if isinstance(e, str))
+    if not bereits_drin:
+        liste.append(ziel)
+        if not await _tools_datei_schreiben(
+                conn, "cfggameplay.json",
+                json.dumps(gameplay, indent=4, ensure_ascii=False) + "\n", loop):
+            return err(f"Die Datei `{ziel}` wurde gespeichert, aber der Eintrag in "
+                       f"der cfggameplay.json ist fehlgeschlagen – bitte von Hand "
+                       f"ergänzen.", 502)
+
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+              "Tool: Custom-Build-Spawner importiert",
+              f"{ziel} ({len(geparst.get('Objects') or [])} Objekte) · {conn.name}")
+    dateien, dateien_status = await _custom_build_dateien(conn, loop)
+    ausgabe = []
+    for name in dateien:
+        objekte = await _custom_build_objekte(conn, name, loop)
+        ausgabe.append({"filename": name, "count": len(objekte), "points": objekte})
+    return ok({"geschrieben": True, "eingetragen": True, "filename": ziel,
+              "files": ausgabe, "status": dateien_status})
+
+
+@_gameplay_tool_locked
+async def api_tools_custombuildmap_remove(request: web.Request) -> web.Response:
+    """Entfernt einen custom/*.json-Eintrag aus objectSpawnersArr UND
+    versucht, die Datei selbst vom Server zu löschen (best effort - schlägt
+    das Löschen fehl, bleibt der Array-Eintrag trotzdem entfernt, damit der
+    Object Spawner die Datei beim nächsten Neustart nicht mehr lädt)."""
+    conn, fehler = _session_conn(request, "tools.custombuildmap")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.custombuildmap", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.custombuildmap.remove", 10)
+    if fehler is not None:
+        return fehler
+    basisname = str(request.match_info.get("filename", "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}\.json", basisname):
+        return err("Ungültiger Dateiname.")
+    ziel = f"custom/{basisname}"
+    if not _mission_dir_of(conn):
+        return err("Kein Mission-Ordner für diesen Server bekannt.", 409)
+    loop = asyncio.get_running_loop()
+    gameplay, status = await _tools_json_lesen(conn, "cfggameplay.json", loop)
+    if status != "ok" or not isinstance(gameplay, dict):
+        return err("Die cfggameplay.json ist nicht lesbar.", 502)
+    liste = _json_wert_finden(gameplay, "objectSpawnersArr")
+    if not isinstance(liste, list):
+        return err("Kein objectSpawnersArr in der cfggameplay.json gefunden.", 404)
+    ziel_norm = _custom_spawner_pfad_normalisieren(ziel)
+    neue_liste = [e for e in liste if not (isinstance(e, str)
+                 and _custom_spawner_pfad_normalisieren(e) == ziel_norm)]
+    if len(neue_liste) == len(liste):
+        return err(f"`{ziel}` steht nicht in objectSpawnersArr.", 404)
+    liste[:] = neue_liste
+    if not await _tools_datei_schreiben(
+            conn, "cfggameplay.json",
+            json.dumps(gameplay, indent=4, ensure_ascii=False) + "\n", loop):
+        return err("Der Eintrag konnte nicht aus der cfggameplay.json entfernt werden.", 502)
+    datei_geloescht = await _tools_datei_loeschen(conn, ziel, loop)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+              "Tool: Custom-Build-Spawner entfernt",
+              f"{ziel} (Datei gelöscht: {datei_geloescht}) · {conn.name}")
+    dateien, dateien_status = await _custom_build_dateien(conn, loop)
+    ausgabe = []
+    for name in dateien:
+        objekte = await _custom_build_objekte(conn, name, loop)
+        ausgabe.append({"filename": name, "count": len(objekte), "points": objekte})
+    return ok({"entfernt": True, "datei_geloescht": datei_geloescht,
+              "files": ausgabe, "status": dateien_status})
+
+
+# ── 2b. Sky Message Generator ─────────────────────────────────────────────
+#  Setzt einen kurzen Text in ein Raster aus DayZ-Objekten um, das senkrecht
+#  in der Luft steht ("Sky Writing"). Ergebnis ist eine Object-Spawner-Datei
+#  unter custom/ plus der zugehoerige Eintrag in objectSpawnersArr - ohne
+#  diesen Eintrag laedt der Server die Datei beim Start nicht.
+#
+#  Nachbau von doordiehub.com/SkyMessenger, mit bewusst korrigierten Fehlern
+#  der Vorlage (jeweils am Fundort kommentiert). Die Rasterschriften sind aus
+#  der Vorlage uebernommen; das Komma hat dort in allen drei Mustern ein
+#  leeres Raster, obwohl es als unterstuetzt angekuendigt wird.
+
+_SKY_FONT_COMPACT = {
+    " ": "000/000/000/000/000",
+    "!": "010/010/010/000/010",
+    "#": "0101/1111/0101/1111/0101",
+    ",": "000/000/000/010/100",
+    "-": "000/000/111/000/000",
+    ".": "000/000/000/000/010",
+    "/": "001/010/010/100/100",
+    "0": "111/101/101/101/111",
+    "1": "010/110/010/010/111",
+    "2": "111/001/111/100/111",
+    "3": "111/001/111/001/111",
+    "4": "101/101/111/001/001",
+    "5": "111/100/111/001/111",
+    "6": "111/100/111/101/111",
+    "7": "111/001/010/010/010",
+    "8": "111/101/111/101/111",
+    "9": "111/101/111/001/111",
+    "=": "000/111/000/111/000",
+    "A": "010/101/111/101/101",
+    "B": "110/101/110/101/110",
+    "C": "111/100/100/100/111",
+    "D": "110/101/101/101/110",
+    "E": "111/100/110/100/111",
+    "F": "111/100/110/100/100",
+    "G": "111/100/101/101/111",
+    "H": "101/101/111/101/101",
+    "I": "111/010/010/010/111",
+    "J": "111/001/001/101/111",
+    "K": "101/110/100/110/101",
+    "L": "100/100/100/100/111",
+    "M": "101/111/101/101/101",
+    "N": "101/111/111/111/101",
+    "O": "111/101/101/101/111",
+    "P": "110/101/110/100/100",
+    "Q": "111/101/101/111/001",
+    "R": "110/101/110/110/101",
+    "S": "111/100/111/001/111",
+    "T": "111/010/010/010/010",
+    "U": "101/101/101/101/111",
+    "V": "101/101/101/101/010",
+    "W": "101/101/101/111/101",
+    "X": "101/010/010/010/101",
+    "Y": "101/101/010/010/010",
+    "Z": "111/001/010/100/111",
+    "_": "000/000/000/000/111",
+}
+
+
+_SKY_FONT_STANDARD = {
+    " ": "00000/00000/00000/00000/00000/00000/00000",
+    "!": "00100/00100/00100/00100/00000/00100/00000",
+    "#": "01010/11111/01010/11111/01010/00000/00000",
+    ",": "00000/00000/00000/00000/00100/00100/01000",
+    "-": "00000/00000/00000/11111/00000/00000/00000",
+    ".": "00000/00000/00000/00000/00000/01100/01100",
+    "/": "00001/00010/00010/00100/01000/01000/10000",
+    "0": "01110/10001/10011/10101/11001/10001/01110",
+    "1": "00100/01100/00100/00100/00100/00100/11111",
+    "2": "01110/10001/00001/00010/00100/01000/11111",
+    "3": "01110/10001/00001/00110/00001/10001/01110",
+    "4": "00010/00110/01010/10010/11111/00010/00010",
+    "5": "11111/10000/11110/00001/00001/10001/01110",
+    "6": "01110/10001/10000/11110/10001/10001/01110",
+    "7": "11111/00001/00010/00100/00100/00100/00100",
+    "8": "01110/10001/10001/01110/10001/10001/01110",
+    "9": "01110/10001/10001/01111/00001/10001/01110",
+    "=": "00000/11111/00000/11111/00000/00000/00000",
+    "A": "00100/01010/10001/11111/10001/10001/10001",
+    "B": "11110/10001/10001/11110/10001/10001/11110",
+    "C": "01111/10000/10000/10000/10000/10000/01111",
+    "D": "11110/10001/10001/10001/10001/10001/11110",
+    "E": "11111/10000/10000/11110/10000/10000/11111",
+    "F": "11111/10000/10000/11110/10000/10000/10000",
+    "G": "01111/10000/10000/10111/10001/10001/01111",
+    "H": "10001/10001/10001/11111/10001/10001/10001",
+    "I": "11111/00100/00100/00100/00100/00100/11111",
+    "J": "11111/00001/00001/00001/00001/10001/01111",
+    "K": "10001/10010/10100/11000/10100/10010/10001",
+    "L": "10000/10000/10000/10000/10000/10000/11111",
+    "M": "10001/11011/10101/10001/10001/10001/10001",
+    "N": "10001/11001/10101/10011/10001/10001/10001",
+    "O": "01110/10001/10001/10001/10001/10001/01110",
+    "P": "11110/10001/10001/11110/10000/10000/10000",
+    "Q": "01110/10001/10001/10001/10101/10011/01111",
+    "R": "11110/10001/10001/11110/10100/10010/10001",
+    "S": "01111/10000/10000/01110/00001/00001/11110",
+    "T": "11111/00100/00100/00100/00100/00100/00100",
+    "U": "10001/10001/10001/10001/10001/10001/01110",
+    "V": "10001/10001/10001/10001/10001/01010/00100",
+    "W": "10001/10001/10001/10001/10101/11011/10001",
+    "X": "10001/01010/00100/00100/00100/01010/10001",
+    "Y": "10001/01010/00100/00100/00100/00100/00100",
+    "Z": "11111/00001/00010/00100/01000/10000/11111",
+    "_": "00000/00000/00000/00000/00000/11111/00000",
+}
+
+
+_SKY_FONT_DETAILED = {
+    " ": "000000000/000000000/000000000/000000000/000000000/000000000/000000000/000000000/000000000",
+    "!": "000111000/000111000/000111000/000111000/000111000/000000000/000000000/000111000/000111000",
+    "#": "001000100/001000100/111111111/001000100/001000100/111111111/001000100/001000100/000000000",
+    ",": "000000000/000000000/000000000/000000000/000000000/000000000/001110000/001110000/011000000",
+    "-": "000000000/000000000/000000000/000000000/111111111/000000000/000000000/000000000/000000000",
+    ".": "000000000/000000000/000000000/000000000/000000000/000000000/000000000/001110000/001110000",
+    "/": "000000010/000000100/000001000/000010000/000100000/001000000/010000000/100000000/000000000",
+    "0": "001111100/010000010/010000110/010001010/010010010/010100010/011000010/010000010/001111100",
+    "1": "000010000/000110000/000010000/000010000/000010000/000010000/000010000/000010000/011111110",
+    "2": "001111100/010000010/000000010/000000100/000001000/000010000/000100000/001000000/011111110",
+    "3": "001111100/010000010/000000010/000000010/000111100/000000010/000000010/010000010/001111100",
+    "4": "000000100/000001100/000010100/000100100/001000100/010000100/011111110/000000100/000000100",
+    "5": "011111110/010000000/010000000/011111100/000000010/000000010/000000010/010000010/001111100",
+    "6": "001111100/010000010/010000000/010000000/011111100/010000010/010000010/010000010/001111100",
+    "7": "011111110/000000010/000000100/000001000/000010000/000010000/000010000/000010000/000010000",
+    "8": "001111100/010000010/010000010/010000010/001111100/010000010/010000010/010000010/001111100",
+    "9": "001111100/010000010/010000010/010000010/001111110/000000010/000000010/010000010/001111100",
+    "=": "000000000/000000000/111111111/000000000/000000000/111111111/000000000/000000000/000000000",
+    "A": "000111000/001000100/010000010/010000010/011111110/010000010/010000010/010000010/010000010",
+    "B": "011111100/010000010/010000010/010000010/011111100/010000010/010000010/010000010/011111100",
+    "C": "001111100/010000010/010000000/010000000/010000000/010000000/010000000/010000010/001111100",
+    "D": "011111100/010000010/010000010/010000010/010000010/010000010/010000010/010000010/011111100",
+    "E": "011111110/010000000/010000000/010000000/011111100/010000000/010000000/010000000/011111110",
+    "F": "011111110/010000000/010000000/010000000/011111100/010000000/010000000/010000000/010000000",
+    "G": "001111100/010000010/010000000/010000000/010001110/010000010/010000010/010000010/001111100",
+    "H": "010000010/010000010/010000010/010000010/011111110/010000010/010000010/010000010/010000010",
+    "I": "011111110/000010000/000010000/000010000/000010000/000010000/000010000/000010000/011111110",
+    "J": "011111110/000000010/000000010/000000010/000000010/000000010/010000010/010000010/001111100",
+    "K": "010000010/010000100/010001000/010010000/011100000/010010000/010001000/010000100/010000010",
+    "L": "010000000/010000000/010000000/010000000/010000000/010000000/010000000/010000000/011111110",
+    "M": "010000010/011000110/010101010/010010010/010000010/010000010/010000010/010000010/010000010",
+    "N": "010000010/011000010/010100010/010010010/010001010/010000110/010000010/010000010/010000010",
+    "O": "001111100/010000010/010000010/010000010/010000010/010000010/010000010/010000010/001111100",
+    "P": "011111100/010000010/010000010/010000010/011111100/010000000/010000000/010000000/010000000",
+    "Q": "001111100/010000010/010000010/010000010/010000010/010010010/010001010/010000110/001111110",
+    "R": "011111100/010000010/010000010/010000010/011111100/010010000/010001000/010000100/010000010",
+    "S": "001111100/010000010/010000000/010000000/001111100/000000010/000000010/010000010/001111100",
+    "T": "011111110/000010000/000010000/000010000/000010000/000010000/000010000/000010000/000010000",
+    "U": "010000010/010000010/010000010/010000010/010000010/010000010/010000010/010000010/001111100",
+    "V": "010000010/010000010/010000010/010000010/010000010/010000010/001000100/000101000/000010000",
+    "W": "010000010/010000010/010000010/010000010/010010010/010101010/011000110/010000010/010000010",
+    "X": "010000010/001000100/000101000/000010000/000010000/000101000/001000100/010000010/010000010",
+    "Y": "010000010/001000100/000101000/000010000/000010000/000010000/000010000/000010000/000010000",
+    "Z": "011111110/000000010/000000100/000001000/000010000/000100000/001000000/010000000/011111110",
+    "_": "000000000/000000000/000000000/000000000/000000000/000000000/000000000/000000000/111111111",
+}
+
+# (Spalten, Zeilen, Schrift) je Muster. Die Spaltenzahl ist der Nennwert fuer
+# die Auswahl; die tatsaechliche Breite wird pro Glyphe gemessen, weil "#" im
+# Compact-Muster vier Spalten breit ist. Die Vorlage rechnet dort weiter mit
+# drei und setzt das Zeichen dadurch versetzt - hier korrigiert.
+_SKY_MUSTER: Dict[str, Tuple[int, int, Dict[str, str]]] = {
+    "compact":  (3, 5, _SKY_FONT_COMPACT),
+    "standard": (5, 7, _SKY_FONT_STANDARD),
+    "detailed": (9, 9, _SKY_FONT_DETAILED),
+}
+
+# Buchstabenhoehe in Metern je Groesse. Der Punktabstand ist Hoehe/Zeilenzahl.
+_SKY_GROESSEN: Dict[str, float] = {"small": 5.0, "medium": 10.0,
+                                   "large": 20.0, "huge": 40.0}
+
+_SKY_SCALES: Tuple[float, ...] = (0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5,
+                                  0.75, 1.0, 1.5, 2.0, 3.0, 5.0)
+
+# Auswahl der Objekte. Die Labels stammen aus der Vorlage, die Classnames
+# NICHT: deren eigene Zuordnung (im Chunk assets/SkyMessenger-*.js) enthaelt
+# mehrere Namen, die es im Spiel nicht gibt. Jeder Eintrag hier ist gegen
+# echte Class-Dumps des Spiels geprueft (ravmustang/DayZ_SA_ClassName_Dump,
+# niboj/DayzXboxConfigTutorial) bzw. gegen den Item-Katalog des Dashboards.
+#
+# Korrigiert gegenueber der Vorlage:
+#   Land_Wreck_Volha        -> es gibt nur _Blue / _Grey / _Police
+#   Land_Wreck_PoliceCar    -> existiert nicht; der Polizeiwagen ist
+#                              Land_Wreck_Volha_Police
+#   StaticObj_Misc_CinderBlock -> nur die Mehrzahl ...CinderBlocks existiert
+#   Barrel_Black            -> existiert nicht; Faesser gibt es in vier
+#                              Farben, dazu die Feuertonnen BarrelHoles_*
+#   rock_apart1.p3d /       -> Modellpfade statt Classnames; die echten
+#   rock_apart2.p3d            Steine heissen StaticObj_Rubble_Rocks1/2
+_SKY_OBJEKTE: Tuple[Tuple[str, str, str], ...] = (
+    ("Rauch",           "M18SmokeGrenade_White",          "Rauchgranate weiß"),
+    ("Rauch",           "M18SmokeGrenade_Green",          "Rauchgranate grün"),
+    ("Rauch",           "M18SmokeGrenade_Red",            "Rauchgranate rot"),
+    ("Rauch",           "M18SmokeGrenade_Purple",         "Rauchgranate violett"),
+    ("Rauch",           "M18SmokeGrenade_Yellow",         "Rauchgranate gelb"),
+    # Nicht in der Vorlage, aber im Item-Katalog belegt.
+    ("Rauch",           "RDG2SmokeGrenade_White",         "RDG-2 Rauch weiß"),
+    ("Rauch",           "RDG2SmokeGrenade_Black",         "RDG-2 Rauch schwarz"),
+    ("Leuchten",        "Roadflare",                      "Signalfackel"),
+    ("Leuchten",        "Flaregun",                       "Signalpistole"),
+    ("Leuchten",        "Ammo_Flare",                     "Leuchtmunition"),
+    ("Knicklicht",      "Chemlight_White",                "Knicklicht weiß"),
+    ("Knicklicht",      "Chemlight_Red",                  "Knicklicht rot"),
+    ("Knicklicht",      "Chemlight_Green",                "Knicklicht grün"),
+    ("Knicklicht",      "Chemlight_Blue",                 "Knicklicht blau"),
+    ("Knicklicht",      "Chemlight_Yellow",               "Knicklicht gelb"),
+    ("Container",       "StaticObj_Container_1D",         "Seecontainer blau"),
+    ("Container",       "Land_Container_1Aoh",            "Seecontainer gelb"),
+    ("Container",       "Land_Container_1Bo",             "Seecontainer rot"),
+    ("Container",       "Land_ContainerLocked_Red_DE",    "Verschlossener Container rot"),
+    ("Container",       "Land_ContainerLocked_Blue_DE",   "Verschlossener Container blau"),
+    ("Container",       "Land_ContainerLocked_Orange_DE", "Verschlossener Container orange"),
+    ("Fässer",          "Barrel_Blue",                    "Fass blau"),
+    ("Fässer",          "Barrel_Red",                     "Fass rot"),
+    ("Fässer",          "Barrel_Green",                   "Fass grün"),
+    ("Fässer",          "Barrel_Yellow",                  "Fass gelb"),
+    ("Fässer",          "BarrelHoles_Blue",               "Feuertonne blau"),
+    ("Fässer",          "BarrelHoles_Red",                "Feuertonne rot"),
+    ("Fässer",          "BarrelHoles_Green",              "Feuertonne grün"),
+    ("Fässer",          "BarrelHoles_Yellow",             "Feuertonne gelb"),
+    ("Militärobjekte",  "StaticObj_Misc_CinderBlocks",    "Schalsteine (Stapel)"),
+    ("Militärobjekte",  "StaticObj_Misc_BagFence_Round",  "Sandsäcke rund"),
+    ("Militärobjekte",  "StaticObj_Misc_BagFence_3m",     "Sandsackwall (3 m)"),
+    ("Militärobjekte",  "StaticObj_Misc_BagFence_Corner", "Sandsackecke"),
+    ("Militärobjekte",  "StaticObj_Misc_ConcreteBlock2",  "Betonsperre"),
+    ("Militärobjekte",  "StaticObj_Misc_ConcreteBlock1",  "Betonblock"),
+    ("Wracks",          "Land_Wreck_Volha_Blue",          "Wrack Volha blau"),
+    ("Wracks",          "Land_Wreck_Volha_Grey",          "Wrack Volha grau"),
+    ("Wracks",          "Land_Wreck_Volha_Police",        "Wrack Polizeiwagen"),
+    ("Wracks",          "Land_Wreck_S1023_Blue",          "Wrack Transporter"),
+    ("Wracks",          "StaticObj_Wreck_T72_Chassis",    "Panzerwrack (T-72)"),
+    # Saisonales Objekt (Walpurgisnacht); die Klasse gibt es laut den
+    # Spielskripten (bonfire.c), sie steht aber in keinem der aelteren
+    # Class-Dumps - bei Problemen zuerst hier nachsehen.
+    ("Feuer",           "Bonfire",                        "Lagerfeuer"),
+    ("Feuer",           "Fireplace",                      "Feuerstelle"),
+    ("Feuer",           "FireplaceIndoor",                "Feuerstelle drinnen"),
+    ("Steine",          "StaticObj_Rubble_Rocks1",        "Felsbrocken groß"),
+    ("Steine",          "StaticObj_Rubble_Rocks2",        "Felsbrocken klein"),
+)
+
+_SKY_MAX_ZEICHEN = 30
+# Ab hier wird gewarnt: so viele Objekte an einer Stelle kosten spuerbar
+# Serverleistung. Kein hartes Limit - das entscheidet der Kunde selbst.
+_SKY_WARNUNG_AB = 400
+# Harte Obergrenze. 9x9-Raster mal 30 Zeichen sind rechnerisch schon ueber
+# 2000 Objekte; darueber hinaus ist die Datei fuer einen Konsolen-Server
+# nicht mehr sinnvoll nutzbar.
+_SKY_MAX_OBJEKTE = 2500
+
+# Erlaubt sind genau die Zeichen, fuer die es in allen drei Mustern eine
+# Glyphe gibt.
+_SKY_ERLAUBT = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ./!#-_=,")
+
+
+def _sky_text_saeubern(roh: str) -> Tuple[str, List[str]]:
+    """Wandelt die Eingabe in den tatsaechlich darstellbaren Text um.
+
+    Rueckgabe ``(text, entfernt)``. ``entfernt`` sind die weggefallenen
+    Zeichen in Eingabereihenfolge, ohne Wiederholungen - damit das Dashboard
+    sagen kann, WAS verschwunden ist. Die Vorlage entfernt solche Zeichen
+    kommentarlos; hier wird es gemeldet.
+
+    ``ß`` wird durch ``str.upper()`` zu ``SS`` und belegt damit zwei Stellen -
+    genau wie in der Vorlage.
+    """
+    text = []
+    entfernt: List[str] = []
+    for zeichen in (roh or "").upper():
+        if zeichen in _SKY_ERLAUBT:
+            text.append(zeichen)
+        elif zeichen not in entfernt:
+            entfernt.append(zeichen)
+    return "".join(text), entfernt
+
+
+def _sky_glyphen(text: str, muster: str) -> List[Tuple[int, List[str]]]:
+    """(Breite, Rasterzeilen) je Zeichen. Unbekannte Zeichen kommen hier nicht
+    mehr an, _sky_text_saeubern hat sie schon entfernt."""
+    schrift = _SKY_MUSTER[muster][2]
+    aus = []
+    for zeichen in text:
+        zeilen = schrift[zeichen].split("/")
+        aus.append((len(zeilen[0]), zeilen))
+    return aus
+
+
+def _sky_objekte_bauen(text: str, muster: str, groesse: str, start_x: float,
+                       start_z: float, hoehe: float, scale: float,
+                       yaw: float, pitch: float, roll: float, text_winkel: float,
+                       classname: str, wand: Optional[Tuple[float, float]]
+                       ) -> Tuple[List[Dict[str, Any]], float, int, int]:
+    """Baut die Objektliste. Rueckgabe ``(objekte, abstand, breite, zeilen)``.
+
+    ``wand`` ist ``(breite_m, hoehe_m)`` im Wandmodus, sonst ``None``; dann
+    ergibt sich der Punktabstand aus der Buchstabengroesse.
+    """
+    spalten_nenn, zeilen_zahl, _ = _SKY_MUSTER[muster]
+    glyphen = _sky_glyphen(text, muster)
+    # Gesamtbreite in Rasterzellen, mit einer Leerspalte zwischen den
+    # Zeichen. Die letzte Trennspalte zaehlt fuer die Zentrierung nicht mit.
+    breite = sum(b + 1 for b, _ in glyphen) - 1 if glyphen else 0
+
+    if wand is not None:
+        # Auto-Anpassung: das Raster soll in die angegebene Wand passen. Die
+        # eingestellte Buchstabengroesse ist dann ohne Wirkung.
+        abstand = min(wand[0] / breite if breite else wand[0],
+                      wand[1] / zeilen_zahl)
+    else:
+        abstand = _SKY_GROESSEN.get(groesse, 10.0) / zeilen_zahl
+
+    bogen = math.radians(text_winkel)
+    cos_w, sin_w = math.cos(bogen), math.sin(bogen)
+    mitte = (breite - 1) / 2.0
+    mitte_zeile = (zeilen_zahl - 1) / 2.0
+
+    objekte: List[Dict[str, Any]] = []
+    spalte_links = 0
+    for glyph_breite, zeilen in glyphen:
+        for r, zeile in enumerate(zeilen):
+            for c, zelle in enumerate(zeile):
+                if zelle != "1":
+                    continue
+                u = (spalte_links + c - mitte) * abstand
+                v = (mitte_zeile - r) * abstand
+                objekte.append({
+                    "name": classname,
+                    "pos": [_sky_rund(start_x + u * cos_w),
+                            _sky_rund(hoehe + v),
+                            _sky_rund(start_z + u * sin_w)],
+                    # Reihenfolge Yaw/Pitch/Roll wie im offiziellen
+                    # Object-Spawner-Format. Die Vorlage schreibt hier
+                    # [Pitch, Yaw, Roll] und dreht die Objekte damit falsch.
+                    "ypr": [_sky_rund(yaw), _sky_rund(pitch), _sky_rund(roll)],
+                    "scale": _sky_rund(scale),
+                    "enableCEPersistency": 0,
+                    "customString": "",
+                })
+        # Vorschub um die TATSAECHLICHE Glyphenbreite plus Trennspalte. Die
+        # Vorlage nimmt hier immer den Nennwert und setzt das vier Spalten
+        # breite "#" im Compact-Muster dadurch versetzt.
+        spalte_links += glyph_breite + 1
+    return objekte, abstand, breite, zeilen_zahl
+
+
+def _sky_dateiname(roh: str) -> str:
+    """Missionsrelativer Zielpfad im custom-Ordner, den der Object Spawner
+    ohnehin schon benutzt."""
+    basis = re.sub(r"[^a-z0-9_-]+", "_", (roh or "").lower()).strip("_")
+    return f"custom/skymessage_{basis or 'nachricht'}.json"
+
+
+def _sky_rund(wert: float) -> Any:
+    """Rundet auf vier Nachkommastellen und gibt ganze Zahlen als int zurueck.
+
+    Die Vorlage laeuft in JavaScript und schreibt dort ``7500`` statt
+    ``7500.0``; ohne diese Umwandlung unterscheiden sich sonst identische
+    Dateien in jeder Zeile.
+    """
+    gerundet = round(wert, 4)
+    return int(gerundet) if gerundet == int(gerundet) else gerundet
+
+
+def _sky_zahl(wert: Any, vorgabe: float) -> float:
+    try:
+        zahl = float(wert)
+    except (TypeError, ValueError):
+        return vorgabe
+    return vorgabe if math.isnan(zahl) or math.isinf(zahl) else zahl
+
+
+async def api_tools_skymessage_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.skymessage")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.skymessage", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    gruppen: Dict[str, List[Dict[str, str]]] = {}
+    for gruppe, classname, label in _SKY_OBJEKTE:
+        gruppen.setdefault(gruppe, []).append({"value": classname, "label": label})
+    antwort: Dict[str, Any] = {
+        "objekte": [{"gruppe": g, "eintraege": e} for g, e in gruppen.items()],
+        # Die Rasterschriften gehen mit an das Dashboard, damit die
+        # Live-Vorschau ohne Server-Anfrage zeichnen kann und die Tabellen
+        # nur an EINER Stelle gepflegt werden muessen.
+        "muster": [{"value": k, "label": f"{v[0]}×{v[1]}", "spalten": v[0],
+                    "zeilen": v[1], "schrift": v[2]} for k, v in _SKY_MUSTER.items()],
+        "groessen": [{"value": k, "meter": v} for k, v in _SKY_GROESSEN.items()],
+        "scales": list(_SKY_SCALES),
+        "max_zeichen": _SKY_MAX_ZEICHEN,
+        "warnung_ab": _SKY_WARNUNG_AB,
+        "max_objekte": _SKY_MAX_OBJEKTE,
+        "spawner": [],
+        "kein_mission_ordner": not _mission_dir_of(conn),
+    }
+    if not antwort["kein_mission_ordner"]:
+        loop = asyncio.get_running_loop()
+        dateien, status = await _custom_build_dateien(conn, loop)
+        antwort["spawner"] = dateien
+        antwort["spawner_status"] = status
+    return ok(antwort)
+
+
+@_gameplay_tool_locked
+async def api_tools_skymessage_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.skymessage")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.skymessage", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    commit = bool(data.get("commit"))
+    # Wie bei den anderen Tools: die Vorschau ist frei, erst das echte
+    # Hochladen wird begrenzt - sonst sperrt die Vorschau den Knopf, der
+    # unmittelbar danach gedrueckt wird.
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.skymessage", 10)
+        if fehler is not None:
+            return fehler
+
+    roh = str(data.get("text") or "")
+    if len(roh) > _SKY_MAX_ZEICHEN:
+        return err(f"Die Nachricht ist zu lang – höchstens {_SKY_MAX_ZEICHEN} "
+                   f"Zeichen (eingegeben: {len(roh)}).")
+    text, entfernt = _sky_text_saeubern(roh)
+    if not text.strip():
+        return err("Bitte eine Nachricht eingeben, die mindestens ein "
+                   "darstellbares Zeichen enthält (A–Z, 0–9, . / ! # - _ = ,).")
+
+    muster = str(data.get("muster") or "standard")
+    if muster not in _SKY_MUSTER:
+        return err("Unbekanntes Raster-Muster.")
+    groesse = str(data.get("groesse") or "medium")
+    if groesse not in _SKY_GROESSEN:
+        return err("Unbekannte Buchstabengröße.")
+
+    classname = str(data.get("classname") or "").strip()
+    if not classname:
+        return err("Bitte ein Objekt auswählen oder einen Classname eingeben.")
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,64}", classname):
+        return err("Der Classname darf nur Buchstaben, Ziffern und "
+                   "Unterstriche enthalten (höchstens 64 Zeichen).")
+
+    scale = _sky_zahl(data.get("scale"), 1.0)
+    if not 0.0 < scale <= 5.0:
+        return err("Die Objektgröße muss zwischen 0 und 5 liegen.")
+
+    wand: Optional[Tuple[float, float]] = None
+    if bool(data.get("wand")):
+        wand_breite = _sky_zahl(data.get("wand_breite"), 15.0)
+        wand_hoehe = _sky_zahl(data.get("wand_hoehe"), 8.0)
+        # Die Vorlage laesst hier auch 0 oder negative Werte durch und
+        # erzeugt dann unbrauchbare Koordinaten.
+        if not 5.0 <= wand_breite <= 200.0:
+            return err("Die Wandbreite muss zwischen 5 und 200 Metern liegen.")
+        if not 2.0 <= wand_hoehe <= 100.0:
+            return err("Die Wandhöhe muss zwischen 2 und 100 Metern liegen.")
+        wand = (wand_breite, wand_hoehe)
+
+    start_x = _sky_zahl(data.get("x"), 7500.0)
+    start_z = _sky_zahl(data.get("z"), 7500.0)
+    hoehe = _sky_zahl(data.get("hoehe"), 500.0)
+    # Wand-Y ersetzt die Flughoehe - aber nur im Wandmodus. Die Vorlage
+    # laesst das Feld auch bei ausgeschaltetem Wandmodus durchschlagen,
+    # obwohl es dort deaktiviert aussieht.
+    if wand is not None and str(data.get("wand_y") or "").strip() != "":
+        hoehe = _sky_zahl(data.get("wand_y"), hoehe)
+
+    text_winkel = _sky_zahl(data.get("text_winkel"), 0.0)
+    if not -180.0 <= text_winkel <= 180.0:
+        return err("Die Textdrehung muss zwischen -180° und 180° liegen.")
+
+    objekte, abstand, breite, zeilen = _sky_objekte_bauen(
+        text, muster, groesse, start_x, start_z, hoehe, scale,
+        _sky_zahl(data.get("yaw"), 0.0), _sky_zahl(data.get("pitch"), 0.0),
+        _sky_zahl(data.get("roll"), 0.0), text_winkel, classname, wand)
+
+    if not objekte:
+        return err("Diese Nachricht ergibt kein einziges Objekt – bitte "
+                   "anderen Text wählen.")
+    if len(objekte) > _SKY_MAX_OBJEKTE:
+        return err(f"Das wären {len(objekte)} Objekte – erlaubt sind höchstens "
+                   f"{_SKY_MAX_OBJEKTE}. Bitte ein kleineres Raster, eine "
+                   f"kürzere Nachricht oder eine kleinere Größe wählen.")
+
+    datei = str(data.get("datei") or "").strip() or _sky_dateiname(text)
+    if not re.fullmatch(r"custom/[A-Za-z0-9_.-]{1,80}\.json", datei):
+        return err("Der Dateiname muss im custom-Ordner liegen und auf .json "
+                   "enden, z. B. custom/skymessage_survive.json.")
+
+    inhalt = json.dumps({"Objects": objekte}, indent=2, ensure_ascii=False) + "\n"
+    dateien = [{"filename": datei, "content": inhalt}]
+
+    antwort: Dict[str, Any] = {
+        "generated": dateien, "objekte": len(objekte), "zeichen": len(text),
+        "text": text, "entfernt": entfernt, "abstand": round(abstand, 3),
+        "breite": breite, "zeilen": zeilen,
+        "warnung": len(objekte) >= _SKY_WARNUNG_AB,
+        "datei": datei,
+    }
+
+    if not _mission_dir_of(conn):
+        # Ohne Mission-Ordner kann nichts hochgeladen werden - erzeugen,
+        # kopieren und herunterladen geht trotzdem.
+        antwort["kein_mission_ordner"] = True
+        return ok(antwort)
+
+    loop = asyncio.get_running_loop()
+    vorhanden, lese_status = await _tools_datei_lesen(conn, datei, loop)
+    antwort["existiert"] = lese_status == "ok"
+    if lese_status == "ok":
+        antwort["bytes_vorher"] = len(vorhanden or "")
+
+    spawner, spawner_status = await _custom_build_dateien(conn, loop)
+    antwort["spawner_status"] = spawner_status
+    antwort["eingetragen"] = datei in spawner
+
+    if not commit:
+        return ok(antwort)
+
+    # Ab hier wird wirklich geschrieben.
+    if lese_status == "error":
+        return err("Die Zieldatei konnte nicht geprüft werden (FTP-Fehler) – "
+                   "nichts geändert.", 502)
+    if not await _tools_datei_schreiben(conn, datei, inhalt, loop):
+        return err("Die Datei konnte nicht per FTP gespeichert werden.", 502)
+    antwort["geschrieben"] = True
+
+    if not antwort["eingetragen"]:
+        gameplay, status = await _tools_json_lesen(conn, "cfggameplay.json", loop)
+        if status != "ok" or not isinstance(gameplay, dict):
+            return err(f"Die Datei `{datei}` wurde gespeichert, aber die "
+                       f"cfggameplay.json ist nicht lesbar – bitte den Eintrag "
+                       f"in objectSpawnersArr von Hand ergänzen.", 502)
+        liste = _json_wert_finden(gameplay, "objectSpawnersArr")
+        if not isinstance(liste, list):
+            # Kein objectSpawnersArr vorhanden: im selben Abschnitt anlegen,
+            # in dem der Object Spawner laut Bohemia erwartet wird.
+            ziel = gameplay.setdefault("WorldsData", {})
+            if not isinstance(ziel, dict):
+                return err(f"Die Datei `{datei}` wurde gespeichert, aber in der "
+                           f"cfggameplay.json gibt es keinen Abschnitt für "
+                           f"objectSpawnersArr – bitte von Hand ergänzen.", 502)
+            liste = []
+            ziel["objectSpawnersArr"] = liste
+        liste.append(datei)
+        if not await _tools_datei_schreiben(conn, "cfggameplay.json",
+                json.dumps(gameplay, indent=4, ensure_ascii=False) + "\n", loop):
+            return err(f"Die Datei `{datei}` wurde gespeichert, aber der Eintrag "
+                       f"in der cfggameplay.json ist fehlgeschlagen – bitte von "
+                       f"Hand ergänzen.", 502)
+        antwort["eingetragen"] = True
+        antwort["eintrag_ergaenzt"] = True
+
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+              "Tool: Sky Message hochgeladen",
+              f"{text} → {datei} ({len(objekte)} Objekte) · {conn.name}")
+    return ok(antwort)
+
+
+# ── 3. Zombie-Horden Generator ────────────────────────────────────────────
+def _tool_events_liste(root: Optional[ET.Element], nur_zombies: bool = False,
+                       nur_fahrzeuge_von: Optional[Dict[str, Any]] = None,
+                       ausblenden: Optional[Set[str]] = None) -> List[str]:
+    namen = []
+    if root is None:
+        return namen
+    for ev in root.findall("event"):
+        name = ev.get("name")
+        if ausblenden and name in ausblenden:
+            # Gehoert zu "NPC + Vehicle Deployment" - dort verwaltet.
+            continue
+        if not name or name.startswith(_RENTAL_EVENT_PREFIX):
+            # Miet-Events gehoeren dem Rental-System (eigene Ablauf-Logik ueber
+            # Neustarts) - hier auftauchend liesse sie ein Admin versehentlich
+            # im Event-Vorlagen-/Fahrzeug-Builder-Tool bearbeiten oder loeschen,
+            # ohne dass die zugehoerige Miet-Zeile in der DB davon erfaehrt.
+            continue
+        kinder = ev.findall("./children/child")
+        typen = [c.get("type", "") for c in kinder]
+        if nur_zombies:
+            if typen and all(t.startswith("Zmb") for t in typen):
+                namen.append(name)
+        elif nur_fahrzeuge_von is not None:
+            if any(t in nur_fahrzeuge_von for t in typen):
+                namen.append(name)
+        else:
+            namen.append(name)
+    return namen
+
+
+def _tool_event_details(root: Optional[ET.Element], name: str) -> Optional[Dict[str, Any]]:
+    if root is None:
+        return None
+    ev = root.find(f'event[@name="{name}"]')
+    if ev is None:
+        return None
+
+    def feld(tag: str, default: str = "") -> str:
+        el = ev.find(tag)
+        return el.text.strip() if el is not None and el.text else default
+    flags = ev.find("flags")
+    kinder = [{"type": c.get("type"), "min": c.get("min"), "max": c.get("max"),
+              "lootmin": c.get("lootmin"), "lootmax": c.get("lootmax")}
+             for c in ev.findall("./children/child")]
+    return {
+        "name": name, "nominal": feld("nominal", "1"), "min": feld("min", "1"),
+        "max": feld("max", "1"), "lifetime": feld("lifetime", "1800"),
+        "restock": feld("restock", "0"), "saferadius": feld("saferadius", "500"),
+        "distanceradius": feld("distanceradius", "500"),
+        "cleanupradius": feld("cleanupradius", "1000"),
+        "position": feld("position", "fixed"), "limit": feld("limit", "custom"),
+        "active": feld("active", "1"),
+        "deletable": flags.get("deletable") if flags is not None else "0",
+        "init_random": flags.get("init_random") if flags is not None else "0",
+        "remove_damaged": flags.get("remove_damaged") if flags is not None else "1",
+        "children": kinder,
+    }
+
+
+def _tool_spawn_positionen(root: Optional[ET.Element], name: str) -> List[Dict[str, Any]]:
+    if root is None:
+        return []
+    ev = root.find(f'event[@name="{name}"]')
+    if ev is None:
+        return []
+    return [{"x": p.get("x"), "z": p.get("z"), "a": p.get("a")} for p in ev.findall("pos")]
+
+
+def _tool_spawn_zonen(root: Optional[ET.Element], name: str) -> List[Dict[str, Any]]:
+    if root is None:
+        return []
+    ev = root.find(f'event[@name="{name}"]')
+    if ev is None:
+        return []
+    return [{"x": z.get("x"), "z": z.get("z"), "r": z.get("r"),
+            "smin": z.get("smin"), "smax": z.get("smax")} for z in ev.findall("zone")]
+
+
+async def api_tools_horde_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.horde")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.horde", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"hordes": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    ev_root, _s1 = await _tools_xml_lesen(conn, "db/events.xml", loop)
+    sp_root, _s2 = await _tools_xml_lesen(conn, "cfgeventspawns.xml", loop)
+    namen = _tool_events_liste(ev_root, nur_zombies=True)
+    hordes = []
+    for n in namen:
+        detail = _tool_event_details(ev_root, n) or {}
+        detail["positions"] = _tool_spawn_positionen(sp_root, n) or _tool_spawn_zonen(sp_root, n)
+        zonen = _tool_spawn_zonen(sp_root, n)
+        if zonen:
+            detail["radius"] = zonen[0].get("r")
+            detail["smin"] = zonen[0].get("smin")
+            detail["smax"] = zonen[0].get("smax")
+        hordes.append(detail)
+    return ok({"hordes": hordes})
+
+
+async def api_tools_horde_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.horde")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.horde", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.horde", 10)
+        if fehler is not None:
+            return fehler
+    name = str(data_in.get("name") or "").strip() or "InfectedHorde"
+    zombies = data_in.get("zombies") or []
+    positions = data_in.get("positions") or []
+    if not zombies:
+        return err("Bitte mindestens einen Zombie-Typ hinzufügen.")
+    if not positions:
+        return err("Bitte mindestens eine Position angeben.")
+    move = TOOL_HORDE_MOVEMENT.get(str(data_in.get("movement") or "stationary"),
+                                   TOOL_HORDE_MOVEMENT["stationary"])
+    try:
+        radius = float(data_in.get("radius", 25))
+        lootmin = float(data_in.get("lootmin", 0))
+        lootmax = float(data_in.get("lootmax", 0))
+        lifetime = int(float(data_in.get("lifetime", 300)))
+        cleanup = int(float(data_in.get("cleanup", 400)))
+    except (TypeError, ValueError):
+        return err("Ungültige Zahl in den Einstellungen.")
+    anzahl = len(positions)
+    kinder = []
+    gesamt = 0
+    for z in zombies:
+        try:
+            n = max(1, round(float(z.get("num", 1))))
+        except (TypeError, ValueError):
+            n = 1
+        typ = str(z.get("item") or "").strip()
+        if not typ:
+            continue
+        kinder.append({"type": typ, "min": n, "max": n, "lootmin": lootmin, "lootmax": lootmax})
+        gesamt += n
+    if not kinder:
+        return err("Bitte mindestens einen gültigen Zombie-Typ angeben.")
+    definition = {
+        "name": name, "nominal": anzahl, "min": anzahl, "max": anzahl, "lifetime": lifetime,
+        "restock": 0, "saferadius": 10, "distanceradius": 300, "cleanupradius": cleanup,
+        "flags": {"deletable": 0, "init_random": 0, "remove_damaged": 1},
+        "position": "fixed", "limit": "custom", "active": 1, "children": kinder,
+    }
+    zonen = []
+    for p in positions:
+        try:
+            x, z = float(p["x"]), float(p["z"])
+        except (TypeError, ValueError, KeyError):
+            return err("Ungültige Position.")
+        zonen.append({"x": x, "y": 0, "z": z, "r": radius, "smin": move["smin"],
+                      "smax": move["smax"], "dmin": move["dmin"], "dmax": move["dmax"]})
+    loop = asyncio.get_running_loop()
+    ev_text, ev_status = await _tools_datei_lesen(conn, "db/events.xml", loop)
+    if ev_status != "ok":
+        return err("db/events.xml nicht lesbar – bitte per /ftp_scan prüfen lassen.", 502)
+    try:
+        neu_ev = _tool_upsert_event(ev_text, definition)
+    except ValueError as e:
+        return err(str(e))
+    sp_text, sp_status = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
+    if sp_status != "ok":
+        return err("cfgeventspawns.xml nicht lesbar – bitte per /ftp_scan prüfen lassen.", 502)
+    try:
+        neu_sp = _tool_write_event_zones(sp_text, name, zonen)
+    except ValueError as e:
+        return err(str(e))
+    if not await _tools_datei_schreiben_wenn(commit, conn, "db/events.xml", neu_ev, loop):
+        return err("db/events.xml konnte nicht gespeichert werden.", 502)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "cfgeventspawns.xml", neu_sp, loop):
+        return err("Event gespeichert, aber Positionen (cfgeventspawns.xml) "
+                   "konnten nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Zombie-Horde gespeichert",
+                  f"{name}: {gesamt}× je Zone, {anzahl} Zone(n) · {conn.name}")
+    ev_block = _tool_finde_benannten_block(neu_ev, "event", name)
+    sp_block = _tool_finde_benannten_block(neu_sp, "event", name)
+    generated = [{"filename": "db/events.xml", "content": ev_block["block"] if ev_block else neu_ev},
+                {"filename": "cfgeventspawns.xml", "content": sp_block["block"] if sp_block else neu_sp}]
+    return ok({"name": name, "total": gesamt, "zones": anzahl, "generated": generated})
+
+
+async def api_tools_horde_batch_get(request: web.Request) -> web.Response:
+    """Tabellen-Editor der Zombie-Horden: Zonen kommen jetzt aus
+    env/zombie_territories.xml statt aus cfgeventspawns.xml. Alte, dort noch
+    gespeicherte Zonen werden zusaetzlich als `legacy_zones` mitgeliefert, damit
+    das Frontend eine Migrationshilfe anbieten kann."""
+    conn, fehler = _session_conn(request, "tools.horde")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.horde", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"hordes": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    ev_root, _s1 = await _tools_xml_lesen(conn, "db/events.xml", loop)
+    zt_root, _s2 = await _tools_xml_lesen(conn, "env/zombie_territories.xml", loop)
+    sp_root, _s3 = await _tools_xml_lesen(conn, "cfgeventspawns.xml", loop)
+    namen = _tool_events_liste(ev_root, nur_zombies=True)
+    zonen_map = _tool_zombie_zonen_lesen(zt_root)
+    hordes = []
+    for n in namen:
+        detail = _tool_event_details(ev_root, n) or {}
+        detail["zones"] = zonen_map.get(n, [])
+        if not detail["zones"]:
+            alte = _tool_spawn_zonen(sp_root, n)
+            if alte:
+                detail["legacy_zones"] = alte
+        hordes.append(detail)
+    return ok({"hordes": hordes})
+
+
+async def api_tools_horde_batch_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.horde")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.horde", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.horde", 10)
+        if fehler is not None:
+            return fehler
+    ops_in = data_in.get("ops") or []
+    if not ops_in:
+        return err("Keine Änderungen im Entwurf.")
+    ops = []
+    for o in ops_in:
+        art = str(o.get("op") or "").strip()
+        if art == "delete":
+            name = str(o.get("name") or "").strip()
+            if not name:
+                return err("Horden-Name zum Löschen fehlt.")
+            ops.append({"op": "delete", "name": name, "original_name": str(o.get("original_name") or name)})
+            continue
+        if art != "upsert":
+            return err(f'Unbekannte Operation „{art}".')
+        try:
+            gebaut = _tool_horde_definition_aus_payload(o)
+        except ValueError as e:
+            return err(str(e))
+        eintrag = dict(gebaut["definition"])
+        eintrag["op"] = "upsert"
+        eintrag["original_name"] = str(o.get("original_name") or eintrag["name"]).strip()
+        eintrag["zones"] = gebaut["zones"]
+        ops.append(eintrag)
+    finale_namen = [o["name"] for o in ops if o.get("op") == "upsert"]
+    if len(finale_namen) != len(set(finale_namen)):
+        return err("Zwei Horden im Entwurf haben denselben Namen.")
+    loop = asyncio.get_running_loop()
+    ev_text, ev_status = await _tools_datei_lesen(conn, "db/events.xml", loop)
+    if ev_status != "ok":
+        return err("db/events.xml nicht lesbar.", 502)
+    zt_text, zt_status = await _tools_datei_lesen(conn, "env/zombie_territories.xml", loop)
+    zt_text_fuer_batch = zt_text if zt_status == "ok" else _TOOL_LEERE_ZOMBIE_TERRITORIES
+    ergebnis = _tool_apply_horde_batch(ev_text, zt_text_fuer_batch, ops)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "db/events.xml", ergebnis["events_xml"], loop):
+        return err("db/events.xml konnte nicht gespeichert werden.", 502)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "env/zombie_territories.xml",
+                                             ergebnis["zombie_territories_xml"], loop):
+        return err("env/zombie_territories.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Zombie-Horden (Batch) gespeichert",
+                  f"{ergebnis['erstellt']} neu, {ergebnis['geaendert']} geändert, "
+                  f"{ergebnis['geloescht']} gelöscht · {conn.name}")
+    generated = [{"filename": "db/events.xml", "content": ergebnis["events_xml"]},
+                {"filename": "env/zombie_territories.xml", "content": ergebnis["zombie_territories_xml"]}]
+    return ok({"erstellt": ergebnis["erstellt"], "geaendert": ergebnis["geaendert"],
+              "geloescht": ergebnis["geloescht"], "generated": generated})
+
+
+# ── 4. Heli-Crash Loot ────────────────────────────────────────────────────
+async def api_tools_heliloot_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.heliloot")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.heliloot", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    ev_root, _s1 = await _tools_xml_lesen(conn, "db/events.xml", loop)
+    st_root, _s2 = await _tools_xml_lesen(conn, "cfgspawnabletypes.xml", loop)
+    detail = _tool_event_details(ev_root, "StaticHeliCrash") or {}
+    node = st_root.find('type[@name="Wreck_UH1Y"]') if st_root is not None else None
+    return ok({
+        "nominal": detail.get("nominal", 5), "min": detail.get("min", 3),
+        "max": detail.get("max", 7), "loot": _tool_spawnable_rows_lesen(node),
+    })
+
+
+async def api_tools_heliloot_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.heliloot")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.heliloot", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.heliloot", 10)
+        if fehler is not None:
+            return fehler
+    loot = data_in.get("loot") or []
+    if not loot:
+        return err("Bitte mindestens ein Loot-Item angeben.")
+    rows = []
+    for item in loot:
+        it = str(item.get("item") or "").strip()
+        if not it:
+            continue
+        try:
+            chance = max(0.0, min(1.0, float(item.get("num", 30)) / 100))
+        except (TypeError, ValueError):
+            chance = 0.3
+        rows.append({"kind": "cargo", "item": it, "chance": chance})
+    if not rows:
+        return err("Bitte mindestens ein gültiges Loot-Item angeben.")
+    try:
+        nominal = int(float(data_in.get("nominal", 5)))
+        minv = int(float(data_in.get("min", 3)))
+        maxv = int(float(data_in.get("max", 7)))
+    except (TypeError, ValueError):
+        return err("Ungültige Zahl bei der Crash-Anzahl.")
+    positions = data_in.get("positions") or []
+    loop = asyncio.get_running_loop()
+    st_text, st_status = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
+    basis = st_text if st_status == "ok" else _TOOL_LEERE_SPAWNABLETYPES
+    if st_status == "error":
+        return err("cfgspawnabletypes.xml per FTP nicht lesbar.", 502)
+    neu_st = _tool_upsert_spawnable_type(basis, "Wreck_UH1Y", rows)
+    ev_text, ev_status = await _tools_datei_lesen(conn, "db/events.xml", loop)
+    if ev_status != "ok":
+        return err("db/events.xml nicht lesbar.", 502)
+    try:
+        neu_ev = _tool_update_event_counts(ev_text, "StaticHeliCrash",
+                                          {"nominal": nominal, "min": minv, "max": maxv})
+    except ValueError as e:
+        return err(str(e))
+    if not await _tools_datei_schreiben_wenn(commit, conn, "cfgspawnabletypes.xml", neu_st, loop):
+        return err("cfgspawnabletypes.xml konnte nicht gespeichert werden.", 502)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "db/events.xml", neu_ev, loop):
+        return err("Loot gespeichert, aber Crash-Anzahl (db/events.xml) "
+                   "konnte nicht gespeichert werden.", 502)
+    sp_block = None
+    if positions:
+        sp_text, sp_status = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
+        if sp_status == "ok":
+            pts = []
+            for p in positions:
+                try:
+                    pts.append({"x": float(p["x"]), "z": float(p["z"]), "a": float(p.get("a", 0))})
+                except (TypeError, ValueError, KeyError):
+                    continue
+            if pts:
+                neu_sp, _added = _tool_upsert_eventspawns(sp_text, "StaticHeliCrash", pts, "append")
+                await _tools_datei_schreiben_wenn(commit, conn, "cfgeventspawns.xml", neu_sp, loop)
+                sp_block = _tool_finde_benannten_block(neu_sp, "event", "StaticHeliCrash")
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Heli-Crash-Loot gespeichert",
+                  f"{len(rows)} Item(s), nominal {nominal} · {conn.name}")
+    st_block = _tool_finde_benannten_block(neu_st, "type", "Wreck_UH1Y")
+    ev_block = _tool_finde_benannten_block(neu_ev, "event", "StaticHeliCrash")
+    generated = [{"filename": "cfgspawnabletypes.xml", "content": st_block["block"] if st_block else neu_st},
+                {"filename": "db/events.xml", "content": ev_block["block"] if ev_block else neu_ev}]
+    if sp_block:
+        generated.append({"filename": "cfgeventspawns.xml", "content": sp_block["block"]})
+    return ok({"items": len(rows), "generated": generated})
+
+
+# ── 5. Fahrzeug-Builder ───────────────────────────────────────────────────
+async def api_tools_vehicle_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.vehicle")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.vehicle", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"vehicle_events": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    ev_root, _s1 = await _tools_xml_lesen(conn, "db/events.xml", loop)
+    sp_root, _s2 = await _tools_xml_lesen(conn, "cfgeventspawns.xml", loop)
+    st_root, _s3 = await _tools_xml_lesen(conn, "cfgspawnabletypes.xml", loop)
+    namen = _tool_events_liste(ev_root, nur_fahrzeuge_von=TOOL_VEHICLES,
+                               ausblenden=_deployment_eventnamen(conn))
+    events = []
+    for n in namen:
+        detail = _tool_event_details(ev_root, n) or {}
+        typ = next((c["type"] for c in detail.get("children", []) if c["type"] in TOOL_VEHICLES), None)
+        detail["type"] = typ
+        detail["positions"] = _tool_spawn_positionen(sp_root, n)
+        node = None
+        color_suffix = ""
+        if st_root is not None and typ:
+            # Erst ohne Farbe suchen, dann jede belegte Variante - so findet ein
+            # zuvor mit Farbe gespeichertes Fahrzeug seinen Block beim Nachladen
+            # wieder, ohne die Farbe extra zu speichern.
+            for suffix in [""] + list(TOOL_VEHICLES[typ].get("farben", [])):
+                kandidat = st_root.find(f'type[@name="{typ}{("_" + suffix) if suffix else ""}"]')
+                if kandidat is not None:
+                    node = kandidat
+                    color_suffix = suffix
+                    break
+        detail["parts"] = _tool_vehicle_rows_lesen(node)
+        detail["color_suffix"] = color_suffix
+        events.append(detail)
+    return ok({"vehicle_events": events})
+
+
+async def api_tools_vehicle_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.vehicle")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.vehicle", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.vehicle", 10)
+        if fehler is not None:
+            return fehler
+    typ = str(data_in.get("type") or "").strip()
+    if typ not in TOOL_VEHICLES:
+        return err("Unbekannter Fahrzeugtyp.")
+    color_suffix = str(data_in.get("color_suffix") or "").strip()
+    if color_suffix and color_suffix not in TOOL_VEHICLES[typ].get("farben", []):
+        return err("Unbekannte Farbvariante für diesen Fahrzeugtyp.")
+    event_name = str(data_in.get("name") or "").strip() or ("Vehicle" + typ.replace("_", ""))
+    pos_mode = "append" if data_in.get("pos_mode") == "append" else "replace"
+    positions = data_in.get("positions") or []
+    # "Spawnpunkte jetzt anlegen" ist optional (Haken im Formular) - wer nur
+    # die Ausstattung (cfgspawnabletypes.xml) bauen will, braucht weder
+    # Event noch Position. Ohne den Haken bleiben db/events.xml und
+    # cfgeventspawns.xml unangetastet.
+    spawn_erstellen = bool(data_in.get("spawn_erstellen", True))
+    if spawn_erstellen and not positions:
+        return err("Bitte mindestens eine Position angeben.")
+    loop = asyncio.get_running_loop()
+    neu_ev = neu_sp = None
+    added = 0
+    if spawn_erstellen:
+        try:
+            nominal = int(float(data_in.get("nominal", 3)))
+            minv = int(float(data_in.get("min", 2)))
+            maxv = int(float(data_in.get("max", 4)))
+        except (TypeError, ValueError):
+            return err("Ungültige Zahl bei nominal/min/max.")
+        definition = {
+            "name": event_name, "nominal": nominal, "min": minv, "max": maxv,
+            "lifetime": 300, "restock": 0, "saferadius": 500, "distanceradius": 500,
+            "cleanupradius": 2500, "flags": {"deletable": 0, "init_random": 0, "remove_damaged": 1},
+            "position": "fixed", "limit": "custom", "active": 1,
+            "children": [{"type": typ, "min": minv, "max": maxv, "lootmin": 0, "lootmax": 0}],
+        }
+        pts = []
+        for p in positions:
+            try:
+                pts.append({"x": float(p["x"]), "z": float(p["z"]), "a": float(p.get("a", 0))})
+            except (TypeError, ValueError, KeyError):
+                return err("Ungültige Position.")
+        ev_text, ev_status = await _tools_datei_lesen(conn, "db/events.xml", loop)
+        if ev_status != "ok":
+            return err("db/events.xml nicht lesbar.", 502)
+        try:
+            neu_ev = _tool_upsert_event(ev_text, definition)
+        except ValueError as e:
+            return err(str(e))
+        sp_text, sp_status = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
+        if sp_status != "ok":
+            return err("cfgeventspawns.xml nicht lesbar.", 502)
+        try:
+            neu_sp, added = _tool_upsert_eventspawns(sp_text, event_name, pts, pos_mode)
+        except ValueError as e:
+            return err(str(e))
+        if not await _tools_datei_schreiben_wenn(commit, conn, "db/events.xml", neu_ev, loop):
+            return err("db/events.xml konnte nicht gespeichert werden.", 502)
+        if not await _tools_datei_schreiben_wenn(commit, conn, "cfgeventspawns.xml", neu_sp, loop):
+            return err("Event gespeichert, aber Positionen konnten nicht gespeichert werden.", 502)
+    st_block = None
+    farb_typ = f"{typ}_{color_suffix}" if color_suffix else typ
+    rows = []
+    # Jedes Teil ist ein einzeln angehaktes Checkbox-Element mit eigener
+    # Chance (siehe toolVehicleModal) - kein gemeinsamer "komplett fahrbereit"-
+    # Haken mehr davor, der war ueberfluessig: nichts angehakt heisst schon
+    # leere parts-Liste, also keine Zeilen.
+    for part in (data_in.get("parts") or []):
+        it = str(part.get("item") or "").strip()
+        if not it:
+            continue
+        try:
+            chance = max(0.0, min(1.0, float(part.get("chance", 1.0))))
+        except (TypeError, ValueError):
+            chance = 1.0
+        try:
+            item_chance = max(0.0, min(1.0, float(part.get("item_chance", 1.0))))
+        except (TypeError, ValueError):
+            item_chance = 1.0
+        rows.append({"kind": "attachments", "item": it,
+                    "chance": chance, "item_chance": item_chance})
+    # Kofferraum-Inhalt bleibt unabhaengig - ein Wrack kann Beute enthalten,
+    # ohne fahrbereit zu sein.
+    for c in (data_in.get("cargo") or []):
+        it = str(c.get("item") or "").strip()
+        if not it:
+            continue
+        try:
+            chance = max(0.0, min(1.0, float(c.get("num", 100)) / 100))
+        except (TypeError, ValueError):
+            chance = 1.0
+        rows.append({"kind": "cargo", "item": it, "chance": chance})
+    if rows:
+        st_text, st_status = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
+        basis = st_text if st_status == "ok" else _TOOL_LEERE_SPAWNABLETYPES
+        if st_status != "error":
+            # Farbvariante NUR hier am Ausstattungs-Classname - das Fahrzeug-
+            # Event/der Spawn (oben) bleibt am Basis-Typ, Nitrado-Events
+            # laufen generisch pro Fahrzeugtyp, nicht pro Farbe.
+            neu_st = _tool_upsert_spawnable_type(basis, farb_typ, rows)
+            await _tools_datei_schreiben_wenn(commit, conn, "cfgspawnabletypes.xml", neu_st, loop)
+            st_block = _tool_finde_benannten_block(neu_st, "type", farb_typ)
+    if not spawn_erstellen and not rows:
+        return err("Bitte mindestens ein Teil auswählen oder Spawnpunkte anlegen.")
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Fahrzeug gespeichert",
+                  f"{event_name} ({TOOL_VEHICLES[typ]['label']}), {added} neue Position(en) · {conn.name}")
+    generated = []
+    if spawn_erstellen:
+        ev_block = _tool_finde_benannten_block(neu_ev, "event", event_name)
+        sp_block = _tool_finde_benannten_block(neu_sp, "event", event_name)
+        generated.append({"filename": "db/events.xml", "content": ev_block["block"] if ev_block else neu_ev})
+        generated.append({"filename": "cfgeventspawns.xml", "content": sp_block["block"] if sp_block else neu_sp})
+    if st_block:
+        generated.append({"filename": "cfgspawnabletypes.xml", "content": st_block["block"]})
+    return ok({"name": event_name, "positions_added": added, "generated": generated})
+
+
+# ── NPC + Vehicle Deployment (erste Version: nur Fahrzeuge) ──────────────
+# Schreibt NUR eigene Segmente zwischen DAYZCODE-Markern in db/events.xml und
+# cfgeventspawns.xml. cfgspawnabletypes.xml wird nur gelesen: die Klasse muss
+# dort schon definiert sein (Vanilla-Ausstattung gilt), ein zweiter <type>
+# derselben Klasse waere ein Duplikat. Kein eigenes Backup - dafuer gibt es das
+# Modul "Backup der Server-Dateien".
+_DEPLOY_SUFFIX_RE = re.compile(r"[A-Za-z0-9_]{1,24}")
+_DEPLOY_MAX_PUNKTE = 20
+
+
+def _deployments(conn: ServerConnection) -> List[Dict[str, Any]]:
+    return [d for d in (conn.get("deployments") or []) if isinstance(d, dict)]
+
+
+def _deployment_eventnamen(conn: ServerConnection) -> Set[str]:
+    return {str(d.get("event_name")) for d in _deployments(conn) if d.get("event_name")}
+
+
+def _deploy_presets_fuer(conn: ServerConnection) -> Dict[str, Dict[str, Any]]:
+    karte = _canonical_map_name(str(conn.get("map_name") or ""))
+    return {k: v for k, v in TOOL_DEPLOY_VEHICLES.items()
+            if v["karten"] is None or karte is None or karte in v["karten"]}
+
+
+def _deploy_punkte_pruefen(roh: Any) -> List[Dict[str, float]]:
+    if not isinstance(roh, list) or not roh:
+        raise ValueError("Bitte mindestens einen Spawnpunkt auf der Karte setzen.")
+    if len(roh) > _DEPLOY_MAX_PUNKTE:
+        raise ValueError(f"Höchstens {_DEPLOY_MAX_PUNKTE} Spawnpunkte pro Einsatz.")
+    punkte = []
+    for p in roh:
+        try:
+            x, z, a = float(p["x"]), float(p["z"]), float(p.get("a", 0) or 0)
+        except (TypeError, ValueError, KeyError):
+            raise ValueError("Ungültiger Spawnpunkt.") from None
+        if not all(math.isfinite(v) for v in (x, z, a)):
+            raise ValueError("Ungültiger Spawnpunkt.")
+        if not (0 <= x <= 20000 and 0 <= z <= 20000):
+            raise ValueError("Ein Spawnpunkt liegt außerhalb der Karte.")
+        if not 0 <= a < 360:
+            raise ValueError("Der Winkel muss zwischen 0 und 359 liegen.")
+        punkte.append({"x": round(x, 1), "z": round(z, 1), "a": round(a, 1)})
+    return punkte
+
+
+def _deploy_status(dep_id: str, ev_text: Optional[str], sp_text: Optional[str]) -> str:
+    def hat(text: Optional[str]) -> bool:
+        if text is None:
+            return False
+        return any(s["id"] == dep_id for s in _dayzcode_segmente(text, streng=False))
+    ev, sp = hat(ev_text), hat(sp_text)
+    if ev and sp:
+        return "ok"
+    return "teilweise" if (ev or sp) else "fehlt"
+
+
+async def _deploy_vorbereiten(request: web.Request, aktion: str):
+    conn, fehler = _session_conn(request, "tools.deployment")
+    if fehler is not None:
+        return None, fehler
+    fehler = await _modul_pruefen("tools.deployment", request, conn)
+    if fehler is not None:
+        return None, fehler
+    fehler = await _dash_gate(request, conn, "tools", aktion)
+    if fehler is not None:
+        return None, fehler
+    return conn, None
+
+
+async def api_tools_deployment_get(request: web.Request) -> web.Response:
+    conn, fehler = await _deploy_vorbereiten(request, "view")
+    if fehler is not None:
+        return fehler
+    presets = [{"key": k, "label": v["label"], "klasse": v["klasse"],
+                "image": _deploy_bild(v), "bald": bool(v.get("bald"))}
+               for k, v in _deploy_presets_fuer(conn).items()]
+    npc_presets = [{"key": k, "label": v["label"], "event": v["event"],
+                    "items": [i for _art, i in v["items"]],
+                    "slots": [[art, i] for art, i in v["items"]]}
+                   for k, v in TOOL_DEPLOY_NPCS.items()]
+    if not _mission_dir_of(conn):
+        return ok({"presets": presets, "npc_presets": npc_presets, "freie_koerper": [],
+                   "deployments": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    ev_text, ev_s = await _tools_datei_lesen(conn, "db/events.xml", loop)
+    sp_text, sp_s = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
+    st_text, st_s = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
+    liste = []
+    for d in _deployments(conn):
+        eintrag = {k: d.get(k) for k in ("id", "event_name", "preset", "klasse", "art",
+                                         "punkte", "erstellt")}
+        eintrag["status"] = _deploy_status(str(d.get("id")),
+                                           ev_text if ev_s == "ok" else None,
+                                           sp_text if sp_s == "ok" else None)
+        liste.append(eintrag)
+    return ok({"presets": presets, "npc_presets": npc_presets,
+               "freie_koerper": _deploy_freie_koerper(conn, st_text if st_s == "ok" else None),
+               "deployments": liste})
+
+
+def _deploy_freie_koerper(conn: ServerConnection, st_text: Optional[str]) -> List[str]:
+    """Koerperklassen ohne eigenen <type> in cfgspawnabletypes.xml und ohne
+    anderen NPC-Einsatz - nur die bekommen eine eigene Ausruestung."""
+    if st_text is None:
+        return []
+    belegt = {str(d.get("klasse")) for d in _deployments(conn) if d.get("art") == "npc"}
+    return [k for k in TOOL_DEPLOY_SURVIVORS
+            if k not in belegt and _tool_finde_benannten_block(st_text, "type", k) is None]
+
+
+async def api_tools_deployment_deploy(request: web.Request) -> web.Response:
+    conn, fehler = await _deploy_vorbereiten(request, "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    commit = bool(data.get("commit"))
+    art = "npc" if data.get("art") == "npc" else "fahrzeug"
+    if art == "npc":
+        preset = TOOL_DEPLOY_NPCS.get(str(data.get("preset") or ""))
+        if preset is None:
+            return err("Diese NPC-Vorlage gibt es nicht.", 422)
+        klasse = str(data.get("koerper") or "")
+        if klasse not in TOOL_DEPLOY_SURVIVORS:
+            return err("Bitte einen gültigen Körper auswählen.", 422)
+    else:
+        preset = _deploy_presets_fuer(conn).get(str(data.get("preset") or ""))
+        if preset is None:
+            return err("Diese Vorlage gibt es für die Karte dieses Servers nicht.", 422)
+        if preset.get("bald"):
+            return err("Dieses Fahrzeug kommt erst mit DayZ 1.30 – Einsetzen noch gesperrt.", 422)
+        klasse = preset["klasse"]
+    try:
+        punkte = _deploy_punkte_pruefen(data.get("positions"))
+    except ValueError as e:
+        return err(str(e))
+    dep_id = f"dv_{uuid.uuid4().hex[:10]}"
+    suffix = str(data.get("suffix") or "").strip()
+    if suffix and not _DEPLOY_SUFFIX_RE.fullmatch(suffix):
+        return err("Der eigene Name darf nur Buchstaben, Ziffern und _ enthalten "
+                   "(höchstens 24 Zeichen).")
+    praefix = preset["event"] if art == "npc" else f"Vehicle{klasse}"
+    event_name = f"{praefix}_{suffix or dep_id[3:7].upper()}"
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.deployment", 10)
+        if fehler is not None:
+            return fehler
+    loop = asyncio.get_running_loop()
+    ev_text, ev_s = await _tools_datei_lesen(conn, "db/events.xml", loop)
+    sp_text, sp_s = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
+    st_text, st_s = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
+    if ev_s != "ok" or sp_s != "ok" or st_s != "ok":
+        return err("db/events.xml, cfgeventspawns.xml oder cfgspawnabletypes.xml "
+                   "nicht lesbar.", 502)
+    if art == "npc":
+        if klasse not in _deploy_freie_koerper(conn, st_text):
+            return err(f"Der Körper „{klasse}“ ist schon belegt – bitte einen anderen wählen.", 409)
+    elif _tool_finde_benannten_block(st_text, "type", klasse) is None:
+        return err(f"In der cfgspawnabletypes.xml fehlt der Eintrag „{klasse}“ – "
+                   f"das Fahrzeug würde ohne Ausstattung spawnen.", 422)
+    for text in (ev_text, sp_text):
+        if _tool_finde_benannten_block(text, "event", event_name) is not None:
+            return err(f"Ein Event „{event_name}“ gibt es schon – bitte einen "
+                       f"anderen eigenen Namen wählen.", 409)
+    try:
+        ev_block = _dayzcode_event_xml(event_name, klasse, len(punkte),
+                                       lifetime=3600 if art == "npc" else 300)
+        sp_block = _dayzcode_spawn_xml(event_name, punkte)
+        dateien = [("db/events.xml", ev_text,
+                    _dayzcode_einfuegen(ev_text, "events", dep_id, ev_block), ev_block),
+                   ("cfgeventspawns.xml", sp_text,
+                    _dayzcode_einfuegen(sp_text, "eventposdef", dep_id, sp_block), sp_block)]
+        if art == "npc":
+            st_block = _dayzcode_type_xml(klasse, preset["items"])
+            dateien.append(("cfgspawnabletypes.xml", st_text,
+                            _dayzcode_einfuegen(st_text, "spawnabletypes", dep_id, st_block),
+                            st_block))
+        for _name, _alt, neu, _block in dateien:
+            _dayzcode_segmente(neu)
+            ET.fromstring(neu)
+    except ET.ParseError as e:
+        return err(f"Die Server-Datei ist danach kein gültiges XML ({e}) – nichts geschrieben.")
+    except ValueError as e:
+        return err(str(e))
+    generated = [{"filename": name, "content": block} for name, _alt, _neu, block in dateien]
+    if not commit:
+        return ok({"event_name": event_name, "generated": generated})
+    geschrieben = []
+    for name, alt, neu, _block in dateien:
+        if await _tools_datei_schreiben(conn, name, neu, loop):
+            geschrieben.append((name, alt))
+            continue
+        # Rollback: bereits geschriebene Dateien zuruecksetzen - sonst bliebe
+        # z. B. ein Event ohne Spawnpunkte zurueck.
+        fehlgeschlagen = [n for n, a in geschrieben
+                          if not await _tools_datei_schreiben(conn, n, a, loop)]
+        if not geschrieben:
+            return err(f"{name} konnte nicht gespeichert werden – nichts geändert.", 502)
+        return err(f"{name} konnte nicht gespeichert werden – "
+                   + ("die übrigen Dateien wurden zurückgesetzt." if not fehlgeschlagen
+                      else "ACHTUNG: " + ", ".join(fehlgeschlagen)
+                           + " konnte nicht zurückgesetzt werden, bitte prüfen."), 502)
+    eintraege = _deployments(conn)
+    eintraege.append({"id": dep_id, "event_name": event_name, "preset": data.get("preset"),
+                      "klasse": klasse, "art": art, "punkte": punkte,
+                      "erstellt": time.time()})
+    _conn_store(conn, "deployments", eintraege)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+               "Tool: NPC eingesetzt" if art == "npc" else "Tool: Fahrzeug eingesetzt",
+               f"{event_name} ({len(punkte)} Punkt(e)) · {conn.name}")
+    return ok({"event_name": event_name, "id": dep_id, "generated": generated})
+
+
+async def api_tools_deployment_remove(request: web.Request) -> web.Response:
+    conn, fehler = await _deploy_vorbereiten(request, "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    dep_id = str(data.get("id") or "")
+    eintrag = next((d for d in _deployments(conn) if d.get("id") == dep_id), None)
+    if eintrag is None:
+        return err("Diesen Einsatz gibt es nicht (mehr).", 404)
+    fehler = _dash_rate_limited(request, "tools.deployment", 10)
+    if fehler is not None:
+        return fehler
+    loop = asyncio.get_running_loop()
+    dateien = ["db/events.xml", "cfgeventspawns.xml"]
+    if eintrag.get("art") == "npc":
+        dateien.append("cfgspawnabletypes.xml")
+    for datei in dateien:
+        text, status = await _tools_datei_lesen(conn, datei, loop)
+        if status != "ok":
+            return err(f"{datei} nicht lesbar.", 502)
+        try:
+            neu, gefunden = _dayzcode_entfernen(text, dep_id)
+        except ValueError as e:
+            return err(f"{datei}: {e}")
+        if gefunden and not await _tools_datei_schreiben(conn, datei, neu, loop):
+            return err(f"{datei} konnte nicht gespeichert werden.", 502)
+    _conn_store(conn, "deployments", [d for d in _deployments(conn) if d.get("id") != dep_id])
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Einsatz entfernt",
+               f"{eintrag.get('event_name')} · {conn.name}")
+    return ok({"entfernt": dep_id})
+
+
+# PRA schema: BohemiaInteractive/DayZ-Script-Diff,
+# scripts/3_game/cfgplayerrestrictedareajsondata.c and
+# DayZ-Central-Economy/dayzOffline.sakhal/pra/warheadstorage.json.
+# PlayerBase.AfterStoreLoad checks these areas on loading a saved character.
+_TELEPORT_NAME = re.compile(r"[A-Za-z0-9_]{1,64}")
+
+
+def _teleports(conn: ServerConnection) -> List[Dict[str, Any]]:
+    # Never conn.get(): legacy configuration fallback could expose another tenant.
+    return [dict(item) for item in conn.data.get("teleports", []) if isinstance(item, dict)]
+
+
+def _teleport_files(data: Dict[str, Any], conn: ServerConnection):
+    name = data.get("name")
+    if not isinstance(name, str) or not _TELEPORT_NAME.fullmatch(name):
+        raise ValueError("Zonenname: 1–64 Buchstaben, Ziffern oder _ verwenden.")
+    map_name = _canonical_map_name(str(conn.data.get("map_name") or ""))
+    world_size = DEFAULT_MAP_SIZES.get(map_name)
+    if world_size is None:
+        raise ValueError("Karte unbekannt – zuerst die Serververbindung prüfen.")
+
+    def number(value, low, high):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("Alle Koordinaten, Größen und Winkel müssen Zahlen sein.")
+        if not low <= value <= high or not math.isfinite(value):
+            raise ValueError("Koordinate, Größe oder Winkel außerhalb des erlaubten Bereichs.")
+        return value
+
+    def position(item):
+        if not isinstance(item, dict):
+            raise ValueError("Ungültiger Punkt.")
+        return [number(item.get("x"), 0, world_size),
+                number(item.get("y"), -1000, 10000),
+                number(item.get("z"), 0, world_size)]
+
+    def rotation(item, keys):
+        return [number(item.get(key, 0), -360, 360) for key in keys]
+
+    boxes, targets = data.get("boxes"), data.get("targets")
+    if not isinstance(boxes, list) or not 1 <= len(boxes) <= 100:
+        raise ValueError("Bitte 1–100 Auslöse-Boxen angeben.")
+    if not isinstance(targets, list) or not 1 <= len(targets) <= 100:
+        raise ValueError("Bitte 1–100 Zielpunkte angeben.")
+    pra_boxes, objects = [], []
+    for box in boxes:
+        pos = position(box)
+        size = [number(box.get(key), 0.1, world_size) for key in ("width", "height", "depth")]
+        pra_boxes.append([size, rotation(box, ("yaw", "pitch", "roll")), pos])
+        classname = box.get("object", "")
+        if not isinstance(classname, str) or (classname and not re.fullmatch(r"[A-Za-z0-9_]{1,128}", classname)):
+            raise ValueError("Ungültiger Objekt-Classname.")
+        if classname:
+            objects.append({"name": classname, "pos": pos,
+                            "ypr": rotation(box, ("objectYaw", "objectPitch", "objectRoll")),
+                            "scale": 1, "enableCEPersistency": 0})
+    pra = {"areaName": name, "PRABoxes": pra_boxes,
+           "safePositions3D": [position(p) for p in targets]}
+    files = [(f"custom/pra/{name}.json", pra)]
+    if objects:
+        files.append((f"custom/{name}_objects.json", {"Objects": objects}))
+    return name, [(path, json.dumps(content, indent=4, ensure_ascii=False) + "\n")
+                  for path, content in files]
+
+
+async def _teleport_prepare(request, action):
+    conn, error = _session_conn(request, "tools.teleports")
+    if error is not None:
+        return None, error
+    error = await _modul_pruefen("tools.teleports", request, conn)
+    if error is None:
+        error = await _dash_gate(request, conn, "tools", action)
+    return conn, error
+
+
+async def api_tools_teleports_get(request: web.Request) -> web.Response:
+    conn, error = await _teleport_prepare(request, "view")
+    if error is not None:
+        return error
+    return ok({"teleports": [{k: item.get(k) for k in ("id", "name", "files", "created")}
+                             for item in _teleports(conn)],
+               "kein_mission_ordner": not bool(_mission_dir_of(conn))})
+
+
+async def _teleport_gameplay(conn, loop):
+    raw, status = await _tools_datei_lesen(conn, "cfggameplay.json", loop)
+    if status != "ok":
+        raise ValueError("Die cfggameplay.json ist nicht lesbar.")
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Die cfggameplay.json enthält ungültiges JSON.") from exc
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("WorldsData", {}), dict):
+        raise ValueError("WorldsData muss ein JSON-Objekt sein.")
+    for key in ("playerRestrictedAreaFiles", "objectSpawnersArr"):
+        value = parsed.get("WorldsData", {}).get(key, [])
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ValueError("PRA- und Object-Spawner-Einträge müssen Listen von Dateipfaden sein.")
+    return raw, parsed
+
+
+def _teleport_key(path):
+    return "playerRestrictedAreaFiles" if path.startswith("custom/pra/") else "objectSpawnersArr"
+
+
+async def _teleport_transaction(conn, changes, manifest, loop):
+    """Compensate every attempted mutation, including a failed partial write/delete."""
+    attempted = []
+    old_manifest = _teleports(conn)
+    had_manifest = "teleports" in conn.data
+    saving_manifest = False
+    try:
+        for path, before, after in changes:
+            attempted.append((path, before))
+            success = (await _tools_datei_loeschen(conn, path, loop) if after is None
+                       else await _tools_datei_schreiben(conn, path, after, loop))
+            if not success:
+                raise OSError(path)
+        saving_manifest = True
+        _conn_store(conn, "teleports", manifest, strict=True)
+    except Exception:
+        failed = []
+        for path, before in reversed(attempted):
+            try:
+                if before is None:
+                    _, status = await _tools_datei_lesen(conn, path, loop)
+                    restored = status == "missing" or await _tools_datei_loeschen(conn, path, loop)
+                else:
+                    restored = await _tools_datei_schreiben(conn, path, before, loop)
+                if not restored:
+                    failed.append(path)
+            except Exception:
+                failed.append(path)
+        if saving_manifest:
+            try:
+                _conn_store(conn, "teleports", old_manifest, strict=True)
+            except Exception:
+                failed.append("connections.json")
+            if not had_manifest:
+                conn.data.pop("teleports", None)
+        message = "Speichern fehlgeschlagen – Änderungen wurden zurückgesetzt."
+        if failed:
+            message = "Rollback unvollständig – folgende Dateien prüfen: " + ", ".join(failed)
+        return err(message, 502)
+    return None
+
+
+async def api_tools_teleports_post(request: web.Request) -> web.Response:
+    conn, error = await _teleport_prepare(request, "edit")
+    if error is not None:
+        return error
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    if not isinstance(data, dict) or type(data.get("commit", False)) is not bool:
+        return err("Ungültige Teleport-Anfrage.")
+    try:
+        name, files = _teleport_files(data, conn)
+    except ValueError as exc:
+        return err(str(exc))
+    commit = data.get("commit", False)
+    if commit:
+        error = _dash_rate_limited(request, "tools.teleports", 10)
+        if error is not None:
+            return error
+    async with _schaden_lock(conn.service_id):
+        loop = asyncio.get_running_loop()
+        entries = _teleports(conn)
+        if any(item.get("name", "").lower() == name.lower() for item in entries):
+            return err("Dieser Teleport-Name ist bereits vorhanden.", 409)
+        try:
+            raw, gameplay = await _teleport_gameplay(conn, loop)
+        except ValueError as exc:
+            return err(str(exc), 502)
+        worlds_created = "WorldsData" not in gameplay
+        worlds = gameplay.setdefault("WorldsData", {})
+        keys_created = [key for key in ("playerRestrictedAreaFiles", "objectSpawnersArr")
+                        if key not in worlds and any(_teleport_key(p) == key for p, _ in files)]
+        # Reserve both names, even if this deployment has no visible objects.
+        for path in (f"custom/pra/{name}.json", f"custom/{name}_objects.json"):
+            _, status = await _tools_datei_lesen(conn, path, loop)
+            if status not in ("ok", "missing"):
+                return err("Vorhandene Teleport-Dateien konnten nicht geprüft werden.", 502)
+            refs = worlds.get(_teleport_key(path), [])
+            if status == "ok" or any(_custom_spawner_pfad_normalisieren(p).lower() == path.lower() for p in refs):
+                return err("Dieser Teleport-Name ist bereits vorhanden.", 409)
+        for path, _ in files:
+            key = _teleport_key(path)
+            if key not in worlds:
+                # Neue Liste direkt hinter objectSpawnersArr (sonst ganz vorne)
+                # einsortieren statt ans Ende - sonst steht sie in der Vorschau
+                # hinter langen Listen wie environmentMinTemps und wird uebersehen.
+                vorher = list(worlds.items())
+                pos = next((i + 1 for i, (k, _v) in enumerate(vorher)
+                            if k == "objectSpawnersArr"), 0)
+                vorher.insert(pos, (key, []))
+                worlds.clear()
+                worlds.update(vorher)
+            worlds[key].append(path)
+        updated = json.dumps(gameplay, indent=4, ensure_ascii=False) + "\n"
+        generated = [{"filename": p, "content": content} for p, content in files]
+        generated.append({"filename": "cfggameplay.json", "content": updated})
+        if not commit:
+            return ok({"name": name, "generated": generated})
+        # FTP does not create missing parent directories on STOR.
+        for folder in ("custom", "custom/pra"):
+            if not await loop.run_in_executor(None, conn.ftp.mkdir,
+                                             f"{_mission_dir_of(conn).rstrip('/')}/{folder}"):
+                return err("Der Teleport-Ordner konnte nicht angelegt werden.", 502)
+        entry = {"id": uuid.uuid4().hex, "name": name, "files": [p for p, _ in files],
+                 "created": time.time(), "gameplay_before": raw, "gameplay_after": updated,
+                 "keys_created": keys_created, "worlds_created": worlds_created}
+        changes = [(p, None, content) for p, content in files] + [("cfggameplay.json", raw, updated)]
+        error = await _teleport_transaction(conn, changes, entries + [entry], loop)
+        if error is not None:
+            return error
+        return ok({"id": entry["id"], "name": name, "generated": generated})
+
+
+async def api_tools_teleports_remove(request: web.Request) -> web.Response:
+    conn, error = await _teleport_prepare(request, "edit")
+    if error is not None:
+        return error
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    if not isinstance(data, dict):
+        return err("Ungültige Teleport-Anfrage.")
+    error = _dash_rate_limited(request, "tools.teleports.remove", 10)
+    if error is not None:
+        return error
+    async with _schaden_lock(conn.service_id):
+        entries = _teleports(conn)
+        entry = next((item for item in entries if item.get("id") == data.get("id")), None)
+        if entry is None:
+            return err("Diesen Teleport gibt es nicht (mehr).", 404)
+        loop = asyncio.get_running_loop()
+        try:
+            raw, gameplay = await _teleport_gameplay(conn, loop)
+        except ValueError as exc:
+            return err(str(exc), 502)
+        worlds = gameplay.get("WorldsData", {})
+        file_changes = []
+        for path in entry["files"]:
+            before, status = await _tools_datei_lesen(conn, path, loop)
+            if status not in ("ok", "missing"):
+                return err("Vorhandene Teleport-Dateien konnten nicht geprüft werden.", 502)
+            if status == "ok":
+                file_changes.append((path, before, None))
+            key = _teleport_key(path)
+            if key in worlds:
+                worlds[key] = [p for p in worlds[key]
+                               if _custom_spawner_pfad_normalisieren(p) != path]
+        for key in entry.get("keys_created", []):
+            if worlds.get(key) == []:
+                worlds.pop(key)
+        if entry.get("worlds_created") and not worlds:
+            gameplay.pop("WorldsData", None)
+        updated = json.dumps(gameplay, indent=4, ensure_ascii=False) + "\n"
+        if raw == entry.get("gameplay_after"):
+            updated = entry["gameplay_before"]
+        remaining = [item for item in entries if item["id"] != entry["id"]]
+        # Removing out of order must not resurrect an older deployment via its snapshot.
+        for item in remaining:
+            item.pop("gameplay_after", None)
+            item["keys_created"] = list(set(item.get("keys_created", []) + entry.get("keys_created", [])))
+            item["worlds_created"] = item.get("worlds_created", False) or entry.get("worlds_created", False)
+        error = await _teleport_transaction(conn, [("cfggameplay.json", raw, updated)] + file_changes,
+                                            remaining, loop)
+        if error is not None:
+            return error
+        return ok({"entfernt": entry["id"]})
+
+
+# ── 6. Rucksack-Builder (Inhalte & Aufsätze) ──────────────────────────────
+def _tool_upsert_bag_cargo(text: str, name: str, items: List[Dict[str, Any]]) -> str:
+    """Wie ``_tool_upsert_spawnable_type``, aber mit EINEM gemeinsamen
+    ``<cargo>``-Block fuer alle Items statt einem Block je Zeile - so baut es
+    auch die Referenzseite (doordiehub.com/BuildABag), naeher an echter
+    DayZ-Server-Praxis als das alte Ein-Block-pro-Zeile-Muster."""
+    zeilen = []
+    for it in items:
+        try:
+            chance = max(0.0, min(1.0, float(it.get("chance", 1.0))))
+        except (TypeError, ValueError):
+            chance = 1.0
+        zeilen.append(f'            <item name="{_tool_esc_xml(it["item"])}" chance="{chance:.2f}"/>')
+    snippet = (f'<type name="{_tool_esc_xml(name)}">\n'
+               f'        <cargo chance="1.00">\n' + "\n".join(zeilen) +
+               f'\n        </cargo>\n    </type>')
+    return _tool_benannten_block_ersetzen(text, "spawnabletypes", "type", name, snippet)
+
+
+def _tool_bag_cargo_lesen(node: Optional[ET.Element]) -> List[Dict[str, Any]]:
+    """Liest die Cargo-Items eines ``<type>``-Knotens fuers Vorbelegen - liest
+    ALLE ``<cargo>``-Bloecke (falls von Hand/frueher mehrere angelegt wurden),
+    nicht nur den ersten."""
+    if node is None:
+        return []
+    rows = []
+    for b in node.findall("cargo"):
+        for item in b.findall("item"):
+            if not item.get("name"):
+                continue
+            try:
+                chance = max(0.0, min(1.0, float(item.get("chance") or 0)))
+            except (TypeError, ValueError):
+                chance = 0.0
+            rows.append({"item": item.get("name"), "chance": chance})
+    return rows
+
+
+async def api_tools_bag_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.spawnable")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.spawnable", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"bags": {}, "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    st_root, _s = await _tools_xml_lesen(conn, "cfgspawnabletypes.xml", loop)
+    bags = {}
+    if st_root is not None:
+        for bag in TOOL_BAGS:
+            node = st_root.find(f'type[@name="{bag}"]')
+            if node is not None:
+                bags[bag] = _tool_bag_cargo_lesen(node)
+    return ok({"bags": bags})
+
+
+async def api_tools_bag_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.spawnable")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.spawnable", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.spawnable", 10)
+        if fehler is not None:
+            return fehler
+    bag = str(data_in.get("bag") or "").strip()
+    if bag not in TOOL_BAGS:
+        return err("Unbekannte Tasche.")
+    items = []
+    for c in (data_in.get("cargo") or []):
+        it = str(c.get("item") or "").strip()
+        if not it:
+            continue
+        try:
+            chance = max(0.0, min(1.0, float(c.get("chance", 1.0))))
+        except (TypeError, ValueError):
+            chance = 1.0
+        items.append({"item": it, "chance": chance})
+    if not items:
+        return err("Bitte mindestens ein Item hinzufügen.")
+    loop = asyncio.get_running_loop()
+    st_text, st_status = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
+    basis = st_text if st_status == "ok" else _TOOL_LEERE_SPAWNABLETYPES
+    if st_status == "error":
+        return err("cfgspawnabletypes.xml per FTP nicht lesbar.", 502)
+    neu = _tool_upsert_bag_cargo(basis, bag, items)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "cfgspawnabletypes.xml", neu, loop):
+        return err("cfgspawnabletypes.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Rucksack gespeichert",
+                  f"{TOOL_BAGS[bag]['label']}: {len(items)} Item(s) · {conn.name}")
+    block = _tool_finde_benannten_block(neu, "type", bag)
+    generated = [{"filename": "cfgspawnabletypes.xml", "content": block["block"] if block else neu}]
+    return ok({"bag": bag, "items": len(items), "generated": generated})
+
+
+# ── 7. Event-Vorlagen ──────────────────────────────────────────────────────
+async def api_tools_event_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.event")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.event", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"events": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    ev_root, _s1 = await _tools_xml_lesen(conn, "db/events.xml", loop)
+    sp_root, _s2 = await _tools_xml_lesen(conn, "cfgeventspawns.xml", loop)
+    namen = _tool_events_liste(ev_root, ausblenden=_deployment_eventnamen(conn))
+    events = []
+    for n in namen:
+        detail = _tool_event_details(ev_root, n) or {}
+        detail["positions"] = _tool_spawn_positionen(sp_root, n)
+        events.append(detail)
+    return ok({"events": events})
+
+
+async def api_tools_event_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.event")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.event", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.event", 10)
+        if fehler is not None:
+            return fehler
+    name = str(data_in.get("name") or "").strip() or "StaticMeinEvent"
+    kinder_in = data_in.get("children") or []
+    kinder = []
+    for c in kinder_in:
+        typ = str(c.get("item") or "").strip()
+        if not typ:
+            continue
+        try:
+            n = max(1, round(float(c.get("num", 1))))
+        except (TypeError, ValueError):
+            n = 1
+        kinder.append({"type": typ, "min": n, "max": n, "lootmin": 0, "lootmax": 0})
+    if not kinder:
+        return err("Bitte mindestens ein Kind (was spawnt) angeben.")
+    try:
+        definition = {
+            "name": name,
+            "nominal": int(float(data_in.get("nominal", 1))),
+            "min": int(float(data_in.get("min", 1))),
+            "max": int(float(data_in.get("max", 1))),
+            "lifetime": int(float(data_in.get("lifetime", 1800))),
+            "restock": int(float(data_in.get("restock", 0))),
+            "saferadius": int(float(data_in.get("saferadius", 500))),
+            "distanceradius": int(float(data_in.get("distanceradius", 500))),
+            "cleanupradius": int(float(data_in.get("cleanupradius", 1000))),
+            "flags": {"deletable": 1 if data_in.get("deletable") else 0,
+                     "init_random": 1 if data_in.get("init_random") else 0,
+                     "remove_damaged": 1 if data_in.get("remove_damaged") else 0},
+            "position": str(data_in.get("position") or "fixed"),
+            "limit": str(data_in.get("limit") or "custom"),
+            "active": 1 if data_in.get("active", True) else 0,
+            "children": kinder,
+        }
+    except (TypeError, ValueError):
+        return err("Ungültige Zahl in den Event-Einstellungen.")
+    loop = asyncio.get_running_loop()
+    ev_text, ev_status = await _tools_datei_lesen(conn, "db/events.xml", loop)
+    if ev_status != "ok":
+        return err("db/events.xml nicht lesbar.", 502)
+    try:
+        neu_ev = _tool_upsert_event(ev_text, definition)
+    except ValueError as e:
+        return err(str(e))
+    if not await _tools_datei_schreiben_wenn(commit, conn, "db/events.xml", neu_ev, loop):
+        return err("db/events.xml konnte nicht gespeichert werden.", 502)
+    positions = data_in.get("positions") or []
+    sp_block = None
+    if positions:
+        pts = []
+        for p in positions:
+            try:
+                pts.append({"x": float(p["x"]), "z": float(p["z"]), "a": float(p.get("a", 0))})
+            except (TypeError, ValueError, KeyError):
+                continue
+        if pts:
+            sp_text, sp_status = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
+            if sp_status == "ok":
+                neu_sp, _added = _tool_upsert_eventspawns(sp_text, name, pts, "replace")
+                await _tools_datei_schreiben_wenn(commit, conn, "cfgeventspawns.xml", neu_sp, loop)
+                sp_block = _tool_finde_benannten_block(neu_sp, "event", name)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Event-Vorlage gespeichert",
+                  f"{name} · {conn.name}")
+    ev_block = _tool_finde_benannten_block(neu_ev, "event", name)
+    generated = [{"filename": "db/events.xml", "content": ev_block["block"] if ev_block else neu_ev}]
+    if sp_block:
+        generated.append({"filename": "cfgeventspawns.xml", "content": sp_block["block"]})
+    return ok({"name": name, "generated": generated})
+
+
+async def api_tools_event_batch_post(request: web.Request) -> web.Response:
+    """Tabellen-Editor der Event-Vorlagen: mehrere Events in einem Rutsch anlegen,
+    aendern, umbenennen oder loeschen. Anders als api_tools_event_post (die bleibt
+    unveraendert bestehen) liest diese Route beide Dateien genau einmal, wendet
+    alle Operationen im Speicher an und schreibt beide Dateien nur einmal zusammen."""
+    conn, fehler = _session_conn(request, "tools.event")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.event", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.event", 10)
+        if fehler is not None:
+            return fehler
+    ops_in = data_in.get("ops") or []
+    if not ops_in:
+        return err("Keine Änderungen im Entwurf.")
+    ops = []
+    for o in ops_in:
+        art = str(o.get("op") or "").strip()
+        if art == "delete":
+            name = str(o.get("name") or "").strip()
+            if not name:
+                return err("Event-Name zum Löschen fehlt.")
+            ops.append({"op": "delete", "name": name, "original_name": str(o.get("original_name") or name)})
+            continue
+        if art != "upsert":
+            return err(f'Unbekannte Operation „{art}".')
+        try:
+            definition = _tool_event_definition_aus_payload(o)
+        except ValueError as e:
+            return err(str(e))
+        definition["op"] = "upsert"
+        definition["original_name"] = str(o.get("original_name") or definition["name"]).strip()
+        definition["positions"] = o.get("positions")
+        ops.append(definition)
+    finale_namen = [o["name"] for o in ops if o.get("op") == "upsert"]
+    if len(finale_namen) != len(set(finale_namen)):
+        return err("Zwei Events im Entwurf haben denselben Namen.")
+    loop = asyncio.get_running_loop()
+    ev_text, ev_status = await _tools_datei_lesen(conn, "db/events.xml", loop)
+    if ev_status != "ok":
+        return err("db/events.xml nicht lesbar.", 502)
+    sp_text, sp_status = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
+    sp_text_fuer_batch = sp_text if sp_status == "ok" else None
+    try:
+        ergebnis = _tool_apply_event_batch(ev_text, sp_text_fuer_batch, ops)
+    except ValueError as e:
+        return err(str(e))
+    if not await _tools_datei_schreiben_wenn(commit, conn, "db/events.xml", ergebnis["events_xml"], loop):
+        return err("db/events.xml konnte nicht gespeichert werden.", 502)
+    if ergebnis["eventspawns_xml"] is not None:
+        if not await _tools_datei_schreiben_wenn(commit, conn, "cfgeventspawns.xml",
+                                                 ergebnis["eventspawns_xml"], loop):
+            return err("cfgeventspawns.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Event-Vorlagen (Batch) gespeichert",
+                  f"{ergebnis['erstellt']} neu, {ergebnis['geaendert']} geändert, "
+                  f"{ergebnis['geloescht']} gelöscht · {conn.name}")
+    generated = [{"filename": "db/events.xml", "content": ergebnis["events_xml"]}]
+    if ergebnis["eventspawns_xml"] is not None:
+        generated.append({"filename": "cfgeventspawns.xml", "content": ergebnis["eventspawns_xml"]})
+    return ok({"erstellt": ergebnis["erstellt"], "geaendert": ergebnis["geaendert"],
+              "geloescht": ergebnis["geloescht"], "generated": generated})
+
+
+# ── 8. Spawn Point Generator ──────────────────────────────────────────────
+async def api_tools_spawnpoint_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.spawnpoint")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.spawnpoint", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"positions": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    root, status = await _tools_xml_lesen(conn, "cfgplayerspawnpoints.xml", loop)
+    if status == "error":
+        return err("cfgplayerspawnpoints.xml per FTP nicht lesbar.", 502)
+    return ok({"positions": _tool_spawnpoint_positionen_lesen(root),
+              "allow_in_water": _tool_spawnpoint_allow_in_water_lesen(root)})
+
+
+async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.spawnpoint")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.spawnpoint", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.spawnpoint", 10)
+        if fehler is not None:
+            return fehler
+    mode = str(data_in.get("mode") or "replace")
+    positions_in = data_in.get("positions") or []
+    positions = []
+    for p in positions_in:
+        try:
+            positions.append({"x": float(p["x"]), "z": float(p["z"])})
+        except (TypeError, ValueError, KeyError):
+            return err("Ungültige Position.")
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "cfgplayerspawnpoints.xml", loop)
+    if status == "error":
+        return err("cfgplayerspawnpoints.xml per FTP nicht lesbar.", 502)
+    basis = text if status == "ok" else _TOOL_LEERE_SPAWNPOINTS
+    try:
+        neu = _tool_spawnpoint_positionen_schreiben(basis, positions, mode)
+        neu = _tool_spawnpoint_allow_in_water_schreiben(neu, bool(data_in.get("allow_in_water")))
+    except ValueError as e:
+        return err(str(e))
+    if not await _tools_datei_schreiben_wenn(commit, conn, "cfgplayerspawnpoints.xml", neu, loop):
+        return err("cfgplayerspawnpoints.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Spawn-Punkte gespeichert",
+                  f"{len(positions)} Punkt(e) · {conn.name}")
+    root = ET.fromstring(neu)
+    total = len(_tool_spawnpoint_positionen_lesen(root))
+    # Anders als bei den anderen Tools (die nur einen einfuegbaren Block in eine
+    # groessere Datei zeigen) ist cfgplayerspawnpoints.xml komplett das, was
+    # gebraucht wird - der Download muss deshalb die GANZE Datei sein (inkl.
+    # <?xml?>-Kopfzeile, <playerspawnpoints>, <hop>/<travel>), sonst laedt der
+    # Kunde nur ein <fresh>-Fragment herunter, das server-seitig ungueltig ist.
+    generated = [{"filename": "cfgplayerspawnpoints.xml", "content": neu}]
+    return ok({"total": total, "generated": generated})
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Alt Account Finder: Tool-Kachel, agiert zur Laufzeit als Feed
+#  ("alt_account", siehe FEED_TYPES) - der eigentliche Kanal wird also ganz
+#  normal auf der Feeds-Seite gewaehlt, hier nur der Ein/Aus-Schalter und die
+#  Anzeige der bereits erkannten Mehrfach-Zuordnungen dieses Servers.
+# ──────────────────────────────────────────────────────────────────────────
+async def api_tools_altaccountfinder_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.altaccountfinder")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.altaccountfinder", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    mehrfach = db.alt_account_mehrfach(conn.service_id)
+    return ok({
+        "enabled": bool(conn.get("alt_account_enabled", False)),
+        "mehrfach": mehrfach,
+    })
+
+
+async def api_tools_altaccountfinder_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.altaccountfinder")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.altaccountfinder", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.altaccountfinder", 10)
+    if fehler is not None:
+        return fehler
+    data_in = await body(request)
+    if "enabled" in data_in:
+        _conn_store(conn, "alt_account_enabled", bool(data_in["enabled"]))
+    return ok({"enabled": bool(conn.get("alt_account_enabled", False))})
+
+
+def _abandoned_bases_payload(conn: ServerConnection) -> Dict[str, Any]:
+    return {
+        "enabled": bool(conn.get("abandoned_bases_enabled", False)),
+        "builder_inactive_enabled": bool(conn.get("abandoned_bases_builder_inactive_enabled", True)),
+        "builder_inactive_days": int(conn.get("abandoned_bases_builder_inactive_days", 14) or 14),
+        "no_flag_enabled": bool(conn.get("abandoned_bases_no_flag_enabled", True)),
+        "no_flag_hours": int(conn.get("abandoned_bases_no_flag_hours", 48) or 48),
+        "flag_lowered_enabled": bool(conn.get("abandoned_bases_flag_lowered_enabled", True)),
+        "no_activity_enabled": bool(conn.get("abandoned_bases_no_activity_enabled", True)),
+        "no_activity_days": int(conn.get("abandoned_bases_no_activity_days", 21) or 21),
+        "cluster_radius_m": int(conn.get("abandoned_bases_cluster_radius_m", 60) or 60),
+        "min_parts": int(conn.get("abandoned_bases_min_parts", 10) or 10),
+        "report_every_hours": int(conn.get("abandoned_bases_report_every_hours", 24) or 24),
+        "repeat_after_days": int(conn.get("abandoned_bases_repeat_after_days", 7) or 7),
+        "embed_color": str(conn.get("abandoned_bases_embed_color") or "A16207"),
+    }
+
+
+async def api_abandoned_bases_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "abandoned_bases")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("abandoned_bases", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "feeds", "view")
+    if fehler is not None:
+        return fehler
+    return ok(_abandoned_bases_payload(conn))
+
+
+_ABANDONED_INT_FELDER = {
+    "builder_inactive_days": (1, 365), "no_flag_hours": (1, 24 * 30), "no_activity_days": (1, 365),
+    "cluster_radius_m": (5, 1000), "min_parts": (1, 5000),
+    "report_every_hours": (1, 24 * 30), "repeat_after_days": (1, 365),
+}
+
+
+async def api_abandoned_bases_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "abandoned_bases")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("abandoned_bases", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "feeds", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "feeds.abandoned_bases", 10)
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    for schluessel in ("enabled", "builder_inactive_enabled", "no_flag_enabled",
+                      "flag_lowered_enabled", "no_activity_enabled"):
+        if schluessel in data:
+            _conn_store(conn, f"abandoned_bases_{schluessel}", bool(data[schluessel]))
+    for schluessel, (minimum, maximum) in _ABANDONED_INT_FELDER.items():
+        if schluessel in data:
+            try:
+                wert = int(data[schluessel])
+            except (TypeError, ValueError):
+                return err(f"„{schluessel}“ muss eine Zahl sein.")
+            _conn_store(conn, f"abandoned_bases_{schluessel}", max(minimum, min(maximum, wert)))
+    if "embed_color" in data:
+        farbe = str(data["embed_color"] or "").lstrip("#").strip()
+        try:
+            int(farbe, 16)
+        except ValueError:
+            return err("Ungültige Farbe (Hex-Code erwartet, z. B. A16207).")
+        _conn_store(conn, "abandoned_bases_embed_color", farbe.upper())
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Verlassene-Basen-Einstellungen geändert",
+              conn.name)
+    return ok(_abandoned_bases_payload(conn))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  CE-Dynamic-Events-Feed: ein Feed-Kanal ("ce_events", siehe FEED_TYPES),
+#  acht unabhaengige Sub-Schalter je Server. Erkennung selbst laeuft im
+#  Poll-Zyklus (_lese_ce_events/_ce_events_zeilen_auswerten), hier nur die
+#  Ein/Aus-Schalter-Verwaltung - 1:1 dasselbe Muster wie Verlassene Basen.
+# ──────────────────────────────────────────────────────────────────────────
+def _ce_events_payload(conn: ServerConnection) -> Dict[str, Any]:
+    return {schalter: bool(conn.get(f"ce_events_{schalter}_enabled", True))
+            for schalter in _CE_EVENT_SCHALTER_LABEL}
+
+
+async def api_ce_events_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "ce_events")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("ce_events", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "feeds", "view")
+    if fehler is not None:
+        return fehler
+    return ok(_ce_events_payload(conn))
+
+
+async def api_ce_events_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "ce_events")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("ce_events", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "feeds", "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "feeds.ce_events", 10)
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    for schalter in _CE_EVENT_SCHALTER_LABEL:
+        if schalter in data:
+            _conn_store(conn, f"ce_events_{schalter}_enabled", bool(data[schalter]))
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "CE-Events-Einstellungen geändert",
+              conn.name)
+    return ok(_ce_events_payload(conn))
+
+
+# ── 9. Types Booster ──────────────────────────────────────────────────────
+def _tool_types_kategorien_lesen(root: Optional[ET.Element]) -> List[str]:
+    """Eindeutige Kategorien aus db/types.xml, "" steht fuer "ohne Kategorie" -
+    das Frontend zeigt dafuer ein eigenes Label."""
+    if root is None:
+        return []
+    kategorien = set()
+    for t in root.findall("type"):
+        cat = t.find("category")
+        kategorien.add(cat.get("name") or "" if cat is not None else "")
+    return sorted(kategorien, key=lambda k: (k == "", k.lower()))
+
+
+def _tool_types_filter_trifft(kategorie: str, modus: str, gewaehlte: Any) -> bool:
+    if modus == "include":
+        return kategorie in gewaehlte
+    if modus == "exclude":
+        return kategorie not in gewaehlte
+    return True
+
+
+def _tool_types_block_werte_setzen(block: str, neuer_nominal: int, neuer_min: Optional[int]) -> str:
+    """Setzt nur <nominal> und optional <min> innerhalb eines <type>-Blocks -
+    alle anderen Tags (usage, value, flags, category, ...) bleiben unangetastet."""
+    if re.search(r'<nominal\s*>[^<]*</nominal\s*>', block):
+        block = re.sub(r'(<nominal\s*>)[^<]*(</nominal\s*>)',
+                       lambda m: m.group(1) + str(neuer_nominal) + m.group(2), block, count=1)
+    else:
+        block = re.sub(r'(<type\b[^>]*>)',
+                       lambda m: m.group(1) + f'<nominal>{neuer_nominal}</nominal>', block, count=1)
+    if neuer_min is not None:
+        if re.search(r'<min\s*>[^<]*</min\s*>', block):
+            block = re.sub(r'(<min\s*>)[^<]*(</min\s*>)',
+                           lambda m: m.group(1) + str(neuer_min) + m.group(2), block, count=1)
+        else:
+            block = re.sub(r'(</nominal\s*>)',
+                           lambda m: m.group(1) + f'<min>{neuer_min}</min>', block, count=1)
+    return block
+
+
+def _tool_types_transform_anwenden(text: str, root: ET.Element, optionen: Dict[str, Any]) -> Dict[str, Any]:
+    """Veraendert Nominal-Werte in db/types.xml chirurgisch je <type>-Block -
+    reine Transformation, kein FTP-Zugriff. `root` muss aus `text` geparst sein;
+    gelesen wird aus dem unveraenderten root (keine Doppel-Anwendung), geschrieben
+    chirurgisch in den fortlaufend aktualisierten Text. `optionen["modus"]`
+    entscheidet zwischen "boost" (multiplizieren, mit optionalem Smart Boost fuer
+    0-Werte) und "reduce" (prozentual verringern - 0-Werte bleiben immer 0,
+    Smart Boost gibt es hier bewusst nicht: ein Nullwert vor der Reduktion
+    kuenstlich anzuheben waere das Gegenteil von reduzieren)."""
+    modus_rechnung = optionen.get("modus", "boost")
+    auto_min = optionen["auto_min"]
+    filter_modus = optionen.get("filter_mode", "all")
+    gewaehlte = set(optionen.get("categories") or [])
+    neu = text
+    aenderungen = []
+    geprueft = 0
+    uebersprungen = 0
+    for t in root.findall("type"):
+        name = t.get("name")
+        if not name:
+            continue
+        geprueft += 1
+        cat_el = t.find("category")
+        kategorie = (cat_el.get("name") or "") if cat_el is not None else ""
+        if not _tool_types_filter_trifft(kategorie, filter_modus, gewaehlte):
+            continue
+        nom_el = t.find("nominal")
+        try:
+            alt_nominal = int(nom_el.text.strip()) if nom_el is not None and nom_el.text else 0
+        except ValueError:
+            uebersprungen += 1
+            continue
+        if modus_rechnung == "reduce":
+            if alt_nominal <= 0:
+                uebersprungen += 1
+                continue
+            neuer_nominal = math.floor(alt_nominal * (1 - optionen["reduction_percent"] / 100))
+        else:
+            if alt_nominal <= 0:
+                if not optionen["smart_boost"]:
+                    uebersprungen += 1
+                    continue
+                basis = optionen.get("smart_boost_start", 1)
+            else:
+                basis = alt_nominal
+            neuer_nominal = math.floor(basis * optionen["faktor"])
+        neuer_min = min(neuer_nominal, math.floor(neuer_nominal * 0.60)) if auto_min else None
+        found = _tool_finde_benannten_block(neu, "type", name)
+        if not found:
+            uebersprungen += 1
+            continue
+        neuer_block = _tool_types_block_werte_setzen(found["block"], neuer_nominal, neuer_min)
+        neu = neu[:found["start"]] + neuer_block + neu[found["end"]:]
+        min_el = t.find("min")
+        alt_min = min_el.text.strip() if min_el is not None and min_el.text else None
+        aenderungen.append({"name": name, "category": kategorie,
+                            "nominal_alt": alt_nominal, "nominal_neu": neuer_nominal,
+                            "min_alt": alt_min, "min_neu": neuer_min})
+    return {"text": neu, "geprueft": geprueft, "geaendert": len(aenderungen),
+           "uebersprungen": uebersprungen, "aenderungen": aenderungen}
+
+
+async def _api_tools_types_transform_get(request: web.Request, modul_key: str) -> web.Response:
+    conn, fehler = _session_conn(request, modul_key)
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen(modul_key, request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"types_count": 0, "categories": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+    if status != "ok":
+        return err("db/types.xml per FTP nicht lesbar.", 502)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return err("db/types.xml ist kein gültiges XML.")
+    return ok({"types_count": len(root.findall("type")),
+              "categories": _tool_types_kategorien_lesen(root),
+              "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()})
+
+
+async def api_tools_typesbooster_get(request: web.Request) -> web.Response:
+    return await _api_tools_types_transform_get(request, "tools.typesbooster")
+
+
+async def api_tools_typesreducer_get(request: web.Request) -> web.Response:
+    return await _api_tools_types_transform_get(request, "tools.typesreducer")
+
+
+async def _api_tools_types_transform_post(request: web.Request, modul_key: str,
+                                          modus_rechnung: str) -> web.Response:
+    """Gemeinsamer Kern fuer Types Booster und Types Reducer - zwei getrennte
+    Tools (eigene Berechtigung, eigene Kachel, kein Umschalter im Frontend),
+    die intern dieselbe chirurgische Nominal-Transformation nutzen."""
+    conn, fehler = _session_conn(request, modul_key)
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen(modul_key, request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    quelle_lokal = str(data_in.get("source_xml") or "").strip()
+    if commit and quelle_lokal:
+        return err("Eine lokal eingefügte types.xml kann nur zur Vorschau genutzt werden, nicht hochgeladen.")
+    if not quelle_lokal and not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    optionen = {
+        "modus": modus_rechnung, "auto_min": bool(data_in.get("auto_min", True)),
+        "filter_mode": str(data_in.get("filter_mode") or "all"),
+        "categories": data_in.get("categories") or [],
+    }
+    if modus_rechnung == "reduce":
+        try:
+            reduction_percent = float(data_in.get("reduction_percent", 50))
+        except (TypeError, ValueError):
+            return err("Ungültiger Reduktions-Prozentsatz.")
+        if not 10.0 <= reduction_percent <= 90.0:
+            return err("Der Reduktions-Prozentsatz muss zwischen 10 und 90 liegen.")
+        optionen["reduction_percent"] = reduction_percent
+    else:
+        try:
+            faktor = float(data_in.get("factor", 2.0))
+        except (TypeError, ValueError):
+            return err("Ungültiger Boost-Multiplikator.")
+        if not 1.0 <= faktor <= 100.0:
+            return err("Der Boost-Multiplikator muss zwischen 1.0 und 100 liegen.")
+        try:
+            smart_start = max(0, int(float(data_in.get("smart_boost_start", 1))))
+        except (TypeError, ValueError):
+            smart_start = 1
+        optionen["faktor"] = faktor
+        optionen["smart_boost"] = bool(data_in.get("smart_boost"))
+        optionen["smart_boost_start"] = smart_start
+    loop = asyncio.get_running_loop()
+    if quelle_lokal:
+        text = quelle_lokal
+    else:
+        if commit:
+            fehler = _dash_rate_limited(request, modul_key, 10)
+            if fehler is not None:
+                return fehler
+        text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+        if status != "ok":
+            return err("db/types.xml per FTP nicht lesbar.", 502)
+        quell_hash = str(data_in.get("source_hash") or "")
+        if quell_hash and quell_hash != hashlib.sha256(text.encode("utf-8")).hexdigest():
+            return err("db/types.xml wurde inzwischen geändert – bitte neu laden und Vorschau erneut erzeugen.", 409)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return err("Das ist kein gültiges XML (types.xml).")
+    ergebnis = _tool_types_transform_anwenden(text, root, optionen)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "db/types.xml", ergebnis["text"], loop):
+        return err("db/types.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        if modus_rechnung == "reduce":
+            _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Types Reducer gespeichert",
+                      f"{optionen['reduction_percent']:.0f}% · {ergebnis['geaendert']} geändert · {conn.name}")
+        else:
+            _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Types Booster gespeichert",
+                      f"Faktor {optionen['faktor']}× · {ergebnis['geaendert']} geändert · {conn.name}")
+    return ok({"geprueft": ergebnis["geprueft"], "geaendert": ergebnis["geaendert"],
+              "uebersprungen": ergebnis["uebersprungen"], "aenderungen": ergebnis["aenderungen"][:200],
+              "generated": [{"filename": "db/types.xml", "content": ergebnis["text"]}]})
+
+
+async def api_tools_typesbooster_post(request: web.Request) -> web.Response:
+    return await _api_tools_types_transform_post(request, "tools.typesbooster", "boost")
+
+
+async def api_tools_typesreducer_post(request: web.Request) -> web.Response:
+    return await _api_tools_types_transform_post(request, "tools.typesreducer", "reduce")
+
+
+# ── 10. Types Organizer ───────────────────────────────────────────────────
+# Anders als Types Booster/Reducer keine chirurgische Teiländerung: die ganze
+# Datei wird nach Kategorien gruppiert neu zusammengesetzt. Freie Kommentare,
+# Leerzeilen und die urspruengliche Reihenfolge ausserhalb der einzelnen
+# <type>-Bloecke gehen dabei bewusst verloren - das Frontend zeigt dazu eine
+# deutliche Warnung. Die Zuordnung Classname->Kategorie ist Heuristik: alles
+# nicht eindeutig Erkannte landet sichtbar unter "Misc Items".
+_TOOL_ORGANIZER_KATEGORIEN = (
+    "Armbands", "Ammo", "Animals", "Attachments", "Bags", "Belts", "Clothing",
+    "Clothing Improvised", "Feet", "Firearms", "Flags", "Food", "Gas Gear",
+    "Gas Masks", "Ghillies", "Gloves", "Hats", "Helmets", "Infected",
+    "Land Items", "Lights", "Magazines", "Masks", "Medical Items",
+    "Melee Items", "Misc Items", "Nades & Traps", "Navigation Items",
+    "Pelts", "Plants", "Optics", "Seeds", "Static Objects", "Storage Items",
+    "Supplies", "Suppressors", "Tacticals", "Tools", "Vests",
+    "Vehicle Parts", "Vehicles",
+)
+
+_TOOL_ORGANIZER_REGELN = tuple((kategorie, re.compile(muster, re.IGNORECASE)) for kategorie, muster in (
+    ("Ammo", r'^Ammo_'),
+    ("Magazines", r'^Mag_'),
+    ("Land Items", r'^Land_'),
+    ("Seeds", r'^Seeds?_'),
+    ("Flags", r'^Flag_'),
+    ("Infected", r'^Zmb'),
+    ("Armbands", r'Armband'),
+    ("Belts", r'Belt_'),
+    ("Pelts", r'Pelt'),
+    ("Suppressors", r'Suppressor'),
+    ("Optics", r'(ACOG|Kobra|PSO\b|EOTech|Holosight|Reflex|NVGoggles|Nightvision|Scope|Buris|LRSight|IronSight)'),
+    ("Attachments", r'(Handguard|Foregrip|Bipod|CarryHandle|OpticRail|MuzzleBrake|FlashHider|Choke_|'
+                    r'Compensator|Buttstock|Stock_|PistolGrip|Riser|Barrel_|Battery9V)'),
+    ("Firearms", r'\b(AK101|AK74|AKM|AKS74U|CZ527|CZ75|CR75|CR527|Deagle|FNX45|Glock19|IJ70|Izh18|'
+                r'Longhorn|M4A1|MP5K|Mosin|Repeater|SKS|Sporter22|SVAL|SVD|UMP45|VSS|Vikhr|Bizon|FAL|'
+                r'Blaze95|Winchester70|Tundra|ASVAL|Sawnoff|Colt1911|CZ61|B95|DMR|Aug|VSD|KAM|KA101|KA74)\b'),
+    ("Melee Items", r'(Axe|Hatchet|Machete|Knife|Crowbar|Sledgehammer|Pitchfork|Pickaxe|Sickle|'
+                    r'BaseballBat|Bat_|Cleaver|FireAxe|Hoe_)'),
+    ("Nades & Traps", r'(Grenade|BearTrap|Mine_|Claymore|TripFlare|Frag_)'),
+    ("Vehicles", r'(OffroadHatchback|CivilianSedan|Sedan_02|Hatchback_02|Truck_01|Bus_01|Vodnik|Vybor|Scooter)'),
+    ("Vehicle Parts", r'(Wheel|CarDoor|CarBattery|CarRadiator|SparkPlug|GlowPlug|CarSeat|Headlight|'
+                      r'TailLight|Muffler|Carburetor|Radiator)'),
+    ("Bags", r'(Backpack|Kotomka|Mochila|TaloonBag|CanvasBag|_Bag$|Bag_)'),
+    ("Storage Items", r'(Barrel|Crate_|Container|Chest_|Cabinet|Locker|GunSafe|Case_|TentSmall|'
+                      r'TentBig|CarTent|StorageShelf)'),
+    ("Gas Masks", r'GasMask'),
+    ("Gas Gear", r'(NBC|Hazmat|CBRN)'),
+    ("Masks", r'(Balaclava|HockeyMask|WolfMask|BearMask|RabbitMask|ClownMask|Bandana)'),
+    ("Ghillies", r'Ghillie'),
+    ("Clothing Improvised", r'Improvised'),
+    ("Helmets", r'(Helmet|Ssh68|Kolpak|MotoHelmet|PSH77)'),
+    ("Hats", r'(Ushanka|Beanie|CowboyHat|BoonieHat|PetrOldHat|HunterCap|BaseballCap|WoolHat|'
+            r'PanamaHat|WatchCap|Cap_|Hat_)'),
+    ("Gloves", r'(Gloves|Mitten)'),
+    ("Vests", r'(Vest_|PlateCarrier|ChestHolster|Vestpouch)'),
+    ("Feet", r'(Boots_|Shoes_|Sneakers|CombatBoots|WorkingBoots|HikingBoots|Sandals|RainBoots)'),
+    ("Tacticals", r'Tactical'),
+    ("Navigation Items", r'(Compass|GPS|Rangefinder|Map_)'),
+    ("Lights", r'(Flashlight|Headlamp|Chemlight|Lightstick|Lantern)'),
+    ("Static Objects", r'(StaticObj|Watchtower|Barricade|Fence_)'),
+    ("Plants", r'(Plant_|Mushroom|Bush_|Tree_|Garden)'),
+    ("Food", r'(Apple|Pear|Plum|Tomato|Potato|Pumpkin|Zucchini|Cucumber|BakedBeans|CannedFood|Pasta|'
+            r'Rice|Powdered|Canned|Fish_|Meat_|Steak|Sausage|Bacon|TunaCan|PeachesCan|SpaghettiCan|'
+            r'Water_|Cooking)'),
+    ("Medical Items", r'(Bandage|Splint|Morphine|Epinephrine|Tetracycline|Vitamin|Iodine|Charcoal|'
+                      r'SalineBag|BloodBag|Disinfectant|PainKiller|Adrenaline|SurgicalKit)'),
+    ("Animals", r'(Cow_|Wolf_|Bear_|Deer_|Goat_|Boar_|Rabbit_|Chicken_|Hen_)'),
+    ("Supplies", r'(Rope|Duct|Sewing|Fireplace|Matches|Lighter|Sharpening|WhetStone|Tarp|Wire_|'
+                r'Nail_|Stick_|WoodenPlank|Log_)'),
+    ("Tools", r'(Wrench|Screwdriver|Pliers|Shovel|Hammer_|Handsaw|WoodAxe|CanOpener|Radio_|Binocular)'),
+    ("Clothing", r'(Jacket|Shirt_|Coat_|Pants_|Jeans_|Sweater|Hoodie|TShirt|Dress_|Trousers|Suit_|Robe_)'),
+))
+
+
+def _tool_organizer_kategorie_von_classname(name: str) -> str:
+    for kategorie, muster in _TOOL_ORGANIZER_REGELN:
+        if muster.search(name):
+            return kategorie
+    return "Misc Items"
+
+
+_TOOL_TYPE_BLOCK_MUSTER = re.compile(
+    r'<type(?=[\s/>])[^>]*\bname=(["\'])([^"\']+)\1[^>]*(?:/>|>[\s\S]*?</type\s*>)')
+
+
+def _tool_organizer_bloecke_lesen(text: str) -> List[Dict[str, str]]:
+    """Extrahiert alle <type name="...">-Bloecke Byte-genau aus dem Originaltext.
+    Duplikate und eine leere Datei werden als Fehler behandelt, statt still
+    etwas zu verwerfen."""
+    bloecke = []
+    gesehen = set()
+    duplikate = []
+    for m in _TOOL_TYPE_BLOCK_MUSTER.finditer(text):
+        name = m.group(2)
+        if name in gesehen:
+            if name not in duplikate:
+                duplikate.append(name)
+            continue
+        gesehen.add(name)
+        bloecke.append({"name": name, "block": m.group(0).strip()})
+    if duplikate:
+        namen = ", ".join(f'„{n}"' for n in duplikate)
+        raise ValueError(f'Doppelte Type-Namen in der Datei – bitte zuerst bereinigen: {namen}')
+    if not bloecke:
+        raise ValueError('Keine <type name="…">-Einträge in der Datei gefunden.')
+    return bloecke
+
+
+def _tool_organizer_erzeugen(text: str, optionen: Dict[str, Any]) -> Dict[str, Any]:
+    """Baut eine komplett neue, nach Kategorien gruppierte types.xml. Reine
+    Transformation, kein FTP-Zugriff."""
+    bloecke = _tool_organizer_bloecke_lesen(text)
+    gruppen: Dict[str, List[Dict[str, str]]] = {k: [] for k in _TOOL_ORGANIZER_KATEGORIEN}
+    unbekannt = []
+    for b in bloecke:
+        kategorie = _tool_organizer_kategorie_von_classname(b["name"])
+        gruppen[kategorie].append(b)
+        if kategorie == "Misc Items":
+            unbekannt.append(b["name"])
+    if optionen.get("alphabetisch", True):
+        for k in gruppen:
+            gruppen[k].sort(key=lambda b: b["name"].lower())
+    genutzt = [(k, gruppen[k]) for k in _TOOL_ORGANIZER_KATEGORIEN if gruppen[k]]
+    zeitstempel = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    zeilen = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+             "<!-- Organisiert vom Dashboard Types Organizer -->",
+             f"<!-- Erzeugt am {zeitstempel} UTC -->"]
+    if optionen.get("navigation", True):
+        zeilen.append("<!-- ===== SCHNELLE NAVIGATION =====")
+        for k, liste in genutzt:
+            zeilen.append(f"[{k}] ({len(liste)} Eintrag/Einträge)")
+        zeilen.append("=================================== -->")
+    zeilen.append("<types>")
+    for k, liste in genutzt:
+        if optionen.get("kategorie_header", True):
+            trenner = "=" * 50
+            zeilen.append(f"    <!-- {trenner} -->")
+            zeilen.append(f"    <!-- KATEGORIE: {k.upper()} ({len(liste)}) -->")
+            zeilen.append(f"    <!-- {trenner} -->")
+        for b in liste:
+            zeilen.append("    " + b["block"])
+    zeilen.append("</types>")
+    neu_text = "\n".join(zeilen) + "\n"
+    return {"text": neu_text, "gesamt": len(bloecke), "kategorien_genutzt": len(genutzt),
+           "kategorien": [{"name": k, "anzahl": len(v)} for k, v in genutzt],
+           "unbekannt": unbekannt[:200], "unbekannt_gesamt": len(unbekannt)}
+
+
+async def api_tools_typesorganizer_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.typesorganizer")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.typesorganizer", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"types_count": 0, "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+    if status != "ok":
+        return err("db/types.xml per FTP nicht lesbar.", 502)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return err("db/types.xml ist kein gültiges XML.")
+    return ok({"types_count": len(root.findall("type")),
+              "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()})
+
+
+async def api_tools_typesorganizer_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.typesorganizer")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.typesorganizer", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    quelle_lokal = str(data_in.get("source_xml") or "").strip()
+    if commit and quelle_lokal:
+        return err("Eine lokal eingefügte types.xml kann nur zur Vorschau genutzt werden, nicht hochgeladen.")
+    if not quelle_lokal and not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    optionen = {
+        "navigation": bool(data_in.get("navigation", True)),
+        "kategorie_header": bool(data_in.get("kategorie_header", True)),
+        "alphabetisch": bool(data_in.get("alphabetisch", True)),
+    }
+    loop = asyncio.get_running_loop()
+    if quelle_lokal:
+        text = quelle_lokal
+    else:
+        if commit:
+            fehler = _dash_rate_limited(request, "tools.typesorganizer", 5)
+            if fehler is not None:
+                return fehler
+        text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+        if status != "ok":
+            return err("db/types.xml per FTP nicht lesbar.", 502)
+        quell_hash = str(data_in.get("source_hash") or "")
+        if quell_hash and quell_hash != hashlib.sha256(text.encode("utf-8")).hexdigest():
+            return err("db/types.xml wurde inzwischen geändert – bitte neu laden und Vorschau erneut erzeugen.", 409)
+    try:
+        ET.fromstring(text)
+    except ET.ParseError:
+        return err("Das ist kein gültiges XML (types.xml).")
+    try:
+        ergebnis = _tool_organizer_erzeugen(text, optionen)
+    except ValueError as e:
+        return err(str(e))
+    if not await _tools_datei_schreiben_wenn(commit, conn, "db/types.xml", ergebnis["text"], loop):
+        return err("db/types.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Types Organizer gespeichert",
+                  f"{ergebnis['gesamt']} Type(s) neu sortiert · {ergebnis['kategorien_genutzt']} "
+                  f"Kategorie(n) · {ergebnis['unbekannt_gesamt']} unbekannt · {conn.name}")
+    return ok({"gesamt": ergebnis["gesamt"], "kategorien_genutzt": ergebnis["kategorien_genutzt"],
+              "kategorien": ergebnis["kategorien"], "unbekannt": ergebnis["unbekannt"],
+              "unbekannt_gesamt": ergebnis["unbekannt_gesamt"],
+              "generated": [{"filename": "db/types.xml", "content": ergebnis["text"]}]})
+
+
+# ── 10b. Erweiterter Types Manager ────────────────────────────────────────
+#  Einzelbearbeitung der db/types.xml: eine durchsuchbare Liste aller Items,
+#  in der jeder Wert eines <type>-Blocks gezielt geaendert werden kann.
+#
+#  Abgrenzung zu den drei vorhandenen Types-Werkzeugen: Booster und Reducer
+#  aendern nominal/min in der Masse, der Organizer baut die ganze Datei um -
+#  keines bearbeitet ein einzelnes Item, und keines kann lifetime, restock,
+#  quantmin, quantmax, cost, Kategorie, usage, value oder die flags.
+#
+#  Vorlage war der Loot-Tab des Vorgaengerprojekts (Init_c-Manager). Dessen
+#  Speicherweg wird bewusst NICHT uebernommen: er hat die komplette XML neu
+#  serialisiert und dabei Kommentare und Formatierung des Kunden verloren.
+#  Hier wird wie im Rest der Tools chirurgisch nur der betroffene Block
+#  ersetzt.
+
+# Zahlenfelder: (Tag, Minimum, Maximum, Kurzerklaerung fuer das ℹ️ im
+# Dashboard). Die Grenzen sind bewusst weit - sie fangen Vertipper und
+# Vorzeichenfehler ab, ohne jemandem eine ungewoehnliche, aber gueltige
+# Einstellung zu verbieten.
+_TM_ZAHLENFELDER: Tuple[Tuple[str, int, int, str], ...] = (
+    ("nominal", 0, 10000,
+     "Zielanzahl: so viele Exemplare versucht der Server auf der Karte zu halten."),
+    ("min", 0, 10000,
+     "Mindestanzahl: sinkt der Bestand darunter, wird nachgeliefert. "
+     "Sollte nicht über nominal liegen."),
+    ("lifetime", 0, 3888000,
+     "Lebensdauer in Sekunden: so lange bleibt ein unberührtes Exemplar liegen, "
+     "bevor es verschwindet. 3888000 sind 45 Tage."),
+    ("restock", 0, 3888000,
+     "Nachschubsperre in Sekunden: so lange wartet der Server nach dem Aufbrauchen, "
+     "bevor er neu spawnt. 0 heißt sofort."),
+    ("quantmin", -1, 100,
+     "Mindest-Füllstand in Prozent, mit dem das Item spawnt (Munition, Getränke). "
+     "-1 schaltet die Vorgabe ab."),
+    ("quantmax", -1, 100,
+     "Höchst-Füllstand in Prozent, mit dem das Item spawnt. -1 schaltet die "
+     "Vorgabe ab."),
+    ("cost", 0, 100,
+     "Spawn-Priorität von 0 bis 100: höhere Werte werden bei der Verteilung "
+     "bevorzugt. Vorgabe ist 100."),
+)
+
+# Attribute des <flags>-Tags. Jedes ist 0 oder 1.
+_TM_FLAGS: Tuple[Tuple[str, str], ...] = (
+    ("count_in_cargo",
+     "Zählt Exemplare in Behältern (Kisten, Rucksäcke am Boden) zum Bestand."),
+    ("count_in_hoarder",
+     "Zählt Exemplare in Zelten und Verstecken zum Bestand."),
+    ("count_in_map",
+     "Zählt frei auf der Karte liegende Exemplare zum Bestand. Steht bei den "
+     "meisten Items auf 1."),
+    ("count_in_player",
+     "Zählt Exemplare im Inventar eingeloggter Spieler zum Bestand."),
+    ("crafted",
+     "Markiert das Item als hergestellt – es wird dann nicht über die "
+     "Loot-Ökonomie verteilt."),
+    ("deloot",
+     "Spawnt bei dynamischen Ereignissen (Heli-Crash, Polizeiauto) statt im "
+     "normalen Loot."),
+)
+
+_TM_ZAHLEN_INDEX: Dict[str, Tuple[int, int, str]] = {
+    tag: (mini, maxi, hinweis) for tag, mini, maxi, hinweis in _TM_ZAHLENFELDER}
+_TM_FLAG_NAMEN: Tuple[str, ...] = tuple(name for name, _ in _TM_FLAGS)
+
+# Listenfelder: mehrere <usage name="..."/> bzw. <value name="..."/> je Item.
+_TM_LISTENFELDER: Tuple[Tuple[str, str], ...] = (
+    ("usage",
+     "Fundorte: wo das Item überhaupt auftauchen darf (Military, Farm, …). "
+     "Ohne Eintrag spawnt es nirgends im normalen Loot."),
+    ("value",
+     "Loot-Stufe (Tier): in welchen Zonen der Karte das Item vorkommt. "
+     "Tier1 ist küstennah, höhere Stufen liegen im Landesinneren."),
+    ("tag",
+     "Ablageort im Gebäude: floor (Boden), shelves (Regale) oder ground "
+     "(im Freien). Ohne Eintrag entscheidet der Server selbst."),
+)
+
+
+def _tm_text(element: Optional[ET.Element]) -> Optional[str]:
+    if element is None or element.text is None:
+        return None
+    wert = element.text.strip()
+    return wert or None
+
+
+def _tm_type_lesen(el: ET.Element) -> Dict[str, Any]:
+    """Ein <type>-Element als flaches Dict fuers Dashboard."""
+    eintrag: Dict[str, Any] = {"name": el.get("name") or ""}
+    for tag, _, _, _ in _TM_ZAHLENFELDER:
+        roh = _tm_text(el.find(tag))
+        try:
+            eintrag[tag] = int(roh) if roh is not None else None
+        except ValueError:
+            # Kaputter Wert in der Kundendatei: als "nicht gesetzt" anzeigen,
+            # statt die ganze Liste scheitern zu lassen.
+            eintrag[tag] = None
+    cat = el.find("category")
+    eintrag["category"] = (cat.get("name") or "") if cat is not None else ""
+    for tag, _ in _TM_LISTENFELDER:
+        eintrag[tag] = [k.get("name") or "" for k in el.findall(tag) if k.get("name")]
+    flags_el = el.find("flags")
+    eintrag["flags"] = {
+        name: (1 if (flags_el is not None and flags_el.get(name) == "1") else 0)
+        for name in _TM_FLAG_NAMEN}
+    eintrag["hat_flags"] = flags_el is not None
+    return eintrag
+
+
+def _tm_einrueckung(block: str) -> str:
+    """Einrueckung der Kindzeilen eines <type>-Blocks, damit eingefuegte Tags
+    nicht aus der Formatierung des Kunden herausfallen."""
+    treffer = re.search(r"\n([ \t]+)<", block)
+    return treffer.group(1) if treffer else "        "
+
+
+def _tm_zahl_setzen(block: str, tag: str, wert: Optional[int]) -> str:
+    """Setzt, ergaenzt oder entfernt ein einfaches Wert-Tag im Block."""
+    vorhanden = re.search(r"[ \t]*<" + tag + r"\s*>[^<]*</" + tag + r"\s*>\n?", block)
+    if wert is None:
+        # Ausdruecklich geleert: Tag entfernen, damit der Server seine
+        # eigene Vorgabe benutzt.
+        return block[:vorhanden.start()] + block[vorhanden.end():] if vorhanden else block
+    if vorhanden:
+        return re.sub(r"(<" + tag + r"\s*>)[^<]*(</" + tag + r"\s*>)",
+                      lambda m: m.group(1) + str(wert) + m.group(2), block, count=1)
+    # Fehlendes Tag direkt hinter dem oeffnenden <type ...> anlegen.
+    einzug = _tm_einrueckung(block)
+    return re.sub(r"(<type\b[^>]*>)",
+                  lambda m: f"{m.group(1)}\n{einzug}<{tag}>{wert}</{tag}>", block, count=1)
+
+
+def _tm_kategorie_setzen(block: str, name: str) -> str:
+    vorhanden = re.search(r"[ \t]*<category\b[^>]*/?>(?:</category\s*>)?\n?", block)
+    if not name:
+        return block[:vorhanden.start()] + block[vorhanden.end():] if vorhanden else block
+    neu = f'<category name="{_tool_esc_xml(name)}"/>'
+    if vorhanden:
+        return re.sub(r"<category\b[^>]*/?>(?:</category\s*>)?", neu, block, count=1)
+    einzug = _tm_einrueckung(block)
+    return re.sub(r"(</type\s*>)", f"{einzug}{neu}\n" + r"\1", block, count=1)
+
+
+def _tm_liste_setzen(block: str, tag: str, namen: List[str]) -> str:
+    """Ersetzt ALLE <usage>- bzw. <value>-Tags des Blocks durch die neue Menge."""
+    muster = re.compile(r"[ \t]*<" + tag + r"\b[^>]*/?>(?:</" + tag + r"\s*>)?\n?")
+    treffer = list(muster.finditer(block))
+    einzug = _tm_einrueckung(block)
+    neue = "".join(f'{einzug}<{tag} name="{_tool_esc_xml(n)}"/>\n' for n in namen)
+    if treffer:
+        # An die Stelle des ersten alten Tags setzen, alle weiteren entfernen.
+        ergebnis = block[:treffer[0].start()] + neue
+        rest = block[treffer[0].end():]
+        for t in reversed(treffer[1:]):
+            versatz = t.start() - treffer[0].end()
+            rest = rest[:versatz] + rest[versatz + (t.end() - t.start()):]
+        return ergebnis + rest
+    if not namen:
+        return block
+    return re.sub(r"(</type\s*>)", neue + r"\1", block, count=1)
+
+
+def _tm_flags_setzen(block: str, flags: Dict[str, int]) -> str:
+    attribute = " ".join(f'{name}="{1 if flags.get(name) else 0}"'
+                         for name in _TM_FLAG_NAMEN)
+    neu = f"<flags {attribute}/>"
+    if re.search(r"<flags\b[^>]*/?>(?:</flags\s*>)?", block):
+        return re.sub(r"<flags\b[^>]*/?>(?:</flags\s*>)?", neu, block, count=1)
+    einzug = _tm_einrueckung(block)
+    return re.sub(r"(</type\s*>)", f"{einzug}{neu}\n" + r"\1", block, count=1)
+
+
+def _tm_block_anwenden(block: str, aenderung: Dict[str, Any]) -> str:
+    """Traegt eine Aenderung chirurgisch in einen <type>-Block ein. Alles, was
+    nicht ausdruecklich in ``aenderung`` steht, bleibt unangetastet."""
+    for tag, _, _, _ in _TM_ZAHLENFELDER:
+        if tag in aenderung:
+            block = _tm_zahl_setzen(block, tag, aenderung[tag])
+    if "category" in aenderung:
+        block = _tm_kategorie_setzen(block, str(aenderung["category"] or ""))
+    for tag, _ in _TM_LISTENFELDER:
+        if tag in aenderung:
+            block = _tm_liste_setzen(block, tag, list(aenderung[tag] or []))
+    if "flags" in aenderung:
+        block = _tm_flags_setzen(block, dict(aenderung["flags"] or {}))
+    return block
+
+
+def _tm_aenderung_pruefen(name: str, roh: Dict[str, Any],
+                          bekannt: Dict[str, set]) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Prueft eine einzelne Item-Aenderung. Rueckgabe (saubere Aenderung, Fehler).
+
+    Die Vorlage prueft ueberhaupt nicht und schreibt ungueltige Eingaben als 0
+    in die Kundendatei - hier wird stattdessen abgelehnt.
+    """
+    sauber: Dict[str, Any] = {}
+    for tag, mini, maxi, _ in _TM_ZAHLENFELDER:
+        if tag not in roh:
+            continue
+        wert = roh[tag]
+        if wert is None or wert == "":
+            sauber[tag] = None
+            continue
+        try:
+            zahl = int(wert)
+        except (TypeError, ValueError):
+            return {}, f"{name}: „{wert}“ ist keine ganze Zahl für {tag}."
+        if not mini <= zahl <= maxi:
+            return {}, (f"{name}: {tag} muss zwischen {mini} und {maxi} liegen "
+                        f"(eingegeben: {zahl}).")
+        sauber[tag] = zahl
+    if ("nominal" in sauber and "min" in sauber
+            and sauber["nominal"] is not None and sauber["min"] is not None
+            and sauber["min"] > sauber["nominal"]):
+        return {}, (f"{name}: min ({sauber['min']}) darf nicht über nominal "
+                    f"({sauber['nominal']}) liegen.")
+    if "category" in roh:
+        wert = str(roh["category"] or "").strip()
+        if wert and wert not in bekannt["category"]:
+            return {}, f"{name}: unbekannte Kategorie „{wert}“."
+        sauber["category"] = wert
+    for tag, _ in _TM_LISTENFELDER:
+        if tag not in roh:
+            continue
+        werte = [str(w).strip() for w in (roh[tag] or []) if str(w).strip()]
+        unbekannt = [w for w in werte if w not in bekannt[tag]]
+        if unbekannt:
+            return {}, f"{name}: unbekannte {tag}-Werte: {', '.join(unbekannt)}."
+        # Reihenfolge der Datei beibehalten, Doppelte entfernen.
+        sauber[tag] = list(dict.fromkeys(werte))
+    if "flags" in roh:
+        flags = roh["flags"] or {}
+        if not isinstance(flags, dict):
+            return {}, f"{name}: flags müssen ein Objekt sein."
+        unbekannt = [k for k in flags if k not in _TM_FLAG_NAMEN]
+        if unbekannt:
+            return {}, f"{name}: unbekannte flags: {', '.join(unbekannt)}."
+        sauber["flags"] = {k: (1 if flags.get(k) else 0) for k in _TM_FLAG_NAMEN}
+    return sauber, None
+
+
+# In welchem Abschnitt der cfglimitsdefinition.xml die Auswahl je Feld steht.
+_TM_LIMITS_ABSCHNITTE: Tuple[Tuple[str, str, str], ...] = (
+    ("category", "categories", "category"),
+    ("usage", "usageflags", "usage"),
+    ("value", "valueflags", "value"),
+    ("tag", "tags", "tag"),
+)
+
+
+def _tm_limits_lesen(text: Optional[str]) -> Dict[str, List[str]]:
+    """Die erlaubten Kategorien, Fundorte, Stufen und Ablageorte aus der
+    cfglimitsdefinition.xml des Servers.
+
+    Das ist die massgebliche Liste - sie enthaelt auch Werte, die in der
+    types.xml noch gar nicht vorkommen (z. B. Lunapark oder Unique). Die
+    Auswahl nur aus der types.xml abzuleiten wuerde genau die verschlucken.
+    """
+    aus: Dict[str, List[str]] = {}
+    if not text:
+        return aus
+    try:
+        wurzel = ET.fromstring(text)
+    except ET.ParseError:
+        return aus
+    for feld, abschnitt, kind in _TM_LIMITS_ABSCHNITTE:
+        el = wurzel.find(abschnitt)
+        if el is None:
+            continue
+        namen = [k.get("name") for k in el.findall(kind) if k.get("name")]
+        if namen:
+            aus[feld] = namen
+    return aus
+
+
+def _tm_datei_lesen(root: ET.Element) -> Dict[str, Any]:
+    """Alle <type>-Eintraege plus die in DIESER Datei tatsaechlich benutzten
+    Kategorien, Fundorte und Stufen - so passt die Auswahl auch bei einem
+    Server mit Mods, statt einer fest verdrahteten Vanilla-Liste."""
+    eintraege = []
+    doppelt: List[str] = []
+    gesehen: set = set()
+    bekannt: Dict[str, set] = {"category": set()}
+    for tag, _ in _TM_LISTENFELDER:
+        bekannt[tag] = set()
+    for el in root.findall("type"):
+        name = el.get("name")
+        if not name:
+            continue
+        if name in gesehen:
+            # Die Vorlage nimmt hier still den letzten Block. Das ist ein
+            # stiller Datenverlust - hier wird der Name gemeldet und beim
+            # Schreiben ausgelassen.
+            if name not in doppelt:
+                doppelt.append(name)
+            continue
+        gesehen.add(name)
+        eintrag = _tm_type_lesen(el)
+        if eintrag["category"]:
+            bekannt["category"].add(eintrag["category"])
+        for tag, _ in _TM_LISTENFELDER:
+            bekannt[tag].update(eintrag[tag])
+        eintraege.append(eintrag)
+    return {"types": eintraege, "doppelt": doppelt,
+            "bekannt": {k: sorted(v) for k, v in bekannt.items()}}
+
+
+async def _tm_auswahl(conn: ServerConnection, daten: Dict[str, Any],
+                      loop) -> Tuple[Dict[str, List[str]], bool]:
+    """Die Auswahllisten fuers Dashboard. Grundlage ist die
+    cfglimitsdefinition.xml des Servers; was die types.xml darueber hinaus
+    schon benutzt, wird ergaenzt, damit ein bestehender (etwa von einer Mod
+    gesetzter) Wert nicht aus der Auswahl faellt und beim Speichern als
+    unbekannt abgelehnt wuerde.
+
+    Rueckgabe (Auswahl, ob die cfglimitsdefinition.xml gelesen werden konnte).
+    """
+    text, status = await _tools_datei_lesen(conn, "cfglimitsdefinition.xml", loop)
+    limits = _tm_limits_lesen(text if status == "ok" else None)
+    auswahl: Dict[str, List[str]] = {}
+    for feld in ["category"] + [t for t, _ in _TM_LISTENFELDER]:
+        vorgabe = limits.get(feld, [])
+        zusatz = sorted(set(daten["bekannt"].get(feld, [])) - set(vorgabe))
+        auswahl[feld] = list(vorgabe) + zusatz
+    return auswahl, bool(limits)
+
+
+async def api_tools_typesmanager_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.typesmanager")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.typesmanager", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    felder = {
+        "zahlen": [{"tag": t, "min": mi, "max": ma, "hinweis": h}
+                   for t, mi, ma, h in _TM_ZAHLENFELDER],
+        "listen": [{"tag": t, "hinweis": h} for t, h in _TM_LISTENFELDER],
+        "flags": [{"name": n, "hinweis": h} for n, h in _TM_FLAGS],
+    }
+    if not _mission_dir_of(conn):
+        return ok({"types": [], "felder": felder, "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+    if status != "ok":
+        return ok({"types": [], "felder": felder, "status": status})
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        return err(f"db/types.xml ist kein gültiges XML: {e}", 409)
+    daten = _tm_datei_lesen(root)
+    daten["bekannt"], daten["limits_gelesen"] = await _tm_auswahl(conn, daten, loop)
+    daten["felder"] = felder
+    daten["status"] = "ok"
+    # Damit ein zweiter Bearbeiter die Datei nicht unbemerkt ueberschreibt.
+    daten["quelle_hash"] = hashlib.sha256((text or "").encode("utf8")).hexdigest()
+    return ok(daten)
+
+
+async def api_tools_typesmanager_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.typesmanager")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.typesmanager", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    commit = bool(data.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.typesmanager", 10)
+        if fehler is not None:
+            return fehler
+
+    aenderungen = data.get("aenderungen")
+    if not isinstance(aenderungen, dict) or not aenderungen:
+        return err("Keine Änderungen übergeben.")
+
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+    if status != "ok":
+        return err("db/types.xml konnte nicht gelesen werden – nichts geändert.", 502)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        return err(f"db/types.xml ist kein gültiges XML: {e}", 409)
+
+    hash_jetzt = hashlib.sha256((text or "").encode("utf8")).hexdigest()
+    if data.get("quelle_hash") and data["quelle_hash"] != hash_jetzt:
+        return err("Die db/types.xml auf dem Server hat sich inzwischen geändert. "
+                   "Bitte das Tool neu öffnen – sonst gehen fremde Änderungen "
+                   "verloren.", 409)
+
+    daten = _tm_datei_lesen(root)
+    auswahl, _ = await _tm_auswahl(conn, daten, loop)
+    bekannt = {k: set(v) for k, v in auswahl.items()}
+    vorhanden = {e["name"] for e in daten["types"]}
+    doppelt = set(daten["doppelt"])
+
+    neu = text
+    geschrieben: List[str] = []
+    nicht_gefunden: List[str] = []
+    for name, roh in aenderungen.items():
+        if not isinstance(roh, dict):
+            return err(f"{name}: ungültiges Änderungsformat.")
+        if name in doppelt:
+            return err(f"„{name}“ steht mehrfach in der db/types.xml. Bitte den "
+                       f"doppelten Eintrag erst von Hand entfernen – sonst wäre "
+                       f"nicht eindeutig, welcher geändert wird.", 409)
+        if name not in vorhanden:
+            nicht_gefunden.append(name)
+            continue
+        sauber, fehlertext = _tm_aenderung_pruefen(name, roh, bekannt)
+        if fehlertext:
+            return err(fehlertext)
+        if not sauber:
+            continue
+        found = _tool_finde_benannten_block(neu, "type", name)
+        if not found:
+            nicht_gefunden.append(name)
+            continue
+        neuer_block = _tm_block_anwenden(found["block"], sauber)
+        neu = neu[:found["start"]] + neuer_block + neu[found["end"]:]
+        geschrieben.append(name)
+
+    if nicht_gefunden:
+        return err("Diese Items stehen nicht in der db/types.xml: "
+                   + ", ".join(sorted(nicht_gefunden)), 409)
+    if not geschrieben:
+        return err("Keine der übergebenen Änderungen verändert etwas.")
+
+    try:
+        ET.fromstring(neu)
+    except ET.ParseError as e:
+        # Sicherheitsnetz: lieber gar nichts schreiben als eine kaputte
+        # types.xml auf dem Kundenserver.
+        return err(f"Die Änderung hätte ungültiges XML erzeugt ({e}) – "
+                   f"nichts geändert.", 500)
+
+    antwort: Dict[str, Any] = {
+        "generated": [{"filename": "db/types.xml", "content": neu}],
+        "geaendert": len(geschrieben), "namen": sorted(geschrieben),
+        "quelle_hash": hash_jetzt,
+    }
+    if not commit:
+        return ok(antwort)
+
+    if not await _tools_datei_schreiben(conn, "db/types.xml", neu, loop):
+        return err("db/types.xml konnte nicht per FTP gespeichert werden.", 502)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+              "Tool: Types Manager gespeichert",
+              f"{len(geschrieben)} Item(s) · {conn.name}")
+    antwort["geschrieben"] = True
+    return ok(antwort)
+
+
+# ── 11. Random Presets Generator ──────────────────────────────────────────
+# Bearbeitet cfgrandompresets.xml chirurgisch je Gruppe (wie Event-Vorlagen),
+# NICHT durch Neugenerierung der ganzen Datei. Nur die beiden echten,
+# vom Bohemia-Vanilla-Format belegten Gruppentypen "cargo" und "attachments"
+# werden unterstuetzt - ein "outfit"-Typ existiert nur auf der Referenzseite,
+# nicht im echten DayZ-Format, und wird deshalb bewusst nicht angeboten.
+_TOOL_RANDOMPRESETS_TYPEN = ("cargo", "attachments")
+
+
+def _tool_randompresets_lesen(root: Optional[ET.Element]) -> List[Dict[str, Any]]:
+    gruppen = []
+    if root is None:
+        return gruppen
+    for typ in _TOOL_RANDOMPRESETS_TYPEN:
+        for el in root.findall(typ):
+            name = el.get("name")
+            if not name:
+                continue
+            gruppen.append({
+                "typ": typ, "name": name, "chance": el.get("chance") or "0.1",
+                "items": [{"name": it.get("name"), "chance": it.get("chance") or "0.1"}
+                         for it in el.findall("item") if it.get("name")],
+            })
+    return gruppen
+
+
+def _tool_randompresets_definition_aus_payload(op: Dict[str, Any]) -> Dict[str, Any]:
+    name = str(op.get("name") or "").strip()
+    if not name:
+        raise ValueError("Gruppenname darf nicht leer sein.")
+    typ = str(op.get("typ") or "").strip()
+    if typ not in _TOOL_RANDOMPRESETS_TYPEN:
+        raise ValueError(f'Unbekannter Gruppentyp „{typ}".')
+    try:
+        chance = float(op.get("chance", 0.1))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f'Ungültige Chance in Gruppe „{name}".') from e
+    if not 0.0 <= chance <= 1.0:
+        raise ValueError(f'Die Chance in Gruppe „{name}" muss zwischen 0 und 1 liegen.')
+    items = []
+    for it in (op.get("items") or []):
+        it_name = str(it.get("name") or "").strip()
+        if not it_name:
+            continue
+        try:
+            it_chance = float(it.get("chance", 0.1))
+        except (TypeError, ValueError) as e:
+            raise ValueError(f'Ungültige Item-Chance in Gruppe „{name}".') from e
+        if not 0.0 <= it_chance <= 1.0:
+            raise ValueError(f'Item-Chance in Gruppe „{name}" muss zwischen 0 und 1 liegen.')
+        items.append({"name": it_name, "chance": it_chance})
+    if not items:
+        raise ValueError(f'Gruppe „{name}" braucht mindestens ein Item.')
+    return {"typ": typ, "name": name, "chance": chance, "items": items}
+
+
+def _tool_randompreset_block_bauen(typ: str, name: str, chance: float, items: List[Dict[str, Any]]) -> str:
+    zeilen = [f'    <{typ} chance="{chance:.2f}" name="{_tool_esc_xml(name)}">']
+    for it in items:
+        zeilen.append(f'        <item name="{_tool_esc_xml(it["name"])}" chance="{float(it["chance"]):.2f}" />')
+    zeilen.append(f'    </{typ}>')
+    return "\n".join(zeilen)
+
+
+def _tool_apply_randompresets_batch(text: str, ops: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Wendet eine Liste von Gruppen-Operationen (Loeschen/Anlegen/Aendern/
+    Umbenennen/Typwechsel) chirurgisch an - reine Transformation, kein
+    FTP-Zugriff. Nicht angefasste Gruppen, Kommentare und Reihenfolge bleiben
+    bytegenau erhalten."""
+    neu = text
+    erstellt = geaendert = geloescht = 0
+    for op in ops:
+        original_typ = op.get("original_typ") or op.get("typ")
+        original_name = op.get("original_name") or op.get("name")
+        if op.get("op") == "delete":
+            neu, gefunden = _tool_entferne_benannten_block(neu, original_typ, original_name)
+            if gefunden:
+                geloescht += 1
+            continue
+        typ, name = op["typ"], op["name"]
+        vorhanden_vorher = _tool_finde_benannten_block(neu, original_typ, original_name) is not None
+        if (original_typ != typ or original_name != name) and vorhanden_vorher:
+            neu, _ = _tool_entferne_benannten_block(neu, original_typ, original_name)
+            vorhanden_vorher = False
+        block = _tool_randompreset_block_bauen(typ, name, op["chance"], op["items"])
+        neu = _tool_benannten_block_ersetzen(neu, "randompresets", typ, name, block)
+        if vorhanden_vorher:
+            geaendert += 1
+        else:
+            erstellt += 1
+    return {"text": neu, "erstellt": erstellt, "geaendert": geaendert, "geloescht": geloescht}
+
+
+async def api_tools_randompresets_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.randompresets")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.randompresets", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"gruppen": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "cfgrandompresets.xml", loop)
+    if status != "ok":
+        return err("cfgrandompresets.xml per FTP nicht lesbar.", 502)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return err("cfgrandompresets.xml ist kein gültiges XML.")
+    classnames: List[str] = []
+    types_text, types_status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+    if types_status == "ok":
+        try:
+            types_root = ET.fromstring(types_text)
+            classnames = [t.get("name") for t in types_root.findall("type") if t.get("name")]
+        except ET.ParseError:
+            classnames = []
+    return ok({"gruppen": _tool_randompresets_lesen(root), "classnames": classnames,
+              "hash": hashlib.sha256(text.encode("utf-8")).hexdigest(), "backup": text})
+
+
+async def api_tools_randompresets_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.randompresets")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.randompresets", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    quelle_lokal = str(data_in.get("source_xml") or "").strip()
+    if commit and quelle_lokal:
+        return err("Eine lokal eingefügte cfgrandompresets.xml kann nur zur Vorschau genutzt werden, "
+                  "nicht hochgeladen.")
+    if not quelle_lokal and not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    ops_in = data_in.get("ops") or []
+    if not ops_in:
+        return err("Keine Änderungen im Entwurf.")
+    ops = []
+    for o in ops_in:
+        art = str(o.get("op") or "").strip()
+        if art == "delete":
+            name = str(o.get("name") or "").strip()
+            typ = str(o.get("typ") or "").strip()
+            if not name or typ not in _TOOL_RANDOMPRESETS_TYPEN:
+                return err("Ungültige Angaben zum Löschen.")
+            ops.append({"op": "delete", "typ": typ, "name": name,
+                       "original_typ": str(o.get("original_typ") or typ),
+                       "original_name": str(o.get("original_name") or name)})
+            continue
+        if art != "upsert":
+            return err(f'Unbekannte Operation „{art}".')
+        try:
+            definition = _tool_randompresets_definition_aus_payload(o)
+        except ValueError as e:
+            return err(str(e))
+        definition["op"] = "upsert"
+        definition["original_typ"] = str(o.get("original_typ") or definition["typ"])
+        definition["original_name"] = str(o.get("original_name") or definition["name"]).strip()
+        ops.append(definition)
+    finale = [(o["typ"], o["name"]) for o in ops if o.get("op") == "upsert"]
+    if len(finale) != len(set(finale)):
+        return err("Zwei Gruppen im Entwurf haben denselben Typ und Namen.")
+    loop = asyncio.get_running_loop()
+    if quelle_lokal:
+        text = quelle_lokal
+    else:
+        if commit:
+            fehler = _dash_rate_limited(request, "tools.randompresets", 10)
+            if fehler is not None:
+                return fehler
+        text, status = await _tools_datei_lesen(conn, "cfgrandompresets.xml", loop)
+        if status != "ok":
+            return err("cfgrandompresets.xml per FTP nicht lesbar.", 502)
+        quell_hash = str(data_in.get("source_hash") or "")
+        if quell_hash and quell_hash != hashlib.sha256(text.encode("utf-8")).hexdigest():
+            return err("cfgrandompresets.xml wurde inzwischen geändert – bitte neu laden und "
+                      "Vorschau erneut erzeugen.", 409)
+    try:
+        ET.fromstring(text)
+    except ET.ParseError:
+        return err("Das ist kein gültiges XML (cfgrandompresets.xml).")
+    ergebnis = _tool_apply_randompresets_batch(text, ops)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "cfgrandompresets.xml", ergebnis["text"], loop):
+        return err("cfgrandompresets.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Random Presets gespeichert",
+                  f"{ergebnis['erstellt']} neu, {ergebnis['geaendert']} geändert, "
+                  f"{ergebnis['geloescht']} gelöscht · {conn.name}")
+    return ok({"erstellt": ergebnis["erstellt"], "geaendert": ergebnis["geaendert"],
+              "geloescht": ergebnis["geloescht"],
+              "generated": [{"filename": "cfgrandompresets.xml", "content": ergebnis["text"]}]})
+
+
+# ── 13. Messages Generator ────────────────────────────────────────────────
+# Bearbeitet db/messages.xml - das echte, von Bohemia dokumentierte Vanilla-
+# In-Game-Nachrichtensystem (siehe community.bistudio.com/wiki/DayZ:Server_
+# Messages), NICHT die Discord-Ankündigungen dieses Dashboards und NICHT
+# serverDZ.cfg. Da <message>-Bloecke keinen eindeutigen Schluessel (kein
+# "name"-Attribut) haben, ist eine chirurgische Teiländerung wie bei
+# Event-Vorlagen/Random Presets nicht möglich - die Datei wird bei jedem
+# Speichern komplett aus der aktuellen Liste neu erzeugt (wie Types
+# Organizer), das Frontend zeigt dazu eine Warnung.
+_TOOL_MESSAGES_MAX_TEXT = 160
+
+
+def _tool_messages_lesen(root: Optional[ET.Element]) -> List[Dict[str, Any]]:
+    eintraege = []
+    if root is None:
+        return eintraege
+    for el in root.findall("message"):
+        text_el = el.find("text")
+        text = (text_el.text or "").strip() if text_el is not None and text_el.text else ""
+
+        def _int_feld(tag: str) -> Optional[int]:
+            e = el.find(tag)
+            if e is None or not (e.text or "").strip():
+                return None
+            try:
+                return int(e.text.strip())
+            except ValueError:
+                return None
+
+        onconnect = el.find("onconnect") is not None or el.find("onConnect") is not None
+        shutdown_el = el.find("shutdown")
+        shutdown = bool(shutdown_el is not None and (shutdown_el.text or "").strip() == "1")
+        eintraege.append({"text": text, "onconnect": onconnect, "delay": _int_feld("delay"),
+                          "repeat": _int_feld("repeat"), "deadline": _int_feld("deadline"),
+                          "shutdown": shutdown})
+    return eintraege
+
+
+def _tool_messages_eintrag_aus_payload(op: Dict[str, Any], index: int) -> Dict[str, Any]:
+    nr = index + 1
+    text = str(op.get("text") or "").strip()
+    if not text:
+        raise ValueError(f'Nachricht {nr}: Text darf nicht leer sein.')
+    if len(text) > _TOOL_MESSAGES_MAX_TEXT:
+        raise ValueError(f'Nachricht {nr}: Text darf höchstens {_TOOL_MESSAGES_MAX_TEXT} Zeichen haben.')
+    onconnect = bool(op.get("onconnect"))
+    shutdown = bool(op.get("shutdown"))
+
+    def _int_oder_none(wert: Any, feld: str) -> Optional[int]:
+        if wert is None or wert == "":
+            return None
+        try:
+            n = int(wert)
+        except (TypeError, ValueError):
+            raise ValueError(f'Nachricht {nr}: „{feld}" muss eine ganze Zahl sein.')
+        if n < 0:
+            raise ValueError(f'Nachricht {nr}: „{feld}" darf nicht negativ sein.')
+        return n
+
+    delay = _int_oder_none(op.get("delay"), "delay") if onconnect else None
+    repeat = _int_oder_none(op.get("repeat"), "repeat")
+    deadline = _int_oder_none(op.get("deadline"), "deadline")
+    if repeat is not None and repeat <= 0:
+        raise ValueError(f'Nachricht {nr}: „repeat" muss größer 0 sein.')
+    if deadline is not None and deadline <= 0:
+        raise ValueError(f'Nachricht {nr}: „deadline" muss größer 0 sein.')
+    if shutdown and not deadline:
+        raise ValueError(f'Nachricht {nr}: „Server bei Ablauf stoppen" braucht einen Countdown (deadline).')
+    if not (onconnect or repeat or deadline):
+        raise ValueError(f'Nachricht {nr}: mindestens On Connect, Repeat oder Countdown auswählen.')
+    return {"text": text, "onconnect": onconnect, "delay": delay, "repeat": repeat,
+            "deadline": deadline, "shutdown": shutdown}
+
+
+def _tool_messages_xml_bauen(eintraege: List[Dict[str, Any]]) -> str:
+    zeilen = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>', "<messages>"]
+    for e in eintraege:
+        zeilen.append("    <message>")
+        if e["onconnect"]:
+            zeilen.append("        <onconnect>1</onconnect>")
+        if e["delay"] is not None:
+            zeilen.append(f'        <delay>{e["delay"]}</delay>')
+        if e["repeat"] is not None:
+            zeilen.append(f'        <repeat>{e["repeat"]}</repeat>')
+        if e["deadline"] is not None:
+            zeilen.append(f'        <deadline>{e["deadline"]}</deadline>')
+        if e["shutdown"]:
+            zeilen.append("        <shutdown>1</shutdown>")
+        zeilen.append(f'        <text>{_tool_esc_xml(e["text"])}</text>')
+        zeilen.append("    </message>")
+    zeilen.append("</messages>")
+    return "\n".join(zeilen) + "\n"
+
+
+async def api_tools_messages_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.messages")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.messages", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"eintraege": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "db/messages.xml", loop)
+    if status == "missing":
+        return ok({"eintraege": [], "existiert_nicht": True, "hash": None})
+    if status != "ok":
+        return err("db/messages.xml per FTP nicht lesbar.", 502)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return err("db/messages.xml ist kein gültiges XML.")
+    return ok({"eintraege": _tool_messages_lesen(root),
+              "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()})
+
+
+async def api_tools_messages_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.messages")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.messages", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    quelle_lokal = str(data_in.get("source_xml") or "").strip()
+    if commit and quelle_lokal:
+        return err("Eine lokal eingefügte messages.xml kann nur zur Vorschau genutzt werden, "
+                  "nicht hochgeladen.")
+    if not quelle_lokal and not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    ops_in = data_in.get("eintraege")
+    if not isinstance(ops_in, list):
+        return err("Es fehlt das Feld „eintraege“ (Array).")
+    if len(ops_in) > 200:
+        return err("Zu viele Nachrichten in einem Entwurf (maximal 200).")
+    eintraege = []
+    for i, op in enumerate(ops_in):
+        try:
+            eintraege.append(_tool_messages_eintrag_aus_payload(op, i))
+        except ValueError as e:
+            return err(str(e))
+    loop = asyncio.get_running_loop()
+    if quelle_lokal:
+        pass
+    else:
+        if commit:
+            fehler = _dash_rate_limited(request, "tools.messages", 10)
+            if fehler is not None:
+                return fehler
+        text_alt, status = await _tools_datei_lesen(conn, "db/messages.xml", loop)
+        if status == "error":
+            return err("db/messages.xml per FTP nicht lesbar.", 502)
+        if status == "ok":
+            quell_hash = str(data_in.get("source_hash") or "")
+            if quell_hash and quell_hash != hashlib.sha256(text_alt.encode("utf-8")).hexdigest():
+                return err("db/messages.xml wurde inzwischen geändert – bitte neu laden und "
+                          "Vorschau erneut erzeugen.", 409)
+    neuer_text = _tool_messages_xml_bauen(eintraege)
+    if not await _tools_datei_schreiben_wenn(commit, conn, "db/messages.xml", neuer_text, loop):
+        return err("db/messages.xml konnte nicht gespeichert werden.", 502)
+    if commit:
+        anzahl_shutdown = sum(1 for e in eintraege if e["shutdown"])
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Messages Generator gespeichert",
+                  f"{len(eintraege)} Nachricht(en), davon {anzahl_shutdown} mit Shutdown · {conn.name}")
+    return ok({"anzahl": len(eintraege),
+              "generated": [{"filename": "db/messages.xml", "content": neuer_text}]})
+
+
+cmd_change_damage_settings.autocomplete("server")(_server_autocomplete)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /test – Letztes Log-Event pro Typ in die jeweiligen Channels
+# ══════════════════════════════════════════════════════════════
+@bot.tree.command(
+    name="test",
+    description=app_commands.locale_str("🧪 Postet das letzte Log-Event jedes Typs in die jeweiligen Channels")
+)
+@app_commands.describe(zeilen="Zu durchsuchende Log-Zeilen (Standard: 500, max: 2000)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_test(interaction: discord.Interaction, zeilen: int = 500,
+                   server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "test"):
+        return await _deny_subcmd(interaction)
+    conn = await _require_conn(interaction, need_ftp=True, server=server)
+    if conn is None:
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    # ── 1. Log-Datei lesen ────────────────────────────────────
+    log_dir = conn.get("ftp_log_dir")
+    if not log_dir:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Log-Verzeichnis nicht konfiguriert. Wende dich an den Bot-Betreiber.",
+            "❌ Log directory not configured. Please contact the bot operator."), ephemeral=True
+        )
+
+    loop = asyncio.get_running_loop()
+    adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
+    if not adm_files:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Keine ADM-Dateien gefunden.", "❌ No ADM files found."), ephemeral=True)
+
+    content = await loop.run_in_executor(None, conn.ftp.read_file, adm_files[-1])
+    if not content:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Log-Datei konnte nicht gelesen werden.",
+            "❌ Could not read the log file."), ephemeral=True)
+
+    # ── 2. Letzten N Zeilen parsen ────────────────────────────
+    zeilen = max(50, min(zeilen, 2000))
+    recent_lines = "\n".join(content.splitlines()[-zeilen:])
+    # Eigener Parser: mit conn.parser schrieb /test historische Positionen
+    # ueber die aktuellen und liess den naechsten Zonenlauf eine laengst
+    # verlassene Position fuer frisch halten.
+    events, _eigen = _historisch_parsen(conn, recent_lines)
+
+    # ── 3. Pro Feed-Typ das neueste Event merken ───────────────
+    # FEED_TYPES (fein: kill, connect, zombie_death, …) statt LOG_TYPES (grob:
+    # killfeed, joinleave, …) – genau das ist der Schluessel, den _dispatch
+    # tatsaechlich verwendet und den das Dashboard schreibt. Mit LOG_TYPES
+    # meldete /test hier fuer JEDES Event "kein Channel konfiguriert", selbst
+    # wenn im Dashboard alles korrekt eingerichtet war.
+    # Events kommen in Lesereihenfolge → letztes überschreibt → neuestes bleibt
+    latest_by_logtype: Dict[str, Dict] = {}
+    for ev in events:
+        # Dieselbe Rueckfallkette wie _dispatch: fein → grob → catch_all.
+        # Ohne den groben und den catch_all-Schluessel meldete /test bei einem
+        # Kunden, der NUR "Alles Übrige" gesetzt hat, faelschlich "kein
+        # Ereignis" bzw. "kein Channel" – obwohl der Poller genau dorthin
+        # postet.
+        for lt in (_feed_key(ev), DayZLogParser.EVENT_TO_LOG.get(ev["type"]),
+                   "catch_all"):
+            if lt:
+                latest_by_logtype[lt] = ev
+
+    # ── 4. Pro Feed-Typ in konfigurierten Channel posten ──────
+    sent:     List[Tuple[str, str]] = []  # (feed_type, channel_mention)
+    no_event: List[str]             = []  # Feed-Typ ohne Event im gescannten Bereich
+    no_ch:    List[str]             = []  # Feed-Typ mit Event aber ohne Channel
+    errors:   List[Tuple[str, str]] = []  # (feed_type, Fehlermeldung)
+
+    for lt in FEED_TYPES:
+        ev   = latest_by_logtype.get(lt)
+        feed = cfg.feed_settings(interaction.guild_id or conn.guild_id,
+                                 lt, conn.service_id)
+        ch_id = feed["channel_id"] if feed else None
+
+        if not ev:
+            no_event.append(lt)
+            continue
+        if not ch_id:
+            no_ch.append(lt)
+            continue
+
+        ch = bot.get_channel(int(ch_id))
+        if not ch:
+            errors.append((lt, _t(interaction, "Channel nicht gefunden (ID veraltet?)",
+                                  "Channel not found (outdated ID?)")))
+            continue
+
+        embed = EmbedBuilder.build(ev)
+        if not embed:
+            errors.append((lt, _t(interaction, "Embed konnte nicht erstellt werden",
+                                  "Could not build the embed")))
+            continue
+
+        # Test-Kennung in den Embed-Titel & Author einbauen
+        embed.title = f"🧪 [TEST] {embed.title or lt}"
+        embed.set_author(
+            name=_t(interaction, f"Testpost via /test · {interaction.user.display_name}",
+                   f"Test post via /test · {interaction.user.display_name}"),
+            icon_url=interaction.user.display_avatar.url if interaction.user.display_avatar else None
+        )
+
+        try:
+            await ch.send(embed=embed)
+            sent.append((lt, ch.mention))
+        except discord.Forbidden:
+            errors.append((lt, _t(interaction, f"Keine Schreibrechte in {ch.mention}",
+                                  f"No write permission in {ch.mention}")))
+        except Exception as ex:
+            errors.append((lt, str(ex)[:80]))
+
+    # ── 5. Ergebnis-Embed senden ──────────────────────────────
+    ok_count = len(sent)
+    color = 0x2ECC71 if ok_count > 0 else 0xE74C3C
+
+    summary = discord.Embed(
+        title=_t(interaction, "🧪 Test-Ergebnis", "🧪 Test Result"),
+        description=_t(
+            interaction,
+            f"Gescannt: letzte **{zeilen}** Zeilen aus `{adm_files[-1].split('/')[-1]}`\n"
+            f"Events gefunden: **{len(events)}** · Gepostet: **{ok_count}**",
+            f"Scanned: last **{zeilen}** lines from `{adm_files[-1].split('/')[-1]}`\n"
+            f"Events found: **{len(events)}** · Posted: **{ok_count}**"),
+        color=color,
+    )
+
+    def _gekuerzt(zeilen_liste: List[str], trenner: str = "\n") -> str:
+        # FEED_TYPES hat gut 50 Eintraege – ungekuerzt sprengt das locker
+        # das 1024-Zeichen-Limit eines Embed-Feldes.
+        text = trenner.join(zeilen_liste[:20])
+        rest = len(zeilen_liste) - 20
+        if rest > 0:
+            text += _t(interaction, f"{trenner}… und {rest} weitere",
+                      f"{trenner}… and {rest} more")
+        return text[:1024]
+
+    if sent:
+        lines = [f"✅ `{lt}` → {ch}" for lt, ch in sent]
+        summary.add_field(
+            name=_t(interaction, f"✅ Erfolgreich gepostet ({len(sent)})",
+                   f"✅ Successfully Posted ({len(sent)})"),
+            value=_gekuerzt(lines),
+            inline=False
+        )
+    if no_ch:
+        lines = [f"⚪ `{lt}`" for lt in no_ch]
+        summary.add_field(
+            name=_t(interaction, f"⚪ Kein Channel konfiguriert ({len(no_ch)})",
+                   f"⚪ No Channel Configured ({len(no_ch)})"),
+            value=_gekuerzt(lines, "  "),
+            inline=False
+        )
+    if no_event:
+        lines = [f"🔍 `{lt}`" for lt in no_event]
+        summary.add_field(
+            name=_t(interaction, f"🔍 Kein Event in den letzten {zeilen} Zeilen ({len(no_event)})",
+                   f"🔍 No Event in the Last {zeilen} Lines ({len(no_event)})"),
+            value=_gekuerzt(lines, "  "),
+            inline=False
+        )
+    if errors:
+        lines = [f"❌ `{lt}` — {msg}" for lt, msg in errors]
+        summary.add_field(
+            name=_t(interaction, f"❌ Fehler ({len(errors)})", f"❌ Error(s) ({len(errors)})"),
+            value=_gekuerzt(lines),
+            inline=False
+        )
+
+    summary.set_footer(text=_t(
+        interaction,
+        "🔍-Typen = diese Events kommen in deinen Logs nicht vor "
+        "(z.B. Damage/Loot brauchen Server-Mods). "
+        "⚪-Typen → im Dashboard unter „Feeds“ einrichten",
+        "🔍 types = these events don't occur in your logs "
+        "(e.g. damage/loot need server mods). "
+        "⚪ types → set up in the dashboard under „Feeds“"
+    ))
+    await interaction.followup.send(embed=summary, ephemeral=True)
+
+
+@bot.tree.command(name="ftp_status", description=app_commands.locale_str("🔌 Testet die FTP-Verbindung zum Nitrado-Server"))
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_ftp_status(interaction: discord.Interaction, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "ftp_status"):
+        return await _deny_subcmd(interaction)
+    await interaction.response.defer(ephemeral=True)
+    conn = await _require_conn(interaction, need_ftp=True, server=server)
+    if conn is None:
+        return
+
+    host     = conn.get("ftp_host", "–")
+    port     = conn.get("ftp_port", 21)
+    user     = conn.get("ftp_user", "–")
+    noch_nicht_gesetzt = _t(interaction, "Noch nicht gesetzt", "Not set yet")
+    log_dir  = conn.get("ftp_log_dir",  noch_nicht_gesetzt)
+
+    loop = asyncio.get_running_loop()
+
+    # ── 1. Login-Test ─────────────────────────────────────────
+    connect_ok  = False
+    connect_msg = ""
+    t_connect   = 0.0
+    try:
+        import ftplib, time as _time
+        def _test_login():
+            t0  = _time.monotonic()
+            ftp = ftplib.FTP()
+            ftp.connect(host, int(port), timeout=15)
+            ftp.login(user, conn.get("ftp_password", ""))
+            welcome = ftp.getwelcome()
+            ftp.quit()
+            return _time.monotonic() - t0, welcome
+        t_connect, welcome = await loop.run_in_executor(None, _test_login)
+        connect_ok  = True
+        connect_msg = welcome[:80] if welcome else _t(interaction, "Verbindung erfolgreich",
+                                                       "Connection successful")
+    except Exception as e:
+        connect_msg = str(e)[:120]
+
+    # ── 2. Log-Verzeichnis lesen ──────────────────────────────
+    adm_count  = 0
+    adm_latest = "–"
+    if connect_ok and log_dir and log_dir != noch_nicht_gesetzt:
+        try:
+            adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
+            adm_count  = len(adm_files)
+            adm_latest = (adm_files[-1].split("/")[-1] if adm_files
+                         else _t(interaction, "Keine gefunden", "None found"))
+        except Exception as e:
+            adm_latest = _t(interaction, f"Fehler: {e}", f"Error: {e}")
+
+    # ── 3. Nitrado-Banliste prüfen (Servereinstellungen, nicht FTP) ──
+    try:
+        ban_names, _bcat, _bkey = await _read_banlist(conn)
+        ban_msg = _t(interaction, f"✅ {len(ban_names)} Einträge", f"✅ {len(ban_names)} entries")
+    except Exception as e:
+        ban_msg = f"⚠️ {e}"
+
+    # ── Embed zusammenbauen ───────────────────────────────────
+    if connect_ok:
+        color = 0x2ECC71
+        title = _t(interaction, "🟢 FTP-Verbindung erfolgreich", "🟢 FTP Connection Successful")
+    else:
+        color = 0xE74C3C
+        title = _t(interaction, "🔴 FTP-Verbindung fehlgeschlagen", "🔴 FTP Connection Failed")
+
+    embed = discord.Embed(title=title, color=color)
+    embed.add_field(name="Host",
+                    value=f"`{host}:{port}`",                              inline=True)
+    embed.add_field(name=_t(interaction, "Benutzer", "User"),
+                    value=f"`{user}`",                                     inline=True)
+    embed.add_field(name=_t(interaction, "Ping / Antwortzeit", "Ping / Response Time"),
+                    value=f"`{t_connect*1000:.0f} ms`" if connect_ok else "–", inline=True)
+    embed.add_field(name=_t(interaction, "Server-Antwort", "Server Response"),
+                    value=f"`{connect_msg}`" if connect_ok else f"❌ `{connect_msg}`",
+                    inline=False)
+    embed.add_field(name=_t(interaction, "Log-Verzeichnis", "Log Directory"),
+                    value=f"`{log_dir}`",                                  inline=False)
+    embed.add_field(name=_t(interaction, "ADM-Dateien gefunden", "ADM Files Found"),
+                    value=_t(interaction, f"`{adm_count}`  •  Neueste: `{adm_latest}`",
+                            f"`{adm_count}`  •  Latest: `{adm_latest}`"),   inline=False)
+    embed.add_field(name=_t(interaction, "Nitrado-Banliste (Servereinstellungen)",
+                            "Nitrado Ban List (Server Settings)"),
+                    value=ban_msg,                                         inline=False)
+
+    if not connect_ok:
+        embed.set_footer(text=_t(
+            interaction, "Tipp: Wende dich an den Bot-Betreiber, damit er die Zugangsdaten neu holt",
+            "Tip: Please contact the bot operator to fetch the credentials again"))
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+cmd_ftp_scan.autocomplete("server")(_server_autocomplete)
+cmd_raw_log.autocomplete("server")(_server_autocomplete)
+cmd_test.autocomplete("server")(_server_autocomplete)
+cmd_ftp_status.autocomplete("server")(_server_autocomplete)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /ping – Verbindung zum Bot (global, immer nutzbar - siehe
+#  _PREMIUM_FREE_COMMANDS: laeuft in jedem Discord, auch ohne zugeordneten
+#  Server, denn _premium_check greift hier gar nicht erst.)
+# ══════════════════════════════════════════════════════════════
+@bot.tree.command(name="ping",
+                  description=app_commands.locale_str("🏓 Zeigt die Verbindung zum Bot in ms"))
+async def cmd_ping(interaction: discord.Interaction):
+    ms = round(bot.latency * 1000)
+    await interaction.response.send_message(f"🏓 Pong! **{ms} ms**", ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /hilfe – Alle Befehle
+# ══════════════════════════════════════════════════════════════
+@bot.tree.command(name=app_commands.locale_str("hilfe"),
+                  description=app_commands.locale_str("❓ Zeigt alle verfügbaren Bot-Befehle"))
+async def cmd_hilfe(interaction: discord.Interaction):
+    # Spam-Schutz: pro Nutzer, guild-übergreifend per gid=0-Fallback (DMs)
+    gid = interaction.guild_id or 0
+    remaining = db.cooldown_remaining(gid, interaction.user.id, "hilfe")
+    if remaining > 0:
+        return await interaction.response.send_message(
+            embed=_cooldown_embed("/hilfe", remaining), ephemeral=True)
+    db.set_cooldown(gid, interaction.user.id, "hilfe",
+                    int(cfg.config.get("hilfe_cooldown_seconds", 30)))
+    embed = discord.Embed(
+        title=_t(interaction, "🎮 DayZ Bot – Befehlsübersicht", "🎮 DayZ Bot – Command Overview"),
+        description=_t(interaction, "Alle Befehle (Admin-Rolle erforderlich, außer /hilfe)",
+                       "All commands (admin role required, except /help)"),
+        color=0x5865F2
+    )
+    embed.add_field(name=_t(interaction, "⚙️ Server-Verwaltung", "⚙️ Server Management"), value=_t(
+        interaction,
+        "`/neustart` — Server neu starten\n"
+        "`/stoppen` — Server stoppen\n"
+        "`/serverstatus` — Server-Status anzeigen\n"
+        "`/auto restart <intervall>` — Geplante Neustarts (Uhrzeit per Dropdown)\n"
+        "`/auto status` / `/auto off` — Zeitplan anzeigen / deaktivieren\n"
+        "`/change_damage_settings <bereich> <zustand>` — Base-/Container-Schaden "
+        "an/aus *(wirkt nach Neustart)*",
+        "`/restart` — Restart the server\n"
+        "`/stop` — Stop the server\n"
+        "`/serverstatus` — Show server status\n"
+        "`/auto restart <interval>` — Scheduled restarts (start time via dropdown)\n"
+        "`/auto status` / `/auto off` — Show / disable the schedule\n"
+        "`/change_damage_settings <area> <state>` — Base/container damage "
+        "on/off *(takes effect after a restart)*"
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "🔨 Spieler-Verwaltung", "🔨 Player Management"), value=_t(
+        interaction,
+        "`/ban <spieler> [grund]` — Auf die Nitrado-Banliste setzen (Komma = mehrere)\n"
+        "`/ban_entfernen <spieler>` — Von der Nitrado-Banliste entfernen\n"
+        "`/banlist` — Nitrado-Banliste anzeigen\n"
+        "`/whitelist add <spieler>` — Auf die Nitrado-Whitelist setzen (Komma = mehrere)\n"
+        "`/whitelist remove <spieler>` — Von der Nitrado-Whitelist entfernen\n"
+        "`/whitelist show` — Nitrado-Whitelist anzeigen\n"
+        "`/send whitelist panel <panel> <admin>` — Whitelist-Anmelde-Panel senden\n"
+        "`/admin_position` — Letzte Positionen\n"
+        "`/spieler_suche <name>` — Spieler in Logs suchen",
+        "`/ban <player> [reason]` — Add to the Nitrado ban list (comma = multiple)\n"
+        "`/ban_remove <player>` — Remove from the Nitrado ban list\n"
+        "`/banlist` — Show the Nitrado ban list\n"
+        "`/whitelist add <player>` — Add to the Nitrado whitelist (comma = multiple)\n"
+        "`/whitelist remove <player>` — Remove from the Nitrado whitelist\n"
+        "`/whitelist show` — Show the Nitrado whitelist\n"
+        "`/send whitelist panel <panel> <admin>` — Send the whitelist signup panel\n"
+        "`/admin_position` — Last known positions\n"
+        "`/player_search <name>` — Search for a player in the logs"
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "📡 Feed-Verwaltung", "📡 Feed Management"), value=_t(
+        interaction,
+        "`/show_feeds` — Zeigt, welche Feeds für diesen Server eingerichtet sind\n"
+        "`/test [zeilen]` — Beispiel-Event je Feed-Typ aus den letzten Log-Zeilen\n"
+        "*Einrichten, ändern und löschen im Dashboard unter „Feeds“ – "
+        "dort mit Farbe, Position und Zeitstempel je Feed.*",
+        "`/show_feeds` — Shows which feeds are set up for this server\n"
+        "`/test [lines]` — Sample event per feed type from the latest log lines\n"
+        "*Set up, change and delete feeds in the dashboard under „Feeds“ – "
+        "with color, position and timestamp per feed.*"
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "🛡️ Zonen-Pings", "🛡️ Zone Pings"), value=_t(
+        interaction,
+        "`/zone list` — Alle aktiven Zonen dieses Servers\n"
+        "`/zone allowlist add|remove|show <zone> <spieler>` — Spieler in einer Zone "
+        "ignorieren / wieder melden / anzeigen\n"
+        "*Anlegen und Bearbeiten im Dashboard unter „Zones“ – dort auch "
+        "Polygon-Zonen und mehrere Ping-Rollen.*",
+        "`/zone list` — All active zones of this server\n"
+        "`/zone allowlist add|remove|show <zone> <player>` — Ignore a player in a zone "
+        "/ report them again / show the list\n"
+        "*Create and edit in the dashboard under „Zones“ – also "
+        "polygon zones and multiple ping roles.*"
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "📢 Einrichtung", "📢 Setup"), value=_t(
+        interaction,
+        "Nitrado-Token, Server-Auswahl, Feeds, Zonen, Shop, Ankündigungen und "
+        "Auto-Neustarts werden im **Web-Dashboard** eingerichtet (Adresse steht "
+        "beim Start im Log).\n"
+        "Die früheren Befehle `/setup token`, `/setup feeds`, "
+        "`/setup uebersicht`, `/edit_feeds` und `/zone create|edit|remove` "
+        "gibt es nicht mehr.",
+        "Nitrado token, server selection, feeds, zones, shop, announcements and "
+        "auto-restarts are set up in the **web dashboard** (the address is "
+        "in the log at startup).\n"
+        "The former commands `/setup token`, `/setup feeds`, "
+        "`/setup uebersicht`, `/edit_feeds` and `/zone create|edit|remove` "
+        "no longer exist."
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "📊 Kill-Stats & Belohnungen", "📊 Kill Stats & Rewards"), value=_t(
+        interaction,
+        "`/stats <spieler>` — Kills, Tode, K/D, Lieblingswaffe, weitester Kill\n"
+        "`/leaderboard` — Top 10 PvP-Killer\n"
+        "`/link <playstation-name>` / `/unlink` — Account verknüpfen (Kill- & Spielzeit-Geld)\n"
+        "`/username list` — Eigene Verknüpfung anzeigen (Admins: alle, 🟢 = online)\n"
+        "`/forcelink <name> <@user>` / `/forceunlink <@user>` *(Admin)*\n"
+        "`/bounty <spieler> <betrag>` — Kopfgeld aussetzen · `/bounties` — aktive Kopfgelder",
+        "`/stats <player>` — Kills, deaths, K/D, favorite weapon, longest kill\n"
+        "`/leaderboard` — Top 10 PvP killers\n"
+        "`/link <playstation-name>` / `/unlink` — Link your account (kill & playtime money)\n"
+        "`/username list` — Show your own link (admins: all, 🟢 = online)\n"
+        "`/forcelink <name> <@user>` / `/forceunlink <@user>` *(admin)*\n"
+        "`/bounty <player> <amount>` — Place a bounty · `/bounties` — active bounties"
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "🔧 Diagnose", "🔧 Diagnostics"), value=_t(
+        interaction,
+        "`/ftp_scan` — FTP neu scannen *(Bot-Eigentümer)*\n"
+        "`/ftp_status` — FTP-Verbindung testen\n"
+        "`/raw_log [zeilen]` — Rohe Log-Zeilen anzeigen (Debug)\n"
+        "`/test [zeilen]` — Letztes Event pro Typ in Channels posten",
+        "`/ftp_scan` — Re-scan FTP *(bot owner)*\n"
+        "`/ftp_status` — Test the FTP connection\n"
+        "`/raw_log [lines]` — Show raw log lines (debug)\n"
+        "`/test [lines]` — Post the latest event per type into the channels"
+    ), inline=False)
+    embed.add_field(name="💰 Economy", value=_t(
+        interaction,
+        "`/balance [@user]` — Wallet & Bank\n"
+        "`/deposit [amount]` / `/withdraw [amount]`\n"
+        "`/pay <@user> <betrag>` — Geld an Mitspieler überweisen\n"
+        "`/work` `/daily` `/beg` — Geld verdienen\n"
+        "`/addmoney` `/removemoney` `/setbalance` *(Admin)*\n"
+        "`/economy_reload` — config.json neu laden *(Bot-Eigentümer)*",
+        "`/balance [@user]` — Wallet & bank\n"
+        "`/deposit [amount]` / `/withdraw [amount]`\n"
+        "`/pay <@user> <amount>` — Transfer money to another member\n"
+        "`/work` `/daily` `/beg` — Earn money\n"
+        "`/addmoney` `/removemoney` `/setbalance` *(admin)*\n"
+        "`/economy_reload` — Reload config.json *(bot owner)*"
+    ), inline=False)
+    embed.add_field(name="🎰 Casino", value=_t(
+        interaction,
+        "`/blackjack <bet>` — Blackjack mit Hit/Stand-Buttons\n"
+        "`/roulette <bet> <wager>` — red/black/even/odd/low/high/0-36\n"
+        "`/slots <bet>` — Slot-Maschine",
+        "`/blackjack <bet>` — Blackjack with Hit/Stand buttons\n"
+        "`/roulette <bet> <wager>` — red/black/even/odd/low/high/0-36\n"
+        "`/slots <bet>` — Slot machine"
+    ), inline=False)
+    embed.add_field(name="🛒 Shop", value=_t(
+        interaction,
+        "`/shop list [category]` — Item-Katalog (leer = Kategorie-Übersicht)\n"
+        "`/buy <item> <amount> <x> <z> [y]` — Item kaufen (spawnt nach Neustart)\n"
+        "`/shop pending` `/shop check` `/shop cleanup` `/shop enable` `/shop rentals` *(Admin)*\n"
+        "*Katalog, Bundles und Mietartikel im Dashboard unter „Shop“ verwalten.*\n"
+        "*Shop-Log und Economy-Log als Feed einrichten: Dashboard → „Feeds“.*",
+        "`/shop list [category]` — Item catalog (empty = category overview)\n"
+        "`/buy <item> <amount> <x> <z> [y]` — Buy an item (spawns after the next restart)\n"
+        "`/shop pending` `/shop check` `/shop cleanup` `/shop enable` `/shop rentals` *(admin)*\n"
+        "*Manage the catalog, bundles and rental items in the dashboard under „Shop“.*\n"
+        "*Set up shop log and economy log as a feed: dashboard → „Feeds“.*"
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "📢 Ankündigungen", "📢 Announcements"), value=_t(
+        interaction,
+        "`/erstellen` — Neue wiederkehrende Ankündigung anlegen (Tag/Uhrzeit/Wiederholung per Dropdown)\n"
+        "`/liste` — Alle Ankündigungen mit nächstem Sendetermin & Countdown\n"
+        "`/löschen <index>` — Ankündigung löschen\n"
+        "`/edit ankuendigung <index>` — Nachricht/Bild einer Ankündigung ändern\n"
+        "`/hackban <user_id> [grund]` — Discord-Nutzer per ID bannen",
+        "`/create` — Create a new recurring announcement (day/time/repeat via dropdown)\n"
+        "`/list` — All announcements with next send time & countdown\n"
+        "`/delete <index>` — Delete an announcement\n"
+        "`/edit announcement <index>` — Change an announcement's message/image\n"
+        "`/hackban <user_id> [reason]` — Ban a Discord user by ID"
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "🎉 Gewinnspiele", "🎉 Giveaways"), value=_t(
+        interaction,
+        "`/gcreate` — Gewinnspiel per Formular erstellen\n"
+        "`/gstart <dauer> <sieger> <preis> [beschreibung]` — Gewinnspiel direkt starten\n"
+        "`/glist` — Laufende Gewinnspiele anzeigen\n"
+        "`/gdelete <id>` — Gewinnspiel löschen\n"
+        "`/gend <id>` — Gewinnspiel vorzeitig beenden und Sieger auslosen\n"
+        "`/greroll <id> [anzahl]` — Neue Sieger für ein beendetes Gewinnspiel auslosen\n"
+        "`/gsettings set [farbe] [rolle]` — Embed-Farbe und Pflichtrolle festlegen",
+        "`/gcreate` — Create a giveaway via form\n"
+        "`/gstart <duration> <winners> <prize> [description]` — Start a giveaway directly\n"
+        "`/glist` — Show running giveaways\n"
+        "`/gdelete <id>` — Delete a giveaway\n"
+        "`/gend <id>` — End a giveaway early and draw winners\n"
+        "`/greroll <id> [count]` — Draw new winners for an ended giveaway\n"
+        "`/gsettings set [color] [role]` — Set embed color and required role"
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "🗺️ Event Vorlagen", "🗺️ Event Templates"), value=_t(
+        interaction,
+        "`/events add <vorlage> <x> <z> [y] [name]` — Vorlage an einer Position hinzufügen\n"
+        "`/events list` — Zeigt alle hinzugefügten Event-Instanzen\n"
+        "`/events remove <name>` — Entfernt eine hinzugefügte Instanz\n"
+        "Vorlagen werden im Dashboard unter „Event Vorlagen“ angelegt.",
+        "`/events add <template> <x> <z> [y] [name]` — Add a template at a position\n"
+        "`/events list` — Show all added event instances\n"
+        "`/events remove <name>` — Remove an added instance\n"
+        "Templates are created in the dashboard under „Event Templates“."
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "🚩 Fraktionen", "🚩 Factions"), value=_t(
+        interaction,
+        "`/faction info [fraktion]` — Details einer Fraktion\n"
+        "`/faction list` — Alle Fraktionen dieses Servers *(Admin)*\n"
+        "`/faction balance [fraktion]` — Kontostand der Fraktionskasse\n"
+        "`/faction deposit/withdraw/pay <betrag>` — Fraktionskasse verwalten\n"
+        "`/faction stats [fraktion]` / `/faction map [fraktion]` — Statistiken / Kartenbild\n"
+        "`/faction member add|remove <spieler>` — Mitglieder verwalten (Leader/Officer)\n"
+        "`/faction permission grant|revoke <mitglied>` — Officer-Rechte vergeben (Leader)\n"
+        "*Fraktionen anlegen im Dashboard unter „Factions“.*",
+        "`/faction info [faction]` — Details of a faction\n"
+        "`/faction list` — All factions of this server *(admin)*\n"
+        "`/faction balance [faction]` — Faction treasury balance\n"
+        "`/faction deposit/withdraw/pay <amount>` — Manage the faction treasury\n"
+        "`/faction stats [faction]` / `/faction map [faction]` — Statistics / map image\n"
+        "`/faction member add|remove <player>` — Manage members (leader/officer)\n"
+        "`/faction permission grant|revoke <member>` — Grant officer permissions (leader)\n"
+        "*Create factions in the dashboard under „Factions“.*"
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "🎫 Tickets", "🎫 Tickets"), value=_t(
+        interaction,
+        "`/send ticket panel <panel>` — Ticket-Panel senden (Admin)\n"
+        "`/ticket add|remove <channel> <mitglied>` — Person zu einem Ticket hinzufügen/entfernen (Support)\n"
+        "`/ticket clear_stale` — Verwaiste Ticket-Sperren aufräumen (Admin)\n"
+        "*Öffnen läuft über den Panel-Knopf, Kategorien im Dashboard unter „Tickets“.*",
+        "`/send ticket panel <panel>` — Send the ticket panel (admin)\n"
+        "`/ticket add|remove <channel> <member>` — Add/remove a person from a ticket (support)\n"
+        "`/ticket clear_stale` — Clean up orphaned ticket locks (admin)\n"
+        "*Opening happens via the panel button; manage categories in the dashboard under „Tickets“.*"
+    ), inline=False)
+    _c_hilfe = _conn_of(interaction)
+    admin_ids = _c_hilfe.get("admin_role_ids", []) if _c_hilfe is not None else []
+    admin_name = (_c_hilfe.get("admin_role_name", "DayZ Admin") if _c_hilfe is not None
+                  else "DayZ Admin")
+    # Kein Verweis mehr auf die Dashboard-Optionen: admin_role_ids wird dort
+    # nicht angeboten (siehe api_options) – der Tipp schickte Betreiber auf
+    # die Suche nach einer Einstellung, die es an der Stelle nicht gibt.
+    if admin_ids:
+        footer = (_t(interaction, "Admin-Rollen-IDs: ", "Admin role IDs: ")
+                  + ', '.join(str(i) for i in admin_ids))
+    else:
+        footer = _t(
+            interaction,
+            f"Admin-Rolle: {admin_name} (admin_role_ids stehen in der connections.json des Servers)",
+            f"Admin role: {admin_name} (admin_role_ids is set in the server's connections.json)")
+    embed.set_footer(text=footer)
+    await interaction.response.send_message(embed=embed)
+
+
+# ══════════════════════════════════════════════════════════════
+#  ANKÜNDIGUNGEN – Wiederkehrende geplante Nachrichten
+#  (/erstellen, /liste, /löschen, /edit ankuendigung, /hackban)
+# ══════════════════════════════════════════════════════════════
+ANNOUNCEMENTS_FILE = "announcements.json"
+
+try:
+    with open(ANNOUNCEMENTS_FILE, "r", encoding="utf-8") as f:
+        ann_data = json.load(f)
+except FileNotFoundError:
+    ann_data = {"announcements": []}
+    with open(ANNOUNCEMENTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(ann_data, f, ensure_ascii=False, indent=4)
+
+
+def save_announcements():
+    with open(ANNOUNCEMENTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(ann_data, f, ensure_ascii=False, indent=4)
+
+
+def _ann_eigene(conn: Optional["ServerConnection"]) -> List[Tuple[int, dict]]:
+    """Ankündigungen eines Servers als ``[(Position in der Datei, Eintrag)]``.
+
+    Alle Ankündigungen liegen in einer gemeinsamen Datei. Ohne diese Filterung
+    zeigte ``/liste`` jedem Kunden die Ankündigungen aller anderen – und
+    ``/löschen 0`` traf den erstbesten fremden Eintrag. Alt-Einträge ohne
+    ``service_id`` gehören dem Hauptserver.
+    """
+    if conn is None:
+        return []
+    haupt = connections.primary()
+    out: List[Tuple[int, dict]] = []
+    for i, ann in enumerate(ann_data.get("announcements", [])):
+        sid = str(ann.get("service_id") or "")
+        if sid == conn.service_id or (not sid and haupt is conn):
+            out.append((i, ann))
+    return out
+
+
+async def _ann_position(interaction: discord.Interaction,
+                        index: int) -> Optional[int]:
+    """Rechnet die in ``/liste`` angezeigte Nummer in die Dateiposition um.
+
+    Antwortet selbst, wenn die Nummer nicht zu einer eigenen Ankündigung
+    gehört – der Aufrufer bricht dann mit ``return`` ab.
+    """
+    conn = _conn_of(interaction)
+    if conn is None:
+        await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+        return None
+    eigene = _ann_eigene(conn)
+    if index < 0 or index >= len(eigene):
+        await interaction.response.send_message(_t(
+            interaction,
+            "❌ Ungültige Nummer – `/liste` zeigt die Ankündigungen dieses Servers.",
+            "❌ Invalid number – `/list` shows this server's announcements."),
+            ephemeral=True)
+        return None
+    return eigene[index][0]
+
+
+def should_send_today(ann: dict, today: date) -> bool:
+    """
+    Prüft ob eine Ankündigung heute gesendet werden soll,
+    basierend auf dem repeat-Typ und dem letzten Sendedatum.
+    """
+    repeat = ann.get("repeat", "weekly")
+    last_sent_str = ann.get("last_sent")
+
+    # Intervall in Wochen bestimmen
+    interval_map = {
+        "weekly":    1,
+        "biweekly":  2,
+        "triweekly": 3,
+        "monthly":   4,  # ~4 Wochen
+    }
+    interval_weeks = interval_map.get(repeat, 1)
+
+    if not last_sent_str:
+        # Noch nie gesendet → darf heute gesendet werden
+        return True
+
+    last_sent = date.fromisoformat(last_sent_str)
+    next_send = last_sent + timedelta(weeks=interval_weeks)
+
+    return today >= next_send
+
+
+def get_next_send_datetime(ann: dict) -> datetime:
+    """
+    Berechnet den nächsten Sendezeitpunkt einer Ankündigung
+    als datetime-Objekt (Europe/Berlin).
+    """
+    tz = _berlin_tz()
+    repeat = ann.get("repeat", "weekly")
+    last_sent_str = ann.get("last_sent")
+    time_str = ann.get("time", "00:00")
+    hour, minute = map(int, time_str.split(":"))
+
+    interval_map = {
+        "weekly":    1,
+        "biweekly":  2,
+        "triweekly": 3,
+        "monthly":   4,
+    }
+    interval_weeks = interval_map.get(repeat, 1)
+
+    today = datetime.now(tz).date()
+
+    if not last_sent_str:
+        # Noch nie gesendet → nächster passender Wochentag
+        day_map = {
+            "monday": 0, "tuesday": 1, "wednesday": 2,
+            "thursday": 3, "friday": 4, "saturday": 5, "sunday": 6
+        }
+        target_weekday = day_map.get(ann.get("day", "monday"), 0)
+        days_ahead = (target_weekday - today.weekday()) % 7
+        next_date = today + timedelta(days=days_ahead)
+    else:
+        last_sent = date.fromisoformat(last_sent_str)
+        next_date = last_sent + timedelta(weeks=interval_weeks)
+
+    return datetime(next_date.year, next_date.month, next_date.day, hour, minute, 0, tzinfo=tz)
+
+
+def format_countdown(dt: datetime) -> str:
+    """Gibt die verbleibende Zeit bis dt als lesbaren String zurück."""
+    now = datetime.now(_berlin_tz())
+    diff = dt - now
+
+    if diff.total_seconds() <= 0:
+        return "Wird gleich gesendet"
+
+    total_seconds = int(diff.total_seconds())
+    days    = total_seconds // 86400
+    hours   = (total_seconds % 86400) // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+
+    parts = []
+    if days:    parts.append(f"{days}T")
+    if hours:   parts.append(f"{hours}Std")
+    if minutes: parts.append(f"{minutes}Min")
+    parts.append(f"{seconds}Sek")
+
+    return " ".join(parts)
+
+
+ann_already_sent = set()
+
+
+async def check_announcements():
+    now = datetime.now(_berlin_tz())
+
+    day = now.strftime("%A").lower()
+    time_str = now.strftime("%H:%M")
+    today = now.date()
+
+    for ann in ann_data["announcements"]:
+
+        if ann["day"] == day and ann["time"] == time_str:
+
+            # Die service_id gehoert in den Schluessel: zwei Server derselben
+            # Guild koennen zur selben Minute unterschiedliche Ankuendigungen
+            # in denselben Channel planen. Ohne sie galt die zweite nach dem
+            # ersten Versand als "schon gesendet" und fiel stillschweigend aus.
+            key = (f"{today.isoformat()}-{day}-{time_str}-{ann['channel_id']}"
+                   f"-{ann.get('service_id') or ''}-{ann.get('message', '')[:40]}")
+
+            if key in ann_already_sent:
+                continue
+
+            # Repeat-Logik prüfen
+            if not should_send_today(ann, today):
+                continue
+
+            channel = bot.get_channel(int(ann["channel_id"]))
+
+            if channel:
+
+                embed = discord.Embed(
+                    description=ann["message"],
+                    color=discord.Color.blue()
+                )
+
+                if ann.get("image"):
+                    embed.set_image(url=ann["image"])
+
+                try:
+                    await channel.send(embed=embed)
+                    ann_already_sent.add(key)
+
+                    # Letztes Sendedatum speichern
+                    ann["last_sent"] = today.isoformat()
+                    save_announcements()
+
+                except Exception as e:
+                    log.error(f"[ANKÜNDIGUNG] Fehler beim Senden: {e}")
+
+
+@tasks.loop(minutes=1)
+async def announcement_scheduler():
+    await check_announcements()
+
+
+# ─── Ankündigungs-UI: Tag / Uhrzeit / Wiederholung ───
+
+_WOCHENTAGE_EN = {
+    "Montag": "Monday", "Dienstag": "Tuesday", "Mittwoch": "Wednesday",
+    "Donnerstag": "Thursday", "Freitag": "Friday", "Samstag": "Saturday", "Sonntag": "Sunday",
+}
+
+
+class TagSelect(discord.ui.Select):
+
+    def __init__(self, sprache: str = "de"):
+
+        tage = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+        werte = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        options = [
+            discord.SelectOption(label=_WOCHENTAGE_EN[tag] if sprache == "en" else tag, value=wert)
+            for tag, wert in zip(tage, werte)
+        ]
+
+        super().__init__(
+            placeholder="Select day" if sprache == "en" else "Tag auswählen",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+
+        self.view.selected_day = self.values[0]
+
+        await interaction.response.defer()
+
+
+class TimeSelect(discord.ui.Select):
+
+    def __init__(self, page=0, sprache: str = "de"):
+
+        all_times = []
+
+        for h in range(24):
+
+            all_times.append(f"{h:02d}:00")
+            all_times.append(f"{h:02d}:30")
+
+        per_page = 16
+
+        start = page * per_page
+        end = start + per_page
+
+        times = all_times[start:end]
+
+        options = [
+            discord.SelectOption(label=t, value=t)
+            for t in times
+        ]
+
+        super().__init__(
+            placeholder=(f"Time (page {page+1}/3)" if sprache == "en"
+                        else f"Uhrzeit (Seite {page+1}/3)"),
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+
+        self.view.selected_time = self.values[0]
+
+        await interaction.response.defer()
+
+
+class RepeatSelect(discord.ui.Select):
+
+    def __init__(self, sprache: str = "de"):
+
+        if sprache == "en":
+            options = [
+                discord.SelectOption(label="Every week", value="weekly"),
+                discord.SelectOption(label="Every 2 weeks", value="biweekly"),
+                discord.SelectOption(label="Every 3 weeks", value="triweekly"),
+                discord.SelectOption(label="Every month", value="monthly"),
+            ]
+        else:
+            options = [
+                discord.SelectOption(label="Jede Woche", value="weekly"),
+                discord.SelectOption(label="Alle 2 Wochen", value="biweekly"),
+                discord.SelectOption(label="Alle 3 Wochen", value="triweekly"),
+                discord.SelectOption(label="Jeden Monat", value="monthly"),
+            ]
+
+        super().__init__(
+            placeholder="Select repeat interval" if sprache == "en" else "Wiederholung auswählen",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+
+        self.view.selected_repeat = self.values[0]
+        await interaction.response.defer()
+
+
+class PageButton(discord.ui.Button):
+
+    def __init__(self, label, page):
+
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.primary
+        )
+
+        self.page = page
+
+    async def callback(self, interaction: discord.Interaction):
+
+        view = CreateAnnouncementView(page=self.page, sprache=self.view.sprache)
+
+        view.selected_day = self.view.selected_day
+        view.selected_time = self.view.selected_time
+        view.selected_repeat = self.view.selected_repeat
+
+        await interaction.response.edit_message(view=view)
+
+
+class NextButton(discord.ui.Button):
+
+    def __init__(self, sprache: str = "de"):
+
+        super().__init__(
+            label="Next" if sprache == "en" else "Weiter",
+            style=discord.ButtonStyle.success
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+
+        if not self.view.selected_day or not self.view.selected_time or not self.view.selected_repeat:
+
+            await interaction.response.send_message(_t(
+                interaction, "Bitte Tag und Uhrzeit wählen.",
+                "Please select a day and time."),
+                ephemeral=True
+            )
+
+            return
+
+        modal = AnnouncementModal(
+            self.view.selected_day,
+            self.view.selected_time,
+            self.view.selected_repeat,
+            self.view.sprache
+        )
+
+        await interaction.response.send_modal(modal)
+
+
+class CreateAnnouncementView(discord.ui.View):
+
+    def __init__(self, page=0, sprache: str = "de"):
+
+        super().__init__(timeout=300)
+
+        self.selected_day = None
+        self.selected_time = None
+        self.selected_repeat = None
+        self.sprache = sprache
+
+        self.add_item(TagSelect(sprache))
+        self.add_item(TimeSelect(page, sprache))
+        self.add_item(RepeatSelect(sprache))
+
+        if page > 0:
+            self.add_item(PageButton("⬅", page - 1))
+
+        if page < 2:
+            self.add_item(PageButton("➡", page + 1))
+
+        self.add_item(NextButton(sprache))
+
+
+class AnnouncementModal(discord.ui.Modal):
+
+    def __init__(self, day, time, repeat_type, sprache: str = "de"):
+
+        super().__init__(title="Announcement" if sprache == "en" else "Ankündigung")
+
+        self.day = day
+        self.time = time
+        self.repeat_type = repeat_type
+        self.sprache = sprache
+
+        self.msg = discord.ui.TextInput(
+            label="Message" if sprache == "en" else "Nachricht",
+            style=discord.TextStyle.paragraph,
+            max_length=2000
+        )
+
+        self.channel = discord.ui.TextInput(
+            label="Channel ID" if sprache == "en" else "Channel-ID"
+        )
+
+        self.image = discord.ui.TextInput(
+            label="Image URL" if sprache == "en" else "Bild URL",
+            required=False
+        )
+
+        self.add_item(self.msg)
+        self.add_item(self.channel)
+        self.add_item(self.image)
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        try:
+            kanal_id = int(self.channel.value)
+
+        except Exception:
+
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Fehlerhafte Channel-ID", "❌ Invalid channel ID"),
+                ephemeral=True
+            )
+
+        # Bewusst NICHT bot.get_channel(): das findet jeden Channel, den der Bot
+        # sieht – auch die anderer Kunden. Der Zielchannel muss in DIESER Guild
+        # liegen, sonst liesse sich hier eine wiederkehrende Ankuendigung im
+        # Discord eines fremden Kunden einplanen.
+        channel = interaction.guild.get_channel(kanal_id) if interaction.guild else None
+
+        if not channel:
+
+            return await interaction.response.send_message(_t(
+                interaction,
+                "❌ Channel nicht gefunden – er muss in diesem Discord-Server liegen.",
+                "❌ Channel not found – it must be in this Discord server."),
+                ephemeral=True
+            )
+
+        _conn = _conn_of(interaction)
+        ann_data["announcements"].append({
+            "message": self.msg.value,
+            "channel_id": str(self.channel.value),
+            "day": self.day,
+            "time": self.time,
+            "repeat": self.repeat_type,
+            "image": self.image.value.strip() if self.image.value else None,
+            "last_sent": None,  # Wird nach dem ersten Senden gesetzt
+            # Gehoert zu genau einem Server, sonst sehen alle Kunden alles
+            "service_id": _conn.service_id if _conn is not None else "",
+        })
+
+        save_announcements()
+
+        await interaction.response.send_message(_t(
+            interaction, "✅ Ankündigung gespeichert", "✅ Announcement saved"),
+            ephemeral=True
+        )
+
+
+class EditAnnouncementModal(discord.ui.Modal):
+
+    def __init__(self, index, sprache: str = "de"):
+
+        super().__init__(title="Edit Announcement" if sprache == "en" else "Ankündigung bearbeiten")
+
+        self.index = index
+        self.sprache = sprache
+
+        ann = ann_data["announcements"][index]
+        # Der Index ist eine Position in EINER globalen Liste. Wird waehrend
+        # das Modal offen ist ein frueherer Eintrag geloescht, rutscht ein
+        # fremder Datensatz auf diese Position – ohne Merkmal wuerde dann beim
+        # Absenden die Ankuendigung eines anderen Kunden ueberschrieben.
+        self.gehoert_zu = str(ann.get("service_id") or "")
+        self.war_text = str(ann.get("message") or "")
+
+        self.message_input = discord.ui.TextInput(
+            label="New message" if sprache == "en" else "Neue Nachricht",
+            style=discord.TextStyle.paragraph,
+            default=ann["message"],
+            max_length=2000
+        )
+
+        self.image_input = discord.ui.TextInput(
+            label="New image URL" if sprache == "en" else "Neue Bild URL",
+            default=ann.get("image") or "",
+            required=False
+        )
+
+        self.add_item(self.message_input)
+        self.add_item(self.image_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        eintraege = ann_data["announcements"]
+        # Steht an der gemerkten Stelle noch derselbe Eintrag? Sonst hat sich
+        # die Liste zwischenzeitlich verschoben und wir wuerden den falschen
+        # (moeglicherweise fremden) Datensatz ueberschreiben.
+        ziel = eintraege[self.index] if 0 <= self.index < len(eintraege) else None
+        if (ziel is None
+                or str(ziel.get("service_id") or "") != self.gehoert_zu
+                or str(ziel.get("message") or "") != self.war_text):
+            return await interaction.response.send_message(_t(
+                interaction,
+                "❌ Die Liste hat sich inzwischen geändert – bitte `/liste` erneut "
+                "aufrufen und die Ankündigung neu auswählen.",
+                "❌ The list has changed in the meantime – please run `/list` again "
+                "and re-select the announcement."),
+                ephemeral=True
+            )
+
+        ziel["message"] = self.message_input.value
+
+        ziel["image"] = (
+            self.image_input.value.strip()
+            if self.image_input.value
+            else None
+        )
+
+        save_announcements()
+
+        await interaction.response.send_message(_t(
+            interaction, "✅ Ankündigung bearbeitet", "✅ Announcement edited"),
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name=app_commands.locale_str("erstellen"),
+                  description=app_commands.locale_str("📢 Neue wiederkehrende Ankündigung anlegen"))
+async def cmd_ann_erstellen(interaction: discord.Interaction):
+    if not _subcmd_allowed(interaction, "ann_erstellen"):
+        return await _deny_subcmd(interaction)
+
+    sprache = _sprache(interaction)
+    await interaction.response.send_message(
+        "Start setup:" if sprache == "en" else "Setup starten:",
+        view=CreateAnnouncementView(sprache=sprache),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name=app_commands.locale_str("liste"),
+                  description=app_commands.locale_str("📋 Zeigt alle geplanten Ankündigungen"))
+async def cmd_ann_liste(interaction: discord.Interaction):
+    if not _subcmd_allowed(interaction, "ann_liste"):
+        return await _deny_subcmd(interaction)
+
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    eigene = _ann_eigene(conn)
+
+    sprache = _sprache(interaction)
+    embed = discord.Embed(
+        title="📋 Announcements" if sprache == "en" else "📋 Ankündigungen",
+        color=discord.Color.blue()
+    )
+
+    if not eigene:
+
+        embed.description = ("No announcements saved." if sprache == "en"
+                             else "Keine Ankündigungen gespeichert.")
+
+    else:
+
+        if sprache == "en":
+            repeat_label = {
+                "weekly": "Every week", "biweekly": "Every 2 weeks",
+                "triweekly": "Every 3 weeks", "monthly": "Every month",
+            }
+            day_label = {
+                "monday": "Monday", "tuesday": "Tuesday", "wednesday": "Wednesday",
+                "thursday": "Thursday", "friday": "Friday",
+                "saturday": "Saturday", "sunday": "Sunday"
+            }
+        else:
+            repeat_label = {
+                "weekly":    "Jede Woche",
+                "biweekly":  "Alle 2 Wochen",
+                "triweekly": "Alle 3 Wochen",
+                "monthly":   "Jeden Monat",
+            }
+
+            day_label = {
+                "monday": "Montag", "tuesday": "Dienstag", "wednesday": "Mittwoch",
+                "thursday": "Donnerstag", "friday": "Freitag",
+                "saturday": "Samstag", "sunday": "Sonntag"
+            }
+
+        for i, (_pos, ann) in enumerate(eigene):
+
+            last_sent_str = ann.get("last_sent")
+            if sprache == "en":
+                last_sent_display = (
+                    f"📅 Last sent: **{last_sent_str}** at **{ann['time']}**"
+                    if last_sent_str else "📅 Last sent: **Never**"
+                )
+            else:
+                last_sent_display = (
+                    f"📅 Zuletzt gesendet: **{last_sent_str}** um **{ann['time']} Uhr**"
+                    if last_sent_str
+                    else "📅 Zuletzt gesendet: **Noch nie**"
+                )
+
+            next_dt = get_next_send_datetime(ann)
+            if sprache == "en":
+                next_display = (
+                    f"⏭️ Next post: **{next_dt.strftime('%d.%m.%Y')}** at **{next_dt.strftime('%H:%M')}**\n"
+                    f"⏱️ In: **{format_countdown(next_dt)}**"
+                )
+            else:
+                next_display = (
+                    f"⏭️ Nächster Post: **{next_dt.strftime('%d.%m.%Y')}** um **{next_dt.strftime('%H:%M')} Uhr**\n"
+                    f"⏱️ In: **{format_countdown(next_dt)}**"
+                )
+
+            zeiteinheit = "" if sprache == "en" else " Uhr"
+            embed.add_field(
+                name=f"#{i} • {day_label.get(ann['day'], ann['day'])} • {ann['time']}{zeiteinheit} • "
+                     f"{repeat_label.get(ann.get('repeat', 'weekly'), ann.get('repeat', ''))}",
+                value=(
+                    f"💬 {ann['message']}\n"
+                    f"📢 Channel: <#{ann['channel_id']}>\n"
+                    f"{last_sent_display}\n"
+                    f"{next_display}"
+                ),
+                inline=False
+            )
+
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name=app_commands.locale_str("löschen"),
+                  description=app_commands.locale_str("🗑️ Löscht eine Ankündigung"))
+@app_commands.describe(index="Nummer der Ankündigung (siehe /liste)")
+async def cmd_ann_loeschen(
+    interaction: discord.Interaction,
+    index: int
+):
+    if not _subcmd_allowed(interaction, "ann_loeschen"):
+        return await _deny_subcmd(interaction)
+
+    pos = await _ann_position(interaction, index)
+    if pos is None:
+        return
+
+    ann_data["announcements"].pop(pos)
+
+    save_announcements()
+
+    await interaction.response.send_message(
+        _t(interaction, "✅ Gelöscht", "✅ Deleted"),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="hackban", description=app_commands.locale_str("🔨 Bannt einen Discord-Benutzer per ID."))
+@app_commands.describe(
+    user_id="Discord User-ID",
+    grund="Grund für den Bann"
+)
+async def cmd_hackban(
+    interaction: discord.Interaction,
+    user_id: str,
+    grund: str = "Kein Grund angegeben"
+):
+    if not _subcmd_allowed(interaction, "hackban"):
+        return await _deny_subcmd(interaction)
+
+    if grund == "Kein Grund angegeben":
+        grund = _t(interaction, grund, "No reason given")
+
+    try:
+
+        user = await bot.fetch_user(int(user_id))
+
+        await interaction.guild.ban(
+            user,
+            reason=grund,
+            delete_message_days=0
+        )
+
+        await interaction.response.send_message(_t(
+            interaction, f"✅ Benutzer {user} wurde gebannt.\nGrund: {grund}",
+            f"✅ User {user} has been banned.\nReason: {grund}")
+        )
+
+    except discord.NotFound:
+
+        await interaction.response.send_message(_t(
+            interaction, "❌ Benutzer nicht gefunden.", "❌ User not found."),
+            ephemeral=True
+        )
+
+    except discord.Forbidden:
+
+        await interaction.response.send_message(_t(
+            interaction, "❌ Keine Rechte.", "❌ No permission."),
+            ephemeral=True
+        )
+
+    except ValueError:
+
+        await interaction.response.send_message(_t(
+            interaction, "❌ Ungültige User-ID.", "❌ Invalid user ID."),
+            ephemeral=True
+        )
+
+    except Exception as e:
+
+        await interaction.response.send_message(
+            f"❌ {_t(interaction, 'Fehler', 'Error')}: {e}",
+            ephemeral=True
+        )
+
+
+# ══════════════════════════════════════════════════════════════
+#  GEWINNSPIELE (/gcreate, /gstart, /glist, /gdelete, /greroll, /gsettings)
+#  Teilnahme über einen persistenten Button, automatisches Beenden per
+#  Hintergrund-Schleife (siehe DayZBot.giveaways_loop). Ein Gewinnspiel ist
+#  ein kleiner, seltener Datensatz je Server - JSON ueber _conn_store, wie
+#  Tickets/Zonen/Fraktionen, kein eigenes SQLite noetig.
+# ══════════════════════════════════════════════════════════════
+_GIVEAWAY_FARBE_DEFAULT = 0xF1C40F  # Gold, giveaway-typisch
+
+
+def _giveaways(conn: ServerConnection) -> List[Dict[str, Any]]:
+    gw = conn.get("giveaways")
+    if not isinstance(gw, list):
+        gw = []
+        conn.set("giveaways", gw)
+    return gw
+
+
+def _ensure_giveaway_ids(eintraege: List[Dict]) -> bool:
+    """Vergibt fortlaufende `id`-Felder an Gewinnspiele ohne eins (analog
+    _ensure_ticket_ids)."""
+    changed = False
+    next_id = 1 + max([int(e.get("id") or 0) for e in eintraege if isinstance(e, dict)] or [0])
+    for e in eintraege:
+        if isinstance(e, dict) and not e.get("id"):
+            e["id"] = next_id
+            next_id += 1
+            changed = True
+    return changed
+
+
+_DAUER_EINHEITEN: Dict[str, float] = {
+    "s": 1, "sek": 1, "sekunde": 1, "sekunden": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minuten": 60, "minutes": 60,
+    "h": 3600, "std": 3600, "stunde": 3600, "stunden": 3600, "hr": 3600, "hrs": 3600,
+    "hour": 3600, "hours": 3600,
+    "d": 86400, "tag": 86400, "tage": 86400, "day": 86400, "days": 86400,
+    "w": 604800, "woche": 604800, "wochen": 604800, "week": 604800, "weeks": 604800,
+}
+_DAUER_TOKEN_RE = re.compile(r"(\d+)\s*([a-zA-ZäöüÄÖÜ]+)")
+
+
+def _dauer_parsen(text: str) -> Optional[float]:
+    """"10 minutes"/"1h30m"/"2 Tage" -> Sekunden, oder None bei ungueltigem
+    Text. Reine Funktion, unterstuetzt mehrere Zahl+Einheit-Paare
+    hintereinander (deutsche und englische Einheiten-Aliase)."""
+    treffer = list(_DAUER_TOKEN_RE.finditer(text or ""))
+    if not treffer:
+        return None
+    gesamt = 0.0
+    for match in treffer:
+        zahl_text, einheit_text = match.group(1), match.group(2).lower()
+        faktor = _DAUER_EINHEITEN.get(einheit_text)
+        if faktor is None:
+            return None
+        gesamt += int(zahl_text) * faktor
+    return gesamt if gesamt > 0 else None
+
+
+def _giveaway_finden(conn: ServerConnection, giveaway_id: int) -> Optional[Dict[str, Any]]:
+    return next((g for g in _giveaways(conn)
+                if isinstance(g, dict) and int(g.get("id") or 0) == giveaway_id), None)
+
+
+def _giveaway_embed(eintrag: Dict[str, Any], sprache: str, beendet: bool) -> "discord.Embed":
+    farbe = int(eintrag.get("farbe") or _GIVEAWAY_FARBE_DEFAULT)
+    titel = _tt(sprache, "🎉 Gewinnspiel beendet", "🎉 Giveaway Ended") if beendet \
+        else _tt(sprache, "🎉 Gewinnspiel", "🎉 Giveaway")
+    embed = discord.Embed(title=titel, description=str(eintrag.get("description") or "") or None,
+                          color=farbe)
+    embed.add_field(name=_tt(sprache, "🎁 Preis", "🎁 Prize"), value=str(eintrag.get("prize") or "–"),
+                    inline=True)
+    embed.add_field(name=_tt(sprache, "🏆 Sieger-Anzahl", "🏆 Winners"),
+                    value=str(eintrag.get("winners_count") or 1), inline=True)
+    if beendet:
+        sieger = eintrag.get("winners") or []
+        wert = ", ".join(f"<@{uid}>" for uid in sieger) if sieger else \
+            _tt(sprache, "Niemand hat teilgenommen", "Nobody entered")
+        embed.add_field(name=_tt(sprache, "🏆 Sieger", "🏆 Winners"), value=wert, inline=False)
+    else:
+        ends_at = int(eintrag.get("ends_at") or 0)
+        embed.add_field(name=_tt(sprache, "⏰ Endet", "⏰ Ends"), value=f"<t:{ends_at}:R>", inline=False)
+        embed.add_field(name=_tt(sprache, "🎟️ Teilnehmer", "🎟️ Entrants"),
+                        value=str(len(eintrag.get("entrants") or [])), inline=True)
+    ersteller = eintrag.get("created_by")
+    if ersteller:
+        embed.set_footer(text=_tt(sprache, f"Erstellt von {ersteller}", f"Created by {ersteller}")
+                         if isinstance(ersteller, str) else None)
+    return embed
+
+
+def _giveaway_sieger_text(eintrag: Dict[str, Any], sprache: str) -> str:
+    sieger = eintrag.get("winners") or []
+    preis = str(eintrag.get("prize") or "–")
+    if not sieger:
+        return _tt(sprache, f"🎉 Das Gewinnspiel um **{preis}** ist beendet – niemand hat teilgenommen.",
+                   f"🎉 The giveaway for **{preis}** has ended – nobody entered.")
+    mentions = ", ".join(f"<@{uid}>" for uid in sieger)
+    return _tt(sprache, f"🎉 Herzlichen Glückwunsch {mentions}! Ihr habt **{preis}** gewonnen.",
+              f"🎉 Congratulations {mentions}! You won **{preis}**.")
+
+
+class GiveawayCreateModal(discord.ui.Modal):
+    """Formular fuer /gcreate - Vorbild: WhitelistRequestModal."""
+
+    def __init__(self, service_id: str, sprache: str = "de"):
+        super().__init__(title="🎉 Gewinnspiel erstellen" if sprache == "de" else "🎉 Create a Giveaway")
+        self.service_id = service_id
+        self.sprache = sprache
+        self.dauer_in = discord.ui.TextInput(
+            label="Dauer" if sprache == "de" else "Duration",
+            placeholder="z.B. 10 minutes" if sprache == "de" else "Ex: 10 minutes",
+            required=True, max_length=32)
+        self.sieger_in = discord.ui.TextInput(
+            label="Anzahl der Sieger" if sprache == "de" else "Number of Winners",
+            default="1", required=True, max_length=4)
+        self.preis_in = discord.ui.TextInput(
+            label="Preis" if sprache == "de" else "Prize", required=True, max_length=200)
+        self.beschreibung_in = discord.ui.TextInput(
+            label="Beschreibung" if sprache == "de" else "Description",
+            required=False, max_length=500, style=discord.TextStyle.paragraph)
+        for feld in (self.dauer_in, self.sieger_in, self.preis_in, self.beschreibung_in):
+            self.add_item(feld)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        dauer_s = _dauer_parsen(str(self.dauer_in.value))
+        if dauer_s is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Ungültige Dauer. Beispiel: `10 minutes`, `1h30m`, `2 Tage`.",
+                "❌ Invalid duration. Example: `10 minutes`, `1h30m`, `2 days`."), ephemeral=True)
+        try:
+            sieger_anzahl = int(str(self.sieger_in.value).strip())
+        except ValueError:
+            sieger_anzahl = 0
+        if sieger_anzahl < 1:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Die Anzahl der Sieger muss mindestens 1 sein.",
+                "❌ The number of winners must be at least 1."), ephemeral=True)
+        conn = connections.for_service(self.service_id)
+        if conn is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieser Server ist nicht mehr verfügbar.",
+                "❌ This server is no longer available."), ephemeral=True)
+        await _giveaway_erstellen(
+            interaction, conn, prize=str(self.preis_in.value).strip(),
+            winners_count=sieger_anzahl, ends_in_seconds=dauer_s,
+            description=str(self.beschreibung_in.value or "").strip(), sprache=self.sprache)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        log.error(f"[GEWINNSPIELE] Erstell-Modal-Fehler: {error}")
+        msg = _t(interaction, "❌ Etwas ist schiefgelaufen. Bitte versuche es erneut.",
+                 "❌ Something went wrong. Please try again.")
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+
+
+async def _giveaway_erstellen(interaction: discord.Interaction, conn: ServerConnection, *,
+                              prize: str, winners_count: int, ends_in_seconds: float,
+                              description: str, sprache: str) -> None:
+    """Gemeinsamer Erstell-Pfad fuer /gcreate (Modal) UND /gstart (direkte
+    Parameter) - baut Embed + Button, postet in den Aufrufer-Channel, legt
+    den Datensatz an."""
+    if not prize:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Bitte einen Preis angeben.", "❌ Please enter a prize."), ephemeral=True)
+    if interaction.channel is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ In diesem Kanal kann kein Gewinnspiel gestartet werden.",
+            "❌ A giveaway can't be started in this channel."), ephemeral=True)
+    eintraege = _giveaways(conn)
+    _ensure_giveaway_ids(eintraege)
+    neue_id = 1 + max([int(e.get("id") or 0) for e in eintraege if isinstance(e, dict)] or [0])
+    eintrag = {
+        "id": neue_id,
+        "message_id": None,
+        "channel_id": interaction.channel_id,
+        "guild_id": interaction.guild_id,
+        "created_by": str(interaction.user),
+        "prize": prize,
+        "description": description,
+        "winners_count": winners_count,
+        "ends_at": time.time() + ends_in_seconds,
+        "sprache": sprache,
+        "farbe": conn.get("giveaway_farbe", _GIVEAWAY_FARBE_DEFAULT),
+        "required_role_id": conn.get("giveaway_required_role_id"),
+        "entrants": [],
+        "winners": [],
+        "status": "running",
+    }
+    embed = _giveaway_embed(eintrag, sprache, beendet=False)
+    view = GiveawayEntryView(conn.service_id, neue_id)
+    try:
+        nachricht = await interaction.channel.send(embed=embed, view=view)
+    except discord.Forbidden:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Ich darf in diesem Kanal nicht schreiben.",
+            "❌ I'm not allowed to post in this channel."), ephemeral=True)
+    eintrag["message_id"] = nachricht.id
+    eintraege.append(eintrag)
+    _conn_store(conn, "giveaways", eintraege)
+    await interaction.response.send_message(_t(
+        interaction, f"✅ Gewinnspiel #{neue_id} gestartet.", f"✅ Giveaway #{neue_id} started."),
+        ephemeral=True)
+
+
+class GiveawayEntryView(discord.ui.View):
+    """Persistenter Teilnahme-Button - Vorbild: TicketChannelView. custom_id
+    traegt Service-ID + Gewinnspiel-ID, damit ein Bot-Neustart ihn nicht
+    verwaist (siehe Wiederanmeldung in setup_hook)."""
+
+    def __init__(self, service_id: str, giveaway_id: int):
+        super().__init__(timeout=None)
+        self.service_id = str(service_id)
+        self.giveaway_id = int(giveaway_id)
+        knopf = discord.ui.Button(
+            label="Teilnehmen", emoji="🎉", style=discord.ButtonStyle.primary,
+            custom_id=f"giveaway_enter:{self.service_id}:{self.giveaway_id}")
+        knopf.callback = self._teilnehmen
+        self.add_item(knopf)
+
+    async def _teilnehmen(self, interaction: discord.Interaction):
+        conn = connections.for_service(self.service_id) if self.service_id else None
+        eintrag = _giveaway_finden(conn, self.giveaway_id) if conn is not None else None
+        if conn is None or eintrag is None:
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieses Gewinnspiel ist nicht mehr bekannt.",
+                "❌ This giveaway is no longer known."), ephemeral=True)
+        if eintrag.get("status") != "running":
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dieses Gewinnspiel ist bereits beendet.",
+                "❌ This giveaway has already ended."), ephemeral=True)
+        rolle_id = eintrag.get("required_role_id")
+        if rolle_id and (not isinstance(interaction.user, discord.Member)
+                        or not any(r.id == int(rolle_id) for r in interaction.user.roles)):
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Dir fehlt die Rolle, die für die Teilnahme nötig ist.",
+                "❌ You're missing the role required to enter."), ephemeral=True)
+        entrants = eintrag.setdefault("entrants", [])
+        if interaction.user.id in entrants:
+            return await interaction.response.send_message(_t(
+                interaction, "ℹ️ Du nimmst bereits teil.", "ℹ️ You're already entered."), ephemeral=True)
+        entrants.append(interaction.user.id)
+        _conn_store(conn, "giveaways", _giveaways(conn))
+        try:
+            embed = _giveaway_embed(eintrag, str(eintrag.get("sprache") or "de"), beendet=False)
+            await interaction.message.edit(embed=embed)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.debug(f"[GEWINNSPIELE] Teilnehmerzahl-Update fehlgeschlagen: {e}")
+        await interaction.response.send_message(_t(
+            interaction, "✅ Du nimmst jetzt teil!", "✅ You're now entered!"), ephemeral=True)
+
+
+gsettings_group = app_commands.Group(
+    name="gsettings", description=app_commands.locale_str("🎉 Gewinnspiel-Einstellungen (Admin)"))
+
+
+@gsettings_group.command(
+    name="set", description=app_commands.locale_str("🎉 Farbe und/oder Pflichtrolle für Gewinnspiele setzen (Admin)"))
+@app_commands.describe(
+    color="Hex-Farbe fürs Gewinnspiel-Embed, z. B. #F1C40F (leer = unverändert)",
+    required_role="Rolle, die zum Teilnehmen nötig ist (leer lassen, um wieder jeden zuzulassen)",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def gsettings_set(interaction: discord.Interaction, color: Optional[str] = None,
+                        required_role: Optional[discord.Role] = None,
+                        server: Optional[str] = None):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gsettings_set")):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    if color:
+        roh = color.strip().lstrip("#")
+        if not re.fullmatch(r"[0-9a-fA-F]{6}", roh):
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Ungültige Farbe. Beispiel: `#F1C40F`.",
+                "❌ Invalid color. Example: `#F1C40F`."), ephemeral=True)
+        _conn_store(conn, "giveaway_farbe", int(roh, 16))
+    if required_role is not None:
+        _conn_store(conn, "giveaway_required_role_id", required_role.id)
+    embed = discord.Embed(
+        title=_t(interaction, "🎉 Gewinnspiel-Einstellungen", "🎉 Giveaway Settings"),
+        color=int(conn.get("giveaway_farbe", _GIVEAWAY_FARBE_DEFAULT)))
+    embed.add_field(name=_t(interaction, "Farbe", "Color"),
+                    value=f"#{int(conn.get('giveaway_farbe', _GIVEAWAY_FARBE_DEFAULT)):06X}")
+    rid = conn.get("giveaway_required_role_id")
+    embed.add_field(name=_t(interaction, "Pflichtrolle", "Required role"),
+                    value=f"<@&{rid}>" if rid else _t(interaction, "Keine (jeder darf teilnehmen)",
+                                                       "None (everyone can enter)"))
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="gcreate", description=app_commands.locale_str(
+    "🎉 Gewinnspiel per Formular erstellen (Admin)"))
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_gcreate(interaction: discord.Interaction, server: Optional[str] = None):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gcreate")):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    await interaction.response.send_modal(GiveawayCreateModal(conn.service_id, _sprache(interaction)))
+
+
+@bot.tree.command(name="gstart", description=app_commands.locale_str(
+    "🎉 Gewinnspiel direkt starten (Admin)"))
+@app_commands.describe(
+    duration="Dauer, z. B. `10 minutes`, `1h30m`, `2 Tage`",
+    winners="Anzahl der Sieger",
+    prize="Der Preis",
+    description="Optionale Beschreibung",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_gstart(interaction: discord.Interaction, duration: str,
+                     winners: app_commands.Range[int, 1], prize: str,
+                     description: Optional[str] = None, server: Optional[str] = None):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gstart")):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    dauer_s = _dauer_parsen(duration)
+    if dauer_s is None:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Ungültige Dauer. Beispiel: `10 minutes`, `1h30m`, `2 Tage`.",
+            "❌ Invalid duration. Example: `10 minutes`, `1h30m`, `2 days`."), ephemeral=True)
+    await _giveaway_erstellen(
+        interaction, conn, prize=prize, winners_count=int(winners), ends_in_seconds=dauer_s,
+        description=(description or "").strip(), sprache=_sprache(interaction))
+
+
+@bot.tree.command(name="glist", description=app_commands.locale_str("🎉 Laufende Gewinnspiele anzeigen"))
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_glist(interaction: discord.Interaction, server: Optional[str] = None):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "glist")):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    laufend = [g for g in _giveaways(conn) if isinstance(g, dict) and g.get("status") == "running"]
+    if not laufend:
+        return await interaction.response.send_message(_t(
+            interaction, "ℹ️ Keine laufenden Gewinnspiele.", "ℹ️ No running giveaways."), ephemeral=True)
+    embed = discord.Embed(title=_t(interaction, f"🎉 Laufende Gewinnspiele ({len(laufend)})",
+                                   f"🎉 Running Giveaways ({len(laufend)})"),
+                          color=_GIVEAWAY_FARBE_DEFAULT)
+    for g in laufend[:25]:
+        embed.add_field(
+            name=f"#{g.get('id')} — {g.get('prize')}",
+            value=_t(interaction,
+                    f"🏆 {g.get('winners_count')} Sieger · 🎟️ {len(g.get('entrants') or [])} Teilnehmer · "
+                    f"Endet <t:{int(g.get('ends_at') or 0)}:R>",
+                    f"🏆 {g.get('winners_count')} winners · 🎟️ {len(g.get('entrants') or [])} entrants · "
+                    f"Ends <t:{int(g.get('ends_at') or 0)}:R>"),
+            inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="gdelete", description=app_commands.locale_str("🎉 Gewinnspiel löschen (Admin)"))
+@app_commands.describe(giveaway_id="Die ID des Gewinnspiels (siehe /glist)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_gdelete(interaction: discord.Interaction, giveaway_id: int, server: Optional[str] = None):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gdelete")):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    eintraege = _giveaways(conn)
+    eintrag = _giveaway_finden(conn, giveaway_id)
+    if eintrag is None:
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Kein Gewinnspiel mit der ID {giveaway_id} gefunden.",
+            f"❌ No giveaway with ID {giveaway_id} found."), ephemeral=True)
+    kanal = await bot._resolve_channel(int(eintrag.get("channel_id") or 0))
+    if kanal is not None and eintrag.get("message_id"):
+        try:
+            nachricht = await kanal.fetch_message(int(eintrag["message_id"]))
+            await nachricht.delete()
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.debug(f"[GEWINNSPIELE] Nachricht beim Löschen nicht entfernbar: {e}")
+    eintraege.remove(eintrag)
+    _conn_store(conn, "giveaways", eintraege)
+    await interaction.response.send_message(_t(
+        interaction, f"✅ Gewinnspiel #{giveaway_id} gelöscht.",
+        f"✅ Giveaway #{giveaway_id} deleted."), ephemeral=True)
+
+
+@bot.tree.command(name="greroll", description=app_commands.locale_str(
+    "🎉 Neue Sieger für ein beendetes Gewinnspiel auslosen (Admin)"))
+@app_commands.describe(giveaway_id="Die ID des Gewinnspiels (siehe /glist)",
+                       count="Wie viele neue Sieger? (Standard: 1)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_greroll(interaction: discord.Interaction, giveaway_id: int,
+                      count: app_commands.Range[int, 1] = 1, server: Optional[str] = None):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "greroll")):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    eintrag = _giveaway_finden(conn, giveaway_id)
+    if eintrag is None or eintrag.get("status") != "ended":
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Kein beendetes Gewinnspiel mit der ID {giveaway_id} gefunden.",
+            f"❌ No ended giveaway with ID {giveaway_id} found."), ephemeral=True)
+    bisherige_sieger = set(eintrag.get("winners") or [])
+    kandidaten = [u for u in (eintrag.get("entrants") or []) if u not in bisherige_sieger]
+    if not kandidaten:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Keine weiteren Teilnehmer für einen Reroll übrig.",
+            "❌ No remaining entrants for a reroll."), ephemeral=True)
+    neue_sieger = random.sample(kandidaten, min(int(count), len(kandidaten)))
+    eintrag["winners"] = list(bisherige_sieger) + neue_sieger
+    _conn_store(conn, "giveaways", _giveaways(conn))
+    sprache = str(eintrag.get("sprache") or "de")
+    mentions = ", ".join(f"<@{uid}>" for uid in neue_sieger)
+    text = _tt(sprache, f"🎉 Neue Auslosung für **{eintrag.get('prize')}**: Herzlichen Glückwunsch {mentions}!",
+              f"🎉 New draw for **{eintrag.get('prize')}**: Congratulations {mentions}!")
+    if len(neue_sieger) < int(count):
+        text += _tt(sprache, "\n(nicht genug Teilnehmer für so viele Sieger)",
+                   "\n(not enough entrants for that many winners)")
+    await interaction.response.send_message(text)
+
+
+@bot.tree.command(name="gend", description=app_commands.locale_str(
+    "🎉 Gewinnspiel vorzeitig beenden und Sieger auslosen (Admin)"))
+@app_commands.describe(giveaway_id="Die ID des Gewinnspiels (siehe /glist)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_gend(interaction: discord.Interaction, giveaway_id: int, server: Optional[str] = None):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gend")):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    eintrag = _giveaway_finden(conn, giveaway_id)
+    if eintrag is None or eintrag.get("status") != "running":
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Kein laufendes Gewinnspiel mit der ID {giveaway_id} gefunden.",
+            f"❌ No running giveaway with ID {giveaway_id} found."), ephemeral=True)
+    await bot._giveaway_beenden(conn, eintrag)
+    _conn_store(conn, "giveaways", _giveaways(conn))
+    await interaction.response.send_message(_t(
+        interaction, f"✅ Gewinnspiel #{giveaway_id} vorzeitig beendet.",
+        f"✅ Giveaway #{giveaway_id} ended early."), ephemeral=True)
+
+
+bot.tree.add_command(gsettings_group)
+
+
+# ══════════════════════════════════════════════════════════════
+#  ECONOMY-DATENBANK (SQLite)
+#  Geldsalden/Buchungen laufen bewusst über SQLite statt JSON,
+#  damit parallele Buchungen die Salden nicht korrumpieren.
+# ══════════════════════════════════════════════════════════════
+ECON_DB_FILE = "economy.db"
+
+class EconomyDB:
+    """Persistenz für Salden (Wallet/Bank), Cooldowns, Käufe und Casino-Historie.
+    Die Verbindung wird lazy beim ersten Zugriff geöffnet – erst dann ist
+    config.json geladen und economy_db_path bekannt. Ein RLock schützt
+    parallele Zugriffe; WAL reduziert fsync-Blocking auf dem Event-Loop."""
+
+    def __init__(self, path: Optional[str] = None):
+        self._lock = threading.RLock()
+        self._path = path
+        self._db: Optional[sqlite3.Connection] = None
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        if self._db is None:
+            with self._lock:
+                if self._db is None:
+                    path = self._path or str(cfg.config.get("economy_db_path") or ECON_DB_FILE)
+                    conn = sqlite3.connect(path, check_same_thread=False)
+                    conn.row_factory = sqlite3.Row
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    self._create_tables(conn)
+                    self._db = conn
+                    log.info(f"[ECON] SQLite-Datenbank bereit: {path}")
+        return self._db
+
+    def _create_tables(self, c: sqlite3.Connection):
+        with self._lock:
+            c.execute("""CREATE TABLE IF NOT EXISTS balances (
+                guild_id INTEGER NOT NULL,
+                user_id  INTEGER NOT NULL,
+                wallet   INTEGER NOT NULL DEFAULT 0,
+                bank     INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS cooldowns (
+                guild_id INTEGER NOT NULL,
+                user_id  INTEGER NOT NULL,
+                action   TEXT    NOT NULL,
+                ready_at REAL    NOT NULL,
+                PRIMARY KEY (guild_id, user_id, action))""")
+            # service_id: auf WELCHEM Nitrado-Server das Item spawnen soll.
+            # Eine Guild kann mehrere Server verwalten - ohne diese Spalte
+            # raeumte Server A beim Neustart die Kaeufe von Server B ab.
+            c.execute("""CREATE TABLE IF NOT EXISTS purchases (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id   TEXT NOT NULL DEFAULT '',
+                guild_id     INTEGER NOT NULL,
+                user_id      INTEGER NOT NULL,
+                user_name    TEXT,
+                item_name    TEXT,
+                classname    TEXT,
+                amount       INTEGER,
+                total_price  INTEGER,
+                x REAL, y REAL, z REAL,
+                area_names   TEXT,
+                status       TEXT DEFAULT 'pending',
+                created_at   REAL,
+                delivered_at REAL)""")
+            # Miet-Items (Shop-Rentals): eigener Neustart-Ablauf-Zähler je Kauf.
+            # event_name ist die eindeutige Instanz-ID des Events/der Position
+            # in db/events.xml + cfgeventspawns.xml (nicht der Katalog-Name der
+            # Vorlage - mehrere Käufe derselben Vorlage brauchen eigene IDs).
+            # status: 'active' (läuft) -> 'expiring' (Stufe 1: lifetime gekürzt,
+            # wartet auf den nächsten Neustart) -> 'removed' (Stufe 2: Event +
+            # Position gelöscht). pos_group NICHT "group" - SQL-Schlüsselwort.
+            c.execute("""CREATE TABLE IF NOT EXISTS rentals (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id         TEXT NOT NULL DEFAULT '',
+                guild_id           INTEGER NOT NULL,
+                user_id            INTEGER NOT NULL,
+                user_name          TEXT,
+                item_name          TEXT,
+                event_name         TEXT NOT NULL UNIQUE,
+                x REAL, y REAL, z REAL, a REAL,
+                pos_group          TEXT,
+                restarts_total     INTEGER NOT NULL,
+                restarts_remaining INTEGER NOT NULL,
+                status             TEXT DEFAULT 'active',
+                expires_at         REAL,
+                created_at         REAL,
+                removed_at         REAL)""")
+            c.execute("""CREATE TABLE IF NOT EXISTS casino_history (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id   INTEGER,
+                user_id    INTEGER,
+                game       TEXT,
+                bet        INTEGER,
+                payout     INTEGER,
+                result     TEXT,
+                created_at REAL)""")
+            # PvP-Kills für /stats und /leaderboard – je Nitrado-Server getrennt,
+            # sonst stünden die Spieler fremder Kunden in derselben Rangliste.
+            c.execute("""CREATE TABLE IF NOT EXISTS kills (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id  TEXT NOT NULL DEFAULT '',
+                created_at  REAL,
+                killer_name TEXT,
+                killer_id   TEXT,
+                victim_name TEXT,
+                victim_id   TEXT,
+                weapon      TEXT,
+                distance    REAL)""")
+            # Discord-User ↔ Ingame-Name(n) - seit dem Mehrfach-Account-Umbau
+            # pro User mehrere Namen moeglich (Server-Limit siehe
+            # max_linked_accounts), ein Name bleibt aber weiterhin nur EINEM
+            # User zugeordnet (UNIQUE guild_id+ingame_name). is_main markiert
+            # den zuerst verlinkten Namen; wird er entfernt, ruecktw der
+            # naechstaeltere Alt-Name nach (siehe unlink_specific).
+            c.execute("""CREATE TABLE IF NOT EXISTS links (
+                guild_id    INTEGER NOT NULL,
+                user_id     INTEGER NOT NULL,
+                ingame_name TEXT    NOT NULL COLLATE NOCASE,
+                ingame_id   TEXT,
+                is_main     INTEGER NOT NULL DEFAULT 0,
+                created_at  REAL,
+                PRIMARY KEY (guild_id, user_id, ingame_name),
+                UNIQUE (guild_id, ingame_name))""")
+            # Kopfgelder (Betrag wurde beim Aussetzen bereits abgebucht)
+            c.execute("""CREATE TABLE IF NOT EXISTS bounties (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id    INTEGER NOT NULL,
+                target_name TEXT    NOT NULL COLLATE NOCASE,
+                amount      INTEGER NOT NULL,
+                placed_by   INTEGER NOT NULL,
+                created_at  REAL,
+                status      TEXT DEFAULT 'open',
+                claimed_by  INTEGER,
+                claimed_at  REAL)""")
+            # Fraktionskassen – faction_id verweist auf die id in
+            # conn.data["factions"] (Stammdaten liegen dort, nicht hier, damit
+            # sie dashboard-editierbar bleiben; nur das Geld selbst braucht die
+            # atomare Abbuchung, die eine JSON-Datei nicht bieten kann).
+            c.execute("""CREATE TABLE IF NOT EXISTS faction_balances (
+                guild_id    INTEGER NOT NULL,
+                faction_id  INTEGER NOT NULL,
+                balance     INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, faction_id))""")
+            # Offene Spielzeit-Sitzungen (connect → disconnect/Restart).
+            # service_id gehoert in den Primaerschluessel: derselbe Spielername
+            # kann gleichzeitig auf mehreren Servern online sein.
+            c.execute("""CREATE TABLE IF NOT EXISTS sessions (
+                service_id      TEXT NOT NULL DEFAULT '',
+                ingame_name     TEXT NOT NULL COLLATE NOCASE,
+                ingame_id       TEXT,
+                connect_ts      REAL NOT NULL,
+                last_seen_ts    REAL NOT NULL,
+                credited_blocks INTEGER NOT NULL DEFAULT 0,
+                connect_log_ts  TEXT,
+                PRIMARY KEY (service_id, ingame_name))""")
+            # Alt Account Finder: welche Gamertags wurden je Server unter
+            # welcher DayZ-Account-ID gesehen. service_id IMMER Teil des
+            # Schluessels - derselbe Account auf zwei Kundendiensten darf nie
+            # zusammengefuehrt werden. "Unbekannt"/leere IDs werden von den
+            # Aufrufern schon vorher verworfen, landen also nie hier.
+            c.execute("""CREATE TABLE IF NOT EXISTS alt_account_names (
+                service_id TEXT NOT NULL DEFAULT '',
+                account_id TEXT NOT NULL,
+                gamertag   TEXT NOT NULL COLLATE NOCASE,
+                first_seen REAL NOT NULL,
+                last_seen  REAL NOT NULL,
+                PRIMARY KEY (service_id, account_id, gamertag))""")
+            # Abandoned Bases: Bauereignisse nah beieinander werden zu einem
+            # "Standort" zusammengefasst. site_id ist ein aus den gerundeten
+            # Cluster-Koordinaten gebildeter Text-Schluessel (siehe
+            # _abandoned_bases_site_id), service_id immer Teil des Schluessels.
+            c.execute("""CREATE TABLE IF NOT EXISTS base_sites (
+                service_id       TEXT NOT NULL DEFAULT '',
+                site_id          TEXT NOT NULL,
+                center_x         REAL NOT NULL,
+                center_z         REAL NOT NULL,
+                part_count       INTEGER NOT NULL DEFAULT 0,
+                first_activity_at REAL NOT NULL,
+                last_activity_at  REAL NOT NULL,
+                last_reported_at  REAL,
+                PRIMARY KEY (service_id, site_id))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS base_site_builders (
+                service_id   TEXT NOT NULL DEFAULT '',
+                site_id      TEXT NOT NULL,
+                account_id   TEXT NOT NULL,
+                gamertag     TEXT NOT NULL COLLATE NOCASE,
+                last_build_at REAL NOT NULL,
+                PRIMARY KEY (service_id, site_id, account_id))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS base_site_flags (
+                service_id      TEXT NOT NULL DEFAULT '',
+                site_id         TEXT NOT NULL,
+                last_raised_at  REAL,
+                last_lowered_at REAL,
+                PRIMARY KEY (service_id, site_id))""")
+            # Letzte bekannte Onlinezeit je DayZ-Account - unabhaengig vom Alt
+            # Account Finder gepflegt (der greift nur bei Gamertag-Wechsel),
+            # ausschliesslich fuer die "Erbauer inaktiv seit"-Regel gebraucht.
+            c.execute("""CREATE TABLE IF NOT EXISTS player_last_seen (
+                service_id TEXT NOT NULL DEFAULT '',
+                account_id TEXT NOT NULL,
+                last_seen  REAL NOT NULL,
+                PRIMARY KEY (service_id, account_id))""")
+            # Spieler-Seite im Dashboard: JEDER jemals per Connect gesehene
+            # Ingame-Name, unabhaengig von /link - guild_id Teil des
+            # Schluessels, weil derselbe Server mehreren Guilds gehoeren kann
+            # (siehe Mehrfach-Guild-Umbau) und jede ihre eigene Sicht auf
+            # "wer hat sich hier schon verbunden" braucht. Die Discord-ID
+            # kommt nicht hier rein, sondern wird beim Lesen aus der
+            # links-Tabelle dazugejoint - sonst liefen beide Tabellen
+            # auseinander, sobald jemand /unlink macht.
+            c.execute("""CREATE TABLE IF NOT EXISTS player_roster (
+                guild_id     INTEGER NOT NULL,
+                service_id   TEXT    NOT NULL DEFAULT '',
+                ingame_name  TEXT    NOT NULL COLLATE NOCASE,
+                first_seen   REAL,
+                last_login   REAL,
+                total_playtime_seconds INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, service_id, ingame_name))""")
+            self._migriere_serverspalten(c)
+            c.commit()
+
+    def _migriere_serverspalten(self, c: sqlite3.Connection):
+        """Ergaenzt ``service_id`` in Alt-Datenbanken.
+
+        Ohne diese Spalte zaehlten Kills aller Kunden in eine gemeinsame
+        Rangliste und ein Neustart auf einem Server beendete die Spielzeit-
+        Sitzungen aller anderen. Bestandsdaten bekommen die Service-ID des
+        Hauptservers, denn vor der Mandantentrennung gab es nur ihn.
+        """
+        try:
+            haupt = connections.primary()
+            alt_id = haupt.service_id if haupt is not None else ""
+        except Exception:  # noqa: BLE001 – Registry evtl. noch nicht geladen
+            alt_id = ""
+        spalten_links = {r["name"] for r in c.execute("PRAGMA table_info(links)")}
+        if spalten_links and "is_main" not in spalten_links:
+            # Primaerschluessel aendert sich (mehrere Namen pro User moeglich)
+            # → Tabelle neu aufbauen. Jede Bestandszeile war bisher die
+            # einzige ihres Users, wird also zum Hauptaccount.
+            c.execute("ALTER TABLE links RENAME TO links_alt")
+            c.execute("""CREATE TABLE links (
+                guild_id    INTEGER NOT NULL,
+                user_id     INTEGER NOT NULL,
+                ingame_name TEXT    NOT NULL COLLATE NOCASE,
+                ingame_id   TEXT,
+                is_main     INTEGER NOT NULL DEFAULT 0,
+                created_at  REAL,
+                PRIMARY KEY (guild_id, user_id, ingame_name),
+                UNIQUE (guild_id, ingame_name))""")
+            c.execute(
+                "INSERT INTO links (guild_id, user_id, ingame_name, ingame_id, is_main, created_at) "
+                "SELECT guild_id, user_id, ingame_name, ingame_id, 1, created_at FROM links_alt")
+            c.execute("DROP TABLE links_alt")
+            log.info("[ECON] Tabelle 'links' auf Mehrfach-Accounts umgestellt "
+                     "(Bestand → jeweils Hauptaccount).")
+        spalten_sessions = {r["name"] for r in c.execute("PRAGMA table_info(sessions)")}
+        if spalten_sessions and "connect_log_ts" not in spalten_sessions:
+            # Nur eine neue, NULL-faehige Spalte - der Primaerschluessel bleibt
+            # unveraendert, deshalb reicht ADD COLUMN ohne Tabellen-Neubau.
+            c.execute("ALTER TABLE sessions ADD COLUMN connect_log_ts TEXT")
+            log.info("[ECON] Tabelle 'sessions' um connect_log_ts ergänzt "
+                     "(genauere Spielzeit-Berechnung aus den ADM-Zeitstempeln).")
+        for tabelle in ("kills", "sessions", "purchases"):
+            spalten = {r["name"] for r in c.execute(f"PRAGMA table_info({tabelle})")}
+            if not spalten or "service_id" in spalten:
+                continue
+            if tabelle == "purchases":
+                # Offene Kaeufe gehoeren dem Server, der ihre Guild bedient –
+                # vor dem Mehrserverbetrieb war das je Guild genau einer.
+                c.execute("ALTER TABLE purchases "
+                          "ADD COLUMN service_id TEXT NOT NULL DEFAULT ''")
+                try:
+                    for zeile in c.execute(
+                            "SELECT DISTINCT guild_id FROM purchases").fetchall():
+                        gid = zeile["guild_id"] if isinstance(zeile, sqlite3.Row) else zeile[0]
+                        ziel = connections.for_guild(gid)
+                        if ziel is not None:
+                            c.execute("UPDATE purchases SET service_id=? WHERE guild_id=?",
+                                      (ziel.service_id, gid))
+                except Exception as e:  # noqa: BLE001 – Registry evtl. noch leer
+                    log.warning(f"[ECON] Kaeufe konnten nicht zugeordnet werden: {e}")
+            elif tabelle == "sessions":
+                # Primaerschluessel aendert sich → Tabelle neu aufbauen
+                c.execute("ALTER TABLE sessions RENAME TO sessions_alt")
+                c.execute("""CREATE TABLE sessions (
+                    service_id      TEXT NOT NULL DEFAULT '',
+                    ingame_name     TEXT NOT NULL COLLATE NOCASE,
+                    ingame_id       TEXT,
+                    connect_ts      REAL NOT NULL,
+                    last_seen_ts    REAL NOT NULL,
+                    credited_blocks INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (service_id, ingame_name))""")
+                c.execute(
+                    "INSERT INTO sessions (service_id, ingame_name, ingame_id, "
+                    "connect_ts, last_seen_ts, credited_blocks) "
+                    "SELECT ?, ingame_name, ingame_id, connect_ts, last_seen_ts, "
+                    "credited_blocks FROM sessions_alt", (alt_id,))
+                c.execute("DROP TABLE sessions_alt")
+            else:
+                c.execute("ALTER TABLE kills ADD COLUMN service_id TEXT NOT NULL DEFAULT ''")
+                c.execute("UPDATE kills SET service_id=?", (alt_id,))
+            log.info(f"[ECON] Tabelle '{tabelle}' um service_id ergaenzt "
+                     f"(Bestand → Server {alt_id or '-'}).")
+
+    # ── Salden ────────────────────────────────────────────────
+    def _guild_conn(self, guild_id: int) -> Optional["ServerConnection"]:
+        try:
+            return connections.for_guild(int(guild_id))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _max_balances(self, guild_id: int) -> Tuple[int, int]:
+        """(max_cash, max_bank) dieser Guild – jede Geldquelle (Arbeit, Casino,
+        Kills, Admin-Befehle) laeuft ueber add_wallet/set_wallet/deposit/
+        withdraw und wird dadurch automatisch an EINER Stelle gedeckelt.
+
+        Beide Werte werden HIER hart auf ``0 … _SQLITE_INT_MAX`` geklemmt, auch
+        wenn in der Konfiguration Unsinn steht. Zwei Gruende, beide real
+        aufgetreten:
+
+        * Ein Wert oberhalb von i64 (z. B. 9223372036854776000, wie ihn ein
+          Browser aus der Vorgabe macht – JavaScript rechnet ab ca. 9·10^15
+          ungenau) laesst SQLite beim Binden mit ``OverflowError`` aussteigen,
+          und zwar bei JEDER Geldbewegung. Die Economy waere komplett tot.
+        * Ein NEGATIVER Wert machte aus ``MIN(max, MAX(0, …))`` ein negatives
+          Wallet – danach schlaegt jede Abbuchung fehl und der Spieler ist
+          dauerhaft ausgesperrt.
+        """
+        _c = self._guild_conn(guild_id)
+        quelle = _c if _c is not None else cfg.config
+        def _grenze(key: str) -> int:
+            try:
+                wert = int(quelle.get(key, DEFAULT_CONFIG[key]) or 0)
+            except (TypeError, ValueError):
+                wert = int(DEFAULT_CONFIG[key])
+            return max(0, min(wert, _SQLITE_INT_MAX))
+        return _grenze("max_balance_cash"), _grenze("max_balance_bank")
+
+    def ensure_user(self, guild_id: int, user_id: int):
+        """Legt den User mit Startguthaben an, falls noch nicht vorhanden.
+
+        Das Startguthaben kommt vom Server dieser Guild – jeder Kunde legt es
+        im Dashboard selbst fest. Es wird an derselben Obergrenze gekappt wie
+        jede andere Geldquelle: sonst startete ein neuer Spieler bei
+        ``starting_balance=5000`` und ``max_balance_cash=1000`` sofort ueber
+        dem selbst gesetzten Limit.
+        """
+        _c = self._guild_conn(guild_id)
+        max_cash, _ = self._max_balances(guild_id)
+        start = int((_c.get("starting_balance", 0) if _c is not None
+                     else cfg.config.get("starting_balance", 0)) or 0)
+        start = max(0, min(start, max_cash))
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO balances (guild_id, user_id, wallet, bank) VALUES (?,?,?,0)",
+                (guild_id, user_id, start))
+            self._conn.commit()
+
+    def wipe_balance(self, guild_id: int, user_id: int) -> None:
+        """Löscht Wallet+Bank komplett (wipe_money_on_leave: Server verlassen).
+        Nächster /balance o.ä. legt den Nutzer via ensure_user wieder mit dem
+        normalen Startguthaben an, statt für immer bei 0 zu bleiben."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM balances WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id))
+            self._conn.commit()
+
+    def get_balance(self, guild_id: int, user_id: int) -> Tuple[int, int]:
+        self.ensure_user(guild_id, user_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT wallet, bank FROM balances WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id)).fetchone()
+        return (int(row["wallet"]), int(row["bank"])) if row else (0, 0)
+
+    def add_wallet(self, guild_id: int, user_id: int, delta: int) -> Tuple[int, int]:
+        """Addiert delta (auch negativ) aufs Wallet – nie unter 0, nie über
+        max_balance_cash. Gibt (wallet, bank) zurück."""
+        self.ensure_user(guild_id, user_id)
+        max_cash, _ = self._max_balances(guild_id)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE balances SET wallet = MIN(?, MAX(0, wallet + ?)) "
+                "WHERE guild_id=? AND user_id=?",
+                (max_cash, int(delta), guild_id, user_id))
+            self._conn.commit()
+        return self.get_balance(guild_id, user_id)
+
+    def set_wallet(self, guild_id: int, user_id: int, value: int) -> Tuple[int, int]:
+        self.ensure_user(guild_id, user_id)
+        max_cash, _ = self._max_balances(guild_id)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE balances SET wallet = MIN(?, MAX(0, ?)) WHERE guild_id=? AND user_id=?",
+                (max_cash, int(value), guild_id, user_id))
+            self._conn.commit()
+        return self.get_balance(guild_id, user_id)
+
+    def try_spend_wallet(self, guild_id: int, user_id: int, amount: int) -> bool:
+        """Atomare Abbuchung: nur wenn genug Guthaben vorhanden ist (kein Race möglich)."""
+        if amount < 0:
+            return False
+        if amount == 0:
+            return True   # Gratis-Item (Preis 0): nichts abzubuchen, Kauf ist gültig
+        self.ensure_user(guild_id, user_id)
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE balances SET wallet = wallet - ? "
+                "WHERE guild_id=? AND user_id=? AND wallet >= ?",
+                (amount, guild_id, user_id, amount))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def deposit(self, guild_id: int, user_id: int, amount: Optional[int]) -> Tuple[int, int, int]:
+        """Wallet → Bank. amount=None → alles, gedeckelt durch max_balance_bank.
+        Gibt (verschoben, wallet, bank) zurück."""
+        self.ensure_user(guild_id, user_id)
+        _, max_bank = self._max_balances(guild_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT wallet, bank FROM balances WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id)).fetchone()
+            move = int(row["wallet"]) if amount is None else min(int(amount), int(row["wallet"]))
+            move = max(0, min(move, max_bank - int(row["bank"])))
+            if move <= 0:
+                return 0, int(row["wallet"]), int(row["bank"])
+            self._conn.execute(
+                "UPDATE balances SET wallet = wallet - ?, bank = bank + ? "
+                "WHERE guild_id=? AND user_id=?",
+                (move, move, guild_id, user_id))
+            self._conn.commit()
+            return move, int(row["wallet"]) - move, int(row["bank"]) + move
+
+    def withdraw(self, guild_id: int, user_id: int, amount: Optional[int]) -> Tuple[int, int, int]:
+        """Bank → Wallet. amount=None → alles, gedeckelt durch max_balance_cash.
+        Gibt (verschoben, wallet, bank) zurück."""
+        self.ensure_user(guild_id, user_id)
+        max_cash, _ = self._max_balances(guild_id)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT wallet, bank FROM balances WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id)).fetchone()
+            move = int(row["bank"]) if amount is None else min(int(amount), int(row["bank"]))
+            move = max(0, min(move, max_cash - int(row["wallet"])))
+            if move <= 0:
+                return 0, int(row["wallet"]), int(row["bank"])
+            self._conn.execute(
+                "UPDATE balances SET wallet = wallet + ?, bank = bank - ? "
+                "WHERE guild_id=? AND user_id=?",
+                (move, move, guild_id, user_id))
+            self._conn.commit()
+            return move, int(row["wallet"]) + move, int(row["bank"]) - move
+
+    # ── Fraktionskassen ───────────────────────────────────────
+    def get_faction_balance(self, guild_id: int, faction_id: int) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT balance FROM faction_balances WHERE guild_id=? AND faction_id=?",
+                (guild_id, faction_id)).fetchone()
+        return int(row["balance"]) if row else 0
+
+    def add_faction_balance(self, guild_id: int, faction_id: int, delta: int) -> int:
+        """Addiert delta (auch negativ) zur Fraktionskasse – nie unter 0."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO faction_balances (guild_id, faction_id, balance) "
+                "VALUES (?,?,0)", (guild_id, faction_id))
+            self._conn.execute(
+                "UPDATE faction_balances SET balance = MIN(?, MAX(0, balance + ?)) "
+                "WHERE guild_id=? AND faction_id=?",
+                (_SQLITE_INT_MAX, int(delta), guild_id, faction_id))
+            self._conn.commit()
+        return self.get_faction_balance(guild_id, faction_id)
+
+    def try_spend_faction_balance(self, guild_id: int, faction_id: int, amount: int) -> bool:
+        """Atomare Abbuchung aus der Fraktionskasse (kein Race möglich)."""
+        if amount < 0:
+            return False
+        if amount == 0:
+            return True
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE faction_balances SET balance = balance - ? "
+                "WHERE guild_id=? AND faction_id=? AND balance >= ?",
+                (amount, guild_id, faction_id, amount))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def delete_faction_balance(self, guild_id: int, faction_id: int) -> None:
+        """Räumt die Kasse einer gelöschten Fraktion auf."""
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM faction_balances WHERE guild_id=? AND faction_id=?",
+                (guild_id, faction_id))
+            self._conn.commit()
+
+    # ── Cooldowns ─────────────────────────────────────────────
+    def cooldown_remaining(self, guild_id: int, user_id: int, action: str) -> float:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT ready_at FROM cooldowns WHERE guild_id=? AND user_id=? AND action=?",
+                (guild_id, user_id, action)).fetchone()
+        if not row:
+            return 0.0
+        return max(0.0, float(row["ready_at"]) - time.time())
+
+    def set_cooldown(self, guild_id: int, user_id: int, action: str, seconds: float):
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO cooldowns (guild_id, user_id, action, ready_at) "
+                "VALUES (?,?,?,?)",
+                (guild_id, user_id, action, time.time() + max(0.0, seconds)))
+            self._conn.commit()
+
+    # ── Käufe / Delivery-Tracking ─────────────────────────────
+    def create_purchase(self, service_id: str, guild_id: int, user_id: int,
+                        user_name: str,
+                        item_name: str, classname: str, amount: int, total_price: int,
+                        x: float, y: float, z: float, area_names: List[str]) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO purchases
+                   (service_id, guild_id, user_id, user_name, item_name, classname,
+                    amount, total_price, x, y, z, area_names, status, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending',?)""",
+                (str(service_id or ""), guild_id, user_id, user_name, item_name,
+                 classname, amount,
+                 total_price, x, y, z, json.dumps(area_names), time.time()))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def pending_purchases(self, created_before: Optional[float] = None,
+                          guild_id: Optional[int] = None,
+                          service_id: Optional[str] = None) -> List[sqlite3.Row]:
+        """Offene Käufe eines Servers.
+
+        ``guild_id`` grenzt gegen fremde Kunden ab, ``service_id`` gegen die
+        anderen Server derselben Guild – sonst liefert Server A die Kaeufe von
+        Server B aus, markiert sie als geliefert und der Kaeufer bekommt nichts.
+        """
+        q = "SELECT * FROM purchases WHERE status='pending'"
+        args: Tuple = ()
+        if created_before is not None:
+            q += " AND created_at <= ?"
+            args = (created_before,)
+        if guild_id is None:
+            # Ohne Guild gibt es nichts zurueckzugeben. Frueher lieferte der
+            # Aufruf die offenen Kaeufe ALLER Kunden – ein Cleanup auf einem
+            # Server markierte dann fremde Kaeufe als geliefert, obwohl die
+            # Items dort nie gespawnt sind.
+            return []
+        q += " AND guild_id = ?"
+        args = args + (int(guild_id),)
+        if service_id is not None:
+            # Alt-Kaeufe ohne service_id gehoeren dem Server, der sie damals
+            # als einziger der Guild bedient hat – die Migration hat sie ihm
+            # bereits zugeschrieben, leere Werte bleiben trotzdem sichtbar.
+            q += " AND (service_id = ? OR service_id = '')"
+            args = args + (str(service_id),)
+        with self._lock:
+            return list(self._conn.execute(q + " ORDER BY id", args).fetchall())
+
+    def mark_delivered(self, ids: List[int]):
+        if not ids:
+            return
+        now = time.time()
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE purchases SET status='delivered', delivered_at=? WHERE id=?",
+                [(now, i) for i in ids])
+            self._conn.commit()
+
+    # ── Shop-Rentals ────────────────────────────────────────────
+    def create_rental(self, service_id: str, guild_id: int, user_id: int,
+                      user_name: str, item_name: str, event_name: str,
+                      x: float, y: Optional[float], z: float, a: Optional[float],
+                      pos_group: Optional[str], restarts: int,
+                      expires_at: Optional[float]) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """INSERT INTO rentals
+                   (service_id, guild_id, user_id, user_name, item_name, event_name,
+                    x, y, z, a, pos_group, restarts_total, restarts_remaining,
+                    status, expires_at, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?)""",
+                (str(service_id or ""), guild_id, user_id, user_name, item_name,
+                 event_name, x, y, z, a, pos_group, restarts, restarts,
+                 expires_at, time.time()))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def active_rentals(self, guild_id: int, service_id: str) -> List[sqlite3.Row]:
+        """Aktive/ablaufende Mieten EINES Servers - wie pending_purchases immer
+        nach guild_id UND service_id gefiltert, ohne Rückfall auf einen
+        leeren service_id-Altbestand (den gibt es bei einer neuen Tabelle
+        nicht, ein solcher Rückfall würde nur ein Leck zwischen Kunden öffnen)."""
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT * FROM rentals WHERE status IN ('active','expiring') "
+                "AND guild_id=? AND service_id=? ORDER BY id",
+                (int(guild_id), str(service_id or ""))).fetchall())
+
+    def rental_decrement(self, rental_id: int, restarts_remaining: int):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE rentals SET restarts_remaining=? WHERE id=?",
+                (restarts_remaining, rental_id))
+            self._conn.commit()
+
+    def rental_set_expiring(self, rental_id: int):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE rentals SET status='expiring', restarts_remaining=0 WHERE id=?",
+                (rental_id,))
+            self._conn.commit()
+
+    def rental_set_removed(self, rental_id: int):
+        with self._lock:
+            self._conn.execute(
+                "UPDATE rentals SET status='removed', removed_at=? WHERE id=?",
+                (time.time(), rental_id))
+            self._conn.commit()
+
+    def rental_delete(self, rental_id: int):
+        """Nur für den Kauf-Rollback (Schreibvorgang fehlgeschlagen) - die
+        Zeile darf dann nie entstanden sein, nicht nur 'removed' markiert."""
+        with self._lock:
+            self._conn.execute("DELETE FROM rentals WHERE id=?", (rental_id,))
+            self._conn.commit()
+
+    # ── Alt Account Finder ─────────────────────────────────────
+    def alt_account_seen(self, service_id: str, account_id: str,
+                         gamertag: str) -> Optional[str]:
+        """Verarbeitet EINE Connect-Zeile (service_id + Account-ID + Gamertag)
+        atomar und meldet, ob ein Alt-Account-Alarm ausgeloest werden soll.
+
+        Rueckgabe:
+          - None: erster gesehener Name dieses Accounts, oder der Name ist
+            unter dieser Account-ID bereits bekannt (kein Alarm).
+          - sonst: der zuletzt bekannte ANDERE Gamertag derselben Account-ID -
+            der Aufrufer postet damit genau einmal je neu beobachteten Namen
+            einen Alarm (spaetere Connects mit demselben Namen sind dann schon
+            bekannt und liefern beim naechsten Aufruf wieder None).
+
+        service_id ist immer Teil des Schluessels - zwei Kundendienste mit
+        zufaellig derselben Account-ID werden nie zusammengefuehrt.
+        """
+        service_id = str(service_id or "")
+        account_id = str(account_id or "").strip()
+        gamertag = (gamertag or "").strip()
+        if not account_id or not gamertag or account_id.lower() == "unbekannt":
+            return None
+        now = time.time()
+        with self._lock:
+            vorhanden = self._conn.execute(
+                "SELECT gamertag FROM alt_account_names WHERE service_id=? AND account_id=?",
+                (service_id, account_id)).fetchall()
+            bekannte_namen = {str(r["gamertag"]).lower() for r in vorhanden}
+            if gamertag.lower() in bekannte_namen:
+                self._conn.execute(
+                    "UPDATE alt_account_names SET last_seen=? WHERE service_id=? AND "
+                    "account_id=? AND gamertag=? COLLATE NOCASE",
+                    (now, service_id, account_id, gamertag))
+                self._conn.commit()
+                return None
+            self._conn.execute(
+                "INSERT INTO alt_account_names (service_id, account_id, gamertag, "
+                "first_seen, last_seen) VALUES (?,?,?,?,?)",
+                (service_id, account_id, gamertag, now, now))
+            self._conn.commit()
+            if not vorhanden:
+                return None   # erster jemals gesehene Name dieser Account-ID
+            return str(vorhanden[0]["gamertag"])
+
+    def alt_account_mehrfach(self, service_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """Accounts EINES Servers mit mehr als einem beobachteten Gamertag,
+        zuletzt gesehen zuerst - fuer die Dashboard-Anzeige "bekannte
+        Zuordnungen"."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT account_id, group_concat(gamertag, '||') AS gamertags, "
+                "MIN(first_seen) AS first_seen, MAX(last_seen) AS last_seen, "
+                "COUNT(*) AS anzahl FROM alt_account_names WHERE service_id=? "
+                "GROUP BY account_id HAVING anzahl > 1 ORDER BY last_seen DESC LIMIT ?",
+                (str(service_id or ""), limit)).fetchall()
+        return [{"account_id": r["account_id"], "gamertags": str(r["gamertags"]).split("||"),
+                "first_seen": r["first_seen"], "last_seen": r["last_seen"],
+                "anzahl": r["anzahl"]} for r in rows]
+
+    # ── Abandoned Bases ────────────────────────────────────────
+    _ABANDONED_BAU_AKTIONEN = {"placed", "built", "constructed", "attached",
+                              "packed", "folded", "deployed", "mounted"}
+    _ABANDONED_ABBAU_AKTIONEN = {"dismantled", "removed", "unmounted"}
+    # Zaehlt zusaetzlich als Bauaktivitaet (aktualisiert last_activity_at fuer
+    # die "keine Bauaktivitaet"-Regel), erzeugt aber KEIN neues Bauteil -
+    # sonst wuerde eine Reparatur den part_count kuenstlich aufblasen.
+    _ABANDONED_AKTIVITAET_ZUSATZ = {"repaired"}
+
+    def player_seen_now(self, service_id: str, account_id: str) -> None:
+        """Aktualisiert die letzte bekannte Onlinezeit EINES Accounts - fuer
+        die "Erbauer inaktiv seit"-Regel, unabhaengig vom Alt Account Finder."""
+        service_id = str(service_id or "")
+        account_id = str(account_id or "").strip()
+        if not account_id or account_id.lower() == "unbekannt":
+            return
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO player_last_seen (service_id, account_id, last_seen) VALUES (?,?,?) "
+                "ON CONFLICT(service_id, account_id) DO UPDATE SET last_seen=excluded.last_seen",
+                (service_id, account_id, now))
+            self._conn.commit()
+
+    def _abandoned_find_site(self, c: sqlite3.Connection, service_id: str,
+                             x: float, z: float, radius_m: float) -> Optional[str]:
+        """Naechstgelegener bestehender Standort innerhalb des Cluster-Radius,
+        oder None. Bewusst simpel (kein Zusammenfuehren zweier bestehender
+        Standorte) - reicht fuer die hier vorkommenden Basisgroessen."""
+        rows = c.execute(
+            "SELECT site_id, center_x, center_z FROM base_sites WHERE service_id=?",
+            (service_id,)).fetchall()
+        bester = None
+        beste_distanz = radius_m
+        for r in rows:
+            d = ((r["center_x"] - x) ** 2 + (r["center_z"] - z) ** 2) ** 0.5
+            if d <= beste_distanz:
+                bester = r["site_id"]
+                beste_distanz = d
+        return bester
+
+    def abandoned_bases_record_build(self, service_id: str, x: float, z: float,
+                                     account_id: str, gamertag: str, aktion: str,
+                                     radius_m: float) -> None:
+        """Ein Bau-Ereignis in den passenden Standort einsortieren (oder einen
+        neuen anlegen). part_count zaehlt nur objekterzeugende Aktionen -
+        Reparaturen wuerden ihn sonst kuenstlich aufblasen."""
+        service_id = str(service_id or "")
+        account_id = str(account_id or "").strip()
+        aktion = (aktion or "").lower()
+        alle_aktionen = (self._ABANDONED_BAU_AKTIONEN | self._ABANDONED_ABBAU_AKTIONEN
+                        | self._ABANDONED_AKTIVITAET_ZUSATZ)
+        if aktion not in alle_aktionen:
+            return
+        now = time.time()
+        with self._lock:
+            site_id = self._abandoned_find_site(self._conn, service_id, x, z, radius_m)
+            if site_id is None:
+                site_id = uuid.uuid4().hex[:12]
+                self._conn.execute(
+                    "INSERT INTO base_sites (service_id, site_id, center_x, center_z, "
+                    "part_count, first_activity_at, last_activity_at) VALUES (?,?,?,?,0,?,?)",
+                    (service_id, site_id, x, z, now, now))
+            zuwachs = 1 if aktion in self._ABANDONED_BAU_AKTIONEN else 0
+            self._conn.execute(
+                "UPDATE base_sites SET part_count=part_count+?, last_activity_at=? "
+                "WHERE service_id=? AND site_id=?",
+                (zuwachs, now, service_id, site_id))
+            if account_id and account_id.lower() != "unbekannt":
+                self._conn.execute(
+                    "INSERT INTO base_site_builders (service_id, site_id, account_id, gamertag, "
+                    "last_build_at) VALUES (?,?,?,?,?) ON CONFLICT(service_id, site_id, account_id) "
+                    "DO UPDATE SET gamertag=excluded.gamertag, last_build_at=excluded.last_build_at",
+                    (service_id, site_id, account_id, gamertag or account_id, now))
+            self._conn.commit()
+
+    def abandoned_bases_record_flag(self, service_id: str, x: float, z: float,
+                                    raised: bool, radius_m: float) -> None:
+        """Flaggen-Ereignis einem NAHEN, bereits bekannten Standort zuordnen -
+        eine Flagge ganz ohne Bauteile in der Naehe erzeugt keinen Standort."""
+        service_id = str(service_id or "")
+        now = time.time()
+        with self._lock:
+            site_id = self._abandoned_find_site(self._conn, service_id, x, z, radius_m)
+            if site_id is None:
+                return
+            feld = "last_raised_at" if raised else "last_lowered_at"
+            self._conn.execute(
+                f"INSERT INTO base_site_flags (service_id, site_id, {feld}) VALUES (?,?,?) "
+                f"ON CONFLICT(service_id, site_id) DO UPDATE SET {feld}=excluded.{feld}",
+                (service_id, site_id, now))
+            self._conn.commit()
+
+    def abandoned_bases_kandidaten(self, service_id: str, einstellungen: Dict[str, Any]
+                                   ) -> List[Dict[str, Any]]:
+        """Liefert alle Standorte, auf die mindestens eine aktivierte Regel
+        zutrifft und die nicht innerhalb der Wiederholungsfrist bereits
+        gemeldet wurden - sortiert nach laengster Inaktivitaet zuerst."""
+        service_id = str(service_id or "")
+        now = time.time()
+        min_parts = int(einstellungen.get("min_parts", 10))
+        repeat_after_s = float(einstellungen.get("repeat_after_days", 7)) * 86400
+        with self._lock:
+            sites = self._conn.execute(
+                "SELECT * FROM base_sites WHERE service_id=? AND part_count>=?",
+                (service_id, min_parts)).fetchall()
+            ergebnis: List[Dict[str, Any]] = []
+            for s in sites:
+                if s["last_reported_at"] and now - s["last_reported_at"] < repeat_after_s:
+                    continue
+                builder_rows = self._conn.execute(
+                    "SELECT account_id, gamertag, last_build_at FROM base_site_builders "
+                    "WHERE service_id=? AND site_id=?", (service_id, s["site_id"])).fetchall()
+                builders = [dict(r) for r in builder_rows]
+                letzte_online = 0.0
+                for b in builders:
+                    row = self._conn.execute(
+                        "SELECT last_seen FROM player_last_seen WHERE service_id=? AND account_id=?",
+                        (service_id, b["account_id"])).fetchone()
+                    b["last_seen"] = float(row["last_seen"]) if row else 0.0
+                    letzte_online = max(letzte_online, b["last_seen"])
+                flag_row = self._conn.execute(
+                    "SELECT last_raised_at, last_lowered_at FROM base_site_flags "
+                    "WHERE service_id=? AND site_id=?", (service_id, s["site_id"])).fetchone()
+
+                gruende = []
+                if einstellungen.get("builder_inactive_enabled", True) and builders:
+                    grenze_s = float(einstellungen.get("builder_inactive_days", 14)) * 86400
+                    if now - letzte_online >= grenze_s:
+                        gruende.append(("builder_inactive", now - letzte_online))
+                if einstellungen.get("no_flag_enabled", True) and flag_row is None:
+                    grenze_s = float(einstellungen.get("no_flag_hours", 48)) * 3600
+                    if now - s["first_activity_at"] >= grenze_s:
+                        gruende.append(("no_flag", now - s["first_activity_at"]))
+                if (einstellungen.get("flag_lowered_enabled", True) and flag_row is not None
+                        and flag_row["last_lowered_at"] and
+                        (not flag_row["last_raised_at"]
+                         or flag_row["last_raised_at"] < flag_row["last_lowered_at"])):
+                    gruende.append(("flag_lowered", now - flag_row["last_lowered_at"]))
+                if einstellungen.get("no_activity_enabled", True):
+                    grenze_s = float(einstellungen.get("no_activity_days", 21)) * 86400
+                    if now - s["last_activity_at"] >= grenze_s:
+                        gruende.append(("no_activity", now - s["last_activity_at"]))
+
+                if gruende:
+                    ergebnis.append({
+                        "site_id": s["site_id"], "x": s["center_x"], "z": s["center_z"],
+                        "part_count": s["part_count"], "builders": builders,
+                        "gruende": gruende,
+                        "inaktivitaet_sekunden": max(g[1] for g in gruende),
+                    })
+            ergebnis.sort(key=lambda e: e["inaktivitaet_sekunden"], reverse=True)
+            return ergebnis
+
+    def abandoned_bases_als_gemeldet_markieren(self, service_id: str, site_ids: List[str]) -> None:
+        if not site_ids:
+            return
+        now = time.time()
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE base_sites SET last_reported_at=? WHERE service_id=? AND site_id=?",
+                [(now, str(service_id or ""), sid) for sid in site_ids])
+            self._conn.commit()
+
+    # ── Casino-Historie ───────────────────────────────────────
+    def log_casino(self, guild_id: int, user_id: int, game: str,
+                   bet: int, payout: int, result: str):
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO casino_history (guild_id, user_id, game, bet, payout, result, created_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (guild_id, user_id, game, bet, payout, result, time.time()))
+            self._conn.commit()
+
+    # ── Kill-Statistiken ──────────────────────────────────────
+    def record_kill(self, service_id: str, killer_name: str, killer_id: Optional[str],
+                    victim_name: str, victim_id: Optional[str],
+                    weapon: Optional[str], distance: Any):
+        try:
+            dist: Optional[float] = float(str(distance).replace(",", "."))
+        except (TypeError, ValueError):
+            dist = None
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO kills (service_id, created_at, killer_name, killer_id, "
+                "victim_name, victim_id, weapon, distance) VALUES (?,?,?,?,?,?,?,?)",
+                (str(service_id or ""), time.time(), killer_name, killer_id,
+                 victim_name, victim_id, weapon, dist))
+            self._conn.commit()
+
+    def player_stats(self, service_id: str, name: str) -> Optional[Dict]:
+        """Kills, Tode (PvP), Lieblingswaffe und weitester Kill eines Spielers
+        auf **einem** Server."""
+        sid = str(service_id or "")
+        with self._lock:
+            kills = int(self._conn.execute(
+                "SELECT COUNT(*) AS n FROM kills "
+                "WHERE service_id=? AND killer_name=? COLLATE NOCASE",
+                (sid, name)).fetchone()["n"])
+            deaths = int(self._conn.execute(
+                "SELECT COUNT(*) AS n FROM kills "
+                "WHERE service_id=? AND victim_name=? COLLATE NOCASE",
+                (sid, name)).fetchone()["n"])
+            if kills == 0 and deaths == 0:
+                return None
+            fav = self._conn.execute(
+                "SELECT weapon, COUNT(*) AS n FROM kills "
+                "WHERE service_id=? AND killer_name=? COLLATE NOCASE AND weapon IS NOT NULL "
+                "AND weapon NOT IN ('', 'Unbekannt') "
+                "GROUP BY weapon ORDER BY n DESC LIMIT 1", (sid, name)).fetchone()
+            longest = self._conn.execute(
+                "SELECT MAX(distance) AS d FROM kills "
+                "WHERE service_id=? AND killer_name=? COLLATE NOCASE",
+                (sid, name)).fetchone()["d"]
+        return {
+            "kills": kills, "deaths": deaths,
+            "kd": (kills / deaths) if deaths else float(kills),
+            "fav_weapon": fav["weapon"] if fav else None,
+            "fav_weapon_kills": int(fav["n"]) if fav else 0,
+            "longest": float(longest) if longest is not None else None,
+        }
+
+    def leaderboard(self, service_id: str, limit: int = 10) -> List[Dict]:
+        sid = str(service_id or "")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT killer_name AS name, COUNT(*) AS kills, MAX(distance) AS best "
+                "FROM kills WHERE service_id=? GROUP BY killer_name COLLATE NOCASE "
+                "ORDER BY kills DESC, best DESC LIMIT ?", (sid, limit)).fetchall()
+            out: List[Dict] = []
+            for r in rows:
+                deaths = int(self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM kills "
+                    "WHERE service_id=? AND victim_name=? COLLATE NOCASE",
+                    (sid, r["name"])).fetchone()["n"])
+                out.append({"name": r["name"], "kills": int(r["kills"]), "deaths": deaths,
+                            "kd": (int(r["kills"]) / deaths) if deaths else float(r["kills"]),
+                            "best": float(r["best"]) if r["best"] is not None else None})
+        return out
+
+    def known_player_names(self, service_id: str, prefix: str = "",
+                           limit: int = 25) -> List[str]:
+        """Spielernamen aus Kills + Sitzungen **dieses** Servers (Autocomplete)."""
+        like = f"%{prefix}%" if prefix else "%"
+        sid = str(service_id or "")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT name FROM ("
+                "  SELECT killer_name AS name FROM kills WHERE service_id=?"
+                "  UNION SELECT victim_name FROM kills WHERE service_id=?"
+                "  UNION SELECT ingame_name FROM sessions WHERE service_id=?) "
+                "WHERE name LIKE ? COLLATE NOCASE ORDER BY name LIMIT ?",
+                (sid, sid, sid, like, limit)).fetchall()
+        return [r["name"] for r in rows if r["name"]]
+
+    # ── /link: Discord ↔ Ingame-Name ──────────────────────────
+    def count_links_of_user(self, guild_id: int, user_id: int) -> int:
+        """Wie viele Namen dieser User in dieser Guild schon verlinkt hat -
+        Grundlage fuer das max_linked_accounts-Limit in /link."""
+        with self._lock:
+            return int(self._conn.execute(
+                "SELECT COUNT(*) AS n FROM links WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id)).fetchone()["n"])
+
+    def link_user(self, guild_id: int, user_id: int, ingame_name: str) -> Tuple[bool, str]:
+        """Verknüpft einen Discord-User mit einem weiteren Ingame-Namen (ein
+        Name bleibt pro Guild eindeutig). Der ERSTE Name eines Users wird
+        automatisch Hauptaccount (is_main), jeder weitere ein Alt-Account -
+        das Server-Limit dafuer prueft der Aufrufer (conn.get
+        "max_linked_accounts"), nicht diese Methode."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT user_id FROM links WHERE guild_id=? AND ingame_name=? COLLATE NOCASE",
+                (guild_id, ingame_name)).fetchone()
+            if row and int(row["user_id"]) != user_id:
+                return False, "name_taken"
+            ist_erster = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM links WHERE guild_id=? AND user_id=?",
+                (guild_id, user_id)).fetchone()["n"] == 0
+            self._conn.execute(
+                "INSERT OR REPLACE INTO links "
+                "(guild_id, user_id, ingame_name, ingame_id, is_main, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (guild_id, user_id, ingame_name, None, 1 if ist_erster else 0, time.time()))
+            self._conn.commit()
+        return True, "ok"
+
+    def unlink_specific(self, guild_id: int, user_id: int, ingame_name: str) -> bool:
+        """Entfernt GENAU diesen verlinkten Namen dieses Users. War er der
+        Hauptaccount, ruecktw der naechstaeltere Alt-Account automatisch nach
+        (ein Hauptaccount bleibt bestehen, solange noch irgendein Name
+        verlinkt ist). Gibt False, wenn der User nicht MIT DIESEM Namen
+        verlinkt war."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT is_main FROM links WHERE guild_id=? AND user_id=? "
+                "AND ingame_name=? COLLATE NOCASE",
+                (guild_id, user_id, ingame_name)).fetchone()
+            if not row:
+                return False
+            self._conn.execute(
+                "DELETE FROM links WHERE guild_id=? AND user_id=? AND ingame_name=? COLLATE NOCASE",
+                (guild_id, user_id, ingame_name))
+            if row["is_main"]:
+                naechster = self._conn.execute(
+                    "SELECT ingame_name FROM links WHERE guild_id=? AND user_id=? "
+                    "ORDER BY created_at ASC LIMIT 1", (guild_id, user_id)).fetchone()
+                if naechster:
+                    self._conn.execute(
+                        "UPDATE links SET is_main=1 WHERE guild_id=? AND user_id=? "
+                        "AND ingame_name=? COLLATE NOCASE",
+                        (guild_id, user_id, naechster["ingame_name"]))
+            self._conn.commit()
+        return True
+
+    def get_links_by_user(self, guild_id: int, user_id: int) -> List[sqlite3.Row]:
+        """Alle verlinkten Namen dieses Users in dieser Guild, Hauptaccount
+        zuerst, danach Alt-Accounts nach Alter."""
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT * FROM links WHERE guild_id=? AND user_id=? "
+                "ORDER BY is_main DESC, created_at ASC", (guild_id, user_id)).fetchall())
+
+    def get_main_link_by_user(self, guild_id: int, user_id: int) -> Optional[sqlite3.Row]:
+        """Nur der Hauptaccount dieses Users - fuer Stellen, die absichtlich
+        nur EINEN Namen brauchen (Fraktions-Zonen-Allowlist, Karten-Position,
+        Selbst-Kopfgeld-Sperre bei /bounty), nicht alle Alt-Accounts."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM links WHERE guild_id=? AND user_id=? AND is_main=1",
+                (guild_id, user_id)).fetchone()
+
+    def links_for_name(self, ingame_name: str,
+                       guild_id: Optional[int] = None) -> List[sqlite3.Row]:
+        """Verknüpfungen zu einem Ingame-Namen (case-insensitive).
+
+        Mit ``guild_id`` nur die dieser Guild – sonst bekaeme ein gleichnamiger
+        Spieler auf einem fremden Server die Belohnung ausgezahlt.
+        """
+        with self._lock:
+            if guild_id is None:
+                return list(self._conn.execute(
+                    "SELECT * FROM links WHERE ingame_name=? COLLATE NOCASE",
+                    (ingame_name,)).fetchall())
+            return list(self._conn.execute(
+                "SELECT * FROM links WHERE guild_id=? AND ingame_name=? COLLATE NOCASE",
+                (int(guild_id), ingame_name)).fetchall())
+
+    def update_link_id(self, ingame_name: str, ingame_id: str,
+                       guild_id: Optional[int] = None):
+        """Trägt die im Log gesehene Ingame-ID zum verlinkten Namen nach –
+        mit ``guild_id`` nur in der Guild des Servers, von dem das Log stammt."""
+        if not ingame_id:
+            return
+        with self._lock:
+            if guild_id is None:
+                self._conn.execute(
+                    "UPDATE links SET ingame_id=? WHERE ingame_name=? COLLATE NOCASE "
+                    "AND (ingame_id IS NULL OR ingame_id != ?)",
+                    (ingame_id, ingame_name, ingame_id))
+            else:
+                self._conn.execute(
+                    "UPDATE links SET ingame_id=? WHERE guild_id=? AND "
+                    "ingame_name=? COLLATE NOCASE "
+                    "AND (ingame_id IS NULL OR ingame_id != ?)",
+                    (ingame_id, int(guild_id), ingame_name, ingame_id))
+            self._conn.commit()
+
+    def list_links(self, guild_id: int) -> List[sqlite3.Row]:
+        """Alle Verknüpfungen einer Guild, alphabetisch nach PSN-Name."""
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT * FROM links WHERE guild_id=? ORDER BY ingame_name COLLATE NOCASE",
+                (guild_id,)).fetchall())
+
+    # ── Spieler-Seite (player_roster) ─────────────────────────
+    def roster_upsert_login(self, guild_id: int, service_id: str, ingame_name: str) -> None:
+        """Connect-Event: Zeile anlegen (first_seen=jetzt) oder nur last_login
+        auffrischen, falls schon vorhanden."""
+        now = time.time()
+        sid = str(service_id or "")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO player_roster (guild_id, service_id, ingame_name, "
+                "first_seen, last_login, total_playtime_seconds) VALUES (?,?,?,?,?,0) "
+                "ON CONFLICT(guild_id, service_id, ingame_name) "
+                "DO UPDATE SET last_login=excluded.last_login",
+                (guild_id, sid, ingame_name, now, now))
+            self._conn.commit()
+
+    def roster_backfill_add(self, guild_id: int, service_id: str, ingame_name: str) -> bool:
+        """Traegt einen Namen NUR ein, wenn er noch nicht in der Liste steht -
+        fuer den Ruecklese-Abgleich alter ADM-Dateien beim (Neu-)Start
+        (siehe DayZBot._roster_backfill_falls_noetig). Anders als
+        roster_upsert_login wird ein bereits bekannter Namen NICHT
+        angefasst (kein "last_login" auf jetzt setzen fuer einen Alt-Fund).
+        Gibt True zurueck, wenn tatsaechlich eine neue Zeile entstanden ist."""
+        sid = str(service_id or "")
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO player_roster (guild_id, service_id, ingame_name, "
+                "first_seen, last_login, total_playtime_seconds) VALUES (?,?,?,?,?,0)",
+                (guild_id, sid, ingame_name, now, now))
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def roster_add_playtime(self, guild_id: int, service_id: str,
+                            ingame_name: str, seconds: float) -> None:
+        """Disconnect-Event: verstrichene Sitzungsdauer der Gesamt-Spielzeit
+        zuschlagen. Legt die Zeile an, falls sie (z.B. durch Bot-Neustart
+        waehrend der Sitzung) noch fehlt."""
+        if seconds <= 0:
+            return
+        sid = str(service_id or "")
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO player_roster (guild_id, service_id, ingame_name, "
+                "first_seen, last_login, total_playtime_seconds) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(guild_id, service_id, ingame_name) "
+                "DO UPDATE SET total_playtime_seconds = total_playtime_seconds + excluded.total_playtime_seconds",
+                (guild_id, sid, ingame_name, time.time(), time.time(), int(seconds)))
+            self._conn.commit()
+
+    def roster_hat_namen(self, guild_id: int, service_id: str, ingame_name: str) -> bool:
+        """True, wenn dieser Ingame-Name schon einmal auf DIESEM Server (in
+        dieser Guild) per Connect gesehen wurde - Vorbedingung fuer /link."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM player_roster WHERE guild_id=? AND service_id=? "
+                "AND ingame_name=? COLLATE NOCASE",
+                (guild_id, str(service_id or ""), ingame_name)).fetchone()
+        return row is not None
+
+    def roster_list(self, guild_id: int, service_id: str, suche: str = "",
+                    limit: int = 10, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
+        """Spieler-Seite: Zeilen dieses Servers, mit Discord-ID (falls verlinkt)
+        und Online-Status dazugejoint. Gibt (zeilen, gesamtzahl) zurueck."""
+        sid = str(service_id or "")
+        like = f"%{suche}%" if suche else "%"
+        with self._lock:
+            gesamt = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM player_roster "
+                "WHERE guild_id=? AND service_id=? AND ingame_name LIKE ? COLLATE NOCASE",
+                (guild_id, sid, like)).fetchone()["n"]
+            rows = self._conn.execute(
+                "SELECT r.ingame_name AS ingame_name, r.first_seen AS first_seen, "
+                "r.last_login AS last_login, r.total_playtime_seconds AS total_playtime_seconds, "
+                "l.user_id AS user_id, "
+                "EXISTS(SELECT 1 FROM sessions s WHERE s.service_id=r.service_id "
+                "  AND s.ingame_name=r.ingame_name COLLATE NOCASE) AS online "
+                "FROM player_roster r "
+                "LEFT JOIN links l ON l.guild_id=r.guild_id "
+                "  AND l.ingame_name=r.ingame_name COLLATE NOCASE "
+                "WHERE r.guild_id=? AND r.service_id=? AND r.ingame_name LIKE ? COLLATE NOCASE "
+                "ORDER BY r.last_login DESC LIMIT ? OFFSET ?",
+                (guild_id, sid, like, limit, offset)).fetchall()
+        return [dict(r) for r in rows], int(gesamt)
+
+    def roster_delete(self, guild_id: int, service_id: str, ingame_name: str) -> bool:
+        """Loescht eine Spieler-Zeile und entlinkt NUR DIESEN Namen, falls
+        verknuepft - andere Accounts (Haupt/Alt) desselben Discord-Users
+        bleiben unangetastet. War der entfernte Name der Hauptaccount, ruecktw
+        der naechstaeltere Alt-Account nach. Ein spaeterer erneuter Connect
+        legt den Namen frisch UND unverlinkt wieder an."""
+        sid = str(service_id or "")
+        with self._lock:
+            link = self._conn.execute(
+                "SELECT user_id, is_main FROM links WHERE guild_id=? "
+                "AND ingame_name=? COLLATE NOCASE", (guild_id, ingame_name)).fetchone()
+            if link:
+                uid = int(link["user_id"])
+                self._conn.execute(
+                    "DELETE FROM links WHERE guild_id=? AND ingame_name=? COLLATE NOCASE",
+                    (guild_id, ingame_name))
+                if link["is_main"]:
+                    naechster = self._conn.execute(
+                        "SELECT ingame_name FROM links WHERE guild_id=? AND user_id=? "
+                        "ORDER BY created_at ASC LIMIT 1", (guild_id, uid)).fetchone()
+                    if naechster:
+                        self._conn.execute(
+                            "UPDATE links SET is_main=1 WHERE guild_id=? AND user_id=? "
+                            "AND ingame_name=? COLLATE NOCASE",
+                            (guild_id, uid, naechster["ingame_name"]))
+            cur = self._conn.execute(
+                "DELETE FROM player_roster WHERE guild_id=? AND service_id=? "
+                "AND ingame_name=? COLLATE NOCASE",
+                (guild_id, sid, ingame_name))
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def has_session(self, service_id: str, ingame_name: str) -> bool:
+        """True, wenn für den Spieler auf DIESEM Server eine Sitzung offen ist."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM sessions WHERE service_id=? AND ingame_name=? COLLATE NOCASE",
+                (str(service_id or ""), ingame_name)).fetchone()
+        return row is not None
+
+    def sync_sessions_from_positions(self, service_id: str, positions: Dict,
+                                     max_age_seconds: int = 300,
+                                     guild_id: Optional[int] = None) -> int:
+        """Öffnet Sitzungen für VERLINKTE Spieler, die laut Log-Positions-Tracking
+        gerade aktiv sind, aber keine offene Sitzung haben (verpasstes Connect-Event
+        durch Bot-Downtime/Backlog-Skip oder /link während man schon online ist).
+        Gibt die Anzahl neu geöffneter Sitzungen zurück."""
+        now_utc = datetime.now(timezone.utc)
+        with self._lock:
+            if guild_id is None:
+                rows = self._conn.execute(
+                    "SELECT DISTINCT ingame_name FROM links").fetchall()
+            else:
+                # Nur Verknuepfungen DIESER Guild – sonst entstehen auf Server A
+                # Geister-Sitzungen fuer Namen, die nur bei Kunde B verlinkt sind.
+                rows = self._conn.execute(
+                    "SELECT DISTINCT ingame_name FROM links WHERE guild_id=?",
+                    (int(guild_id),)).fetchall()
+            linked = {str(r["ingame_name"]).lower() for r in rows}
+        opened = 0
+        for pname, info in list(positions.items()):
+            if pname.lower() not in linked:
+                continue
+            try:
+                seen = datetime.fromisoformat(str(info.get("last_seen", "")))
+            except ValueError:
+                continue
+            if (now_utc - seen).total_seconds() > max_age_seconds:
+                continue
+            if self.has_session(service_id, pname):
+                continue
+            self.open_session(service_id, pname, info.get("id"))
+            opened += 1
+            log.info(f"[PLAYTIME] Sitzung für {pname} aus Log-Sichtung geöffnet (Connect-Event verpasst).")
+        return opened
+
+    # ── Bounties (Kopfgelder) ─────────────────────────────────
+    def add_bounty(self, guild_id: int, target_name: str, amount: int, placed_by: int) -> int:
+        """Setzt ein Kopfgeld aus (Betrag wurde bereits abgebucht).
+        Gibt die neue Gesamtsumme auf das Ziel zurück."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO bounties (guild_id, target_name, amount, placed_by, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (guild_id, target_name, amount, placed_by, time.time()))
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(amount),0) AS total FROM bounties "
+                "WHERE guild_id=? AND target_name=? COLLATE NOCASE AND status='open'",
+                (guild_id, target_name)).fetchone()
+        return int(row["total"])
+
+    def open_bounties(self, guild_id: int) -> List[sqlite3.Row]:
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT target_name, SUM(amount) AS total, COUNT(*) AS n "
+                "FROM bounties WHERE guild_id=? AND status='open' "
+                "GROUP BY target_name COLLATE NOCASE ORDER BY total DESC",
+                (guild_id,)).fetchall())
+
+    def claim_bounties(self, guild_id: int, target_name: str, claimed_by: int) -> int:
+        """Zahlt alle offenen Kopfgelder auf target_name aus (markiert claimed).
+        Gibt die Gesamtsumme zurück (0 = keine offenen Bounties)."""
+        now = time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(amount),0) AS total FROM bounties "
+                "WHERE guild_id=? AND target_name=? COLLATE NOCASE AND status='open'",
+                (guild_id, target_name)).fetchone()
+            total = int(row["total"])
+            if total > 0:
+                self._conn.execute(
+                    "UPDATE bounties SET status='claimed', claimed_by=?, claimed_at=? "
+                    "WHERE guild_id=? AND target_name=? COLLATE NOCASE AND status='open'",
+                    (claimed_by, now, guild_id, target_name))
+                self._conn.commit()
+        return total
+
+    # ── Spielzeit-Sitzungen ───────────────────────────────────
+    def open_session(self, service_id: str, ingame_name: str, ingame_id: Optional[str],
+                     connect_log_ts: Optional[str] = None):
+        """Connect-Event: neue Sitzung (Reconnect setzt den Zähler zurück).
+
+        ``connect_log_ts`` ist der ADM-Zeitstempel (``HH:MM:SS``) der
+        Connect-Zeile, falls bekannt - Grundlage fuer die genauere
+        Dauer-Berechnung in close_session (siehe dort)."""
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO sessions "
+                "(service_id, ingame_name, ingame_id, connect_ts, last_seen_ts, "
+                "credited_blocks, connect_log_ts) VALUES (?,?,?,?,?,0,?)",
+                (str(service_id or ""), ingame_name, ingame_id, now, now, connect_log_ts))
+            self._conn.commit()
+
+    def close_session(self, service_id: str, ingame_name: str,
+                      disconnect_log_ts: Optional[str] = None) -> float:
+        """Beendet die Sitzung und gibt ihre Dauer in Sekunden zurueck (0.0,
+        wenn keine offene Sitzung gefunden wurde) - Grundlage fuer die
+        Spielzeit-Vergütung bei Disconnect.
+
+        Wird ``disconnect_log_ts`` mitgegeben UND wurde beim Connect
+        ebenfalls ein ADM-Zeitstempel gespeichert, berechnet sich die Dauer
+        aus DIESEN beiden Log-Zeitstempeln statt aus der Wanduhr des Bots
+        (_session_dauer_aus_log_zeitstempeln). Das behebt einen echten Fehler:
+        verarbeitet der Bot Connect und Disconnect im selben Poll-Zyklus oder
+        beim Aufholen eines Rueckstands nach Downtime, liegen beide fuer die
+        Wanduhr nur Millisekunden auseinander, obwohl im Log echte Minuten
+        oder Stunden dazwischen liegen - die Sitzung wurde dann faelschlich
+        mit ~0 Sekunden Dauer gezaehlt. Ohne brauchbare Zeitstempel bleibt die
+        Wanduhr der Rueckfall (besser als gar keine Zahl)."""
+        sid = str(service_id or "")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT connect_ts, connect_log_ts FROM sessions "
+                "WHERE service_id=? AND ingame_name=? COLLATE NOCASE",
+                (sid, ingame_name)).fetchone()
+            self._conn.execute(
+                "DELETE FROM sessions WHERE service_id=? AND ingame_name=? COLLATE NOCASE",
+                (sid, ingame_name))
+            self._conn.commit()
+        if not row:
+            return 0.0
+        aus_log = _session_dauer_aus_log_zeitstempeln(row["connect_log_ts"], disconnect_log_ts)
+        if aus_log is not None:
+            return aus_log
+        return max(0.0, time.time() - float(row["connect_ts"]))
+
+    def close_all_sessions(self, service_id: str):
+        """Alle offenen Sitzungen EINES Servers beenden (Server-Neustart).
+
+        Ohne die Einschraenkung wuerde ein Neustart bei einem Kunden die
+        Spielzeit-Sitzungen aller anderen Kunden mitloeschen.
+        """
+        with self._lock:
+            self._conn.execute("DELETE FROM sessions WHERE service_id=?",
+                               (str(service_id or ""),))
+            self._conn.commit()
+
+    # ── Backup ────────────────────────────────────────────────
+    def backup(self, keep: int = 7) -> Optional[str]:
+        """Konsistente Kopie via SQLite-Backup-API (WAL-sicher):
+        economy.db.bak-YYYY-MM-DD; behält die neuesten `keep` Stück."""
+        path = self._path or str(cfg.config.get("economy_db_path") or ECON_DB_FILE)
+        dest = f"{path}.bak-{datetime.now().strftime('%Y-%m-%d')}"
+        try:
+            with self._lock:
+                dst = sqlite3.connect(dest)
+                try:
+                    self._conn.backup(dst)
+                finally:
+                    dst.close()
+            for old in sorted(glob.glob(f"{path}.bak-*"))[:-max(1, keep)]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+            return dest
+        except Exception as e:
+            log.error(f"[ECON] Backup fehlgeschlagen: {e}")
+            return None
+
+
+db = EconomyDB()
+
+
+# ══════════════════════════════════════════════════════════════
+#  Economy-Hilfsfunktionen
+# ══════════════════════════════════════════════════════════════
+def _srv_conf(interaction: discord.Interaction, key: str) -> Dict:
+    """Einstellungsblock (economy/casino/bounty) des Servers dieser Guild.
+
+    Jeder Kunde stellt Verdienstspannen, Cooldowns und Einsaetze selbst ein;
+    ohne diese Aufloesung gaelten ueberall die Werte des Betreibers.
+    """
+    conn = _conn_of(interaction)
+    wert = (conn.get(key) if conn is not None else cfg.config.get(key))
+    return wert if isinstance(wert, dict) else {}
+
+
+def _cur_symbol(conn: Optional[ServerConnection] = None) -> str:
+    """Waehrungssymbol des gerade behandelten Servers."""
+    conn = conn if conn is not None else _AKTUELLER_SERVER.get()
+    if conn is not None:
+        return str(conn.get("currency_symbol", "₽") or "₽")
+    return cfg.config.get("currency_symbol", "₽")
+
+def _fmt_money(n: int, conn: Optional[ServerConnection] = None) -> str:
+    conn = conn if conn is not None else _AKTUELLER_SERVER.get()
+    voran = bool((conn.get("prepend_currency_symbol", False) if conn is not None
+                 else cfg.config.get("prepend_currency_symbol", False)))
+    sym = _cur_symbol(conn)
+    zahl = f"{int(n):,}"
+    return f"{sym} {zahl}" if voran else f"{zahl} {sym}"
+
+def _cooldown_embed(action_label: str, remaining: float) -> discord.Embed:
+    """Embed mit Discord-Relativzeit, wann der Befehl wieder nutzbar ist."""
+    ready = int(time.time() + remaining)
+    return discord.Embed(
+        title="⏳ Cooldown",
+        description=f"You can use **{action_label}** again <t:{ready}:R>.",
+        color=0x95A5A6)
+
+def _insufficient_embed(needed: int, wallet: int) -> discord.Embed:
+    return discord.Embed(
+        title="❌ Insufficient funds",
+        description=(f"You need **{_fmt_money(needed)}** but your wallet only has "
+                     f"**{_fmt_money(wallet)}**.\nUse `/withdraw` to move money from your bank."),
+        color=0xE74C3C)
+
+def _validate_bet(bet: int, conf: Dict) -> Optional[str]:
+    """Gibt eine Fehlermeldung zurück, wenn der Einsatz außerhalb min/max liegt."""
+    mn = int(conf.get("min_bet", 1))
+    mx = int(conf.get("max_bet", 10 ** 9))
+    if bet < mn:
+        return f"Minimum bet is **{_fmt_money(mn)}**."
+    if bet > mx:
+        return f"Maximum bet is **{_fmt_money(mx)}**."
+    return None
+
+async def _post_feed(guild_id: Union[int, str, List[int], List[str], None],
+                     log_type: str, embed: discord.Embed,
+                     content: Optional[str] = None, channel_id: Optional[int] = None,
+                     service_id: Optional[str] = None,
+                     anhang: Optional[Tuple[bytes, str]] = None,
+                     view: Optional[discord.ui.View] = None) -> Tuple[bool, str]:
+    """Postet ein Embed in den konfigurierten Feed-Channel (eine Guild oder alle).
+    content: optionaler Nachrichtentext vor dem Embed (z. B. Rollen-Ping bei Zonen).
+    channel_id: optionaler Ziel-Channel, der die Feed-Konfiguration überschreibt
+    (z. B. eigener Warn-Channel einer Zone).
+    service_id: von welchem Nitrado-Server das Ereignis stammt – entscheidet bei
+    mehreren Servern derselben Guild, in welchen Channel es geht.
+    anhang: optional (bytes, dateiname) für einen Datei-Anhang (z. B. ADM/RPT-
+    Download-Feeds) – aus den rohen Bytes wird PRO Versand ein frisches
+    discord.File gebaut, da ein einzelnes File-Objekt sich nicht mehrfach
+    verschicken laesst (mehrere Guilds bei channel_id=None).
+    view: optionale discord.ui.View (z. B. Übersetzen-Button) – wird bei
+    mehreren Zielen (channel_id=None) an JEDEN Post gehängt.
+
+    Rückgabe ``(erfolg, grund)`` – ``grund`` ist einer von "sent",
+    "channel_not_found", "channel_not_configured", "discord_forbidden",
+    "discord_http_error". Ohne diesen Rückgabewert blieb ein fehlgeschlagener
+    Versand (falscher/geloeschter Channel, fehlende Berechtigung) fuer den
+    Aufrufer nicht von einem erfolgreichen zu unterscheiden – bei Zonen-Pings
+    lief dadurch der Cooldown, obwohl nie etwas ankam (siehe _post_zone_ping)."""
+    async def _send(ch_id: int, tag: str) -> Tuple[bool, str]:
+        ch = await bot._resolve_channel(int(ch_id))
+        if not ch:
+            log.warning(f"[FEED] {tag}: Channel {ch_id} nicht auflösbar.")
+            return False, "channel_not_found"
+        datei = (discord.File(io.BytesIO(anhang[0]), filename=anhang[1])
+                if anhang is not None else None)
+        try:
+            if content:
+                await ch.send(content=content, embed=embed, file=datei, view=view,
+                              allowed_mentions=discord.AllowedMentions(roles=True))
+            else:
+                await ch.send(embed=embed, file=datei, view=view)
+            return True, "sent"
+        except discord.Forbidden as e:
+            log.error(f"[FEED] {tag}: {e}")
+            return False, "discord_forbidden"
+        except Exception as e:
+            log.error(f"[FEED] {tag}: {e}")
+            return False, "discord_http_error"
+
+    if channel_id:
+        return await _send(channel_id, f"{log_type} → Channel {channel_id}")
+    # Rückfallkette wie in _dispatch: der erste Schlüssel mit gesetztem Channel
+    # gewinnt. Ohne sie liefen die Betriebswarnungen ins Leere – sie posten
+    # historisch auf "adminlog", das es in FEED_TYPES nicht mehr gibt und das
+    # die Migration entfernt. FTP-Ausfall, übersprungener Rückstand,
+    # Zonen-Rückfall und Link-Meldungen blieben damit stumm, obwohl der
+    # Betreiber den sichtbaren Feed „Admin Action" eingerichtet hatte.
+    kandidaten = [log_type]
+    for ersatz in (_FEED_ALIASSE.get(log_type), "catch_all"):
+        if ersatz and ersatz not in kandidaten:
+            kandidaten.append(ersatz)
+    if isinstance(guild_id, (list, tuple, set)):
+        gids = [str(g) for g in guild_id]
+    elif guild_id:
+        gids = [str(guild_id)]
+    else:
+        gids = list(cfg.guilds.keys())
+    irgendein_ziel = False
+    letzter_grund = "channel_not_configured"
+    erfolg_gesamt = False
+    for gid in gids:
+        feed = None
+        treffer = log_type
+        for kand in kandidaten:
+            feed = cfg.feed_settings(int(gid), kand, service_id)
+            if feed:
+                treffer = kand
+                break
+        if not feed:
+            continue
+        if not feed.get("enabled", True):
+            # Wie in _dispatch: ein deaktivierter Feed weicht nicht auf den
+            # naechsten Kandidaten aus, er postet fuer diese Guild einfach
+            # nicht - zaehlt aber als gefundenes Ziel, sonst wuerde ein reiner
+            # "channel_not_configured"-Rueckgabewert faelschlich einen
+            # Konfigurationsfehler statt einer bewussten Abschaltung melden.
+            irgendein_ziel = True
+            letzter_grund = "feed_disabled"
+            continue
+        irgendein_ziel = True
+        ok_gid, grund = await _send(feed["channel_id"], f"{treffer} → Guild {gid}")
+        erfolg_gesamt = erfolg_gesamt or ok_gid
+        letzter_grund = grund
+    if not irgendein_ziel:
+        return False, "channel_not_configured"
+    return erfolg_gesamt, letzter_grund
+
+
+async def _notify_link_change(guild_id: Optional[int], embed: discord.Embed):
+    """Meldet /link- und /unlink-Aktionen an die Admins:
+    bevorzugt im adminlog-Feed, sonst im economy_log-Feed.
+
+    Verknuepfungen gehoeren der Guild, nicht einem einzelnen Server – als
+    Zielkanal gilt deshalb der des Leitservers.
+    """
+    _leit = connections.for_guild(guild_id) if guild_id else None
+    sid = _leit.service_id if _leit is not None else None
+    if guild_id and (cfg.get_channel(int(guild_id), "admin_action", sid)
+                     or cfg.get_channel(int(guild_id), "adminlog", sid)):
+        return await _post_feed(guild_id, "adminlog", embed, service_id=sid)
+    await _post_feed(guild_id, "economy_log", embed, service_id=sid)
+
+
+# ══════════════════════════════════════════════════════════════
+#  SHOP-MANAGER – Auslieferung über cfgEffectArea.json
+#  Ablauf: Kauf → Eintrag in cfgEffectArea.json (pending) →
+#  Server-Neustart (Item spawnt) → Eintrag entfernen (delivered).
+#  WICHTIG: Ohne Entfernen respawnt das Item bei JEDEM Neustart!
+# ══════════════════════════════════════════════════════════════
+class ShopManager:
+    AREA_PREFIX = "SHOP_"
+
+    def __init__(self, bot_ref: "DayZBot", conn: "ServerConnection"):
+        self.bot  = bot_ref
+        # Jeder Server liefert in seine eigene cfgEffectArea.json aus und wird
+        # ueber seine eigene Nitrado-Verbindung neu gestartet.
+        self.conn = conn
+        self.lock = asyncio.Lock()   # serialisiert ALLE Schreibzugriffe auf die Datei
+        self._restart_task: Optional[asyncio.Task] = None
+        self._last_restart_ts = 0.0
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self.cleanup_retry_needed = False   # FTP-Fehler beim Cleanup → Retry im Poll-Zyklus
+        self._last_restart_at = 0.0         # Zeitpunkt des zuletzt ERKANNTEN Server-Neustarts
+
+    # ── Cleanup als Task starten (Referenz halten, Fehler loggen) ─
+    def spawn_cleanup(self, delayed: bool = False):
+        """Startet on_restart_detected als Task – nie fire-and-forget.
+        delayed=True bei frisch erkanntem Neustart: die SHOP_-Einträge bleiben
+        in der Datei, bis der Server per A2S wieder online ist (= Boot fertig,
+        cfgEffectArea.json sicher eingelesen), und werden dann sofort entfernt.
+        Ist der Online-Status nicht prüfbar, greift stattdessen der feste
+        delivery_cleanup_delay_seconds-Fallback."""
+        if delayed:
+            self._last_restart_at = time.time()
+        if self._cleanup_task and not self._cleanup_task.done():
+            return
+        self._cleanup_task = asyncio.create_task(self._cleanup_safe(delayed))
+
+    async def _cleanup_safe(self, delayed: bool = False):
+        try:
+            await self.on_restart_detected(delayed)
+        except Exception as e:
+            log.error(f"[SHOP] Delivery-Cleanup fehlgeschlagen: {e}")
+            self.cleanup_retry_needed = True
+
+    # ── Pfad zur cfgEffectArea.json ──────────────────────────
+    def effect_area_path(self) -> Optional[str]:
+        path = self.conn.get("cfg_effect_area_path")
+        if path:
+            return path
+        mission = self.conn.get("ftp_mission_dir")
+        if mission:
+            return f"{mission.rstrip('/')}/cfgEffectArea.json"
+        return None
+
+    # ── JSON parsen (Areas-Key dynamisch, leere Datei ok) ─────
+    @staticmethod
+    def _parse_effect_area(raw: Optional[str]) -> Tuple[Dict, str]:
+        """Gibt (Daten, Areas-Key) zurück. Fehlende/leere Datei → Grundstruktur."""
+        if not raw or not raw.strip():
+            return {"Areas": [], "SafePositions": []}, "Areas"
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("Wurzel-Element ist kein JSON-Objekt")
+        # Ein Kunde kann eine cfgEffectArea.json mitbringen, die "SafePositions"
+        # noch nie gesehen hat (von Hand gebaut oder mit einem anderen Tool
+        # erzeugt) - ohne dieses setdefault würde der Effekt-Generator (der
+        # dieses Feld nie selbst befuellt) sie beim Speichern schlicht
+        # weglassen, statt wie erwartet "SafePositions": [] zu haben.
+        data.setdefault("SafePositions", [])
+        # 1) Key 'Areas' (Groß-/Kleinschreibung egal)
+        for key, val in data.items():
+            if key.lower() == "areas" and isinstance(val, list):
+                return data, key
+        # 2) Fallback: irgendeine Liste, deren Einträge wie Areas aussehen
+        for key, val in data.items():
+            if isinstance(val, list) and val and isinstance(val[0], dict) and "AreaName" in val[0]:
+                return data, key
+        data.setdefault("Areas", [])
+        return data, "Areas"
+
+    async def _write_json(self, path: str, new_data: Dict) -> bool:
+        """Schreibt die cfgEffectArea.json – OHNE Zusatzdateien im Mission-Ordner.
+        Eine evtl. noch vorhandene .bak aus früheren Bot-Versionen wird entfernt."""
+        loop = asyncio.get_running_loop()
+        content = json.dumps(new_data, ensure_ascii=False, indent=2)
+        ok = await loop.run_in_executor(None, self.conn.ftp.write_file, path, content)
+        if ok:
+            # Aufräumen (Best-Effort): keine .bak mehr im Mission-Ordner
+            await loop.run_in_executor(None, self.conn.ftp.delete_file, path + ".bak")
+        return ok
+
+    # ── Kauf: Einträge anhängen ───────────────────────────────
+    async def add_purchase_entries(self, classnames: List[str], amount: int,
+                                   x: float, y: float, z: float) -> Tuple[bool, str, List[str]]:
+        """Schreibt pro Stück und Classname einen Area-Eintrag (Pos=[X, Höhe, Nord]) –
+        Bundles spawnen alle enthaltenen Items an derselben Koordinate.
+        Gibt (ok, fehlermeldung, area_names) zurück. Erst NACH Erfolg Geld abbuchen!"""
+        path = self.effect_area_path()
+        if not path:
+            return (False,
+                    "cfgEffectArea.json path is not configured. "
+                    "Please contact the bot operator.", [])
+        async with self.lock:
+            loop = asyncio.get_running_loop()
+            raw, status = await loop.run_in_executor(None, self.conn.ftp.read_file_ex, path)
+            if status == "error":
+                # Inhalt unbekannt → NIE mit leerer Grundstruktur überschreiben,
+                # sonst gehen Vanilla-Zonen + andere pending-Käufe verloren
+                return (False,
+                        "FTP read of `cfgEffectArea.json` failed – purchase cancelled, "
+                        "nothing was charged. Please try again in a moment.", [])
+            try:
+                data, areas_key = self._parse_effect_area(raw)
+            except Exception as e:
+                return False, f"Could not parse cfgEffectArea.json: `{e}`", []
+            try:
+                radius = float(self.conn.get("default_radius", 1) or 1)
+            except (TypeError, ValueError):
+                radius = 1.0
+            if radius.is_integer():
+                radius = int(radius)   # "Radius": 1 statt 1.0 – exakt wie das Referenz-Format
+            names: List[str] = []
+            for _ in range(amount):
+                for cn in classnames:
+                    name = f"{self.AREA_PREFIX}{uuid.uuid4().hex}"
+                    names.append(name)
+                    data[areas_key].append({
+                        "AreaName": name,
+                        "Type": cn,
+                        "Data": {"Pos": [float(x), float(y), float(z)], "Radius": radius},
+                    })
+            ok = await self._write_json(path, data)
+            if not ok:
+                return False, "FTP write failed – purchase cancelled, nothing was charged.", []
+            return True, "", names
+
+    # ── Cleanup: Einträge nach Auslieferung entfernen ─────────
+    async def remove_area_entries(self, area_names: List[str]) -> bool:
+        """Entfernt Einträge aus cfgEffectArea.json (verhindert Respawn bei jedem Neustart)."""
+        if not area_names:
+            return True   # nichts zu entfernen → Erfolg (sonst hängen Käufe ewig auf pending)
+        path = self.effect_area_path()
+        if not path:
+            return False
+        wanted = set(area_names)
+        async with self.lock:
+            loop = asyncio.get_running_loop()
+            raw, status = await loop.run_in_executor(None, self.conn.ftp.read_file_ex, path)
+            if status == "error":
+                # Lesefehler ≠ leere Datei: sonst würden Käufe als geliefert
+                # markiert, obwohl die Einträge noch drinstehen (Dauer-Respawn)
+                log.error("[SHOP] Cleanup: cfgEffectArea.json nicht lesbar (FTP) – Retry folgt.")
+                return False
+            try:
+                data, areas_key = self._parse_effect_area(raw)
+            except Exception as e:
+                log.error(f"[SHOP] Cleanup: Parse-Fehler in cfgEffectArea.json: {e}")
+                return False
+            before = len(data[areas_key])
+            data[areas_key] = [a for a in data[areas_key]
+                               if a.get("AreaName") not in wanted]
+            if len(data[areas_key]) == before:
+                return True   # nichts (mehr) enthalten → trotzdem Erfolg
+            return await self._write_json(path, data)
+
+    # ── Verwaiste SHOP_-Einträge entfernen (Selbstheilung) ────
+    async def sweep_orphans(self) -> int:
+        """Entfernt alle SHOP_-Einträge, die zu KEINEM pending-Kauf gehören
+        (entstehen z. B. durch fehlgeschlagenen Rollback). Gibt die Anzahl
+        entfernter Einträge zurück, -1 bei FTP-/Parse-Fehler."""
+        path = self.effect_area_path()
+        if not path:
+            return -1
+        valid: set = set()
+        for r in db.pending_purchases(guild_id=self.conn.guild_id,
+                                      service_id=self.conn.service_id):
+            try:
+                valid.update(json.loads(r["area_names"] or "[]"))
+            except Exception:
+                pass
+        async with self.lock:
+            loop = asyncio.get_running_loop()
+            raw, status = await loop.run_in_executor(None, self.conn.ftp.read_file_ex, path)
+            if status == "error":
+                log.error("[SHOP] Orphan-Sweep: cfgEffectArea.json nicht lesbar (FTP).")
+                return -1
+            try:
+                data, areas_key = self._parse_effect_area(raw)
+            except Exception as e:
+                log.error(f"[SHOP] Orphan-Sweep: Parse-Fehler in cfgEffectArea.json: {e}")
+                return -1
+            keep: List[Dict] = []
+            removed = 0
+            for a in data[areas_key]:
+                name = str(a.get("AreaName", ""))
+                if name.startswith(self.AREA_PREFIX) and name not in valid:
+                    removed += 1
+                else:
+                    keep.append(a)
+            if removed == 0:
+                return 0
+            data[areas_key] = keep
+            ok = await self._write_json(path, data)
+            return removed if ok else -1
+
+    # ── Diagnose + Self-Heal (Basis für /shop check) ──────────
+    async def check_and_heal(self) -> Dict:
+        """Prüft Pfad, Lesbarkeit und JSON-Struktur der cfgEffectArea.json und
+        trägt fehlende Einträge offener Käufe wieder ein (Self-Heal, z. B.
+        nachdem die Datei extern überschrieben wurde). Gibt einen Report zurück."""
+        report: Dict = {"path": self.effect_area_path(),
+                        "last_restart_at": self._last_restart_at}
+        path = report["path"]
+        if not path:
+            report["status"] = "no_path"
+            return report
+        pending = db.pending_purchases(guild_id=self.conn.guild_id,
+                                       service_id=self.conn.service_id)
+        report["pending"] = len(pending)
+        async with self.lock:
+            loop = asyncio.get_running_loop()
+            raw, status = await loop.run_in_executor(None, self.conn.ftp.read_file_ex, path)
+            report["status"] = status
+            if status == "error":
+                return report
+            try:
+                data, areas_key = self._parse_effect_area(raw)
+            except Exception as e:
+                report["status"] = "parse_error"
+                report["error"] = str(e)
+                return report
+            areas = data[areas_key]
+            present = {str(a.get("AreaName", "")) for a in areas}
+            shop_n = sum(1 for n in present if n.startswith(self.AREA_PREFIX))
+            report["areas_total"]     = len(areas)
+            report["shop_entries"]    = shop_n
+            report["vanilla_entries"] = len(areas) - shop_n
+            try:
+                radius = float(self.conn.get("default_radius", 1) or 1)
+            except (TypeError, ValueError):
+                radius = 1.0
+            if radius.is_integer():
+                radius = int(radius)
+            healed_ids: List[int] = []
+            healed_entries = 0
+            for r in pending:
+                try:
+                    names = json.loads(r["area_names"] or "[]")
+                except Exception:
+                    continue
+                cls_list = [c for c in str(r["classname"] or "").split("+") if c]
+                if not cls_list or all(n in present for n in names):
+                    continue
+                # area_names wurden in der Reihenfolge Stück×Classname erzeugt →
+                # Index-Mapping stellt den Classname jedes Eintrags wieder her
+                for i, n in enumerate(names):
+                    if n in present:
+                        continue
+                    areas.append({
+                        "AreaName": n,
+                        "Type": cls_list[i % len(cls_list)],
+                        "Data": {"Pos": [float(r["x"]), float(r["y"]), float(r["z"])],
+                                 "Radius": radius},
+                    })
+                    present.add(n)
+                    healed_entries += 1
+                healed_ids.append(int(r["id"]))
+            report["healed_purchases"] = healed_ids
+            report["healed_entries"]   = healed_entries
+            if healed_entries:
+                report["heal_written"] = await self._write_json(path, data)
+        return report
+
+    # ── Auto-Restart (entprellt) ──────────────────────────────
+    def schedule_auto_restart(self):
+        """Startet den Restart-Timer, falls noch keiner läuft.
+        Käufe innerhalb restart_cooldown_seconds werden gesammelt."""
+        if self._restart_task and not self._restart_task.done():
+            return
+        self._restart_task = asyncio.create_task(self._restart_worker())
+
+    async def _restart_worker(self):
+        delay = max(5, int(self.conn.get("restart_cooldown_seconds", 300) or 300))
+        # Mindestabstand zum vorherigen Auto-Restart erzwingen (Server bootet evtl. noch)
+        wait = max(delay, (self._last_restart_ts + delay) - time.time())
+        log.info(f"[SHOP] Auto-Restart in {int(wait)}s geplant (Käufe werden gesammelt).")
+        await asyncio.sleep(wait)
+        self._last_restart_ts = time.time()
+        try:
+            ok, msg = await self.conn.api.restart()
+            log.info(f"[SHOP] Auto-Restart nach Kauf ausgelöst: ok={ok} – {msg}")
+        except Exception as e:
+            log.error(f"[SHOP] Auto-Restart fehlgeschlagen: {e}")
+
+    # ── Warten bis der Server wieder online ist (A2S) ─────────
+    async def _wait_for_server_online(self) -> bool:
+        """Pollt den Spielserver per A2S, bis er antwortet (= wirklich online).
+        True = online gesehen. False = server_ip/query_port fehlt oder Timeout
+        (delivery_online_wait_max_seconds) – dann greift der feste Delay als
+        Fallback, sonst würden Items bei falschem Query-Port ewig respawnen."""
+        ip = str(self.conn.get("server_ip") or "").split(":")[0].strip()
+        qport = int(self.conn.get("query_port", 0) or 0)
+        if not ip or not qport:
+            log.warning("[SHOP] server_ip/query_port nicht gesetzt – kann Server-online "
+                        "nicht prüfen, nutze festen Delivery-Delay als Fallback.")
+            return False
+        max_wait = max(60, int(self.conn.get("delivery_online_wait_max_seconds", 2700) or 2700))
+        deadline = time.time() + max_wait
+        loop = asyncio.get_running_loop()
+        while time.time() < deadline:
+            info = await loop.run_in_executor(None, a2s_query, ip, qport)
+            if info:
+                return True
+            await asyncio.sleep(20)
+        log.warning(f"[SHOP] Server nach {max_wait // 60} Min nicht per A2S erreichbar – "
+                    "nutze festen Delivery-Delay als Fallback.")
+        return False
+
+    # ── Neustart erkannt (neue ADM-Datei) → ausliefern ────────
+    async def on_restart_detected(self, delayed: bool = False):
+        """Wird vom Log-Poller nach einem erkannten Server-Neustart aufgerufen.
+        Wartet bei delayed, bis der Server per A2S wieder online ist – die neue ADM
+        erscheint früh im Boot, der Server muss die cfgEffectArea.json aber erst
+        vollständig einlesen (zu frühes Entfernen = Items spawnen nie). Antwortet
+        der Server per A2S, ist die Mission geladen → sofort bereinigen. Nur wenn
+        der Online-Status nicht prüfbar ist, greift delivery_cleanup_delay_seconds
+        als fester Fallback-Delay. Danach werden hinreichend alte pending-Käufe
+        geliefert und die Datei bereinigt."""
+        self.cleanup_retry_needed = False
+        grace = int(self.conn.get("delivery_grace_seconds", 90) or 90)
+        poll  = int(self.conn.get("log_poll_interval_seconds", 10) or 10)
+        # Grace muss über dem Poll-Intervall liegen, sonst könnte ein Kauf, der NACH
+        # dem Restart einging, fälschlich als geliefert gelten (bezahlt, nie gespawnt)
+        grace = max(grace, poll + 30)
+        # Cutoff am ERKENNUNGS-Zeitpunkt festmachen: Käufe, die während der
+        # Wartezeit oder eines Retrys eingehen, sind noch nicht gespawnt und
+        # dürfen nicht als geliefert markiert werden
+        restart_at = self._last_restart_at or time.time()
+        cutoff = restart_at - grace
+        rows = db.pending_purchases(created_before=cutoff,
+                                    guild_id=self.conn.guild_id,
+                                    service_id=self.conn.service_id)
+        if not rows:
+            return
+        if delayed:
+            delay = max(0, int(self.conn.get("delivery_cleanup_delay_seconds", 600) or 600))
+            log.info(f"[SHOP] Server-Neustart erkannt – warte bis der Server wieder online "
+                     f"ist, danach werden {len(rows)} Lieferung(en) sofort abgeschlossen.")
+            while True:
+                seen = self._last_restart_at   # Stand vor dem Warten
+                online = await self._wait_for_server_online()
+                if online:
+                    # Server antwortet per A2S → Mission (inkl. cfgEffectArea.json)
+                    # ist geladen, Items sind gespawnt → Einträge sofort entfernen
+                    log.info("[SHOP] Server ist wieder online – SHOP_-Einträge werden "
+                             "jetzt sofort entfernt.")
+                elif delay:
+                    # Online-Status nicht prüfbar (keine server_ip/query_port oder
+                    # A2S-Timeout) → fester Delay als Sicherheits-Fallback, sonst
+                    # könnten die Einträge entfernt werden, bevor der Server die
+                    # Datei eingelesen hat (Item spawnt nie)
+                    log.info(f"[SHOP] Server-online nicht prüfbar – Fallback: warte "
+                             f"{delay // 60} Min festen Delay vor dem Entfernen.")
+                    await asyncio.sleep(delay)
+                # Neuer Restart während des Wartens erkannt? spawn_cleanup startet
+                # keinen zweiten Task, solange dieser läuft → hier von vorn warten,
+                # sonst würden die Einträge mitten im nächsten Boot entfernt.
+                if self._last_restart_at <= seen:
+                    break
+                log.info("[SHOP] Erneuter Server-Neustart während der Wartezeit erkannt – "
+                         "warte erneut auf Server-online.")
+        ids:   List[int] = []
+        names: List[str] = []
+        for r in rows:
+            ids.append(int(r["id"]))
+            try:
+                names.extend(json.loads(r["area_names"] or "[]"))
+            except Exception:
+                pass
+        log.info(f"[SHOP] Liefere {len(ids)} Kauf/Käufe aus (Einträge werden entfernt).")
+        ok = await self.remove_area_entries(names)
+        if not ok:
+            self.cleanup_retry_needed = True
+            log.error("[SHOP] cfgEffectArea.json konnte nicht bereinigt werden – "
+                      "automatischer neuer Versuch beim nächsten Poll-Zyklus.")
+            for warn_gid in {int(r["guild_id"]) for r in rows}:
+                warn = discord.Embed(
+                    title="⚠️ Delivery cleanup failed",
+                    description=("Could not remove delivered `SHOP_` entries from "
+                                 "`cfgEffectArea.json` (FTP error). Items would respawn on "
+                                 "every restart. The bot retries automatically – admins can "
+                                 "also run `/shop cleanup`."),
+                    color=0xE67E22)
+                await _post_feed(warn_gid, "shop_log", warn,
+                                 service_id=self.conn.service_id)
+            return
+        db.mark_delivered(ids)
+        for r in rows:
+            embed = discord.Embed(
+                title="📦 DELIVERED",
+                description=(f"**{r['amount']}× {r['item_name']}** for <@{r['user_id']}> "
+                             f"spawned after the server restart."),
+                color=0x2ECC71)
+            embed.set_footer(text=f"Purchase #{r['id']}")
+            await _post_feed(int(r["guild_id"]), "shop_log", embed,
+                             service_id=self.conn.service_id)
+
+
+class RentalManager:
+    """Verwaltet den Neustart-Ablauf gemieteter Events (siehe RentalCatalog)
+    für EINEN Server. Analog zu ShopManager (Task-Muster, cleanup_retry_needed),
+    aber gegen db/events.xml + cfgeventspawns.xml statt cfgEffectArea.json,
+    und mit einem echten Neustart-ZÄHLER je Miete statt einer einmaligen
+    Auslieferung.
+
+    Zweistufige Entfernung bei Ablauf, weil ein geloeschtes Event nur
+    verhindert, dass DayZ das Objekt NACHspawnt - das bereits stehende
+    Fahrzeug wird dadurch nicht zwangslaeufig entfernt:
+      Stufe 1 ('expiring'): <lifetime> kurz setzen + deletable="1" erzwingen,
+               damit DayZs eigene Aufraeum-Logik das Objekt als abgelaufen
+               einstuft, WARTET einen weiteren Neustart ab.
+      Stufe 2 ('removed'):  Event- und Positions-Block ganz entfernen.
+    Muss vor dem produktiven Einsatz an einem echten Server verifiziert
+    werden (siehe Plan „Offenes Risiko") - ob Stufe 1 das Objekt wirklich
+    entfernt, ist eine DayZ-Engine-Frage, kein Code-Fakt.
+    """
+
+    LIFETIME_KURZ_SEKUNDEN = 30
+
+    def __init__(self, bot_ref: "DayZBot", conn: "ServerConnection"):
+        self.bot = bot_ref
+        self.conn = conn
+        self._cleanup_task: Optional[asyncio.Task] = None
+        self.cleanup_retry_needed = False
+
+    def spawn_cleanup(self, delayed: bool = False):
+        """Startet on_restart_detected als Task – nie fire-and-forget, gleiches
+        Schutzmuster wie ShopManager.spawn_cleanup gegen doppeltes Anstoßen."""
+        if self._cleanup_task and not self._cleanup_task.done():
+            return
+        self._cleanup_task = asyncio.create_task(self._cleanup_safe(delayed))
+
+    async def _cleanup_safe(self, delayed: bool = False):
+        try:
+            await self.on_restart_detected(delayed)
+        except Exception as e:
+            log.error(f"[RENTAL] Ablauf-Bereinigung fehlgeschlagen: {e}")
+            self.cleanup_retry_needed = True
+
+    async def _wait_for_server_online(self) -> bool:
+        """Wie ShopManager._wait_for_server_online: db/events.xml wird beim
+        Mission-Init gelesen, ein zu frühes Schreiben wirkt erst den
+        übernächsten Neustart."""
+        ip = str(self.conn.get("server_ip") or "").split(":")[0].strip()
+        qport = int(self.conn.get("query_port", 0) or 0)
+        if not ip or not qport:
+            return False
+        max_wait = max(60, int(self.conn.get("delivery_online_wait_max_seconds", 2700) or 2700))
+        deadline = time.time() + max_wait
+        loop = asyncio.get_running_loop()
+        while time.time() < deadline:
+            info = await loop.run_in_executor(None, a2s_query, ip, qport)
+            if info:
+                return True
+            await asyncio.sleep(20)
+        return False
+
+    async def on_restart_detected(self, delayed: bool = False):
+        """Vom Log-Poller nach einem erkannten Server-Neustart aufgerufen.
+        Zählt jede aktive Miete einen Neustart herunter und treibt die
+        zweistufige Entfernung abgelaufener Mieten voran."""
+        self.cleanup_retry_needed = False
+        rows = db.active_rentals(self.conn.guild_id or 0, self.conn.service_id)
+        if not rows:
+            return
+        if delayed:
+            await self._wait_for_server_online()
+        if self.conn.ftp is None or not _mission_dir_of(self.conn):
+            self.cleanup_retry_needed = True
+            return
+
+        loop = asyncio.get_running_loop()
+        ev_text, ev_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, self.conn, "db/events.xml")
+        sp_text, sp_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, self.conn, "cfgeventspawns.xml")
+        if ev_status != "ok" or sp_status != "ok":
+            log.error("[RENTAL] events.xml/cfgeventspawns.xml nicht lesbar – "
+                      "Ablauf-Bereinigung wird beim nächsten Poll erneut versucht.")
+            self.cleanup_retry_needed = True
+            return
+
+        neu_ev, neu_sp = ev_text, sp_text
+        datei_aenderung_noetig = False
+        # Erst ALLE Text-Transformationen im Speicher berechnen und sammeln,
+        # welche DB-Uebergaenge von einem Schreiberfolg abhaengen - committet
+        # wird an der DB erst NACH bestaetigtem Schreiberfolg, sonst laufen
+        # Zaehler und Datei auseinander (siehe Plan „Hook in die
+        # Neustart-Erkennung" - genau dieser Fehler wurde per Test gefunden:
+        # ein fehlgeschlagener Schreibvorgang darf den Status nicht trotzdem
+        # auf 'expiring'/'removed' setzen).
+        ausstehend: List[Tuple[str, int, Optional[int]]] = []
+        jetzt = time.time()
+        for r in rows:
+            rid = int(r["id"])
+            name = str(r["event_name"])
+            uebrig = int(r["restarts_remaining"]) - 1
+            zu_alt = bool(r["expires_at"]) and jetzt > float(r["expires_at"])
+            try:
+                if r["status"] == "expiring":
+                    # Stufe 2: ein weiterer Neustart seit Stufe 1 ist vergangen.
+                    neu_ev, _ = _tool_delete_event(neu_ev, name)
+                    neu_sp, _ = _tool_delete_eventspawns(neu_sp, name)
+                    ausstehend.append(("removed", rid, None))
+                    datei_aenderung_noetig = True
+                elif uebrig <= 0 or zu_alt:
+                    # Stufe 1: Lifetime kuerzen + deletable erzwingen, Status
+                    # 'expiring' - Stufe 2 folgt beim naechsten Neustart.
+                    neu_ev = _tool_rental_lifetime_kuerzen(
+                        neu_ev, name, self.LIFETIME_KURZ_SEKUNDEN)
+                    ausstehend.append(("expiring", rid, None))
+                    datei_aenderung_noetig = True
+                else:
+                    ausstehend.append(("decrement", rid, uebrig))
+            except ValueError:
+                # Block schon nicht mehr vorhanden (z.B. von Hand gelöscht) -
+                # unabhängig vom Schreibergebnis dieses Zyklus als entfernt
+                # verbuchen, für diese Zeile gibt es ohnehin nichts zu schreiben.
+                db.rental_set_removed(rid)
+
+        if not datei_aenderung_noetig:
+            # Nur Zaehler-Updates, keine Datei-Aenderung noetig - kein
+            # Schreibrisiko, direkt committen.
+            for _, rid, wert in ausstehend:
+                db.rental_decrement(rid, wert)
+            return
+
+        ok_ev = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, self.conn, "db/events.xml", neu_ev)
+        ok_sp = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, self.conn, "cfgeventspawns.xml", neu_sp)
+        if not (ok_ev and ok_sp):
+            log.error("[RENTAL] events.xml/cfgeventspawns.xml konnten nicht gespeichert "
+                      "werden – automatischer neuer Versuch beim nächsten Poll-Zyklus.")
+            self.cleanup_retry_needed = True
+            return   # NICHTS in der DB ändern - der nächste Versuch wiederholt alles
+
+        for aktion, rid, wert in ausstehend:
+            if aktion == "decrement":
+                db.rental_decrement(rid, wert)
+            elif aktion == "expiring":
+                db.rental_set_expiring(rid)
+            else:
+                db.rental_set_removed(rid)
+                zeile = next((r for r in rows if int(r["id"]) == rid), None)
+                if zeile is not None:
+                    await self._melde_ablauf(zeile)
+
+    async def check_orphans(self) -> Dict[str, Any]:
+        """Diagnose für /shop check: findet RENT_-Events in den Dateien ohne
+        aktive DB-Zeile (z.B. weil ein Admin einen Block trotz des Filters in
+        _tool_events_liste doch von Hand über die API gelöscht hat). Meldet
+        nur, räumt NICHT automatisch auf - anders als ShopManager.sweep_orphans
+        lässt sich ein Fahrzeug-Event nicht gefahrlos aus dem Nichts
+        rekonstruieren, dafür fehlen die Positionsdaten außerhalb der DB."""
+        report: Dict[str, Any] = {"active": 0, "orphaned_events": 0, "status": "ok"}
+        rows = db.active_rentals(self.conn.guild_id or 0, self.conn.service_id)
+        report["active"] = len(rows)
+        valid = {str(r["event_name"]) for r in rows}
+        loop = asyncio.get_running_loop()
+        ev_text, ev_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, self.conn, "db/events.xml")
+        if ev_status != "ok":
+            report["status"] = ev_status
+            return report
+        try:
+            root = ET.fromstring(ev_text)
+        except ET.ParseError:
+            report["status"] = "kaputt"
+            return report
+        gefunden = {ev.get("name") for ev in root.findall("event")
+                   if str(ev.get("name") or "").startswith(_RENTAL_EVENT_PREFIX)}
+        report["orphaned_events"] = len(gefunden - valid)
+        return report
+
+    async def _melde_ablauf(self, row: sqlite3.Row):
+        embed = discord.Embed(
+            title="🚗 Miete abgelaufen",
+            description=f"**{row['item_name']}** von <@{row['user_id']}> wurde entfernt.",
+            color=0xE67E22)
+        embed.set_footer(text=f"Miete #{row['id']}")
+        await _post_feed(int(row["guild_id"]), "shop_log", embed,
+                         service_id=str(row["service_id"] or self.conn.service_id))
+
+
+# ══════════════════════════════════════════════════════════════
+#  ECONOMY-COMMANDS – /work /daily /beg
+# ══════════════════════════════════════════════════════════════
+WORK_FLAVOR = [
+    "You fixed a stranger's car engine and earned {amount}.",
+    "You chopped firewood for a trader camp – {amount} earned.",
+    "You escorted a fresh spawn safely across the map and got {amount}.",
+    "You sold hand-made fishing rods at the market for {amount}.",
+    "You repaired the town water pump – the mayor paid you {amount}.",
+    "You hunted deer and sold the pelts for {amount}.",
+    "You cleared the zombies off a farm – the owner paid {amount}.",
+    "You worked a night shift at the docks and earned {amount}.",
+    "You guided a group through the military zone and were paid {amount}.",
+    "You patched up bullet wounds as a field medic – {amount} earned.",
+]
+
+BEG_SUCCESS = [
+    "A kind survivor tossed you {amount}.",
+    "You found {amount} in an old jacket by the road.",
+    "A trader felt sorry for you and gave you {amount}.",
+    "Someone left {amount} in a rusty can – lucky you.",
+]
+
+BEG_FAIL = [
+    "People just walked past you. Nothing earned.",
+    "A zombie chased you away before anyone could help.",
+    "You got laughed at. No money this time.",
+    "Someone threw a rotten fruit at you instead of money.",
+]
+
+async def _require_guild(interaction: discord.Interaction) -> bool:
+    """Economy/Shop funktionieren nur in einer Guild (Salden sind pro Guild)."""
+    if interaction.guild_id:
+        return True
+    await interaction.response.send_message(_t(
+        interaction, "❌ Dieser Befehl funktioniert nur auf einem Server.",
+        "❌ This command only works inside a server."), ephemeral=True)
+    return False
+
+
+async def _require_economy_enabled(interaction: discord.Interaction) -> bool:
+    """economy_enabled=false (Dashboard → Economy → Grundeinstellungen) schaltet
+    die Verdienst-/Casino-Befehle für Spieler aus. Admin-Befehle (/addmoney
+    usw.) laufen bewusst weiter – der Betreiber soll Guthaben auch bei
+    abgeschalteter Economy noch korrigieren können."""
+    conn = _conn_of(interaction)
+    aktiv = bool((conn.get("economy_enabled", True) if conn is not None
+                 else cfg.config.get("economy_enabled", True)))
+    if aktiv:
+        return True
+    await interaction.response.send_message(_t(
+        interaction, "❌ Economy ist auf diesem Server deaktiviert.",
+        "❌ Economy is disabled on this server."), ephemeral=True)
+    return False
+
+
+@bot.tree.command(name="work", description="💼 Work a job and earn some money")
+async def cmd_work(interaction: discord.Interaction):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conf = _srv_conf(interaction, "economy").get("work", {})
+    gid, uid = interaction.guild_id, interaction.user.id
+
+    remaining = db.cooldown_remaining(gid, uid, "work")
+    if remaining > 0:
+        return await interaction.response.send_message(
+            embed=_cooldown_embed("/work", remaining), ephemeral=True)
+
+    lo, hi = int(conf.get("min", 50)), int(conf.get("max", 150))
+    amount = random.randint(min(lo, hi), max(lo, hi))
+    wallet, _bank = db.add_wallet(gid, uid, amount)
+    db.set_cooldown(gid, uid, "work", int(conf.get("cooldown_seconds", 3600)))
+
+    embed = discord.Embed(
+        title=_t(interaction, "💼 Arbeit erledigt", "💼 Work complete"),
+        description=random.choice(WORK_FLAVOR).format(amount=f"**{_fmt_money(amount)}**"),
+        color=0x2ECC71)
+    embed.set_footer(text=_t(interaction, f"Wallet: {_fmt_money(wallet)}",
+                             f"Wallet: {_fmt_money(wallet)}"))
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="daily", description="📅 Claim your daily bonus")
+async def cmd_daily(interaction: discord.Interaction):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conf = _srv_conf(interaction, "economy").get("daily", {})
+    gid, uid = interaction.guild_id, interaction.user.id
+
+    remaining = db.cooldown_remaining(gid, uid, "daily")
+    if remaining > 0:
+        return await interaction.response.send_message(
+            embed=_cooldown_embed("/daily", remaining), ephemeral=True)
+
+    # amount fest ODER min/max-Bereich – beides erlaubt
+    if "min" in conf and "max" in conf:
+        lo, hi = int(conf["min"]), int(conf["max"])
+        amount = random.randint(min(lo, hi), max(lo, hi))
+    else:
+        amount = int(conf.get("amount", 300))
+    wallet, _bank = db.add_wallet(gid, uid, amount)
+    db.set_cooldown(gid, uid, "daily", int(conf.get("cooldown_seconds", 86400)))
+
+    embed = discord.Embed(
+        title=_t(interaction, "📅 Tagesbonus", "📅 Daily bonus"),
+        description=_t(interaction, f"Du hast deinen Tagesbonus von **{_fmt_money(amount)}** abgeholt!",
+                       f"You claimed your daily bonus of **{_fmt_money(amount)}**!"),
+        color=0x2ECC71)
+    embed.set_footer(text=f"Wallet: {_fmt_money(wallet)}")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="beg", description="🥺 Beg for a little money – might fail")
+async def cmd_beg(interaction: discord.Interaction):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conf = _srv_conf(interaction, "economy").get("beg", {})
+    gid, uid = interaction.guild_id, interaction.user.id
+
+    remaining = db.cooldown_remaining(gid, uid, "beg")
+    if remaining > 0:
+        return await interaction.response.send_message(
+            embed=_cooldown_embed("/beg", remaining), ephemeral=True)
+
+    db.set_cooldown(gid, uid, "beg", int(conf.get("cooldown_seconds", 300)))
+
+    if random.random() < float(conf.get("fail_chance", 0.35)):
+        embed = discord.Embed(
+            title=_t(interaction, "🥺 Betteln fehlgeschlagen", "🥺 Begging failed"),
+            description=random.choice(BEG_FAIL),
+            color=0xE74C3C)
+        return await interaction.response.send_message(embed=embed)
+
+    lo, hi = int(conf.get("min", 5)), int(conf.get("max", 50))
+    amount = random.randint(min(lo, hi), max(lo, hi))
+    wallet, _bank = db.add_wallet(gid, uid, amount)
+
+    embed = discord.Embed(
+        title=_t(interaction, "🥺 Betteln hat sich gelohnt", "🥺 Begging paid off"),
+        description=random.choice(BEG_SUCCESS).format(amount=f"**{_fmt_money(amount)}**"),
+        color=0x2ECC71)
+    embed.set_footer(text=f"Wallet: {_fmt_money(wallet)}")
+    await interaction.response.send_message(embed=embed)
+
+
+# ══════════════════════════════════════════════════════════════
+#  BANK-COMMANDS – /balance /deposit /withdraw
+# ══════════════════════════════════════════════════════════════
+@bot.tree.command(name="balance", description="💳 Show wallet & bank balance")
+@app_commands.describe(user="Another member (optional – leave empty for yourself)")
+async def cmd_balance(interaction: discord.Interaction,
+                      user: Optional[discord.Member] = None):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    target = user or interaction.user
+    if user is not None and user.id != interaction.user.id \
+       and not _darf_fremdes_guthaben_sehen(interaction):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Du darfst hier nur dein eigenes Guthaben ansehen.",
+            "❌ You can only check your own balance here."), ephemeral=True)
+    wallet, bank = db.get_balance(interaction.guild_id, target.id)
+
+    embed = discord.Embed(
+        title=_t(interaction, f"💳 Kontostand – {target.display_name}",
+                 f"💳 Balance – {target.display_name}"),
+        color=0x5865F2)
+    embed.add_field(name="👛 Wallet", value=_fmt_money(wallet),        inline=True)
+    embed.add_field(name="🏦 Bank",   value=_fmt_money(bank),          inline=True)
+    embed.add_field(name="Σ Total",   value=_fmt_money(wallet + bank), inline=True)
+    if target.display_avatar:
+        embed.set_thumbnail(url=target.display_avatar.url)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="deposit", description="🏦 Move money from wallet to bank")
+@app_commands.describe(amount="Amount to deposit (leave empty = everything)")
+async def cmd_deposit(interaction: discord.Interaction,
+                      amount: Optional[app_commands.Range[int, 1]] = None):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    moved, wallet, bank = db.deposit(interaction.guild_id, interaction.user.id, amount)
+    if moved <= 0:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Nichts einzuzahlen – dein Wallet ist leer.",
+            "❌ Nothing to deposit – your wallet is empty."), ephemeral=True)
+    embed = discord.Embed(
+        title=_t(interaction, "🏦 Einzahlung erfolgreich", "🏦 Deposit successful"),
+        description=_t(interaction, f"**{_fmt_money(moved)}** in deine Bank verschoben.",
+                       f"Moved **{_fmt_money(moved)}** into your bank."),
+        color=0x2ECC71)
+    embed.add_field(name="👛 Wallet", value=_fmt_money(wallet), inline=True)
+    embed.add_field(name="🏦 Bank",   value=_fmt_money(bank),   inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="withdraw", description="👛 Move money from bank to wallet")
+@app_commands.describe(amount="Amount to withdraw (leave empty = everything)")
+async def cmd_withdraw(interaction: discord.Interaction,
+                       amount: Optional[app_commands.Range[int, 1]] = None):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    moved, wallet, bank = db.withdraw(interaction.guild_id, interaction.user.id, amount)
+    if moved <= 0:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Nichts abzuheben – deine Bank ist leer.",
+            "❌ Nothing to withdraw – your bank is empty."), ephemeral=True)
+    embed = discord.Embed(
+        title=_t(interaction, "👛 Abhebung erfolgreich", "👛 Withdraw successful"),
+        description=_t(interaction, f"**{_fmt_money(moved)}** in dein Wallet verschoben.",
+                       f"Moved **{_fmt_money(moved)}** into your wallet."),
+        color=0x2ECC71)
+    embed.add_field(name="👛 Wallet", value=_fmt_money(wallet), inline=True)
+    embed.add_field(name="🏦 Bank",   value=_fmt_money(bank),   inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+# ══════════════════════════════════════════════════════════════
+#  ECONOMY-ADMIN-COMMANDS – /addmoney /removemoney /setbalance
+# ══════════════════════════════════════════════════════════════
+async def _post_economy_admin_log(interaction: discord.Interaction, title: str,
+                                  target: discord.Member, amount_text: str,
+                                  wallet: int, color: int):
+    """Jede Admin-Geldaktion in den economy_log-Feed posten."""
+    embed = discord.Embed(
+        title=title,
+        description=(f"**{interaction.user.display_name}** → {target.mention}\n"
+                     f"Amount: **{amount_text}**"),
+        color=color)
+    embed.set_footer(text=f"New wallet: {_fmt_money(wallet)}")
+    _leit = connections.for_guild(interaction.guild_id)
+    await _post_feed(interaction.guild_id, "economy_log", embed,
+                     service_id=_leit.service_id if _leit else None)
+
+
+@bot.tree.command(name="addmoney", description="💰 Add money to a member's wallet (admin)")
+@app_commands.describe(user="Member who receives the money", amount="Amount to add")
+async def cmd_addmoney(interaction: discord.Interaction,
+                       user: discord.Member, amount: app_commands.Range[int, 1]):
+    if not _is_economy_admin(interaction):
+        return await _deny(interaction)
+    wallet, _bank = db.add_wallet(interaction.guild_id, user.id, int(amount))
+    embed = discord.Embed(
+        title=_t(interaction, "💰 Geld hinzugefügt", "💰 Money added"),
+        description=_t(interaction, f"**{_fmt_money(amount)}** zu {user.mention}s Wallet hinzugefügt.",
+                       f"Added **{_fmt_money(amount)}** to {user.mention}'s wallet."),
+        color=0x2ECC71)
+    embed.set_footer(text=_t(interaction, f"Neues Wallet: {_fmt_money(wallet)}",
+                             f"New wallet: {_fmt_money(wallet)}"))
+    await interaction.response.send_message(embed=embed)
+    await _post_economy_admin_log(interaction, "💰 ADMIN: ADD MONEY",
+                                  user, f"+{_fmt_money(amount)}", wallet, 0x2ECC71)
+
+
+@bot.tree.command(name="removemoney", description="💸 Remove money from a member's wallet (admin)")
+@app_commands.describe(user="Member to remove money from", amount="Amount to remove")
+async def cmd_removemoney(interaction: discord.Interaction,
+                          user: discord.Member, amount: app_commands.Range[int, 1]):
+    if not _is_economy_admin(interaction):
+        return await _deny(interaction)
+    old_wallet, _ = db.get_balance(interaction.guild_id, user.id)
+    wallet, _bank = db.add_wallet(interaction.guild_id, user.id, -int(amount))
+    removed = old_wallet - wallet   # nie unter 0 → tatsächlich abgezogener Betrag
+    embed = discord.Embed(
+        title=_t(interaction, "💸 Geld entfernt", "💸 Money removed"),
+        description=_t(interaction, f"**{_fmt_money(removed)}** von {user.mention}s Wallet entfernt.",
+                       f"Removed **{_fmt_money(removed)}** from {user.mention}'s wallet."),
+        color=0xE67E22)
+    embed.set_footer(text=_t(interaction, f"Neues Wallet: {_fmt_money(wallet)}",
+                             f"New wallet: {_fmt_money(wallet)}"))
+    await interaction.response.send_message(embed=embed)
+    await _post_economy_admin_log(interaction, "💸 ADMIN: REMOVE MONEY",
+                                  user, f"-{_fmt_money(removed)}", wallet, 0xE67E22)
+
+
+@bot.tree.command(name="setbalance", description="🎯 Set a member's wallet to an exact amount (admin)")
+@app_commands.describe(user="Member", amount="New wallet amount")
+async def cmd_setbalance(interaction: discord.Interaction,
+                         user: discord.Member, amount: app_commands.Range[int, 0]):
+    if not _is_economy_admin(interaction):
+        return await _deny(interaction)
+    wallet, _bank = db.set_wallet(interaction.guild_id, user.id, int(amount))
+    embed = discord.Embed(
+        title=_t(interaction, "🎯 Kontostand gesetzt", "🎯 Balance set"),
+        description=_t(interaction, f"{user.mention}s Wallet ist jetzt **{_fmt_money(wallet)}**.",
+                       f"{user.mention}'s wallet is now **{_fmt_money(wallet)}**."),
+        color=0x5865F2)
+    await interaction.response.send_message(embed=embed)
+    await _post_economy_admin_log(interaction, "🎯 ADMIN: SET BALANCE",
+                                  user, _fmt_money(wallet), wallet, 0x5865F2)
+
+
+@bot.tree.command(name="economy_reload", description=app_commands.locale_str(
+    "🔄 (Nur Bot-Eigentümer) Lädt config.json (shop/economy/casino) neu, ohne den Bot neu zu starten"))
+async def cmd_economy_reload(interaction: discord.Interaction):
+    # ZUERST bestaetigen, dann erst pruefen: siehe betreiber_alarm_channel -
+    # application_info() beim ersten Aufruf kann laenger als 3s dauern.
+    await interaction.response.defer(ephemeral=True)
+    try:
+        ist_eigentuemer = await _ist_bot_eigentuemer(interaction.user)
+    except Exception as e:  # noqa: BLE001
+        log.error(f"[ECONOMY_RELOAD] Eigentümer-Prüfung fehlgeschlagen: {e}")
+        return await interaction.followup.send(_t(
+            interaction, f"❌ Eigentümer-Prüfung bei Discord fehlgeschlagen: `{e}`",
+            f"❌ Owner check with Discord failed: `{e}`"), ephemeral=True)
+    if not ist_eigentuemer:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Nur der Bot-Eigentümer darf das ausführen.",
+            "❌ Only the bot owner can run this."), ephemeral=True)
+    ok = cfg.reload_config()
+    if ok:
+        _conn_c = _conn_of(interaction)
+        katalog = _catalog_of(interaction)   # nur der Katalog DIESES Servers
+        if katalog is not None:
+            katalog.load()
+            items = [i for i in katalog.items if i.get("enabled", True)]
+            katalog_txt = _t(interaction, f"**{len(items)}** aktive Items aus `{katalog.source}`",
+                             f"**{len(items)}** active items from `{katalog.source}`")
+        else:
+            katalog_txt = _t(interaction, "kein Server zugeordnet", "no server assigned")
+        embed = discord.Embed(
+            title=_t(interaction, "🔄 Config neu geladen", "🔄 Config reloaded"),
+            description=_t(
+                interaction,
+                f"`config.json` wurde erfolgreich neu geladen.\n"
+                f"Katalog: {katalog_txt} · "
+                f"Währung: **{_conn_c.get('currency_name', '?') if _conn_c else '?'} "
+                f"({_cur_symbol(_conn_c)})**",
+                f"`config.json` was reloaded successfully.\n"
+                f"Catalog: {katalog_txt} · "
+                f"Currency: **{_conn_c.get('currency_name', '?') if _conn_c else '?'} "
+                f"({_cur_symbol(_conn_c)})**"),
+            color=0x2ECC71)
+    else:
+        embed = discord.Embed(
+            title=_t(interaction, "❌ Neuladen fehlgeschlagen", "❌ Reload failed"),
+            description=_t(
+                interaction,
+                "`config.json` konnte nicht gelesen werden – Bot-Log / JSON-Syntax prüfen.",
+                "Could not parse `config.json` – check the bot log / JSON syntax."),
+            color=0xE74C3C)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════
+#  KILL-STATS / LINK / BOUNTY / PAY
+# ══════════════════════════════════════════════════════════════
+async def _player_name_ac(interaction: discord.Interaction,
+                          current: str) -> List[app_commands.Choice[str]]:
+    """Autocomplete: bekannte Spielernamen aus Kills + Sitzungen dieses Servers."""
+    conns = _ac_conns(interaction)
+    if not conns:
+        return []
+    loop = asyncio.get_running_loop()
+    out: List[app_commands.Choice] = []
+    gesehen = set()
+    for conn in conns:
+        try:
+            names = await loop.run_in_executor(None, db.known_player_names,
+                                               conn.service_id, current, 25)
+        except Exception:  # noqa: BLE001
+            names = []
+        for n in names:
+            key = n[:100]
+            if key in gesehen:
+                continue        # derselbe Spieler auf beiden Servern → einmal
+            gesehen.add(key)
+            out.append(app_commands.Choice(name=key, value=key))
+            if len(out) >= 25:
+                return out
+    return out
+
+
+@bot.tree.command(name="stats", description=app_commands.locale_str("📊 Kill-Statistiken eines Spielers (Kills, Tode, K/D, Waffe)"))
+@app_commands.describe(spieler="Ingame-/PlayStation-Name")
+@app_commands.autocomplete(spieler=_player_name_ac)
+async def cmd_stats(interaction: discord.Interaction, spieler: str):
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    st = db.player_stats(conn.service_id, spieler.strip())
+    if not st:
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Keine PvP-Daten für **{spieler}** gefunden. Statistiken werden "
+            f"ab jetzt automatisch aus dem Killfeed aufgezeichnet.",
+            f"❌ No PvP data found for **{spieler}**. Stats are recorded "
+            f"automatically from the kill feed from now on."), ephemeral=True)
+    e = discord.Embed(title=_t(interaction, f"📊 Statistiken – {spieler}", f"📊 Stats – {spieler}"),
+                      color=0x5865F2)
+    e.add_field(name="☠️ Kills", value=str(st["kills"]), inline=True)
+    e.add_field(name=_t(interaction, "💀 Tode", "💀 Deaths"), value=str(st["deaths"]), inline=True)
+    e.add_field(name="⚖️ K/D",   value=f"{st['kd']:.2f}", inline=True)
+    e.add_field(name=_t(interaction, "🔫 Lieblingswaffe", "🔫 Favorite Weapon"),
+                value=(f"{st['fav_weapon']} ({st['fav_weapon_kills']} "
+                      f"{_t(interaction, 'Kills', 'kills')})"
+                      if st["fav_weapon"] else "–"), inline=True)
+    e.add_field(name=_t(interaction, "🎯 Weitester Kill", "🎯 Longest Kill"),
+                value=(f"{st['longest']:.0f} m" if st["longest"] else "–"), inline=True)
+    if interaction.guild_id:
+        links = db.links_for_name(spieler.strip(), interaction.guild_id)
+        if links:
+            e.add_field(name=_t(interaction, "🔗 Verknüpft mit", "🔗 Linked To"),
+                        value=f"<@{int(links[0]['user_id'])}>", inline=True)
+    await interaction.response.send_message(embed=e)
+
+
+@bot.tree.command(name="leaderboard", description=app_commands.locale_str("🏆 Top 10 PvP-Killer des Servers"))
+async def cmd_leaderboard(interaction: discord.Interaction):
+    conn = _conn_of(interaction)
+    if conn is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    rows = db.leaderboard(conn.service_id, 10)
+    if not rows:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Noch keine PvP-Kills aufgezeichnet – das Leaderboard füllt sich "
+            "automatisch aus dem Killfeed.",
+            "❌ No PvP kills recorded yet – the leaderboard fills "
+            "automatically from the kill feed."), ephemeral=True)
+    medals = ["🥇", "🥈", "🥉"]
+    tode_wort = _t(interaction, "Tode", "deaths")
+    lines = []
+    for i, r in enumerate(rows):
+        rank = medals[i] if i < 3 else f"`#{i + 1}`"
+        best = f" · 🎯 {r['best']:.0f} m" if r["best"] else ""
+        lines.append(f"{rank} **{r['name']}** – {r['kills']} Kills · "
+                     f"{r['deaths']} {tode_wort} · K/D {r['kd']:.2f}{best}")
+    e = discord.Embed(title=_t(interaction, "🏆 Kill-Leaderboard", "🏆 Kill Leaderboard"),
+                      description="\n".join(lines), color=0xF1C40F)
+    e.set_footer(text=_t(interaction, "Automatisch aus dem Killfeed · /stats <spieler> für Details",
+                         "Automatic from the kill feed · /stats <player> for details"))
+    await interaction.response.send_message(embed=e)
+
+
+def _seen_in_logs(name: str, max_age_seconds: int = 900,
+                  positions: Optional[Dict[str, Dict]] = None) -> Optional[Dict]:
+    """Prüft, ob der Spieler kürzlich in den ADM-Logs auftauchte (Positions-Tracking
+    des Parsers). Gibt den Eintrag (mit 'id') zurück, sonst None.
+
+    Dasselbe Zwei-Fenster-Verhalten wie _online_spieler_namen: ein Eintrag
+    aus einer Connect-Meldung oder einem vollstaendigen PlayerList-Block hat
+    keinen Grund, nach 900s zu verfallen – er gilt bis zum Disconnect."""
+    target = name.lower()
+    now = datetime.now(timezone.utc)
+    for pname, info in list((positions or {}).items()):
+        if pname.lower() != target:
+            continue
+        try:
+            seen = datetime.fromisoformat(str(info.get("last_seen", "")))
+        except (TypeError, ValueError):
+            return None
+        grenze = (_ONLINE_CONNECT_MAX_ALTER
+                  if info.get("quelle") in ("connect", "playerlist")
+                  else max_age_seconds)
+        return info if (now - seen).total_seconds() <= grenze else None
+    return None
+
+
+@bot.tree.command(name="link", description=app_commands.locale_str("🔗 Verknüpft deinen Discord-Account mit deinem PlayStation-Namen"))
+@app_commands.describe(playstation_name="Dein Ingame-Name, exakt wie im Spiel")
+@app_commands.autocomplete(playstation_name=_player_name_ac)
+async def cmd_link(interaction: discord.Interaction, playstation_name: str):
+    if not await _require_guild(interaction):
+        return
+    name = playstation_name.strip()
+    if not name or len(name) > 64:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Ungültiger Name.", "❌ Invalid name."), ephemeral=True)
+    bestehende = db.get_links_by_user(interaction.guild_id, interaction.user.id)
+    if any(str(r["ingame_name"]).lower() == name.lower() for r in bestehende):
+        return await interaction.response.send_message(_t(
+            interaction, f"✅ Du bist bereits mit **{name}** verbunden.",
+            f"✅ You are already linked to **{name}**."), ephemeral=True)
+    _conn = _conn_of(interaction)
+    limit = int((_conn.get("max_linked_accounts", 1) if _conn is not None
+                else cfg.config.get("max_linked_accounts", 1)) or 1)
+    if len(bestehende) >= limit:
+        namen = ", ".join(f"**{r['ingame_name']}**" for r in bestehende)
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Du hast bereits die maximal erlaubten {limit} Account(s) verlinkt "
+            f"({namen}). Trenne zuerst einen mit `/unlink`, um einen anderen zu verknüpfen.",
+            f"❌ You have already linked the maximum of {limit} account(s) "
+            f"({namen}). Use `/unlink` first to free up a slot."), ephemeral=True)
+    _sid_check = _conn.service_id if _conn is not None else ""
+    if not db.roster_hat_namen(interaction.guild_id, _sid_check, name):
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Der Name **{name}** existiert nicht oder du hast dich noch nicht "
+            f"mit dem Server verbunden und mindestens fünf Minuten gewartet. Er muss "
+            f"exakt so geschrieben sein wie oben rechts im DayZ-Hauptmenü.",
+            f"❌ The name **{name}** does not exist, or you haven't connected to the "
+            f"server and waited at least five minutes yet. It must be spelled exactly "
+            f"the way it appears in the top right corner of the DayZ main menu."),
+            ephemeral=True)
+    ok, _why = db.link_user(interaction.guild_id, interaction.user.id, name)
+    if not ok:
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ **{name}** ist bereits mit einem anderen Discord-Account verknüpft. "
+            f"Ein Admin kann das mit `/forcelink` korrigieren.",
+            f"❌ **{name}** is already linked to a different Discord account. "
+            f"An admin can fix this with `/forcelink`."), ephemeral=True)
+    # Logs nach dem PSN-Namen prüfen: Ist der Spieler gerade auf dem Server,
+    # startet der Spielzeit-Zähler sofort (kein neues Connect-Event nötig)
+    seen = _seen_in_logs(name, positions=(_conn.parser.player_positions
+                                          if _conn is not None and _conn.parser else {}))
+    _sid = _conn.service_id if _conn is not None else ""
+    if seen:
+        if seen.get("id"):
+            db.update_link_id(name, str(seen["id"]), interaction.guild_id)
+        if not db.has_session(_sid, name):
+            db.open_session(_sid, name, seen.get("id"))
+        online_line = _t(
+            interaction,
+            "\n🟢 Du bist gerade auf dem Server – der Spielzeit-Zähler läuft ab jetzt!",
+            "\n🟢 You are currently on the server – the playtime counter starts now!")
+    else:
+        online_line = _t(
+            interaction,
+            "\nℹ️ Aktuell nicht in den Logs gesehen – der Spielzeit-Zähler "
+            "startet bei deinem nächsten Connect.",
+            "\nℹ️ Not currently seen in the logs – the playtime counter "
+            "starts on your next connect.")
+    reward   = int((_conn.get("kill_reward", 0) if _conn is not None
+                    else cfg.config.get("kill_reward", 0)) or 0)
+    aktionen = ((_conn.get("action_economy") if _conn is not None
+                else cfg.config.get("action_economy")) or {})
+    pro_stunde = int(aktionen.get("playtime_per_hour", 0) or 0)
+    pt_line  = (_t(interaction,
+                   f"\n⏱️ Spielzeit: **{_fmt_money(pro_stunde)}** pro Stunde auf dem Server",
+                   f"\n⏱️ Playtime: **{_fmt_money(pro_stunde)}** per hour on the server")
+                if pro_stunde != 0 else "")
+    ist_haupt = not bestehende
+    rolle_line = _t(interaction, "🥇 Hauptaccount" if ist_haupt else "➕ Zusatz-Account",
+                    "🥇 Main account" if ist_haupt else "➕ Alt account")
+    e = discord.Embed(
+        title=_t(interaction, "🔗 Account verknüpft", "🔗 Account linked"),
+        description=_t(
+            interaction,
+            f"{interaction.user.mention} ↔ **{name}** ({rolle_line})\n"
+            f"☠️ Pro PvP-Kill: **{_fmt_money(reward)}**{pt_line}{online_line}",
+            f"{interaction.user.mention} ↔ **{name}** ({rolle_line})\n"
+            f"☠️ Per PvP kill: **{_fmt_money(reward)}**{pt_line}{online_line}"),
+        color=0x2ECC71)
+    await interaction.response.send_message(embed=e)
+    note = discord.Embed(
+        title="🔗 /link verwendet",
+        description=(f"{interaction.user.mention} (`{interaction.user}`) hat sich mit **{name}** "
+                     f"verknüpft ({'Hauptaccount' if ist_haupt else 'Zusatz-Account'})."),
+        color=0x2ECC71)
+    await _notify_link_change(interaction.guild_id, note)
+
+
+async def _eigene_links_ac(interaction: discord.Interaction, current: str):
+    if interaction.guild_id is None:
+        return []
+    rows = db.get_links_by_user(interaction.guild_id, interaction.user.id)
+    cur = (current or "").lower()
+    return [app_commands.Choice(name=str(r["ingame_name"]), value=str(r["ingame_name"]))
+           for r in rows if cur in str(r["ingame_name"]).lower()][:25]
+
+
+@bot.tree.command(name="unlink", description=app_commands.locale_str("🔓 Entfernt eine deiner Ingame-Verknüpfungen"))
+@app_commands.describe(playstation_name="Welcher deiner verlinkten Namen getrennt werden soll "
+                                       "(bei nur einem Account: weglassen)")
+@app_commands.autocomplete(playstation_name=_eigene_links_ac)
+async def cmd_unlink(interaction: discord.Interaction, playstation_name: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    bestehende = db.get_links_by_user(interaction.guild_id, interaction.user.id)
+    if not bestehende:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Du bist mit keinem Ingame-Namen verknüpft.",
+            "❌ You are not linked to any in-game name."), ephemeral=True)
+    if playstation_name is None:
+        if len(bestehende) > 1:
+            namen = ", ".join(f"**{r['ingame_name']}**" for r in bestehende)
+            return await interaction.response.send_message(_t(
+                interaction,
+                f"❌ Du hast mehrere Accounts verlinkt ({namen}) – gib bei `/unlink` an, "
+                f"welchen du trennen willst.",
+                f"❌ You have multiple linked accounts ({namen}) – specify which one "
+                f"to unlink with `/unlink`."), ephemeral=True)
+        ziel = str(bestehende[0]["ingame_name"])
+    else:
+        ziel = playstation_name.strip()
+        if not any(str(r["ingame_name"]).lower() == ziel.lower() for r in bestehende):
+            return await interaction.response.send_message(_t(
+                interaction, f"❌ Du bist nicht mit **{ziel}** verknüpft.",
+                f"❌ You are not linked to **{ziel}**."), ephemeral=True)
+    db.unlink_specific(interaction.guild_id, interaction.user.id, ziel)
+    await interaction.response.send_message(_t(
+        interaction, f"🔓 Verknüpfung mit **{ziel}** entfernt.",
+        f"🔓 Link to **{ziel}** removed."), ephemeral=True)
+    note = discord.Embed(
+        title="🔓 /unlink verwendet",
+        description=f"{interaction.user.mention} (`{interaction.user}`) hat die Verknüpfung mit **{ziel}** entfernt.",
+        color=0xE67E22)
+    await _notify_link_change(interaction.guild_id, note)
+
+
+@bot.tree.command(name="forcelink", description=app_commands.locale_str("🔗 (Admin) Verknüpft einen Spieler mit einem Discord-Account"))
+@app_commands.describe(playstation_name="Ingame-Name des Spielers",
+                       user="Discord-Mitglied")
+@app_commands.autocomplete(playstation_name=_player_name_ac)
+async def cmd_forcelink(interaction: discord.Interaction,
+                        playstation_name: str, user: discord.Member):
+    if not _subcmd_allowed(interaction, "forcelink"):
+        return await _deny_subcmd(interaction)
+    if not await _require_guild(interaction):
+        return
+    name = playstation_name.strip()
+    # Bestehende Verknüpfung dieses Namens (anderer User) lösen - /forcelink
+    # ignoriert bewusst das max_linked_accounts-Limit (Admin-Sonderfall).
+    for lk in db.links_for_name(name, interaction.guild_id):
+        if int(lk["user_id"]) != user.id:
+            db.unlink_specific(interaction.guild_id, int(lk["user_id"]), str(lk["ingame_name"]))
+    db.link_user(interaction.guild_id, user.id, name)
+    await interaction.response.send_message(_t(
+        interaction, f"🔗 **{name}** ↔ {user.mention} verknüpft (Admin).",
+        f"🔗 **{name}** ↔ {user.mention} linked (admin)."), ephemeral=True)
+    note = discord.Embed(
+        title="🔗 /forcelink verwendet",
+        description=(f"{interaction.user.mention} hat {user.mention} "
+                     f"mit **{name}** verknüpft."),
+        color=0x2ECC71)
+    await _notify_link_change(interaction.guild_id, note)
+
+
+async def _ziel_user_links_ac(interaction: discord.Interaction, current: str):
+    if interaction.guild_id is None:
+        return []
+    ziel_user = getattr(interaction.namespace, "user", None)
+    if ziel_user is None:
+        return []
+    rows = db.get_links_by_user(interaction.guild_id, int(ziel_user.id))
+    cur = (current or "").lower()
+    return [app_commands.Choice(name=str(r["ingame_name"]), value=str(r["ingame_name"]))
+           for r in rows if cur in str(r["ingame_name"]).lower()][:25]
+
+
+@bot.tree.command(name="forceunlink", description=app_commands.locale_str("🔓 (Admin) Entfernt eine Verknüpfung eines Discord-Accounts"))
+@app_commands.describe(user="Discord-Mitglied",
+                       playstation_name="Welcher verlinkte Name getrennt werden soll "
+                                       "(bei nur einem Account: weglassen)")
+@app_commands.autocomplete(playstation_name=_ziel_user_links_ac)
+async def cmd_forceunlink(interaction: discord.Interaction, user: discord.Member,
+                          playstation_name: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "forceunlink"):
+        return await _deny_subcmd(interaction)
+    if not await _require_guild(interaction):
+        return
+    bestehende = db.get_links_by_user(interaction.guild_id, user.id)
+    if not bestehende:
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ {user.mention} ist mit keinem Ingame-Namen verknüpft.",
+            f"❌ {user.mention} is not linked to any in-game name."), ephemeral=True)
+    if playstation_name is None:
+        if len(bestehende) > 1:
+            namen = ", ".join(f"**{r['ingame_name']}**" for r in bestehende)
+            return await interaction.response.send_message(_t(
+                interaction,
+                f"❌ {user.mention} hat mehrere Accounts verlinkt ({namen}) – gib an, "
+                f"welchen du trennen willst.",
+                f"❌ {user.mention} has multiple linked accounts ({namen}) – specify "
+                f"which one to unlink."), ephemeral=True)
+        ziel = str(bestehende[0]["ingame_name"])
+    else:
+        ziel = playstation_name.strip()
+        if not any(str(r["ingame_name"]).lower() == ziel.lower() for r in bestehende):
+            return await interaction.response.send_message(_t(
+                interaction, f"❌ {user.mention} ist nicht mit **{ziel}** verknüpft.",
+                f"❌ {user.mention} is not linked to **{ziel}**."), ephemeral=True)
+    db.unlink_specific(interaction.guild_id, user.id, ziel)
+    await interaction.response.send_message(_t(
+        interaction, f"🔓 Verknüpfung {user.mention} ↔ **{ziel}** entfernt (Admin).",
+        f"🔓 Link {user.mention} ↔ **{ziel}** removed (admin)."), ephemeral=True)
+    note = discord.Embed(
+        title="🔓 /forceunlink verwendet",
+        description=(f"{interaction.user.mention} hat die Verknüpfung "
+                     f"{user.mention} ↔ **{ziel}** entfernt."),
+        color=0xE67E22)
+    await _notify_link_change(interaction.guild_id, note)
+
+
+username_group = app_commands.Group(name="username",
+                                    description=app_commands.locale_str("🔗 Verknüpfte PSN-Namen verwalten"))
+
+
+@username_group.command(name="list", description=app_commands.locale_str("📋 Zeigt deine verknüpften PSN-Namen (Admins: alle)"))
+async def username_list(interaction: discord.Interaction):
+    if not await _require_guild(interaction):
+        return
+    if not _subcmd_allowed(interaction, "username_list"):
+        # Normale Nutzer sehen nur die eigenen Verknüpfungen
+        eigene = db.get_links_by_user(interaction.guild_id, interaction.user.id)
+        if not eigene:
+            return await interaction.response.send_message(_t(
+                interaction, "ℹ️ Du bist mit keinem PSN-Namen verknüpft. Nutze `/link <psn-name>`.",
+                "ℹ️ You are not linked to any PSN name. Use `/link <psn-name>`."),
+                ephemeral=True)
+        _conn  = _conn_of(interaction)
+        _sid   = _conn.service_id if _conn is not None else ""
+        zeilen = []
+        for r in eigene:
+            online = "🟢 " if db.has_session(_sid, str(r["ingame_name"])) else "⚫ "
+            rolle = "🥇" if r["is_main"] else "➕"
+            zeilen.append(f"{online}{rolle} **{r['ingame_name']}**")
+        e = discord.Embed(
+            title=_t(interaction, "🔗 Deine Verknüpfungen", "🔗 Your Links"),
+            description="\n".join(zeilen),
+            color=0x5865F2)
+        e.set_footer(text=_t(
+            interaction, "🟢 = gerade auf dem Server · 🥇 = Hauptaccount · ➕ = Zusatz-Account",
+            "🟢 = currently on the server · 🥇 = main account · ➕ = alt account"))
+        return await interaction.response.send_message(embed=e, ephemeral=True)
+    rows = db.list_links(interaction.guild_id)
+    if not rows:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "ℹ️ Noch keine Verknüpfungen vorhanden. Spieler verbinden sich mit "
+            "`/link <psn-name>`.",
+            "ℹ️ No links yet. Players link with `/link <psn-name>`."), ephemeral=True)
+    lines = []
+    _conn = _conn_of(interaction)
+    _sid  = _conn.service_id if _conn is not None else ""
+    for r in rows[:50]:
+        online = "🟢 " if db.has_session(_sid, str(r["ingame_name"])) else "⚫ "
+        rolle = "🥇" if r["is_main"] else "➕"
+        lines.append(f"{online}{rolle} **{r['ingame_name']}** ↔ <@{int(r['user_id'])}>")
+    e = discord.Embed(
+        title=_t(interaction, f"🔗 Verknüpfte PSN-Namen ({len(rows)})",
+                 f"🔗 Linked PSN Names ({len(rows)})"),
+        description="\n".join(lines),
+        color=0x5865F2)
+    e.set_footer(text=_t(
+        interaction,
+        "🟢 = gerade auf dem Server · 🥇 = Hauptaccount · ➕ = Zusatz-Account"
+        + (f" · … und {len(rows) - 50} weitere" if len(rows) > 50 else ""),
+        "🟢 = currently on the server · 🥇 = main account · ➕ = alt account"
+        + (f" · … and {len(rows) - 50} more" if len(rows) > 50 else "")))
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+bot.tree.add_command(username_group)
+
+
+@bot.tree.command(name="bounty", description=app_commands.locale_str("🎯 Setzt ein Kopfgeld auf einen Spieler aus (sofort abgebucht)"))
+@app_commands.describe(spieler="Ingame-Name des Ziels", betrag="Kopfgeld aus deinem Wallet")
+@app_commands.autocomplete(spieler=_player_name_ac)
+async def cmd_bounty(interaction: discord.Interaction,
+                     spieler: str, betrag: app_commands.Range[int, 1]):
+    if not await _require_guild(interaction):
+        return
+    name = spieler.strip()
+    eigene = db.get_links_by_user(interaction.guild_id, interaction.user.id)
+    if any(str(r["ingame_name"]).lower() == name.lower() for r in eigene):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Auf deinen eigenen Kopf kannst du kein Kopfgeld aussetzen.",
+            "❌ You can't place a bounty on your own head."), ephemeral=True)
+    bconf   = _srv_conf(interaction, "bounty")
+    min_amt = int(bconf.get("min_amount", 100))
+    max_amt = int(bconf.get("max_amount", 10000))
+    if not (min_amt <= int(betrag) <= max_amt):
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Kopfgeld muss zwischen **{_fmt_money(min_amt)}** und "
+            f"**{_fmt_money(max_amt)}** liegen (`bounty` in config.json).",
+            f"❌ Bounty must be between **{_fmt_money(min_amt)}** and "
+            f"**{_fmt_money(max_amt)}** (`bounty` in config.json)."), ephemeral=True)
+    remaining = db.cooldown_remaining(interaction.guild_id, interaction.user.id, "bounty")
+    if remaining > 0:
+        return await interaction.response.send_message(
+            embed=_cooldown_embed("/bounty", remaining), ephemeral=True)
+    if not db.try_spend_wallet(interaction.guild_id, interaction.user.id, int(betrag)):
+        wallet, _ = db.get_balance(interaction.guild_id, interaction.user.id)
+        return await interaction.response.send_message(
+            embed=_insufficient_embed(int(betrag), wallet), ephemeral=True)
+    total = db.add_bounty(interaction.guild_id, name, int(betrag), interaction.user.id)
+    db.set_cooldown(interaction.guild_id, interaction.user.id, "bounty",
+                    int(bconf.get("cooldown_seconds", 300)))
+    e = discord.Embed(
+        title=_t(interaction, "🎯 Kopfgeld ausgesetzt", "🎯 Bounty placed"),
+        description=_t(
+            interaction,
+            f"**{_fmt_money(betrag)}** auf den Kopf von **{name}**!\n"
+            f"Gesamtes Kopfgeld: **{_fmt_money(total)}**\n"
+            f"Auszahlung automatisch an den (per `/link` verknüpften) Killer.",
+            f"**{_fmt_money(betrag)}** on the head of **{name}**!\n"
+            f"Total bounty: **{_fmt_money(total)}**\n"
+            f"Paid out automatically to the killer (if linked via `/link`)."),
+        color=0xE67E22)
+    e.set_footer(text=_t(interaction, f"Ausgesetzt von {interaction.user.display_name}",
+                         f"Placed by {interaction.user.display_name}"))
+    await interaction.response.send_message(embed=e)
+
+
+@bot.tree.command(name="bounties", description=app_commands.locale_str("🎯 Zeigt alle aktiven Kopfgelder"))
+async def cmd_bounties(interaction: discord.Interaction):
+    if not await _require_guild(interaction):
+        return
+    rows = db.open_bounties(interaction.guild_id)
+    if not rows:
+        return await interaction.response.send_message(_t(
+            interaction, "✅ Keine aktiven Kopfgelder.", "✅ No active bounties."), ephemeral=True)
+    kopfgeld_wort = _t(interaction, "Kopfgeld", "bounty")
+    kopfgelder_wort = _t(interaction, "Kopfgelder", "bounties")
+    lines = [f"🎯 **{r['target_name']}** – {_fmt_money(int(r['total']))} "
+             f"({int(r['n'])} {kopfgelder_wort if int(r['n']) != 1 else kopfgeld_wort})"
+             for r in rows[:20]]
+    e = discord.Embed(title=_t(interaction, "🎯 Aktive Kopfgelder", "🎯 Active Bounties"),
+                      description="\n".join(lines), color=0xE67E22)
+    await interaction.response.send_message(embed=e)
+
+
+@bot.tree.command(name="pay", description=app_commands.locale_str("💸 Überweist Geld aus deinem Wallet an ein anderes Mitglied"))
+@app_commands.describe(user="Empfänger", betrag="Betrag aus deinem Wallet")
+async def cmd_pay(interaction: discord.Interaction,
+                  user: discord.Member, betrag: app_commands.Range[int, 1]):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    if user.id == interaction.user.id:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Du kannst dir nicht selbst Geld überweisen.",
+            "❌ You can't transfer money to yourself."), ephemeral=True)
+    if user.bot:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Bots brauchen kein Geld.", "❌ Bots don't need money."),
+            ephemeral=True)
+    if not db.try_spend_wallet(interaction.guild_id, interaction.user.id, int(betrag)):
+        wallet, _ = db.get_balance(interaction.guild_id, interaction.user.id)
+        return await interaction.response.send_message(
+            embed=_insufficient_embed(int(betrag), wallet), ephemeral=True)
+    new_wallet, _ = db.add_wallet(interaction.guild_id, user.id, int(betrag))
+    e = discord.Embed(
+        title=_t(interaction, "💸 Überweisung", "💸 Transfer"),
+        description=f"{interaction.user.mention} → {user.mention}: **{_fmt_money(betrag)}**",
+        color=0x2ECC71)
+    await interaction.response.send_message(embed=e)
+    log_embed = discord.Embed(
+        title="💸 PLAYER TRANSFER",
+        description=(f"**{interaction.user.display_name}** → **{user.display_name}**\n"
+                     f"Betrag: **{_fmt_money(betrag)}**"),
+        color=0x3498DB)
+    _leit = connections.for_guild(interaction.guild_id)
+    await _post_feed(interaction.guild_id, "economy_log", log_embed,
+                     service_id=_leit.service_id if _leit else None)
+
+
+# ══════════════════════════════════════════════════════════════
+#  CASINO – /slots
+# ══════════════════════════════════════════════════════════════
+@bot.tree.command(name="slots", description="🎰 Spin the slot machine")
+@app_commands.describe(bet="Your bet (paid from wallet)")
+async def cmd_slots(interaction: discord.Interaction, bet: app_commands.Range[int, 1]):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conf = _srv_conf(interaction, "casino").get("slots", {})
+    gid, uid = interaction.guild_id, interaction.user.id
+    bet = int(bet)
+
+    err = _validate_bet(bet, conf)
+    if err:
+        return await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+    remaining = db.cooldown_remaining(gid, uid, "slots")
+    if remaining > 0:
+        return await interaction.response.send_message(
+            embed=_cooldown_embed("/slots", remaining), ephemeral=True)
+    if not db.try_spend_wallet(gid, uid, bet):
+        wallet, _ = db.get_balance(gid, uid)
+        return await interaction.response.send_message(
+            embed=_insufficient_embed(bet, wallet), ephemeral=True)
+    db.set_cooldown(gid, uid, "slots", int(conf.get("cooldown_seconds", 10)))
+
+    symbols = list(conf.get("symbols", ["🍒", "🍋", "🍉", "🔔", "💎", "7️⃣"]))
+    weights = list(conf.get("weights", []))
+    if len(weights) != len(symbols):
+        weights = [1] * len(symbols)   # Gewichte passen nicht → gleichverteilt
+    reels = random.choices(symbols, weights=weights, k=3)
+
+    payout_three = conf.get("payout_three", {})
+    payout_two   = float(conf.get("payout_two", 1.5))
+    if reels[0] == reels[1] == reels[2]:
+        mult = float(payout_three.get(reels[0], 5))
+        result = "three_of_a_kind"
+    elif reels[0] == reels[1] or reels[1] == reels[2] or reels[0] == reels[2]:
+        mult = payout_two
+        result = "pair"
+    else:
+        mult = 0.0
+        result = "lose"
+
+    payout = int(round(bet * mult))
+    if payout > 0:
+        db.add_wallet(gid, uid, payout)
+    db.log_casino(gid, uid, "slots", bet, payout, result)
+    wallet, _bank = db.get_balance(gid, uid)
+
+    net = payout - bet
+    if net > 0:
+        color = 0x2ECC71
+        headline = _t(interaction, f"Du hast **{_fmt_money(payout)}** gewonnen! (netto **+{net:,}**)",
+                     f"You won **{_fmt_money(payout)}**! (net **+{net:,}**)")
+    elif net == 0:
+        color = 0x95A5A6
+        headline = _t(interaction, "Unentschieden – dein Einsatz kam zurück.",
+                     "Break-even – your bet came back.")
+    else:
+        color = 0xE74C3C
+        headline = _t(interaction, f"Du hast **{_fmt_money(bet)}** verloren.",
+                     f"You lost **{_fmt_money(bet)}**.")
+
+    embed = discord.Embed(
+        title="🎰 Slots",
+        description=f"**| {reels[0]} | {reels[1]} | {reels[2]} |**\n\n{headline}",
+        color=color)
+    embed.set_footer(text=_t(interaction, f"Einsatz: {_fmt_money(bet)} · Wallet: {_fmt_money(wallet)}",
+                             f"Bet: {_fmt_money(bet)} · Wallet: {_fmt_money(wallet)}"))
+    await interaction.response.send_message(embed=embed)
+
+
+# ══════════════════════════════════════════════════════════════
+#  CASINO – /roulette
+# ══════════════════════════════════════════════════════════════
+_ROULETTE_RED = {1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36}
+_ROULETTE_NAMED = ("red", "black", "green", "even", "odd", "low", "high")
+
+@bot.tree.command(name="roulette",
+                  description="🎡 Bet on red/black/even/odd/low/high or a single number (0-36)")
+@app_commands.describe(bet="Your bet (paid from wallet)",
+                       wager="red, black, green, even, odd, low, high or a number 0-36")
+async def cmd_roulette(interaction: discord.Interaction,
+                       bet: app_commands.Range[int, 1], wager: str):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conf = _srv_conf(interaction, "casino").get("roulette", {})
+    gid, uid = interaction.guild_id, interaction.user.id
+    bet = int(bet)
+
+    # Wette parsen
+    w = wager.strip().lower()
+    number: Optional[int] = None
+    if w in _ROULETTE_NAMED:
+        kind = w
+    elif w.isdigit() and 0 <= int(w) <= 36:
+        kind, number = "number", int(w)
+    else:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Ungültige Wette. Nutze `red`, `black`, `green`, `even`, `odd`, `low`, `high` "
+            "oder eine Zahl von `0` bis `36`.",
+            "❌ Invalid wager. Use `red`, `black`, `green`, `even`, `odd`, `low`, `high` "
+            "or a number from `0` to `36`."), ephemeral=True)
+
+    err = _validate_bet(bet, conf)
+    if err:
+        return await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+    remaining = db.cooldown_remaining(gid, uid, "roulette")
+    if remaining > 0:
+        return await interaction.response.send_message(
+            embed=_cooldown_embed("/roulette", remaining), ephemeral=True)
+    if not db.try_spend_wallet(gid, uid, bet):
+        wallet, _ = db.get_balance(gid, uid)
+        return await interaction.response.send_message(
+            embed=_insufficient_embed(bet, wallet), ephemeral=True)
+    db.set_cooldown(gid, uid, "roulette", int(conf.get("cooldown_seconds", 5)))
+
+    spin = random.randint(0, 36)
+    if spin == 0:
+        spin_disp = _t(interaction, "🟢 **0** (grün)", "🟢 **0** (green)")
+    elif spin in _ROULETTE_RED:
+        spin_disp = _t(interaction, f"🔴 **{spin}** (rot)", f"🔴 **{spin}** (red)")
+    else:
+        spin_disp = _t(interaction, f"⚫ **{spin}** (schwarz)", f"⚫ **{spin}** (black)")
+
+    # Gewinn & Auszahlungs-Multiplikator (Multiplikator = Gesamt-Rückzahlung × Einsatz)
+    p_num  = float(conf.get("payout_number", 36.0))
+    p_col  = float(conf.get("payout_color", 2.0))
+    p_eo   = float(conf.get("payout_evenodd", 2.0))
+    p_hl   = float(conf.get("payout_highlow", 2.0))
+    won, mult = False, 0.0
+    if kind == "number":
+        won, mult = (spin == number), p_num
+    elif kind == "green":
+        won, mult = (spin == 0), p_num
+    elif kind == "red":
+        won, mult = (spin != 0 and spin in _ROULETTE_RED), p_col
+    elif kind == "black":
+        won, mult = (spin != 0 and spin not in _ROULETTE_RED), p_col
+    elif kind == "even":
+        won, mult = (spin != 0 and spin % 2 == 0), p_eo
+    elif kind == "odd":
+        won, mult = (spin % 2 == 1), p_eo
+    elif kind == "low":
+        won, mult = (1 <= spin <= 18), p_hl
+    elif kind == "high":
+        won, mult = (19 <= spin <= 36), p_hl
+
+    payout = int(round(bet * mult)) if won else 0
+    if payout > 0:
+        db.add_wallet(gid, uid, payout)
+    wager_disp = f"number {number}" if kind == "number" else kind
+    db.log_casino(gid, uid, "roulette", bet, payout, f"{wager_disp}|spin={spin}")
+    wallet, _bank = db.get_balance(gid, uid)
+
+    if won:
+        color = 0x2ECC71
+        headline = _t(interaction, f"Du hast **{_fmt_money(payout)}** gewonnen! (netto **+{payout - bet:,}**)",
+                     f"You won **{_fmt_money(payout)}**! (net **+{payout - bet:,}**)")
+    else:
+        color = 0xE74C3C
+        headline = _t(interaction, f"Du hast **{_fmt_money(bet)}** verloren.",
+                     f"You lost **{_fmt_money(bet)}**.")
+
+    embed = discord.Embed(
+        title="🎡 Roulette",
+        description=_t(
+            interaction,
+            f"Die Kugel landete auf {spin_disp}\nDeine Wette: **{wager_disp}**\n\n{headline}",
+            f"The ball landed on {spin_disp}\nYour wager: **{wager_disp}**\n\n{headline}"),
+        color=color)
+    embed.set_footer(text=_t(interaction, f"Einsatz: {_fmt_money(bet)} · Wallet: {_fmt_money(wallet)}",
+                             f"Bet: {_fmt_money(bet)} · Wallet: {_fmt_money(wallet)}"))
+    await interaction.response.send_message(embed=embed)
+
+
+@cmd_roulette.autocomplete("wager")
+async def _roulette_wager_ac(interaction: discord.Interaction,
+                             current: str) -> List[app_commands.Choice[str]]:
+    cur = current.strip().lower()
+    out = [app_commands.Choice(name=o, value=o)
+           for o in _ROULETTE_NAMED if (not cur) or cur in o]
+    if cur.isdigit() and 0 <= int(cur) <= 36:
+        out.insert(0, app_commands.Choice(name=f"number {cur}", value=cur))
+    return out[:25]
+
+
+# ══════════════════════════════════════════════════════════════
+#  CASINO – /blackjack (spielbar mit Hit/Stand-Buttons)
+# ══════════════════════════════════════════════════════════════
+_BJ_RANKS: Dict[str, int] = {
+    "A": 11, "K": 10, "Q": 10, "J": 10, "10": 10,
+    "9": 9, "8": 8, "7": 7, "6": 6, "5": 5, "4": 4, "3": 3, "2": 2,
+}
+
+def _bj_new_deck() -> List[str]:
+    deck = [f"{rank}{suit}" for rank in _BJ_RANKS for suit in "♠♥♦♣"]
+    random.shuffle(deck)
+    return deck
+
+def _bj_value(hand: List[str]) -> int:
+    """Handwert mit flexiblen Assen (11 → 1 solange über 21)."""
+    total, aces = 0, 0
+    for card in hand:
+        rank = card[:-1]
+        total += _BJ_RANKS[rank]
+        if rank == "A":
+            aces += 1
+    while total > 21 and aces:
+        total -= 10
+        aces -= 1
+    return total
+
+
+class BlackjackView(discord.ui.View):
+    """Interaktives Blackjack: Einsatz ist bereits abgebucht,
+    Auszahlung erfolgt beim Auflösen (Win=2x, Push=1x, Blackjack=1+bonus)."""
+
+    def __init__(self, interaction: discord.Interaction, bet: int, conf: Dict):
+        super().__init__(timeout=120)
+        self.user_id   = interaction.user.id
+        self.guild_id  = interaction.guild_id
+        self.sprache   = _sprache(interaction)
+        self.bet       = bet
+        self.payout_bj = float(conf.get("blackjack_payout", 1.5))
+        self.cooldown_s = int(conf.get("cooldown_seconds", 30))
+        self.deck      = _bj_new_deck()
+        self.player    = [self.deck.pop(), self.deck.pop()]
+        self.dealer    = [self.deck.pop(), self.deck.pop()]
+        self.finished  = False
+        self.message: Optional[discord.Message] = None
+
+    def _t2(self, de: str, en: str) -> str:
+        return en if self.sprache == "en" else de
+
+    async def interaction_check(self, itx: discord.Interaction) -> bool:
+        if itx.user.id != self.user_id:
+            await itx.response.send_message(
+                self._t2("Das ist nicht dein Spiel.", "This is not your game."), ephemeral=True)
+            return False
+        return True
+
+    def build_embed(self, reveal: bool = False, result_line: Optional[str] = None,
+                    color: int = 0x5865F2) -> discord.Embed:
+        dealer_hand = " ".join(self.dealer) if reveal else f"{self.dealer[0]} 🂠"
+        dealer_val  = str(_bj_value(self.dealer)) if reveal else "?"
+        e = discord.Embed(title="🃏 Blackjack", color=color)
+        e.add_field(name=self._t2(f"Deine Hand ({_bj_value(self.player)})",
+                                  f"Your hand ({_bj_value(self.player)})"),
+                    value=" ".join(self.player), inline=False)
+        e.add_field(name=self._t2(f"Dealer ({dealer_val})", f"Dealer ({dealer_val})"),
+                    value=dealer_hand, inline=False)
+        e.add_field(name=self._t2("Einsatz", "Bet"), value=_fmt_money(self.bet), inline=True)
+        if result_line:
+            e.add_field(name=self._t2("Ergebnis", "Result"), value=result_line, inline=False)
+        return e
+
+    def _payout_and_log(self, mult: float, result: str) -> int:
+        payout = int(round(self.bet * mult))
+        if payout > 0:
+            db.add_wallet(self.guild_id, self.user_id, payout)
+        db.log_casino(self.guild_id, self.user_id, "blackjack", self.bet, payout, result)
+        return payout
+
+    def _dealer_play(self):
+        # Dealer zieht bis mindestens 17
+        while _bj_value(self.dealer) < 17:
+            self.dealer.append(self.deck.pop())
+
+    async def _finish(self, itx: Optional[discord.Interaction],
+                      result: str, mult: float, color: int):
+        if self.finished:
+            return   # idempotent – verhindert doppelte Auszahlung bei Races
+        self.finished = True
+        for child in self.children:
+            child.disabled = True
+        payout = self._payout_and_log(mult, result)
+        # Cooldown läuft ab SPIELENDE – der beim Start gesetzte wäre bei
+        # längeren Partien schon abgelaufen und damit wirkungslos
+        db.set_cooldown(self.guild_id, self.user_id, "blackjack", self.cooldown_s)
+        wallet, _bank = db.get_balance(self.guild_id, self.user_id)
+        net = payout - self.bet
+        line = self._t2(
+            f"{result}\nAuszahlung: **{_fmt_money(payout)}** "
+            f"(netto **{'+' if net >= 0 else ''}{net:,}**) · Wallet: {_fmt_money(wallet)}",
+            f"{result}\nPayout: **{_fmt_money(payout)}** "
+            f"(net **{'+' if net >= 0 else ''}{net:,}**) · Wallet: {_fmt_money(wallet)}")
+        embed = self.build_embed(reveal=True, result_line=line, color=color)
+        if itx is not None:
+            await itx.response.edit_message(embed=embed, view=self)
+        elif self.message:
+            try:
+                await self.message.edit(embed=embed, view=self)
+            except Exception:
+                pass
+        self.stop()
+
+    async def _resolve_stand(self, itx: Optional[discord.Interaction]):
+        self._dealer_play()
+        pv, dv = _bj_value(self.player), _bj_value(self.dealer)
+        if dv > 21:
+            await self._finish(itx, self._t2("Dealer überkauft sich – du gewinnst!",
+                                              "Dealer busts – you win!"), 2.0, 0x2ECC71)
+        elif pv > dv:
+            await self._finish(itx, self._t2("Du gewinnst!", "You win!"), 2.0, 0x2ECC71)
+        elif pv == dv:
+            await self._finish(itx, self._t2("Unentschieden – Einsatz zurück.",
+                                              "Push – bet returned."), 1.0, 0x95A5A6)
+        else:
+            await self._finish(itx, self._t2("Dealer gewinnt.", "Dealer wins."), 0.0, 0xE74C3C)
+
+    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary, emoji="🃏")
+    async def hit(self, itx: discord.Interaction, button: discord.ui.Button):
+        if self.finished:   # Doppelklick-/Timeout-Race abfangen
+            return await itx.response.defer()
+        self.player.append(self.deck.pop())
+        value = _bj_value(self.player)
+        if value > 21:
+            return await self._finish(itx, self._t2("Überkauft! Du verlierst.", "Bust! You lose."),
+                                      0.0, 0xE74C3C)
+        if value == 21:
+            return await self._resolve_stand(itx)
+        await itx.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Stand", style=discord.ButtonStyle.secondary, emoji="✋")
+    async def stand(self, itx: discord.Interaction, button: discord.ui.Button):
+        if self.finished:   # Doppelklick-/Timeout-Race abfangen
+            return await itx.response.defer()
+        await self._resolve_stand(itx)
+
+    async def on_timeout(self):
+        # Timeout = automatisch Stand, damit der Einsatz nicht verfällt
+        if not self.finished:
+            await self._resolve_stand(None)
+
+
+@bot.tree.command(name="blackjack", description="🃏 Play blackjack against the dealer (Hit/Stand)")
+@app_commands.describe(bet="Your bet (paid from wallet)")
+async def cmd_blackjack(interaction: discord.Interaction, bet: app_commands.Range[int, 1]):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conf = _srv_conf(interaction, "casino").get("blackjack", {})
+    gid, uid = interaction.guild_id, interaction.user.id
+    bet = int(bet)
+
+    err = _validate_bet(bet, conf)
+    if err:
+        return await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+    remaining = db.cooldown_remaining(gid, uid, "blackjack")
+    if remaining > 0:
+        return await interaction.response.send_message(
+            embed=_cooldown_embed("/blackjack", remaining), ephemeral=True)
+    if not db.try_spend_wallet(gid, uid, bet):
+        wallet, _ = db.get_balance(gid, uid)
+        return await interaction.response.send_message(
+            embed=_insufficient_embed(bet, wallet), ephemeral=True)
+    db.set_cooldown(gid, uid, "blackjack", int(conf.get("cooldown_seconds", 30)))
+
+    view = BlackjackView(interaction, bet, conf)
+    pv, dv = _bj_value(view.player), _bj_value(view.dealer)
+
+    # Natürlicher Blackjack → sofort auflösen, keine Buttons nötig
+    if pv == 21 or dv == 21:
+        if pv == 21 and dv == 21:
+            result = view._t2("Doppelter Blackjack – Unentschieden, Einsatz zurück.",
+                              "Double blackjack – push, bet returned.")
+            mult, color = 1.0, 0x95A5A6
+        elif pv == 21:
+            result = view._t2(f"BLACKJACK! Zahlt {view.payout_bj}x Bonus.",
+                              f"BLACKJACK! Pays {view.payout_bj}x bonus.")
+            mult, color = 1.0 + view.payout_bj, 0xF1C40F
+        else:
+            result = view._t2("Dealer hat Blackjack. Du verlierst.", "Dealer has blackjack. You lose.")
+            mult, color = 0.0, 0xE74C3C
+        payout = view._payout_and_log(mult, result)
+        wallet, _bank = db.get_balance(gid, uid)
+        net = payout - bet
+        line = view._t2(
+            f"{result}\nAuszahlung: **{_fmt_money(payout)}** "
+            f"(netto **{'+' if net >= 0 else ''}{net:,}**) · Wallet: {_fmt_money(wallet)}",
+            f"{result}\nPayout: **{_fmt_money(payout)}** "
+            f"(net **{'+' if net >= 0 else ''}{net:,}**) · Wallet: {_fmt_money(wallet)}")
+        embed = view.build_embed(reveal=True, result_line=line, color=color)
+        view.stop()
+        return await interaction.response.send_message(embed=embed)
+
+    await interaction.response.send_message(embed=view.build_embed(), view=view)
+    view.message = await interaction.original_response()
+
+
+# ══════════════════════════════════════════════════════════════
+#  SHOP-RENTALS – Miet-Katalog (Vorlagen für /shop buy rental)
+# ══════════════════════════════════════════════════════════════
+class RentalCatalog:
+    """Miet-Katalog **eines** Nitrado-Servers, eigene Datei
+    ``shop_rentals_<service_id>.json``.
+
+    Bewusst KEINE gemeinsame Basis mit ``ShopCatalog``: dessen ``load()``
+    verwirft jeden Eintrag ohne ``classname``/``classnames`` - ein
+    Rental-Eintrag hat statt eines Classnamens ein rohes ``event_xml``, würde
+    also beim Laden über ``ShopCatalog`` sofort wieder verschwinden.
+    """
+
+    def __init__(self, service_id: str = ""):
+        self.service_id = str(service_id or "")
+        self.items: List[Dict] = []
+        self._by_key: Dict[str, Dict] = {}
+        # (suchtext, label, value, enabled) – wie ShopCatalog._ac_index, für
+        # das Autocomplete von /shop buy rental.
+        self._ac_index: List[Tuple[str, str, str, bool]] = []
+
+    @property
+    def path(self) -> str:
+        if self.service_id:
+            return f"shop_rentals_{self.service_id}.json"
+        return "shop_rentals.json"
+
+    def load(self):
+        items: Optional[List[Dict]] = None
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                cand = data.get("items") if isinstance(data, dict) else data
+                if isinstance(cand, list):
+                    items = cand
+            except Exception as e:  # noqa: BLE001
+                log.error(f"[RENTAL] {self.path} unlesbar ({e}).")
+        self.items = [it for it in (items or []) if isinstance(it, dict) and it.get("name")]
+        self.rebuild_index()
+
+    def rebuild_index(self):
+        self._by_key.clear()
+        self._ac_index = []
+        for it in self.items:
+            name = str(it.get("name") or "")
+            if not name:
+                continue
+            self._by_key[name.lower()] = it
+            enabled = bool(it.get("enabled", True))
+            flag = "" if enabled else "🚫 "
+            preis = int(it.get("price_per_restart", 0))
+            label = f"{flag}{name} – {preis:,}/Neustart ({it.get('category', 'Misc')})"
+            self._ac_index.append((name.lower(), label[:100], name[:100], enabled))
+
+    def find(self, key: str) -> Optional[Dict]:
+        return self._by_key.get(str(key or "").strip().lower())
+
+    def save(self) -> bool:
+        data: Dict[str, Any] = {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            pass
+        data["items"] = self.items
+        data["_updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.rebuild_index()
+            return True
+        except Exception as e:
+            log.error(f"[RENTAL] Konnte {self.path} nicht speichern: {e}")
+            return False
+
+
+class EventTemplateCatalog:
+    """Event-Vorlagen-Katalog **eines** Nitrado-Servers, eigene Datei
+    ``event_templates_<service_id>.json``.
+
+    Bewusst kein gemeinsamer Code mit ``RentalCatalog``/``ShopCatalog``: eine
+    Vorlage hier hat weder Preis noch Neustart-Grenzen noch Rollen - nur
+    Name, optionale Event-Gruppe, die rohe Event-XML und eine optionale
+    Zonen-XML fuer /events add.
+    """
+
+    def __init__(self, service_id: str = ""):
+        self.service_id = str(service_id or "")
+        self.items: List[Dict] = []
+        self._by_key: Dict[str, Dict] = {}
+        self._ac_index: List[Tuple[str, str, str]] = []  # (suchtext, label, value)
+
+    @property
+    def path(self) -> str:
+        if self.service_id:
+            return f"event_templates_{self.service_id}.json"
+        return "event_templates.json"
+
+    def load(self):
+        items: Optional[List[Dict]] = None
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                cand = data.get("items") if isinstance(data, dict) else data
+                if isinstance(cand, list):
+                    items = cand
+            except Exception as e:  # noqa: BLE001
+                log.error(f"[EVENTVORLAGE] {self.path} unlesbar ({e}).")
+        self.items = [it for it in (items or []) if isinstance(it, dict) and it.get("name")]
+        self.rebuild_index()
+
+    def rebuild_index(self):
+        self._by_key.clear()
+        self._ac_index = []
+        for it in self.items:
+            name = str(it.get("name") or "")
+            if not name:
+                continue
+            self._by_key[name.lower()] = it
+            gruppe = str(it.get("event_group") or "").strip()
+            label = f"{name} ({gruppe})" if gruppe else name
+            self._ac_index.append((name.lower(), label[:100], name[:100]))
+
+    def find(self, key: str) -> Optional[Dict]:
+        return self._by_key.get(str(key or "").strip().lower())
+
+    def save(self) -> bool:
+        data: Dict[str, Any] = {}
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            pass
+        data["items"] = self.items
+        data["_updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.rebuild_index()
+            return True
+        except Exception as e:
+            log.error(f"[EVENTVORLAGE] Konnte {self.path} nicht speichern: {e}")
+            return False
+
+
+# ══════════════════════════════════════════════════════════════
+#  SHOP-COMMANDS – /shop list|pending|cleanup|setprice und /buy
+# ══════════════════════════════════════════════════════════════
+class ShopCatalog:
+    """Item-Katalog **eines** Nitrado-Servers.
+
+    Jeder verbundene Server hat seinen eigenen Katalog in
+    ``shop_items_<service_id>.json`` – sonst würden alle Kunden dieselben
+    Items, Preise und Bundles teilen. Der Katalog wird aus der ``types.xml``
+    des jeweiligen Servers erzeugt (per FTP geholt) oder von Hand gepflegt.
+    Hält Indizes, damit Lookups und Autocomplete auch bei ~1700 Items
+    schnell bleiben.
+    """
+
+    def __init__(self, service_id: str = "", path: str = ""):
+        self.service_id = str(service_id or "")
+        self._path = str(path or "")
+        self.items: List[Dict] = []
+        self.source = self.path
+        self._by_key: Dict[str, Dict] = {}              # name/classname (lower) → Item
+        self.by_category: Dict[str, List[Dict]] = {}
+        # (suchtext, label, value, enabled) – vorberechnet für Autocomplete
+        self._ac_index: List[Tuple[str, str, str, bool]] = []
+
+    # ── Speicherort ──────────────────────────────────────────
+    @property
+    def path(self) -> str:
+        """Katalogdatei dieses Servers."""
+        if self._path:
+            return self._path
+        if self.service_id:
+            return f"shop_items_{self.service_id}.json"
+        return self._legacy_path()
+
+    @staticmethod
+    def _legacy_path() -> str:
+        """Der frühere gemeinsame Katalog aus der Zeit vor der Mandantentrennung."""
+        return str(cfg.config.get("shop_items_file") or "shop_items.json")
+
+    def _erbt_altbestand(self) -> bool:
+        """Darf dieser Katalog den alten gemeinsamen Bestand übernehmen?
+
+        Nur der Server des Betreibers (``primary()``) – bei allen anderen wäre
+        das genau das Leck, das die Trennung verhindern soll: ein neuer Kunde
+        bekäme die Items und Preise eines fremden Servers.
+        """
+        if not self.service_id:
+            return True                      # Dashboard-Vorschau ohne Verbindung
+        try:
+            haupt = connections.primary()
+        except Exception:  # noqa: BLE001 – Registry evtl. noch nicht geladen
+            return False
+        return haupt is not None and haupt.service_id == self.service_id
+
+    @staticmethod
+    def _datei_lesen(path: str) -> Optional[List[Dict]]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:  # noqa: BLE001
+            log.error(f"[SHOP] {path} unlesbar ({e}).")
+            return None
+        cand = data.get("items") if isinstance(data, dict) else data
+        return cand if isinstance(cand, list) else None
+
+    def load(self):
+        path = self.path
+        items = self._datei_lesen(path) if os.path.exists(path) else None
+        migriert = False
+        if items is None and self._erbt_altbestand():
+            # Einmalige Übernahme: aus dem alten gemeinsamen shop_items.json bzw.
+            # aus shop_items in der config.json.
+            legacy = self._legacy_path()
+            if legacy != path and os.path.exists(legacy):
+                items = self._datei_lesen(legacy)
+                migriert = items is not None
+            if items is None:
+                aus_config = list(cfg.config.get("shop_items", []) or [])
+                if aus_config:
+                    items, migriert = aus_config, True
+        if items is None:
+            items = []
+        self.source = path
+        self.items = [it for it in items
+                      if isinstance(it, dict) and (it.get("classname") or it.get("classnames"))]
+        self.rebuild_index()
+        if migriert and self.items:
+            self.save()          # Bestand ab jetzt unter dem eigenen Dateinamen
+            log.info(f"[SHOP] Alter Katalog nach {path} übernommen.")
+        log.info(f"[SHOP] Katalog {self.service_id or '-'}: "
+                 f"{len(self.items)} Items aus {self.source}")
+
+    def rebuild_index(self):
+        self._by_key.clear()
+        self.by_category.clear()
+        self._ac_index = []
+        # Symbol des eigenen Servers – der Katalog wird ausserhalb eines
+        # Befehls geladen, der Kontext hilft hier also nicht weiter.
+        try:
+            _c = connections.for_service(self.service_id) if self.service_id else None
+        except Exception:  # noqa: BLE001
+            _c = None
+        sym = _cur_symbol(_c)
+        for it in self.items:
+            cls_list = _item_classnames(it)
+            if not cls_list:
+                continue
+            is_bundle = len(cls_list) > 1
+            name = str(it.get("name") or cls_list[0])
+            self._by_key.setdefault(name.lower(), it)
+            if not is_bundle:
+                # Classname nur für Einzelitems als Key – Bundles würden echte Items verdecken
+                self._by_key.setdefault(cls_list[0].lower(), it)
+            self.by_category.setdefault(str(it.get("category", "Misc")), []).append(it)
+            enabled = bool(it.get("enabled", True))
+            flag  = "" if enabled else "🚫 "
+            if is_bundle:
+                label = f"{flag}{name} – {int(it.get('price', 0)):,} {sym} (Bundle · {len(cls_list)} items)"
+            else:
+                label = f"{flag}{name} – {int(it.get('price', 0)):,} {sym} ({it.get('category', 'Misc')})"
+            search = " ".join([name.lower()] + [c.lower() for c in cls_list])
+            self._ac_index.append((search, label[:100], name[:100], enabled))
+
+    def find(self, key: str) -> Optional[Dict]:
+        return self._by_key.get(key.strip().lower())
+
+    def save(self) -> bool:
+        """Persistiert Änderungen (/shop setprice, /shop enable) in die Katalogdatei."""
+        data: Dict[str, Any] = {}
+        try:
+            with open(self.source, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            pass
+        data["items"]    = self.items
+        data["_updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            with open(self.source, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            self.rebuild_index()
+            return True
+        except Exception as e:
+            log.error(f"[SHOP] Konnte {self.source} nicht speichern: {e}")
+            return False
+
+
+def _catalog_of(interaction: discord.Interaction,
+                server: Optional[str] = None) -> Optional["ShopCatalog"]:
+    """Der Item-Katalog des gemeinten Servers.
+
+    Es gibt bewusst KEINEN globalen Katalog mehr: ohne zugeordneten Server
+    gibt es auch keine Items, sonst sähe jede Guild den Shop des Betreibers.
+    """
+    conn, _fehler = _conn_waehlen(interaction, server)
+    return conn.catalog if conn is not None else None
+
+
+async def _require_catalog(interaction: discord.Interaction,
+                           server: Optional[str] = None) -> Optional["ShopCatalog"]:
+    """Wie ``_catalog_of``, antwortet aber selbst, wenn die Auswahl scheitert."""
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is not None:
+        return conn.catalog
+    msg = fehler or _premium_missing_text(interaction)
+    if interaction.response.is_done():
+        await interaction.followup.send(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message(msg, ephemeral=True)
+    return None
+
+def _item_classnames(it: Dict) -> List[str]:
+    """Classname-Liste eines Shop-Items: Bundle ("classnames") oder Einzelitem ("classname")."""
+    cls = it.get("classnames")
+    if isinstance(cls, list) and cls:
+        return [str(c) for c in cls]
+    cn = it.get("classname")
+    return [str(cn)] if cn else []
+
+def _shop_line(it: Dict) -> str:
+    """Eine Katalog-Zeile für /shop list – Bundles zeigen ihren Inhalt kompakt."""
+    cls_list = _item_classnames(it)
+    name = str(it.get("name") or (cls_list[0] if cls_list else "?"))
+    extra = ""
+    if len(cls_list) > 1:
+        inhalt = " + ".join(cls_list)
+        if len(inhalt) > 60:
+            inhalt = inhalt[:57] + "…"
+        extra = f"Bundle: {inhalt}, "
+    return (f"• **{name}** — {_fmt_money(int(it.get('price', 0)))} "
+            f"*({extra}max {int(it.get('max_amount_per_buy', 1))}/buy)*")
+
+def _make_item_autocomplete(only_enabled: bool):
+    """Autocomplete über den vorberechneten Index (max. 25 Treffer, Substring-Suche)."""
+    async def _ac(interaction: discord.Interaction,
+                  current: str) -> List[app_commands.Choice[str]]:
+        conns = _ac_conns(interaction)
+        if not conns:
+            return []            # kein zugeordneter Server → nichts vorschlagen
+        mehrere = len(conns) > 1
+        cur = current.strip().lower()
+        out: List[app_commands.Choice] = []
+        gesehen = set()
+        for c in conns:
+            cat = c.catalog
+            if cat is None:
+                continue
+            for search, label, value, enabled in cat._ac_index:
+                if only_enabled and not enabled:
+                    continue
+                if cur and cur not in search:
+                    continue
+                if value in gesehen:
+                    continue      # gleiches Item in beiden Katalogen → einmal zeigen
+                gesehen.add(value)
+                out.append(app_commands.Choice(
+                    name=f"{label} – {c.name}"[:100] if mehrere else label,
+                    value=value))
+                if len(out) >= 25:
+                    return out
+        return out
+    return _ac
+
+_shop_item_autocomplete = _make_item_autocomplete(only_enabled=False)   # Admin-Befehle
+_shop_buy_autocomplete  = _make_item_autocomplete(only_enabled=True)    # /buy
+
+async def _shop_category_autocomplete(interaction: discord.Interaction,
+                                      current: str) -> List[app_commands.Choice[str]]:
+    conns = _ac_conns(interaction)
+    cur = current.strip().lower()
+    zaehler: Dict[str, int] = {}
+    for c in conns:
+        katalog = c.catalog
+        if katalog is None:
+            continue
+        for cat in katalog.by_category:
+            if cur and cur not in cat.lower():
+                continue
+            n = sum(1 for i in katalog.by_category[cat] if i.get("enabled", True))
+            if n:
+                zaehler[cat] = zaehler.get(cat, 0) + n
+    out: List[app_commands.Choice] = []
+    for cat in sorted(zaehler):
+        out.append(app_commands.Choice(name=f"{cat} ({zaehler[cat]} items)"[:100],
+                                       value=cat))
+        if len(out) >= 25:
+            break
+    return out
+
+
+class ShopListView(discord.ui.View):
+    """Einfache Seiten-Navigation für den Item-Katalog."""
+
+    def __init__(self, pages: List[discord.Embed], sprache: str = "de"):
+        super().__init__(timeout=180)
+        self.pages = pages
+        self.index = 0
+        if sprache == "en":
+            self.prev_page.label = "◀ Back"
+            self.next_page.label = "Next ▶"
+        else:
+            self.prev_page.label = "◀ Zurück"
+            self.next_page.label = "Weiter ▶"
+        self._sync()
+
+    def _sync(self):
+        self.prev_page.disabled = self.index <= 0
+        self.next_page.disabled = self.index >= len(self.pages) - 1
+
+    @discord.ui.button(label="◀ Back", style=discord.ButtonStyle.secondary)
+    async def prev_page(self, itx: discord.Interaction, button: discord.ui.Button):
+        self.index = max(0, self.index - 1)
+        self._sync()
+        await itx.response.edit_message(embed=self.pages[self.index], view=self)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next_page(self, itx: discord.Interaction, button: discord.ui.Button):
+        self.index = min(len(self.pages) - 1, self.index + 1)
+        self._sync()
+        await itx.response.edit_message(embed=self.pages[self.index], view=self)
+
+
+shop_group = app_commands.Group(name="shop", description="🛒 Item shop")
+
+@shop_group.command(name="list", description="🛒 Show the shop catalog (all items or one category)")
+@app_commands.describe(category="Category to list – leave empty for the overview",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_list(interaction: discord.Interaction, category: Optional[str] = None,
+                    server: Optional[str] = None):
+    katalog = await _require_catalog(interaction, server=server)
+    if katalog is None:
+        return
+    enabled_items = [it for it in katalog.items if it.get("enabled", True)]
+    if not enabled_items:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "🛒 Der Shop ist aktuell leer. Admins: `types.xml` neben den Bot legen "
+            "und neu starten (der Katalog wird automatisch generiert), oder Items im "
+            "Dashboard unter „Shop“ anlegen.",
+            "🛒 The shop is currently empty. Admins: put your `types.xml` next to the bot "
+            "and restart (the catalog is generated automatically), or add items in the "
+            "dashboard under „Shop“."),
+            ephemeral=True)
+
+    if category is not None:
+        # Eine Kategorie komplett auflisten
+        wanted = category.strip().lower()
+        match = next((c for c in katalog.by_category if c.lower() == wanted), None)
+        items = ([i for i in katalog.by_category.get(match, []) if i.get("enabled", True)]
+                 if match else [])
+        if not items:
+            return await interaction.response.send_message(_t(
+                interaction, f"❌ Keine Kategorie `{category}` – eine aus der Autovervollständigung wählen.",
+                f"❌ No category `{category}` – pick one from the autocomplete list."),
+                ephemeral=True)
+        lines = [_shop_line(it)
+                 for it in sorted(items, key=lambda i: str(i.get("name", "")))]
+        title = _t(interaction, f"🛒 Item-Shop – {match}", f"🛒 Item Shop – {match}")
+    elif len(enabled_items) > 45:
+        # Groß-Katalog (generierte shop_items.json): Kategorie-Übersicht statt 1700 Zeilen
+        lines = []
+        items_wort = _t(interaction, "Items", "items")
+        for cat in sorted(katalog.by_category):
+            items = [i for i in katalog.by_category[cat] if i.get("enabled", True)]
+            if not items:
+                continue
+            prices = [int(i.get("price", 0)) for i in items]
+            lines.append(f"**{cat}** — {len(items)} {items_wort} · "
+                         f"{_fmt_money(min(prices))} – {_fmt_money(max(prices))}")
+        lines.append("")
+        lines.append(_t(interaction, "Nutze `/shop list category:<name>`, um die Items zu durchsuchen.",
+                        "Use `/shop list category:<name>` to browse the items."))
+        title = _t(interaction, "🛒 Item-Shop – Kategorien", "🛒 Item Shop – Categories")
+    else:
+        # Kleiner Katalog: komplette Liste, nach Kategorie gruppiert
+        by_cat: Dict[str, List[Dict]] = {}
+        for it in enabled_items:
+            by_cat.setdefault(it.get("category", "Misc"), []).append(it)
+        lines = []
+        for cat in sorted(by_cat):
+            lines.append(f"__**{cat}**__")
+            for it in sorted(by_cat[cat], key=lambda i: str(i.get("name", ""))):
+                lines.append(_shop_line(it))
+        title = _t(interaction, "🛒 Item-Shop", "🛒 Item Shop")
+
+    # In Seiten à 15 Zeilen aufteilen
+    per_page = 15
+    chunks = [lines[i:i + per_page] for i in range(0, len(lines), per_page)]
+    pages: List[discord.Embed] = []
+    seite_wort = _t(interaction, "Seite", "Page")
+    for i, chunk in enumerate(chunks):
+        e = discord.Embed(
+            title=title,
+            description="\n".join(chunk),
+            color=0x5865F2)
+        e.set_footer(text=_t(
+            interaction,
+            f"{seite_wort} {i + 1}/{len(chunks)} · "
+            f"Kaufen mit /buy <item> <menge> <x> <z> · "
+            f"Items spawnen nach dem nächsten Server-Neustart",
+            f"{seite_wort} {i + 1}/{len(chunks)} · "
+            f"Buy with /buy <item> <amount> <x> <z> · "
+            f"Items spawn after the next server restart"))
+        pages.append(e)
+
+    if len(pages) == 1:
+        return await interaction.response.send_message(embed=pages[0])
+    await interaction.response.send_message(embed=pages[0],
+                                            view=ShopListView(pages, _sprache(interaction)))
+
+shop_list.autocomplete("category")(_shop_category_autocomplete)
+
+
+@shop_group.command(name="pending", description="📦 Show purchases waiting for delivery (admin)")
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_pending(interaction: discord.Interaction, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "shop_pending"):
+        return await _deny_subcmd(interaction)
+    _conn, _fehler = _conn_waehlen(interaction, server)
+    if _conn is None:
+        return await interaction.response.send_message(
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
+    rows = db.pending_purchases(guild_id=interaction.guild_id,
+                                service_id=_conn.service_id)
+    if not rows:
+        return await interaction.response.send_message(_t(
+            interaction, "✅ Keine offenen Lieferungen.", "✅ No pending deliveries."),
+            ephemeral=True)
+    lines = []
+    for r in rows[:25]:
+        lines.append(f"`#{r['id']}` <@{r['user_id']}> — **{r['amount']}× {r['item_name']}** "
+                     f"({_fmt_money(int(r['total_price']))}) · <t:{int(r['created_at'])}:R>")
+    embed = discord.Embed(
+        title=_t(interaction, f"📦 Offene Lieferungen ({len(rows)})",
+                 f"📦 Pending deliveries ({len(rows)})"),
+        description="\n".join(lines),
+        color=0xF39C12)
+    embed.set_footer(text=_t(
+        interaction,
+        "Items spawnen beim nächsten Server-Neustart · /shop cleanup zum manuellen Abschließen",
+        "Items spawn at the next server restart · /shop cleanup to finish manually"))
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@shop_group.command(name="cleanup",
+                    description="🧹 Mark ALL pending purchases as delivered and clean cfgEffectArea.json (admin)")
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_cleanup(interaction: discord.Interaction, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "shop_cleanup"):
+        return await _deny_subcmd(interaction)
+    await interaction.response.defer(ephemeral=True)
+    # Auf dem EIGENEN Server aufräumen – sonst würde ein Admin die offenen
+    # Käufe aller anderen Kunden als geliefert markieren.
+    _conn = await _require_conn(interaction, need_ftp=True, server=server)
+    if _conn is None:
+        return
+    if not _conn.shop:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Shop-Manager noch nicht bereit.", "❌ Shop manager not ready yet."),
+            ephemeral=True)
+    rows = db.pending_purchases(guild_id=interaction.guild_id,
+                                service_id=_conn.service_id)
+    ids, names = [], []
+    for r in rows:
+        ids.append(int(r["id"]))
+        try:
+            names.extend(json.loads(r["area_names"] or "[]"))
+        except Exception:
+            pass
+    if names:
+        ok = await _conn.shop.remove_area_entries(names)
+        if not ok:
+            return await interaction.followup.send(_t(
+                interaction,
+                "❌ cfgEffectArea.json konnte nicht bereinigt werden (FTP-/Parse-Fehler) – "
+                "nichts wurde geändert.",
+                "❌ Could not clean cfgEffectArea.json (FTP/parse error) – nothing was changed."),
+                ephemeral=True)
+    if ids:
+        db.mark_delivered(ids)
+        _conn.shop.cleanup_retry_needed = False
+
+    # Selbstheilung: verwaiste SHOP_-Einträge ohne zugehörigen Kauf entfernen
+    orphans = await _conn.shop.sweep_orphans()
+
+    sprache = _sprache(interaction)
+    parts = []
+    if ids:
+        if sprache == "en":
+            parts.append(f"**{len(ids)}** purchase(s) marked as delivered, "
+                         f"**{len(names)}** entries removed from cfgEffectArea.json.")
+        else:
+            parts.append(f"**{len(ids)}** Kauf/Käufe als geliefert markiert, "
+                         f"**{len(names)}** Einträge aus cfgEffectArea.json entfernt.")
+    if orphans > 0:
+        if sprache == "en":
+            parts.append(f"**{orphans}** orphaned `SHOP_` entr{'y' if orphans == 1 else 'ies'} removed.")
+        else:
+            parts.append(f"**{orphans}** verwaiste `SHOP_`-Einträge entfernt.")
+    elif orphans < 0:
+        parts.append(_t(interaction, "⚠️ Aufräumen verwaister Einträge fehlgeschlagen (FTP-/Parse-Fehler).",
+                        "⚠️ Orphan sweep failed (FTP/parse error)."))
+    if not parts:
+        parts.append(_t(interaction,
+                        "Nichts zu bereinigen – keine offenen Lieferungen und keine verwaisten Einträge.",
+                        "Nothing to clean – no pending deliveries and no orphaned entries."))
+    await interaction.followup.send("🧹 " + " ".join(parts), ephemeral=True)
+
+
+@shop_group.command(name="check",
+                    description=app_commands.locale_str("🩺 Delivery-Diagnose: prüft cfgEffectArea.json & repariert fehlende Einträge (admin)"))
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_check(interaction: discord.Interaction, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "shop_check"):
+        return await _deny_subcmd(interaction)
+    await interaction.response.defer(ephemeral=True)
+    _conn = await _require_conn(interaction, need_ftp=True, server=server)
+    if _conn is None:
+        return
+    if not _conn.shop:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Shop-Manager noch nicht bereit.", "❌ Shop manager not ready yet."),
+            ephemeral=True)
+    rep = await _conn.shop.check_and_heal()
+
+    embed = discord.Embed(title=_t(interaction, "🩺 Shop-Delivery-Diagnose", "🩺 Shop Delivery Diagnostics"),
+                          color=0x5865F2)
+    path = rep.get("path")
+    embed.add_field(name=_t(interaction, "Pfad", "Path"), value=f"`{path}`" if path else _t(
+        interaction,
+        "❌ Nicht konfiguriert – wende dich an den Bot-Betreiber.",
+        "❌ Not configured – please contact the bot operator."), inline=False)
+    status = rep.get("status")
+    if status == "no_path":
+        embed.colour = 0xE74C3C
+        return await interaction.followup.send(embed=embed, ephemeral=True)
+    if status == "error":
+        embed.colour = 0xE74C3C
+        embed.add_field(name=_t(interaction, "Datei", "File"), value=_t(
+            interaction,
+            "❌ FTP-Lesefehler – Verbindung prüfen (`/ftp_status`), dann erneut versuchen.",
+            "❌ FTP read error – check the connection (`/ftp_status`), then try again."),
+            inline=False)
+        return await interaction.followup.send(embed=embed, ephemeral=True)
+    if status == "parse_error":
+        embed.colour = 0xE74C3C
+        embed.add_field(name=_t(interaction, "Datei", "File"),
+                        value=_t(interaction, f"❌ Ungültiges JSON: `{rep.get('error')}`",
+                                f"❌ Invalid JSON: `{rep.get('error')}`"),
+                        inline=False)
+        return await interaction.followup.send(embed=embed, ephemeral=True)
+
+    file_line = _t(
+        interaction,
+        "✅ lesbar, gültiges JSON" if status == "ok" else
+        "⚠️ existiert noch nicht – wird beim ersten Kauf angelegt",
+        "✅ readable, valid JSON" if status == "ok" else
+        "⚠️ doesn't exist yet – will be created on the first purchase")
+    embed.add_field(name=_t(interaction, "Datei", "File"), value=file_line, inline=False)
+    embed.add_field(name=_t(interaction, "Einträge", "Entries"),
+                    value=_t(
+                        interaction,
+                        f"{rep.get('areas_total', 0)} gesamt · "
+                        f"{rep.get('shop_entries', 0)} SHOP_ · "
+                        f"{rep.get('vanilla_entries', 0)} Vanilla",
+                        f"{rep.get('areas_total', 0)} total · "
+                        f"{rep.get('shop_entries', 0)} SHOP_ · "
+                        f"{rep.get('vanilla_entries', 0)} vanilla"), inline=False)
+
+    pending = rep.get("pending", 0)
+    healed  = rep.get("healed_entries", 0)
+    if healed:
+        ok_write = rep.get("heal_written", False)
+        heal_txt = _t(
+            interaction,
+            f"🔧 **{healed}** fehlende Einträge aus "
+            f"{len(rep.get('healed_purchases', []))} offenen Käufen wieder "
+            f"eingetragen" + ("" if ok_write else " – ❌ FTP-Schreibfehler!"),
+            f"🔧 **{healed}** missing entries from "
+            f"{len(rep.get('healed_purchases', []))} pending purchases re-added"
+            + ("" if ok_write else " – ❌ FTP write error!"))
+        embed.add_field(name="Self-Heal", value=heal_txt, inline=False)
+        if not ok_write:
+            embed.colour = 0xE74C3C
+    embed.add_field(name=_t(interaction, "Offene Käufe", "Pending Purchases"),
+                    value=str(pending), inline=True)
+
+    if pending and not _conn.get("auto_restart_after_purchase", False):
+        embed.add_field(
+            name=_t(interaction, "Hinweis", "Note"),
+            value=_t(
+                interaction,
+                "`auto_restart_after_purchase` ist **aus** – Items spawnen erst "
+                "beim nächsten (manuellen/geplanten) Server-Neustart.",
+                "`auto_restart_after_purchase` is **off** – items only spawn "
+                "at the next (manual/scheduled) server restart."), inline=False)
+    if _conn.rentals:
+        rentals_rep = await _conn.rentals.check_orphans()
+        if rentals_rep.get("status") == "ok":
+            verwaist = rentals_rep.get("orphaned_events", 0)
+            embed.add_field(name="🚗 Rentals", value=_t(
+                interaction,
+                f"{rentals_rep.get('active', 0)} aktiv" +
+                (f" · ⚠️ {verwaist} verwaist (Event ohne DB-Eintrag)" if verwaist else ""),
+                f"{rentals_rep.get('active', 0)} active" +
+                (f" · ⚠️ {verwaist} orphaned (event without DB row)" if verwaist else "")),
+                inline=False)
+
+    last = rep.get("last_restart_at") or 0
+    embed.set_footer(text=_t(
+        interaction,
+        "Letzter erkannter Server-Neustart: " +
+        (f"vor {int((time.time() - last) // 60)} Min" if last else "seit Bot-Start keiner"),
+        "Last detected server restart: " +
+        (f"{int((time.time() - last) // 60)} min ago" if last else "none since bot start")))
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@shop_group.command(name="enable", description="🔧 Enable or disable a shop item (admin)")
+@app_commands.describe(item="Item name", enabled="True = buyable, False = hidden from the shop",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_enable(interaction: discord.Interaction, item: str, enabled: bool,
+                      server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "shop_enable"):
+        return await _deny_subcmd(interaction)
+    katalog = await _require_catalog(interaction, server=server)
+    if katalog is None:
+        return
+    it = katalog.find(item)
+    if not it:
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Item `{item}` nicht im Shop-Katalog gefunden.",
+            f"❌ Item `{item}` not found in the shop catalog."), ephemeral=True)
+    it["enabled"] = bool(enabled)
+    saved = katalog.save()
+    state = _t(interaction, "✅ **aktiviert**", "✅ **enabled**") if enabled \
+        else _t(interaction, "🚫 **deaktiviert**", "🚫 **disabled**")
+    note  = "" if saved else _t(
+        interaction,
+        f"\n⚠️ Konnte nicht in `{katalog.source}` gespeichert werden – Änderung nur im Arbeitsspeicher.",
+        f"\n⚠️ Could not persist to `{katalog.source}` – change is in memory only.")
+    await interaction.response.send_message(_t(
+        interaction, f"🔧 **{it['name']}** ist jetzt {state}.{note}",
+        f"🔧 **{it['name']}** is now {state}.{note}"), ephemeral=True)
+
+shop_enable.autocomplete("item")(_shop_item_autocomplete)
+
+shop_list.autocomplete("server")(_server_autocomplete)
+shop_pending.autocomplete("server")(_server_autocomplete)
+shop_cleanup.autocomplete("server")(_server_autocomplete)
+shop_check.autocomplete("server")(_server_autocomplete)
+shop_enable.autocomplete("server")(_server_autocomplete)
+
+
+# ══════════════════════════════════════════════════════════════
+#  SHOP-RENTALS – /shop rentals, /shop buy rental
+#  /shop list kann kein Unterkommando "rental" bekommen: "list" ist selbst
+#  bereits ein Unterkommando von shop_group, Discord erlaubt keine Mischung
+#  aus Unterkommando und Untergruppe unter demselben Namen. Deshalb ein
+#  eigenständiges "/shop rentals". "buy" existiert unter shop_group dagegen
+#  noch nicht (das bestehende /buy ist ein SEPARATES Top-Level-Kommando) und
+#  kann als neue Untergruppe angelegt werden.
+# ══════════════════════════════════════════════════════════════
+async def _rental_buy_autocomplete(interaction: discord.Interaction,
+                                   current: str) -> List[app_commands.Choice[str]]:
+    conns = _ac_conns(interaction)
+    if not conns:
+        return []
+    mehrere = len(conns) > 1
+    cur = current.strip().lower()
+    out: List[app_commands.Choice] = []
+    gesehen = set()
+    for c in conns:
+        cat = c.rentals_catalog
+        for search, label, value, enabled in cat._ac_index:
+            if not enabled:
+                continue
+            if cur and cur not in search:
+                continue
+            if value in gesehen:
+                continue
+            gesehen.add(value)
+            out.append(app_commands.Choice(
+                name=f"{label} – {c.name}"[:100] if mehrere else label, value=value))
+            if len(out) >= 25:
+                return out
+    return out
+
+
+@shop_group.command(name="rentals", description="🚗 Show the rental catalog (vehicles etc. available to rent)")
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_rentals_cmd(interaction: discord.Interaction, server: Optional[str] = None):
+    _conn, _fehler = _conn_waehlen(interaction, server)
+    if _conn is None:
+        return await interaction.response.send_message(
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
+    items = [it for it in _conn.rentals_catalog.items if it.get("enabled", True)]
+    if not items:
+        return await interaction.response.send_message(_t(
+            interaction, "🚗 Aktuell sind keine Miet-Items verfügbar.",
+            "🚗 No rental items are currently available."), ephemeral=True)
+    lines = []
+    for it in sorted(items, key=lambda i: str(i.get("name", ""))):
+        preis = _fmt_money(int(it.get("price_per_restart", 0)))
+        mn, mx = int(it.get("min_restarts", 1)), int(it.get("max_restarts", 1))
+        lines.append(f"**{it['name']}** — {preis}/{_t(interaction, 'Neustart', 'restart')} · "
+                     f"{mn}–{mx} {_t(interaction, 'Neustarts', 'restarts')} · "
+                     f"{it.get('category', 'Vehicle')}")
+    embed = discord.Embed(
+        title=_t(interaction, "🚗 Miet-Katalog", "🚗 Rental Catalog"),
+        description="\n".join(lines), color=0x5865F2)
+    embed.set_footer(text=_t(
+        interaction, "Mieten mit /shop buy rental <item> <restarts> <x> <z>",
+        "Rent with /shop buy rental <item> <restarts> <x> <z>"))
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+shop_rentals_cmd.autocomplete("server")(_server_autocomplete)
+
+
+shop_buy_group = app_commands.Group(name="buy", description="Buy something from the shop",
+                                    parent=shop_group)
+
+
+@shop_buy_group.command(name="rental",
+                        description="🚗 Rent a vehicle/object – spawns at your coordinates for N restarts")
+@app_commands.describe(
+    item="Rental item name (pick from the autocomplete list)",
+    restarts="How many server restarts the rental lasts",
+    x="iZurvive X coordinate (East – the FIRST number on iZurvive)",
+    z="iZurvive Y coordinate (North – the SECOND number on iZurvive)",
+    y="Height / altitude (OPTIONAL)",
+    a="Rotation in degrees (OPTIONAL)",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def shop_buy_rental(interaction: discord.Interaction, item: str,
+                          restarts: app_commands.Range[int, 1], x: float, z: float,
+                          y: Optional[float] = None, a: Optional[float] = None,
+                          server: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    gid, uid = interaction.guild_id, interaction.user.id
+
+    # ── 1. Server EINMAL auflösen – Katalog, Lieferung und Ablauf müssen
+    #       zwingend derselbe Server sein (gleicher Grund wie bei /buy).
+    _conn, _fehler = _conn_waehlen(interaction, server)
+    if _conn is None:
+        return await interaction.response.send_message(
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
+    katalog = _conn.rentals_catalog
+    it = katalog.find(item)
+    if not it or not it.get("enabled", True):
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Miet-Item `{item}` ist nicht verfügbar. `/shop rentals` zeigt den Katalog.",
+            f"❌ Rental item `{item}` is not available. Use `/shop rentals` to see the catalog."),
+            ephemeral=True)
+
+    # ── 1b. Rollen-Beschränkung zuerst (leer = alle dürfen) ───
+    noetig = _rollen_aus_daten(it.get("role_ids"))
+    if noetig and not (isinstance(interaction.user, discord.Member)
+                       and _member_has_role_ids(interaction.user, noetig)):
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Du hast nicht die erforderliche Rolle, um **{it['name']}** zu mieten.\n"
+            "Benötigt wird: " + ", ".join(f"<@&{r}>" for r in noetig),
+            f"❌ You don't have the required role to rent **{it['name']}**.\n"
+            "Required: " + ", ".join(f"<@&{r}>" for r in noetig)),
+            ephemeral=True)
+
+    min_r, max_r = int(it.get("min_restarts", 1)), int(it.get("max_restarts", 1))
+    if not (min_r <= restarts <= max_r):
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ **{it['name']}** kann für {min_r}–{max_r} Neustarts gemietet werden.",
+            f"❌ **{it['name']}** can be rented for {min_r}-{max_r} restarts."), ephemeral=True)
+
+    # ── 2. Koordinaten validieren (iZurvive: x=Ost, z=Nord) ───
+    if not (0.0 <= x <= 20000.0 and 0.0 <= z <= 20000.0):
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Koordinaten außerhalb der Map. Gib die beiden iZurvive-Zahlen als "
+            "`x` (Ost) und `z` (Nord) an, z. B. `x: 4640` `z: 10350`.",
+            "❌ Coordinates out of range. Enter the two iZurvive numbers as "
+            "`x` (East) and `z` (North), e.g. `x: 4640` `z: 10350`."), ephemeral=True)
+
+    # ── 3. Preis prüfen (Vorprüfung, Abbuchung erst nach FTP-Erfolg) ──
+    total = int(it.get("price_per_restart", 0)) * int(restarts)
+    wallet, _bank = db.get_balance(gid, uid)
+    if wallet < total:
+        return await interaction.response.send_message(
+            embed=_insufficient_embed(total, wallet), ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    if _conn.api is None or _conn.ftp is None:
+        return await interaction.followup.send(_t(
+            interaction,
+            "❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn kann nichts "
+            "ausgeliefert werden.\nBitte wende dich an den Bot-Betreiber.",
+            "❌ This server is missing FTP access – without it nothing "
+            "can be delivered.\nPlease contact the bot operator."), ephemeral=True)
+    if not _conn.rentals or not _mission_dir_of(_conn):
+        return await interaction.followup.send(_t(
+            interaction,
+            "❌ Rental-System startet noch oder es ist kein Mission-Ordner bekannt – "
+            "bitte gleich noch einmal versuchen.",
+            "❌ Rental system is still starting up or no mission folder is known – "
+            "try again in a moment."), ephemeral=True)
+
+    # ── 4. Event + Position schreiben (unter dem Rentals-Lock) ───────
+    event_name = _tool_rental_event_name()
+    loop = asyncio.get_running_loop()
+    async with _conn.events_lock:
+        ev_text, ev_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, _conn, "db/events.xml")
+        sp_text, sp_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, _conn, "cfgeventspawns.xml")
+        if ev_status != "ok" or sp_status != "ok":
+            return await interaction.followup.send(_t(
+                interaction, "❌ db/events.xml oder cfgeventspawns.xml sind per FTP nicht lesbar.",
+                "❌ db/events.xml or cfgeventspawns.xml could not be read via FTP."),
+                ephemeral=True)
+        try:
+            renamed = _tool_rental_event_umbenennen(str(it.get("event_xml") or ""), event_name)
+            neu_ev = _tool_rental_event_einfuegen(ev_text, event_name, renamed)
+        except ValueError as e:
+            return await interaction.followup.send(f"❌ {e}", ephemeral=True)
+        pos_group = str(it.get("event_group") or "").strip() or None
+        neu_sp = _tool_rental_pos_schreiben(
+            sp_text, event_name, x, z, y=y, a=a, gruppe=pos_group,
+            zone_xml=(str(it.get("event_zone") or "") or None))
+
+        ok_ev = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, _conn, "db/events.xml", neu_ev)
+        if not ok_ev:
+            return await interaction.followup.send(_t(
+                interaction, "❌ db/events.xml konnte nicht gespeichert werden – "
+                "nichts wurde abgebucht.",
+                "❌ db/events.xml could not be saved – nothing was charged."), ephemeral=True)
+        ok_sp = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, _conn, "cfgeventspawns.xml", neu_sp)
+        if not ok_sp:
+            # Event wurde geschrieben, Position nicht – Event zurückrollen,
+            # sonst bleibt ein Event ohne Position übrig.
+            neu_ev_rollback, _ = _tool_delete_event(neu_ev, event_name)
+            await loop.run_in_executor(
+                None, _tool_datei_schreiben_sync, _conn, "db/events.xml", neu_ev_rollback)
+            return await interaction.followup.send(_t(
+                interaction, "❌ cfgeventspawns.xml konnte nicht gespeichert werden – "
+                "nichts wurde abgebucht.",
+                "❌ cfgeventspawns.xml could not be saved – nothing was charged."),
+                ephemeral=True)
+
+    # ── 5. ... dann Geld abbuchen (atomar). Bei Fehlschlag: Rollback ──
+    if not db.try_spend_wallet(gid, uid, total):
+        rollback_ok = False
+        async with _conn.events_lock:
+            ev2, ev2_status = await loop.run_in_executor(
+                None, _tool_datei_lesen_sync, _conn, "db/events.xml")
+            sp2, sp2_status = await loop.run_in_executor(
+                None, _tool_datei_lesen_sync, _conn, "cfgeventspawns.xml")
+            if ev2_status == "ok" and sp2_status == "ok":
+                ev3, _ = _tool_delete_event(ev2, event_name)
+                sp3, _ = _tool_delete_eventspawns(sp2, event_name)
+                rollback_ok = (
+                    await loop.run_in_executor(
+                        None, _tool_datei_schreiben_sync, _conn, "db/events.xml", ev3)
+                    and await loop.run_in_executor(
+                        None, _tool_datei_schreiben_sync, _conn, "cfgeventspawns.xml", sp3))
+        if not rollback_ok:
+            log.error(f"[RENTAL] Rollback fehlgeschlagen – verwaistes Event: {event_name}")
+            warn = discord.Embed(
+                title="⚠️ Orphaned rental event",
+                description=(f"A cancelled rental purchase could not be rolled back "
+                             f"(`{event_name}`). It needs manual removal via the "
+                             f"Event-Vorlagen tool - `/shop check` also flags it."),
+                color=0xE67E22)
+            await _post_feed(gid, "shop_log", warn, service_id=_conn.service_id)
+        wallet, _bank = db.get_balance(gid, uid)
+        return await interaction.followup.send(
+            embed=_insufficient_embed(total, wallet), ephemeral=True)
+
+    # ── 6. Miete als aktiv speichern ───────────────────────────
+    # expires_at ist nur eine grobe Rückfall-Sicherung (siehe
+    # RentalManager.on_restart_detected) - falls der Server sehr lange ohne
+    # erkannten Neustart durchläuft, verhindert sie einen unbegrenzten Ablauf.
+    expires_at = time.time() + max(1, int(restarts)) * 6 * 3600
+    rental_id = db.create_rental(
+        _conn.service_id, gid, uid, str(interaction.user), it["name"], event_name,
+        x, y, z, a, pos_group, int(restarts), expires_at)
+
+    # ── 7. Auto-Restart oder Hinweis auf nächsten Neustart ────
+    if _conn.get("auto_restart_after_purchase", False) and _conn.shop:
+        _conn.shop.schedule_auto_restart()
+        cooldown = int(_conn.get("restart_cooldown_seconds", 300) or 300)
+        delivery_info = _t(
+            interaction,
+            f"🔄 Ein Server-Neustart wurde geplant – deine Miete spawnt in "
+            f"etwa **{max(5, cooldown)} Sekunden** (plus Startzeit).",
+            f"🔄 A server restart has been scheduled – your rental will spawn "
+            f"in about **{max(5, cooldown)} seconds** (plus boot time).")
+    else:
+        delivery_info = _t(interaction,
+                           "⏳ Deine Miete spawnt beim **nächsten geplanten Server-Neustart**.",
+                           "⏳ Your rental will spawn at the **next scheduled server restart**.")
+
+    # ── 8. Bestätigung an den Käufer ───────────────────────────
+    map_name = _conn.get("map_name", "ChernarusPlus")
+    loc_url  = _izurvive_url(x, z, map_name)
+    near     = _nearest_location(x, z, map_name)
+    near_txt = _t(interaction, f"\n*(Nahe {near})*", f"\n*(Near {near})*") if near else ""
+    wallet, _bank = db.get_balance(gid, uid)
+
+    embed = discord.Embed(
+        title=_t(interaction, "🚗 Miete erfolgreich", "🚗 Rental successful"),
+        description=_t(
+            interaction,
+            f"Du hast **{it['name']}** für **{restarts} Neustart(s)** für "
+            f"**{_fmt_money(total)}** gemietet.",
+            f"You rented **{it['name']}** for **{restarts} restart(s)** for "
+            f"**{_fmt_money(total)}**."),
+        color=0x2ECC71)
+    embed.add_field(name=_t(interaction, "📍 Spawn-Ort", "📍 Spawn location"),
+                    value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=False)
+    embed.add_field(name=_t(interaction, "🚚 Lieferung", "🚚 Delivery"), value=delivery_info, inline=False)
+    embed.add_field(name="👛 Wallet", value=_fmt_money(wallet), inline=True)
+    embed.set_footer(text=f"Miete #{rental_id}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # ── 9. In den shop_log-Feed posten ─────────────────────────
+    feed = discord.Embed(
+        title="🚗 RENTAL PURCHASE",
+        description=f"{interaction.user.mention} rented **{it['name']}** for **{restarts} restart(s)**",
+        color=0x3498DB)
+    feed.add_field(name="Price", value=_fmt_money(total), inline=True)
+    feed.add_field(name="Location", value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=True)
+    feed.set_footer(text=(f"Miete #{rental_id} · {event_name}")[:100])
+    await _post_feed(gid, "shop_log", feed, service_id=_conn.service_id)
+
+shop_buy_rental.autocomplete("item")(_rental_buy_autocomplete)
+shop_buy_rental.autocomplete("server")(_server_autocomplete)
+
+
+bot.tree.add_command(shop_group)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /events add|list|remove – Event-Vorlagen (im Dashboard angelegt) an einer
+#  Position hinzufuegen. Anders als /shop buy rental: kein Preis, keine
+#  Neustart-Grenzen, kein automatischer Ablauf - eine Instanz bleibt
+#  dauerhaft bestehen, bis sie per /events remove wieder entfernt wird.
+#  Nutzt dieselben generischen XML-Werkzeuge wie das Rental-System
+#  (_tool_rental_event_umbenennen/_einfuegen/_pos_schreiben sind trotz des
+#  Namens generisch - keine Duplizierung noetig).
+# ══════════════════════════════════════════════════════════════
+_EVENT_NAME_RE = re.compile(r'^[A-Za-z0-9_\-]{1,64}$')
+
+
+def _event_instances(conn: ServerConnection) -> List[Dict[str, Any]]:
+    inst = conn.get("event_instances")
+    if not isinstance(inst, list):
+        inst = []
+        conn.set("event_instances", inst)
+    return inst
+
+
+def _event_katalog_zufallsname(vorhandener_text: str) -> str:
+    """Erzeugt einen freien Event-Namen im Format "item<4 Ziffern>" (z. B.
+    "item6645"), wenn /events add keinen eigenen Namen bekommt - probiert
+    neu, bis ein Name gefunden ist, der in events.xml noch nicht vorkommt."""
+    for _ in range(50):
+        kandidat = f"item{random.randint(1000, 9999)}"
+        if _tool_finde_benannten_block(vorhandener_text, "event", kandidat) is None:
+            return kandidat
+    return f"item{uuid.uuid4().hex[:6]}"  # praktisch unerreichbar, reines Sicherheitsnetz
+
+
+events_group = app_commands.Group(name="events", description=app_commands.locale_str(
+    "🗺️ Event-Vorlagen an einer Position hinzufügen"))
+
+
+async def _event_template_autocomplete(interaction: discord.Interaction,
+                                       current: str) -> List[app_commands.Choice[str]]:
+    conns = _ac_conns(interaction)
+    if not conns:
+        return []
+    mehrere = len(conns) > 1
+    cur = current.strip().lower()
+    out: List[app_commands.Choice] = []
+    gesehen = set()
+    for c in conns:
+        for search, label, value in c.event_catalog._ac_index:
+            if cur and cur not in search:
+                continue
+            if value in gesehen:
+                continue
+            gesehen.add(value)
+            out.append(app_commands.Choice(
+                name=f"{label} – {c.name}"[:100] if mehrere else label, value=value))
+            if len(out) >= 25:
+                return out
+    return out
+
+
+async def _event_instance_autocomplete(interaction: discord.Interaction,
+                                       current: str) -> List[app_commands.Choice[str]]:
+    conns = _ac_conns(interaction)
+    if not conns:
+        return []
+    mehrere = len(conns) > 1
+    cur = current.strip().lower()
+    out: List[app_commands.Choice] = []
+    for c in conns:
+        for inst in _event_instances(c):
+            name = str(inst.get("event_name") or "")
+            if not name or (cur and cur not in name.lower()):
+                continue
+            label = f"{name} ({inst.get('template')})"
+            out.append(app_commands.Choice(
+                name=f"{label} – {c.name}"[:100] if mehrere else label[:100], value=name))
+            if len(out) >= 25:
+                return out
+    return out
+
+
+@events_group.command(name="add", description=app_commands.locale_str(
+    "🗺️ Fügt eine Event-Vorlage an einer Position hinzu"))
+@app_commands.describe(
+    name="Name der Event-Vorlage (im Dashboard unter „Event Vorlagen“ angelegt)",
+    x="iZurvive X-Koordinate (Ost)",
+    z="iZurvive Z-Koordinate (Nord)",
+    y="Höhe (optional)",
+    event_name="Name bei Nitrado (optional - sonst zufällig, z. B. item6645)",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def events_add(interaction: discord.Interaction, name: str, x: float, z: float,
+                     y: Optional[float] = None, event_name: Optional[str] = None,
+                     server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "events_add"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    vorlage = conn.event_catalog.find(name)
+    if not vorlage:
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Keine Event-Vorlage namens „{name}“ gefunden. Im Dashboard unter "
+            "„Event Vorlagen“ anlegen.",
+            f"❌ No event template named \"{name}\" found. Create one in the dashboard under "
+            "\"Event Templates\"."), ephemeral=True)
+    if not (0.0 <= x <= 20000.0 and 0.0 <= z <= 20000.0):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Koordinaten außerhalb der Map (0–20000).",
+            "❌ Coordinates out of range (0-20000)."), ephemeral=True)
+    if event_name:
+        event_name = event_name.strip()
+        if not _EVENT_NAME_RE.match(event_name):
+            return await interaction.response.send_message(_t(
+                interaction, "❌ Event-Name darf nur Buchstaben, Zahlen, „_“ und „-“ enthalten "
+                "(max. 64 Zeichen).",
+                "❌ Event name may only contain letters, digits, \"_\" and \"-\" (max 64 chars)."),
+                ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    if conn.api is None or conn.ftp is None:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn kann nichts "
+            "hinzugefügt werden.",
+            "❌ This server is missing FTP access – without it nothing can be added."),
+            ephemeral=True)
+    if not _mission_dir_of(conn):
+        return await interaction.followup.send(_t(
+            interaction, "❌ Kein Mission-Ordner bekannt – bitte gleich noch einmal versuchen.",
+            "❌ No mission folder known yet – please try again in a moment."), ephemeral=True)
+
+    loop = asyncio.get_running_loop()
+    async with conn.events_lock:
+        ev_text, ev_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, conn, "db/events.xml")
+        sp_text, sp_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, conn, "cfgeventspawns.xml")
+        if ev_status != "ok" or sp_status != "ok":
+            return await interaction.followup.send(_t(
+                interaction, "❌ db/events.xml oder cfgeventspawns.xml sind per FTP nicht lesbar.",
+                "❌ db/events.xml or cfgeventspawns.xml could not be read via FTP."), ephemeral=True)
+        finaler_name = event_name or _event_katalog_zufallsname(ev_text)
+        if _tool_finde_benannten_block(ev_text, "event", finaler_name) is not None:
+            return await interaction.followup.send(_t(
+                interaction, f"❌ Es gibt bereits ein Event namens „{finaler_name}“.",
+                f"❌ An event named \"{finaler_name}\" already exists."), ephemeral=True)
+        try:
+            umbenannt = _tool_rental_event_umbenennen(str(vorlage.get("event_xml") or ""), finaler_name)
+            neu_ev = _tool_rental_event_einfuegen(ev_text, finaler_name, umbenannt)
+        except ValueError as e:
+            return await interaction.followup.send(f"❌ {e}", ephemeral=True)
+        gruppe = str(vorlage.get("event_group") or "").strip() or None
+        neu_sp = _tool_rental_pos_schreiben(
+            sp_text, finaler_name, x, z, y=y, gruppe=gruppe,
+            zone_xml=(str(vorlage.get("event_zone") or "") or None))
+
+        ok_ev = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, conn, "db/events.xml", neu_ev)
+        if not ok_ev:
+            return await interaction.followup.send(_t(
+                interaction, "❌ db/events.xml konnte nicht gespeichert werden.",
+                "❌ db/events.xml could not be saved."), ephemeral=True)
+        ok_sp = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, conn, "cfgeventspawns.xml", neu_sp)
+        if not ok_sp:
+            # Event wurde geschrieben, Position nicht - zurueckrollen, sonst
+            # bleibt ein Event ohne Position uebrig.
+            neu_ev_rollback, _ = _tool_delete_event(neu_ev, finaler_name)
+            await loop.run_in_executor(
+                None, _tool_datei_schreiben_sync, conn, "db/events.xml", neu_ev_rollback)
+            return await interaction.followup.send(_t(
+                interaction, "❌ cfgeventspawns.xml konnte nicht gespeichert werden.",
+                "❌ cfgeventspawns.xml could not be saved."), ephemeral=True)
+
+    instanzen = _event_instances(conn)
+    instanzen.append({
+        "template": vorlage["name"], "event_name": finaler_name,
+        "x": x, "y": y, "z": z,
+        "created_at": time.time(), "created_by": interaction.user.id,
+    })
+    _conn_store(conn, "event_instances", instanzen)
+
+    map_name = conn.get("map_name", "ChernarusPlus")
+    loc_url = _izurvive_url(x, z, map_name)
+    near = _nearest_location(x, z, map_name)
+    near_txt = _t(interaction, f"\n*(Nahe {near})*", f"\n*(Near {near})*") if near else ""
+    embed = discord.Embed(
+        title=_t(interaction, "🗺️ Event hinzugefügt", "🗺️ Event added"),
+        description=_t(
+            interaction, f"**{vorlage['name']}** wurde als `{finaler_name}` hinzugefügt.",
+            f"**{vorlage['name']}** was added as `{finaler_name}`."),
+        color=0x2ECC71)
+    embed.add_field(name=_t(interaction, "📍 Position", "📍 Location"),
+                    value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=False)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@events_group.command(name="list", description=app_commands.locale_str(
+    "🗺️ Zeigt alle per /events add hinzugefügten Event-Instanzen"))
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def events_list_cmd(interaction: discord.Interaction, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "events_list"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    instanzen = _event_instances(conn)
+    if not instanzen:
+        return await interaction.response.send_message(_t(
+            interaction, "ℹ️ Noch keine Event-Instanzen hinzugefügt.",
+            "ℹ️ No event instances added yet."), ephemeral=True)
+    lines = [f"**{i.get('event_name')}** ({i.get('template')}) — "
+            f"[{float(i.get('x', 0)):.0f} / {float(i.get('z', 0)):.0f}]"
+            for i in instanzen[:25]]
+    embed = discord.Embed(
+        title=_t(interaction, f"🗺️ Event-Instanzen ({len(instanzen)})",
+                 f"🗺️ Event Instances ({len(instanzen)})"),
+        description="\n".join(lines), color=0x5865F2)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@events_group.command(name="remove", description=app_commands.locale_str(
+    "🗺️ Entfernt eine per /events add hinzugefügte Event-Instanz"))
+@app_commands.describe(event_name="Der bei Nitrado vergebene Event-Name (siehe /events list)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def events_remove_cmd(interaction: discord.Interaction, event_name: str,
+                            server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "events_remove"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    instanzen = _event_instances(conn)
+    eintrag = next((i for i in instanzen if str(i.get("event_name")) == event_name), None)
+    if eintrag is None:
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Keine Instanz namens „{event_name}“ gefunden. `/events list` zeigt alle.",
+            f"❌ No instance named \"{event_name}\" found. `/events list` shows all."), ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    if conn.api is None or conn.ftp is None or not _mission_dir_of(conn):
+        return await interaction.followup.send(_t(
+            interaction, "❌ Für diesen Server fehlt der FTP-Zugang.",
+            "❌ This server is missing FTP access."), ephemeral=True)
+
+    loop = asyncio.get_running_loop()
+    async with conn.events_lock:
+        ev_text, ev_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, conn, "db/events.xml")
+        sp_text, sp_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, conn, "cfgeventspawns.xml")
+        if ev_status != "ok" or sp_status != "ok":
+            return await interaction.followup.send(_t(
+                interaction, "❌ db/events.xml oder cfgeventspawns.xml sind per FTP nicht lesbar.",
+                "❌ db/events.xml or cfgeventspawns.xml could not be read via FTP."), ephemeral=True)
+        neu_ev, _ = _tool_delete_event(ev_text, event_name)
+        neu_sp, _ = _tool_delete_eventspawns(sp_text, event_name)
+        ok_ev = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, conn, "db/events.xml", neu_ev)
+        ok_sp = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, conn, "cfgeventspawns.xml", neu_sp)
+    if not (ok_ev and ok_sp):
+        return await interaction.followup.send(_t(
+            interaction, "❌ Konnte nicht vollständig gespeichert werden – bitte erneut versuchen.",
+            "❌ Could not save completely – please try again."), ephemeral=True)
+
+    instanzen.remove(eintrag)
+    _conn_store(conn, "event_instances", instanzen)
+    await interaction.followup.send(_t(
+        interaction, f"✅ „{event_name}“ entfernt.", f"✅ \"{event_name}\" removed."), ephemeral=True)
+
+
+events_add.autocomplete("name")(_event_template_autocomplete)
+events_add.autocomplete("server")(_server_autocomplete)
+events_list_cmd.autocomplete("server")(_server_autocomplete)
+events_remove_cmd.autocomplete("event_name")(_event_instance_autocomplete)
+events_remove_cmd.autocomplete("server")(_server_autocomplete)
+
+bot.tree.add_command(events_group)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /edit ankuendigung – Nachricht/Bild einer geplanten Ankündigung ändern
+# ══════════════════════════════════════════════════════════════
+edit_group = app_commands.Group(name="edit", description="✏️ Edit entries of the shop catalog")
+
+@edit_group.command(name=app_commands.locale_str("ankuendigung"),
+                    description=app_commands.locale_str("✏️ Bearbeitet eine geplante Ankündigung (Nachricht/Bild)"))
+@app_commands.describe(index="Nummer der Ankündigung (siehe /liste)")
+async def edit_ankuendigung(interaction: discord.Interaction, index: int):
+    if not _subcmd_allowed(interaction, "edit_ankuendigung"):
+        return await _deny_subcmd(interaction)
+
+    pos = await _ann_position(interaction, index)
+    if pos is None:
+        return
+
+    modal = EditAnnouncementModal(pos, _sprache(interaction))
+
+    await interaction.response.send_modal(modal)
+
+bot.tree.add_command(edit_group)
+
+
+
+@bot.tree.command(
+    name="buy",
+    description="🛒 Buy an item – it spawns at your coordinates after the next server restart")
+@app_commands.describe(
+    item="Item name (pick from the autocomplete list)",
+    amount="How many to buy",
+    x="iZurvive X coordinate (East – the FIRST number on iZurvive)",
+    z="iZurvive Y coordinate (North – the SECOND number on iZurvive)",
+    y="Height / altitude (OPTIONAL – leave empty for default ground level)",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def cmd_buy(interaction: discord.Interaction, item: str,
+                  amount: app_commands.Range[int, 1], x: float, z: float,
+                  y: Optional[float] = None, server: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    gid, uid = interaction.guild_id, interaction.user.id
+
+    # ── 1. Server EINMAL aufloesen – Katalog, Lieferung, Neustart und
+    #       Karte muessen zwingend derselbe Server sein. Frueher wurde hier
+    #       viermal unabhaengig aufgeloest: der Katalog kam von A, das Item
+    #       spawnte auf B und neu gestartet wurde ein dritter Server.
+    _conn, _fehler = _conn_waehlen(interaction, server)
+    if _conn is None:
+        return await interaction.response.send_message(
+            _fehler or _premium_missing_text(interaction), ephemeral=True)
+    katalog_conn = _conn
+    katalog = _conn.catalog
+    if katalog is None:
+        return await interaction.response.send_message(
+            _premium_missing_text(interaction), ephemeral=True)
+    it = katalog.find(item)
+    if not it or not it.get("enabled", True):
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Item `{item}` ist nicht verfügbar. `/shop list` zeigt den Katalog.",
+            f"❌ Item `{item}` is not available. Use `/shop list` to see the catalog."),
+            ephemeral=True)
+    # ── 1b. Rollen-Beschraenkung: leer heisst, alle duerfen kaufen ──
+    #        Vor allen weiteren Pruefungen, damit niemand ueber die
+    #        Fehlermeldungen erfaehrt, was er ohnehin nicht kaufen darf.
+    noetig = _item_role_ids(it)
+    if noetig and not (isinstance(interaction.user, discord.Member)
+                       and _member_has_role_ids(interaction.user, noetig)):
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Du hast nicht die erforderliche Rolle, um **{it['name']}** zu kaufen.\n"
+            "Benötigt wird: " + ", ".join(f"<@&{r}>" for r in noetig),
+            f"❌ You don't have the required role to buy **{it['name']}**.\n"
+            "Required: " + ", ".join(f"<@&{r}>" for r in noetig)),
+            ephemeral=True)
+
+    max_amount = int(it.get("max_amount_per_buy", 1))
+    if amount > max_amount:
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Du kannst höchstens **{max_amount}× {it['name']}** pro Kauf erwerben.",
+            f"❌ You can buy at most **{max_amount}× {it['name']}** per purchase."),
+            ephemeral=True)
+    cls_list = _item_classnames(it)
+    if not cls_list:
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Item `{it.get('name', item)}` hat keine Classnames konfiguriert – "
+            f"ein Admin muss den Katalog-Eintrag korrigieren.",
+            f"❌ Item `{it.get('name', item)}` has no classnames configured – "
+            f"ask an admin to fix the catalog entry."), ephemeral=True)
+
+    # ── 2. Koordinaten validieren (iZurvive: x=Ost, z=Nord) ───
+    if not (0.0 <= x <= 20000.0 and 0.0 <= z <= 20000.0):
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Koordinaten außerhalb der Map. Gib die beiden iZurvive-Zahlen als "
+            "`x` (Ost) und `z` (Nord) an, z. B. `x: 4640` `z: 10350`.",
+            "❌ Coordinates out of range. Enter the two iZurvive numbers as "
+            "`x` (East) and `z` (North), e.g. `x: 4640` `z: 10350`."), ephemeral=True)
+    # ACHTUNG Achsen-Mapping: cfgEffectArea Pos = [X, HÖHE, NORD]
+    # → iZurvive-X → Pos[0], Höhe (y-Parameter) → Pos[1], iZurvive-Y → Pos[2]
+    y_val = float(katalog_conn.get("default_pos_y", 0.0) or 0.0) if y is None else float(y)
+    if not (-100.0 <= y_val <= 1000.0):
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Höhe `y` außerhalb des Bereichs (−100 … 1000). Leer lassen für Bodenhöhe.",
+            "❌ Height `y` out of range (−100 … 1000). Leave it empty for ground level."),
+            ephemeral=True)
+
+    # ── 3. Preis prüfen (Vorprüfung, Abbuchung erst nach FTP-Erfolg) ──
+    total = int(it.get("price", 0)) * int(amount)
+    wallet, _bank = db.get_balance(gid, uid)
+    if wallet < total:
+        return await interaction.response.send_message(
+            embed=_insufficient_embed(total, wallet), ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    # Auslieferung auf genau dem oben gewaehlten Server – hier wird nur noch
+    # geprueft, ob er einsatzbereit ist, nicht neu aufgeloest.
+    if _conn.api is None or _conn.ftp is None:
+        return await interaction.followup.send(_t(
+            interaction,
+            "❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn kann nichts "
+            "ausgeliefert werden.\nBitte wende dich an den Bot-Betreiber.",
+            "❌ This server is missing FTP access – without it nothing "
+            "can be delivered.\nPlease contact the bot operator."),
+            ephemeral=True)
+    if not _conn.shop:
+        return await interaction.followup.send(_t(
+            interaction, "❌ Shop-System startet noch – bitte gleich noch einmal versuchen.",
+            "❌ Shop system is still starting up – try again in a moment."), ephemeral=True)
+
+    # ── 4. Erst in cfgEffectArea.json schreiben ... ───────────
+    ok, err, area_names = await _conn.shop.add_purchase_entries(
+        cls_list, int(amount), x, y_val, z)
+    if not ok:
         return await interaction.followup.send(
             embed=discord.Embed(title=_t(interaction, "❌ Kauf fehlgeschlagen", "❌ Purchase failed"),
                                description=err, color=0xE74C3C),

@@ -169,14 +169,12 @@ def gepatchtes_link(monkeypatch, edb):
 def _conn_stub(monkeypatch, max_linked_accounts=1):
     conn = _FakeConnLink(max_linked_accounts)
     monkeypatch.setattr(bot, "_conn_of", lambda interaction: conn)
-    monkeypatch.setattr(bot, "_conns_of", lambda interaction: [conn])
     return conn
 
 
 def test_link_erster_account_wird_hauptaccount(monkeypatch, gepatchtes_link):
     _conn_stub(monkeypatch, max_linked_accounts=2)
     gepatchtes_link.roster_upsert_login(111, "1000", "Haupt")
-    gepatchtes_link.roster_add_playtime(111, "1000", "Haupt", 300)
     interaction = _StubInteraction(42)
     _run(bot.cmd_link.callback(interaction, "Haupt"))
     rows = gepatchtes_link.get_links_by_user(111, 42)
@@ -187,8 +185,6 @@ def test_link_zweiter_account_wird_alt_wenn_limit_erlaubt(monkeypatch, gepatchte
     _conn_stub(monkeypatch, max_linked_accounts=2)
     gepatchtes_link.roster_upsert_login(111, "1000", "Haupt")
     gepatchtes_link.roster_upsert_login(111, "1000", "Alt1")
-    gepatchtes_link.roster_add_playtime(111, "1000", "Haupt", 300)
-    gepatchtes_link.roster_add_playtime(111, "1000", "Alt1", 300)
     _run(bot.cmd_link.callback(_StubInteraction(42), "Haupt"))
     _run(bot.cmd_link.callback(_StubInteraction(42), "Alt1"))
     rows = gepatchtes_link.get_links_by_user(111, 42)
@@ -199,64 +195,11 @@ def test_link_lehnt_ab_wenn_limit_erreicht(monkeypatch, gepatchtes_link):
     _conn_stub(monkeypatch, max_linked_accounts=1)
     gepatchtes_link.roster_upsert_login(111, "1000", "Haupt")
     gepatchtes_link.roster_upsert_login(111, "1000", "Alt1")
-    gepatchtes_link.roster_add_playtime(111, "1000", "Haupt", 300)
-    gepatchtes_link.roster_add_playtime(111, "1000", "Alt1", 300)
     _run(bot.cmd_link.callback(_StubInteraction(42), "Haupt"))
     interaction = _StubInteraction(42)
     _run(bot.cmd_link.callback(interaction, "Alt1"))
     assert gepatchtes_link.count_links_of_user(111, 42) == 1
     assert "❌" in interaction.response.sent[0]["content"]
-
-
-def test_link_lehnt_spieler_ohne_fuenf_minuten_ab(monkeypatch, gepatchtes_link):
-    _conn_stub(monkeypatch)
-    gepatchtes_link.roster_upsert_login(111, "1000", "Haupt")
-    gepatchtes_link.roster_add_playtime(111, "1000", "Haupt", 299)
-    interaction = _StubInteraction(42)
-    _run(bot.cmd_link.callback(interaction, "Haupt"))
-    assert gepatchtes_link.get_links_by_user(111, 42) == []
-    assert "fünf Minuten" in interaction.response.sent[0]["content"]
-    gepatchtes_link.roster_add_playtime(111, "1000", "Haupt", 1)
-    _run(bot.cmd_link.callback(_StubInteraction(42), "Haupt"))
-    assert len(gepatchtes_link.get_links_by_user(111, 42)) == 1
-
-
-def test_link_auf_anderem_discord_server_erfordert_eigene_spielzeit(monkeypatch, gepatchtes_link):
-    erster = _conn_stub(monkeypatch)
-    zweiter = _FakeConnLink()
-    zweiter.service_id = "2000"
-    monkeypatch.setattr(bot, "_conn_of", lambda interaction:
-                        erster if interaction.guild_id == 111 else zweiter)
-    monkeypatch.setattr(bot, "_conns_of", lambda interaction:
-                        [erster] if interaction.guild_id == 111 else [zweiter])
-    gepatchtes_link.roster_upsert_login(111, "1000", "Haupt")
-    gepatchtes_link.roster_add_playtime(111, "1000", "Haupt", 300)
-    _run(bot.cmd_link.callback(_StubInteraction(42, 111), "Haupt"))
-    interaction = _StubInteraction(42, 222)
-    _run(bot.cmd_link.callback(interaction, "Haupt"))
-    assert gepatchtes_link.get_links_by_user(222, 42) == []
-    assert "fünf Minuten" in interaction.response.sent[0]["content"]
-    gepatchtes_link.roster_upsert_login(222, "2000", "Haupt")
-    gepatchtes_link.roster_add_playtime(222, "2000", "Haupt", 300)
-    _run(bot.cmd_link.callback(_StubInteraction(42, 222), "Haupt"))
-    assert len(gepatchtes_link.get_links_by_user(222, 42)) == 1
-
-
-def test_link_nutzt_irgendeinen_nitrado_server_der_discord_guild(monkeypatch, gepatchtes_link):
-    erster = _conn_stub(monkeypatch)
-    zweiter = _FakeConnLink()
-    zweiter.service_id = "2000"
-    dritter = _FakeConnLink()
-    dritter.service_id = "3000"
-    monkeypatch.setattr(bot, "_conns_of", lambda interaction:
-                        [erster, zweiter, dritter] if interaction.guild_id == 111 else [])
-    gepatchtes_link.roster_upsert_login(111, "3000", "Haupt")
-    gepatchtes_link.roster_add_playtime(111, "3000", "Haupt", 300)
-    interaction = _StubInteraction(42, 111)
-    _run(bot.cmd_link.callback(interaction, "Haupt"))
-    assert len(gepatchtes_link.get_links_by_user(111, 42)) == 1
-    assert interaction.response.sent[0]["embed"] is not None
-    assert gepatchtes_link.get_links_by_user(222, 42) == []
 
 
 def test_unlink_ohne_namen_bei_nur_einem_account(monkeypatch, gepatchtes_link):
