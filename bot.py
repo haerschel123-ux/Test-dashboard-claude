@@ -7540,6 +7540,9 @@ def _conn_store(conn: ServerConnection, key: str, value: Any, *, strict: bool = 
         connections.save(strict=True)
     else:
         connections.save()
+    # New tenant-only data has no legacy config consumers to mirror to.
+    if key == "eigene_npcs":
+        return
     if connections.primary() is conn:
         cfg.config[key] = value
         cfg.save_config()
@@ -12341,11 +12344,19 @@ def _dayzcode_spawn_xml(name: str, punkte: List[Dict[str, float]]) -> str:
     return "\n".join(zeilen)
 
 
-def _dayzcode_type_xml(klasse: str, items: List[Tuple[str, str]]) -> str:
+def _dayzcode_type_xml(klasse: str, items: List[Tuple[str, str]],
+                      zufall: Optional[List[Tuple[str, List[str]]]] = None) -> str:
     zeilen = [f'<type name="{_tool_esc_xml(klasse)}">']
     for art, item in items:
         zeilen.append(f'    <{art} chance="1.00">')
         zeilen.append(f'        <item name="{_tool_esc_xml(item)}" chance="1.00"/>')
+        zeilen.append(f'    </{art}>')
+    # Alternative-item structure also used in Bohemia's cfgspawnabletypes.xml.
+    for art, alternativen in zufall or []:
+        chance = f"{1 / len(alternativen):.2f}"
+        zeilen.append(f'    <{art} chance="1.00">')
+        for item in alternativen:
+            zeilen.append(f'        <item name="{_tool_esc_xml(item)}" chance="{chance}"/>')
         zeilen.append(f'    </{art}>')
     zeilen.append('</type>')
     return "\n".join(zeilen)
@@ -13035,6 +13046,7 @@ _TOOL_LISTE = (
     ("altaccountfinder", "🔎", "Alt Account Finder"),
     ("daynight", "🌗", "Day/Night Config"),
     ("deployment", "🚚", "NPC + Vehicle Deployment"),
+    ("npcgenerator", "🧍", "NPC Generator"),
     ("teleports", "🚚", "Teleport Generator"),
 )
 
@@ -15036,7 +15048,158 @@ _DEPLOY_MAX_PUNKTE = 20
 
 
 def _deployments(conn: ServerConnection) -> List[Dict[str, Any]]:
-    return [d for d in (conn.get("deployments") or []) if isinstance(d, dict)]
+    return [d for d in conn.data.get("deployments", []) if isinstance(d, dict)]
+
+
+_NPC_NAME_RE = re.compile(r"[A-Za-z0-9_]{1,32}")
+_NPC_MAX_BYTES = 256 * 1024
+_NPC_IMAGE_CATALOG = frozenset(k[6:-5] for k in _EMBEDDED_ASSETS
+                               if k.startswith("items/") and k.endswith(".avif"))
+_NPC_VEHICLE_PARTS = frozenset(c for v in TOOL_VEHICLES.values() for c, _n in v["parts"])
+
+
+def _eigene_npcs(conn: ServerConnection) -> Dict[str, Dict[str, Any]]:
+    # Never conn.get(): the primary customer's configuration is not a fallback.
+    daten = conn.data.get("eigene_npcs", {})
+    return {k: v for k, v in daten.items() if isinstance(v, dict)} if isinstance(daten, dict) else {}
+
+
+def _npc_pruefen(data: Any, *, nur_bilder: bool = False) -> Dict[str, Any]:
+    if not isinstance(data, dict) or data.get("format") != "dayz-npc-1":
+        raise ValueError("Ungültiges NPC-Format: dayz-npc-1 erforderlich.")
+    name, label = data.get("name"), data.get("label")
+    if not isinstance(name, str) or not _NPC_NAME_RE.fullmatch(name):
+        raise ValueError("NPC-Name: 1–32 Buchstaben, Ziffern oder _ verwenden.")
+    if not isinstance(label, str) or not 1 <= len(label) <= 64:
+        raise ValueError("Anzeigename: 1–64 Zeichen verwenden.")
+    koerper = data.get("koerper")
+    if koerper is not None and koerper not in TOOL_DEPLOY_SURVIVORS:
+        raise ValueError("Bitte einen gültigen Körper auswählen.")
+    items, zufall = data.get("items"), data.get("zufall", [])
+    if not isinstance(items, list) or not isinstance(zufall, list):
+        raise ValueError("Items und Zufallsgruppen müssen Listen sein.")
+    if len(zufall) > 8:
+        raise ValueError("Höchstens 8 Zufallsgruppen sind erlaubt.")
+    if len(items) > 40:
+        raise ValueError("Höchstens 40 Teile insgesamt, einschließlich Zufallsalternativen.")
+
+    def classname(value):
+        if (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_]+", value)
+                or (value.lower() not in _NPC_IMAGE_CATALOG
+                    and (nur_bilder or value not in _NPC_VEHICLE_PARTS))):
+            raise ValueError("Ungültige Classname: bitte einen Eintrag aus dem Item-Katalog wählen.")
+        return value
+
+    def pair(value):
+        if (not isinstance(value, (list, tuple)) or len(value) != 2
+                or value[0] not in ("attachments", "cargo")):
+            raise ValueError("Jeder Eintrag braucht attachments oder cargo und einen Classname.")
+        return value
+
+    feste, gruppen = [], []
+    for value in items:
+        art, item = pair(value)
+        feste.append([art, classname(item)])
+    for value in zufall:
+        art, alternativen = pair(value)
+        if not isinstance(alternativen, list) or not 1 <= len(alternativen) <= 10:
+            raise ValueError("Eine Zufallsgruppe braucht 1–10 Classnames.")
+        gruppen.append([art, [classname(item) for item in alternativen]])
+    if len(feste) + sum(len(g[1]) for g in gruppen) > 40:
+        raise ValueError("Höchstens 40 Teile insgesamt, einschließlich Zufallsalternativen.")
+    ergebnis = {"format": "dayz-npc-1", "name": name, "label": label,
+                "items": feste, "zufall": gruppen}
+    if koerper is not None:
+        ergebnis["koerper"] = koerper
+    return ergebnis
+
+
+def _npc_karten(conn: ServerConnection) -> List[Dict[str, Any]]:
+    return [dict(v, key=k, event=f"Npc{k}", slots=v.get("items", []), eigener=True)
+            for k, v in _eigene_npcs(conn).items()]
+
+
+def _npc_speichern(conn: ServerConnection, daten: Dict[str, Dict[str, Any]]) -> None:
+    vorher = conn.data.get("eigene_npcs")
+    try:
+        _conn_store(conn, "eigene_npcs", daten, strict=True)
+    except OSError:
+        if vorher is None:
+            conn.data.pop("eigene_npcs", None)
+        else:
+            conn.data["eigene_npcs"] = vorher
+        raise
+
+
+async def api_tools_npcgenerator_get(request: web.Request) -> web.Response:
+    _conn, fehler = await _deploy_vorbereiten(request, "view")
+    if fehler is not None:
+        return fehler
+    return ok({"koerper": list(TOOL_DEPLOY_SURVIVORS), "catalog": sorted(_NPC_IMAGE_CATALOG),
+               "import_parts": sorted(_NPC_VEHICLE_PARTS)})
+
+
+async def api_tools_npcgenerator_preview(request: web.Request) -> web.Response:
+    _conn, fehler = await _deploy_vorbereiten(request, "view")
+    if fehler is not None:
+        return fehler
+    try:
+        npc = _npc_pruefen(await body(request), nur_bilder=True)
+    except ValueError as e:
+        return err(str(e))
+    return ok({"npc": npc, "xml": _dayzcode_type_xml(
+        npc.get("koerper", TOOL_DEPLOY_SURVIVORS[0]), npc["items"], npc["zufall"])})
+
+
+async def api_tools_deployment_npc_import(request: web.Request) -> web.Response:
+    conn, fehler = await _deploy_vorbereiten(request, "edit")
+    if fehler is not None:
+        return fehler
+    if request.content_length is not None and request.content_length > _NPC_MAX_BYTES:
+        return err("Die NPC-Datei darf höchstens 256 KB groß sein.")
+    data = await body(request)
+    try:
+        npc = _npc_pruefen(data)
+    except ValueError as e:
+        return err(str(e))
+    eigene = _eigene_npcs(conn)
+    if npc["name"] in TOOL_DEPLOY_NPCS:
+        return err("Dieser NPC-Name ist für eine eingebaute Vorlage reserviert.", 409)
+    if npc["name"] in eigene and data.get("overwrite") is not True:
+        return err("Ein eigener NPC mit diesem Namen existiert bereits.", 409, code="npc_exists")
+    fehler = _dash_rate_limited(request, "tools.deployment.npcimport", 5)
+    if fehler is not None:
+        return fehler
+    eigene[npc["name"]] = npc
+    try:
+        _npc_speichern(conn, eigene)
+    except OSError:
+        return err("Die eigenen NPCs konnten nicht dauerhaft gespeichert werden.", 500)
+    return ok({"npc": npc})
+
+
+async def api_tools_deployment_npc_delete(request: web.Request) -> web.Response:
+    conn, fehler = await _deploy_vorbereiten(request, "edit")
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    name = data.get("name")
+    if not isinstance(name, str) or not _NPC_NAME_RE.fullmatch(name):
+        return err("NPC-Name: 1–32 Buchstaben, Ziffern oder _ verwenden.")
+    eigene = _eigene_npcs(conn)
+    if name not in eigene:
+        return err("Diesen eigenen NPC gibt es nicht.", 404)
+    if any(d.get("art") == "npc" and d.get("preset") == name for d in _deployments(conn)):
+        return err("Dieser NPC wird noch eingesetzt – zuerst den Einsatz entfernen.", 409)
+    fehler = _dash_rate_limited(request, "tools.deployment.npcimport", 5)
+    if fehler is not None:
+        return fehler
+    del eigene[name]
+    try:
+        _npc_speichern(conn, eigene)
+    except OSError:
+        return err("Die eigenen NPCs konnten nicht dauerhaft gespeichert werden.", 500)
+    return ok({"entfernt": name})
 
 
 def _deployment_eventnamen(conn: ServerConnection) -> Set[str]:
@@ -15106,7 +15269,8 @@ async def api_tools_deployment_get(request: web.Request) -> web.Response:
                     "slots": [[art, i] for art, i in v["items"]]}
                    for k, v in TOOL_DEPLOY_NPCS.items()]
     if not _mission_dir_of(conn):
-        return ok({"presets": presets, "npc_presets": npc_presets, "freie_koerper": [],
+        return ok({"presets": presets, "npc_presets": npc_presets,
+                   "eigene_npcs": _npc_karten(conn), "freie_koerper": [],
                    "deployments": [], "kein_mission_ordner": True})
     loop = asyncio.get_running_loop()
     ev_text, ev_s = await _tools_datei_lesen(conn, "db/events.xml", loop)
@@ -15120,7 +15284,7 @@ async def api_tools_deployment_get(request: web.Request) -> web.Response:
                                            ev_text if ev_s == "ok" else None,
                                            sp_text if sp_s == "ok" else None)
         liste.append(eintrag)
-    return ok({"presets": presets, "npc_presets": npc_presets,
+    return ok({"presets": presets, "npc_presets": npc_presets, "eigene_npcs": _npc_karten(conn),
                "freie_koerper": _deploy_freie_koerper(conn, st_text if st_s == "ok" else None),
                "deployments": liste})
 
@@ -15146,6 +15310,14 @@ async def api_tools_deployment_deploy(request: web.Request) -> web.Response:
     art = "npc" if data.get("art") == "npc" else "fahrzeug"
     if art == "npc":
         preset = TOOL_DEPLOY_NPCS.get(str(data.get("preset") or ""))
+        if preset is None:
+            eigenes = _eigene_npcs(conn).get(str(data.get("preset") or ""))
+            if eigenes is not None:
+                try:
+                    preset = _npc_pruefen(eigenes)
+                except ValueError as e:
+                    return err(str(e))
+                preset["event"] = f"Npc{preset['name']}"
         if preset is None:
             return err("Diese NPC-Vorlage gibt es nicht.", 422)
         klasse = str(data.get("koerper") or "")
@@ -15199,7 +15371,7 @@ async def api_tools_deployment_deploy(request: web.Request) -> web.Response:
                    ("cfgeventspawns.xml", sp_text,
                     _dayzcode_einfuegen(sp_text, "eventposdef", dep_id, sp_block), sp_block)]
         if art == "npc":
-            st_block = _dayzcode_type_xml(klasse, preset["items"])
+            st_block = _dayzcode_type_xml(klasse, preset["items"], preset.get("zufall"))
             dateien.append(("cfgspawnabletypes.xml", st_text,
                             _dayzcode_einfuegen(st_text, "spawnabletypes", dep_id, st_block),
                             st_block))
@@ -26631,6 +26803,9 @@ def _module_tier(key: str) -> str:
     """Freigabestufe eines Moduls – Standard bleibt "premium", also
     unveraendertes Verhalten, solange Brigarde nichts umstellt. Eine
     Einzelfunktion ohne eigenen Eintrag erbt die Stufe ihrer Kategorie."""
+    # Generator and import are one feature with the same deployment gate.
+    if key == "tools.npcgenerator":
+        return _module_tier("tools.deployment")
     tiers = cfg.config.get("module_tiers") or {}
     tier = tiers.get(key)
     if tier in MODULE_TIERS:
@@ -34033,6 +34208,10 @@ def build_app() -> web.Application:
     r.add_get("/api/tools/vehicle", api_tools_vehicle_get)
     r.add_post("/api/tools/vehicle", api_tools_vehicle_post)
     r.add_get("/api/tools/deployment", api_tools_deployment_get)
+    r.add_get("/api/tools/npcgenerator", api_tools_npcgenerator_get)
+    r.add_post("/api/tools/npcgenerator/preview", api_tools_npcgenerator_preview)
+    r.add_post("/api/tools/deployment/npc-import", api_tools_deployment_npc_import)
+    r.add_post("/api/tools/deployment/npc-delete", api_tools_deployment_npc_delete)
     r.add_post("/api/tools/deployment/deploy", api_tools_deployment_deploy)
     r.add_post("/api/tools/deployment/remove", api_tools_deployment_remove)
     r.add_get("/api/tools/teleports", api_tools_teleports_get)
@@ -34753,6 +34932,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "4bfe17542e2b17f771b9ed4fc044b1d5bb413372db5032ead65d48df43312e4f",
+        "602647f608782bed3c19225ff631a01e310841a64993430e92f8f2649206769d",
         "e2e59818c4288f6e591c6ffc52f285f519da46ba72029a1f6e42c60294269a48",
         "db102d189889fd5c5abbd40682b0a8b92eff3f6ef8714bf062197bc5b8c0daa3",
         "5426b0e6ebb4187939cc274a66a4df1888ff89a23e51ff714f22c358c98d2814",

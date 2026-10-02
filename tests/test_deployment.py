@@ -51,6 +51,13 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def test_deployments_do_not_fall_back_to_primary_config(monkeypatch):
+    conn = bot.ServerConnection({"service_id": "isolated"})
+    monkeypatch.setattr(bot.cfg, "config", {"deployments": [{"id": "private-primary"}]})
+    assert bot._deployments(conn) == []
+    assert bot._deployment_eventnamen(conn) == set()
+
+
 # ── Reine Marker-Funktionen ──────────────────────────────────────────────
 @pytest.mark.parametrize("zeilenende", ["\n", "\r\n"])
 def test_einfuegen_laesst_rest_bytegleich_und_entfernen_stellt_original_her(zeilenende):
