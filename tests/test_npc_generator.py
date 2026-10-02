@@ -162,7 +162,7 @@ def test_custom_deploy_three_segments_random_group_and_remove(monkeypatch, serve
     assert result["data"]["event_name"] == "NpcHaendler_Markt"
     dep_id = result["data"]["id"]
     for content in a.ftp.files.values():
-        assert f"DAYZCODE:START {dep_id}" in content
+        assert f"BRIGARDE-KILLFEED:START {dep_id}" in content
         ET.fromstring(content)
     root = ET.fromstring(a.ftp.files["/mission/cfgspawnabletypes.xml"])
     random = next(group for group in root.findall("./type/attachments")

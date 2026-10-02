@@ -12229,8 +12229,11 @@ def _tool_in_root_einfuegen(text: str, root_tag: str, snippet: str) -> str:
     return head + "    " + snippet.replace("\n", nl) + nl + close_indent + text[idx:]
 
 
-# ── NPC + Vehicle Deployment: eigene Segmente zwischen DAYZCODE-Markern ──
-_DAYZCODE_MARKER_RE = re.compile(r'<!-- DAYZCODE:(START|END) ([A-Za-z0-9_]+) -->')
+# ── Eigene Segmente zwischen BRIGARDE-KILLFEED-Markern (Deployment, Airstrike) ──
+# Geschrieben wird nur noch BRIGARDE-KILLFEED; der fruehere Name DAYZCODE liegt
+# auf Kundenservern bereits in den Dateien und wird deshalb weiter erkannt.
+_DAYZCODE_MARKER = "BRIGARDE-KILLFEED"
+_DAYZCODE_MARKER_RE = re.compile(r'<!-- (?:BRIGARDE-KILLFEED|DAYZCODE):(START|END) ([A-Za-z0-9_]+) -->')
 
 
 def _dayzcode_segmente(text: str, streng: bool = True) -> List[Dict[str, Any]]:
@@ -12248,7 +12251,7 @@ def _dayzcode_segmente(text: str, streng: bool = True) -> List[Dict[str, Any]]:
         if art == "START":
             if offen_id is not None or dep_id in gesehen:
                 if streng:
-                    raise ValueError(f"DAYZCODE-Marker für „{dep_id}“ sind verschachtelt "
+                    raise ValueError(f"Brigarde-Killfeed-Marker für „{dep_id}“ sind verschachtelt "
                                      f"oder doppelt – bitte die Datei prüfen.")
                 offen_id = None
                 continue
@@ -12259,7 +12262,7 @@ def _dayzcode_segmente(text: str, streng: bool = True) -> List[Dict[str, Any]]:
         else:
             if offen_id is None or offen_id != dep_id:
                 if streng:
-                    raise ValueError(f"DAYZCODE-Ende für „{dep_id}“ ohne passenden Anfang.")
+                    raise ValueError(f"Brigarde-Killfeed-Ende für „{dep_id}“ ohne passenden Anfang.")
                 offen_id = None
                 continue
             ende = m.end()
@@ -12270,7 +12273,7 @@ def _dayzcode_segmente(text: str, streng: bool = True) -> List[Dict[str, Any]]:
             gesehen.add(dep_id)
             offen_id = None
     if offen_id is not None and streng:
-        raise ValueError(f"DAYZCODE-Anfang für „{offen_id}“ ohne Ende.")
+        raise ValueError(f"Brigarde-Killfeed-Anfang für „{offen_id}“ ohne Ende.")
     return segmente
 
 
@@ -12293,9 +12296,9 @@ def _dayzcode_einfuegen(text: str, root_tag: str, dep_id: str, block_xml: str) -
     nl = _tool_eol(text)
     zeilenanfang = text.rfind("\n", 0, idx) + 1
     am_zeilenanfang = not text[zeilenanfang:idx].strip()
-    zeilen = [f"<!-- DAYZCODE:START {dep_id} -->"]
+    zeilen = [f"<!-- {_DAYZCODE_MARKER}:START {dep_id} -->"]
     zeilen += block_xml.strip("\n").split("\n")
-    zeilen.append(f"<!-- DAYZCODE:END {dep_id} -->")
+    zeilen.append(f"<!-- {_DAYZCODE_MARKER}:END {dep_id} -->")
     segment = "".join("    " + z + nl for z in zeilen)
     if am_zeilenanfang:
         ergebnis = text[:zeilenanfang] + segment + text[zeilenanfang:]
@@ -12899,7 +12902,7 @@ _TOOL_LEERE_SPAWNPOINTS = (
     '        </generator_params>\n'
     '\n'
     '        <generator_posbubbles>\n'
-    '            <!-- Please note; these coordinates are for map: chernarus -->\n'
+    '            <!-- Brigarde Killfeed Spawnpoint Generator -->\n'
     '        </generator_posbubbles>\n'
     '    </fresh>\n'
     '    <hop></hop>\n'
@@ -15055,7 +15058,7 @@ async def api_tools_vehicle_post(request: web.Request) -> web.Response:
 
 
 # ── NPC + Vehicle Deployment (erste Version: nur Fahrzeuge) ──────────────
-# Schreibt NUR eigene Segmente zwischen DAYZCODE-Markern in db/events.xml und
+# Schreibt NUR eigene Segmente zwischen BRIGARDE-KILLFEED-Markern in db/events.xml und
 # cfgeventspawns.xml. cfgspawnabletypes.xml wird nur gelesen: die Klasse muss
 # dort schon definiert sein (Vanilla-Ausstattung gilt), ein zweiter <type>
 # derselben Klasse waere ein Duplikat. Kein eigenes Backup - dafuer gibt es das
@@ -16861,7 +16864,7 @@ def _tool_organizer_erzeugen(text: str, optionen: Dict[str, Any]) -> Dict[str, A
     genutzt = [(k, gruppen[k]) for k in _TOOL_ORGANIZER_KATEGORIEN if gruppen[k]]
     zeitstempel = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     zeilen = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
-             "<!-- Organisiert vom Dashboard Types Organizer -->",
+             "<!-- Organisiert vom Brigarde Killfeed Types Organizer -->",
              f"<!-- Erzeugt am {zeitstempel} UTC -->"]
     if optionen.get("navigation", True):
         zeilen.append("<!-- ===== SCHNELLE NAVIGATION =====")
@@ -35197,6 +35200,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "82b69830d3348e4e067a57ed2e5f51965c8536cb3a91455a5f00a9334b8c73c1",
         "bc9b1f429e1765965d0af7e8b819e1e1a14457f3be745c23135148fffed790f0",
         "4bfe17542e2b17f771b9ed4fc044b1d5bb413372db5032ead65d48df43312e4f",
         "602647f608782bed3c19225ff631a01e310841a64993430e92f8f2649206769d",

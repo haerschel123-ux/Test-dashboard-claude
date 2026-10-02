@@ -1,6 +1,6 @@
 """NPC + Vehicle Deployment (Fahrzeuge und NPCs).
 
-Kern: eigene Bloecke zwischen <!-- DAYZCODE:START id --> / END-Markern in
+Kern: eigene Bloecke zwischen <!-- BRIGARDE-KILLFEED:START id --> / END-Markern in
 db/events.xml und cfgeventspawns.xml - alles ausserhalb bleibt Byte fuer Byte
 erhalten, cfgspawnabletypes.xml wird nur gelesen, andere Tools duerfen die
 markierten Bloecke nicht anfassen.
@@ -65,7 +65,8 @@ def test_einfuegen_laesst_rest_bytegleich_und_entfernen_stellt_original_her(zeil
     block = bot._dayzcode_event_xml("VehicleOffroadHatchback_Blue_Test", "OffroadHatchback_Blue", 1)
     neu = bot._dayzcode_einfuegen(original, "events", "dv_abc", block)
     ET.fromstring(neu.encode("utf-8"))
-    assert neu.count("<!-- DAYZCODE:START dv_abc -->") == 1
+    assert neu.count("<!-- BRIGARDE-KILLFEED:START dv_abc -->") == 1
+    assert "DAYZCODE" not in neu
     assert "\r\n" not in neu or "\n" not in neu.replace("\r\n", "")  # keine gemischten Enden
     seg = bot._dayzcode_segmente(neu)
     assert [s["id"] for s in seg] == ["dv_abc"]
@@ -85,14 +86,33 @@ def test_zweites_deployment_bleibt_beim_entfernen_unberuehrt():
 
 
 @pytest.mark.parametrize("kaputt", [
-    "<!-- DAYZCODE:START x -->\n<!-- DAYZCODE:START x -->\n",
-    "<!-- DAYZCODE:END x -->\n",
-    "<!-- DAYZCODE:START x -->\n",
+    "<!-- BRIGARDE-KILLFEED:START x -->\n<!-- BRIGARDE-KILLFEED:START x -->\n",
+    "<!-- BRIGARDE-KILLFEED:END x -->\n",
+    "<!-- BRIGARDE-KILLFEED:START x -->\n",
 ])
 def test_kaputte_marker_werfen_im_strengen_modus(kaputt):
     with pytest.raises(ValueError):
         bot._dayzcode_segmente(kaputt)
     bot._dayzcode_segmente(kaputt, streng=False)  # tolerant: kein Fehler
+
+
+def test_alter_dayzcode_marker_wird_weiter_erkannt_und_entfernt():
+    """Auf Kundenservern liegen Bloecke mit dem frueheren Marker DAYZCODE.
+    Sie muessen weiter als eigene gelten und bytegenau entfernbar bleiben -
+    auch gemischt mit neuen BRIGARDE-KILLFEED-Bloecken in derselben Datei."""
+    alt = EVENTS.replace("</events>",
+                         "    <!-- DAYZCODE:START dv_alt -->\n"
+                         "    <event name=\"E_Alt\"><nominal>1</nominal></event>\n"
+                         "    <!-- DAYZCODE:END dv_alt -->\n</events>")
+    assert [s["id"] for s in bot._dayzcode_segmente(alt)] == ["dv_alt"]
+    gemischt = bot._dayzcode_einfuegen(alt, "events", "dv_neu",
+                                       bot._dayzcode_event_xml("E_Neu", "OffroadHatchback_Blue", 1))
+    assert [s["id"] for s in bot._dayzcode_segmente(gemischt)] == ["dv_alt", "dv_neu"]
+    assert "<!-- BRIGARDE-KILLFEED:START dv_neu -->" in gemischt
+    ohne_neu, _ = bot._dayzcode_entfernen(gemischt, "dv_neu")
+    assert ohne_neu == alt
+    zurueck, gefunden = bot._dayzcode_entfernen(ohne_neu, "dv_alt")
+    assert gefunden and zurueck == EVENTS
 
 
 def test_andere_tools_duerfen_markierten_block_nicht_aendern():
