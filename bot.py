@@ -893,6 +893,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.altaccountfinder":             {"label": "Alt Account Finder", "gruppe": "Tools"},
     "tools.daynight":                     {"label": "Day/Night Config", "gruppe": "Tools"},
     "tools.deployment":                   {"label": "NPC + Vehicle Deployment", "gruppe": "Tools"},
+    "tools.airstrike":                    {"label": "Airstrike Generator", "gruppe": "Tools"},
     "tools.teleports":                    {"label": "Teleport Generator", "gruppe": "Tools"},
     "backup":                             {"label": "Backup der Server-Dateien",
                                            "gruppe": "Verbindung"},
@@ -7541,7 +7542,7 @@ def _conn_store(conn: ServerConnection, key: str, value: Any, *, strict: bool = 
     else:
         connections.save()
     # New tenant-only data has no legacy config consumers to mirror to.
-    if key == "eigene_npcs":
+    if key in ("eigene_npcs", "airstrikes"):
         return
     if connections.primary() is conn:
         cfg.config[key] = value
@@ -12278,8 +12279,8 @@ def _dayzcode_pruefe_fremdzugriff(text: str, pos: int) -> None:
     Deployment-Segments aendern oder loeschen will."""
     for seg in _dayzcode_segmente(text, streng=False):
         if seg["start"] <= pos < seg["end"]:
-            raise ValueError("Dieser Eintrag gehört zu „NPC + Vehicle Deployment“ – "
-                             "bitte dort bearbeiten oder entfernen.")
+            tool = "Airstrike Generator" if seg["id"].startswith("as_") else "NPC + Vehicle Deployment"
+            raise ValueError(f"Dieser Eintrag gehört zu „{tool}“ – bitte dort bearbeiten oder entfernen.")
 
 
 def _dayzcode_einfuegen(text: str, root_tag: str, dep_id: str, block_xml: str) -> str:
@@ -12299,7 +12300,9 @@ def _dayzcode_einfuegen(text: str, root_tag: str, dep_id: str, block_xml: str) -
     if am_zeilenanfang:
         ergebnis = text[:zeilenanfang] + segment + text[zeilenanfang:]
     else:
-        segment = nl + segment
+        # Start the marker directly at the insertion point: a leading newline
+        # or indent would otherwise survive removal in compact, one-line XML.
+        segment = segment[4:]
         ergebnis = text[:idx] + segment + text[idx:]
     if ergebnis.replace(segment, "", 1) != text:
         raise ValueError("Interner Fehler: Einfügen hätte Inhalt außerhalb der Marker verändert.")
@@ -12313,23 +12316,33 @@ def _dayzcode_entfernen(text: str, dep_id: str) -> Tuple[str, bool]:
     return text, False
 
 
-def _dayzcode_event_xml(name: str, klasse: str, anzahl: int, lifetime: int = 300) -> str:
+def _dayzcode_event_xml(name: str, klasse: str, anzahl: int, lifetime: int = 300,
+                       parameters: Optional[Dict[str, Any]] = None) -> str:
     n = int(anzahl)
+    values = {"nominal": n, "min": n, "max": n, "lifetime": int(lifetime), "restock": 0,
+              "saferadius": 500, "distanceradius": 500, "cleanupradius": 200,
+              "child_min": n, "child_max": n, "lootmin": 0, "lootmax": 0}
+    flags = {"deletable": 0, "init_random": 0, "remove_damaged": 1}
+    if parameters:
+        values.update({key: value for key, value in parameters.items() if key != "flags"})
+        flags.update(parameters.get("flags", {}))
     return (f'<event name="{_tool_esc_xml(name)}">\n'
-            f'    <nominal>{n}</nominal>\n'
-            f'    <min>{n}</min>\n'
-            f'    <max>{n}</max>\n'
-            f'    <lifetime>{int(lifetime)}</lifetime>\n'
-            f'    <restock>0</restock>\n'
-            f'    <saferadius>500</saferadius>\n'
-            f'    <distanceradius>500</distanceradius>\n'
-            f'    <cleanupradius>200</cleanupradius>\n'
-            f'    <flags deletable="0" init_random="0" remove_damaged="1"/>\n'
+            f'    <nominal>{values["nominal"]}</nominal>\n'
+            f'    <min>{values["min"]}</min>\n'
+            f'    <max>{values["max"]}</max>\n'
+            f'    <lifetime>{values["lifetime"]}</lifetime>\n'
+            f'    <restock>{values["restock"]}</restock>\n'
+            f'    <saferadius>{values["saferadius"]}</saferadius>\n'
+            f'    <distanceradius>{values["distanceradius"]}</distanceradius>\n'
+            f'    <cleanupradius>{values["cleanupradius"]}</cleanupradius>\n'
+            f'    <flags deletable="{flags["deletable"]}" init_random="{flags["init_random"]}" '
+            f'remove_damaged="{flags["remove_damaged"]}"/>\n'
             f'    <position>fixed</position>\n'
             f'    <limit>mixed</limit>\n'
             f'    <active>1</active>\n'
             f'    <children>\n'
-            f'        <child lootmax="0" lootmin="0" max="{n}" min="{n}" '
+            f'        <child lootmax="{values["lootmax"]}" lootmin="{values["lootmin"]}" '
+            f'max="{values["child_max"]}" min="{values["child_min"]}" '
             f'type="{_tool_esc_xml(klasse)}"/>\n'
             f'    </children>\n'
             f'</event>')
@@ -13013,7 +13026,7 @@ _TOOL_KEIN_MISSION_ORDNER = "Mission-Ordner unbekannt – FTP-Zugangsdaten prüf
 
 
 def _gameplay_tool_locked(handler):
-    """Share the damage-command lock across all gameplay read/modify/write tools."""
+    """Share the damage-command lock across mission read/modify/write tools."""
     async def locked(request):
         conn, error = _session_conn(request)
         if error is not None:
@@ -13046,6 +13059,7 @@ _TOOL_LISTE = (
     ("altaccountfinder", "🔎", "Alt Account Finder"),
     ("daynight", "🌗", "Day/Night Config"),
     ("deployment", "🚚", "NPC + Vehicle Deployment"),
+    ("airstrike", "💥", "Airstrike Generator"),
     ("npcgenerator", "🧍", "NPC Generator"),
     ("teleports", "🚚", "Teleport Generator"),
 )
@@ -14544,7 +14558,7 @@ async def api_tools_horde_get(request: web.Request) -> web.Response:
     loop = asyncio.get_running_loop()
     ev_root, _s1 = await _tools_xml_lesen(conn, "db/events.xml", loop)
     sp_root, _s2 = await _tools_xml_lesen(conn, "cfgeventspawns.xml", loop)
-    namen = _tool_events_liste(ev_root, nur_zombies=True)
+    namen = _tool_events_liste(ev_root, nur_zombies=True, ausblenden=_deployment_eventnamen(conn))
     hordes = []
     for n in namen:
         detail = _tool_event_details(ev_root, n) or {}
@@ -14558,6 +14572,7 @@ async def api_tools_horde_get(request: web.Request) -> web.Response:
     return ok({"hordes": hordes})
 
 
+@_gameplay_tool_locked
 async def api_tools_horde_post(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request, "tools.horde")
     if fehler is not None:
@@ -14672,7 +14687,7 @@ async def api_tools_horde_batch_get(request: web.Request) -> web.Response:
     ev_root, _s1 = await _tools_xml_lesen(conn, "db/events.xml", loop)
     zt_root, _s2 = await _tools_xml_lesen(conn, "env/zombie_territories.xml", loop)
     sp_root, _s3 = await _tools_xml_lesen(conn, "cfgeventspawns.xml", loop)
-    namen = _tool_events_liste(ev_root, nur_zombies=True)
+    namen = _tool_events_liste(ev_root, nur_zombies=True, ausblenden=_deployment_eventnamen(conn))
     zonen_map = _tool_zombie_zonen_lesen(zt_root)
     hordes = []
     for n in namen:
@@ -14686,6 +14701,7 @@ async def api_tools_horde_batch_get(request: web.Request) -> web.Response:
     return ok({"hordes": hordes})
 
 
+@_gameplay_tool_locked
 async def api_tools_horde_batch_post(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request, "tools.horde")
     if fehler is not None:
@@ -14904,6 +14920,7 @@ async def api_tools_vehicle_get(request: web.Request) -> web.Response:
     return ok({"vehicle_events": events})
 
 
+@_gameplay_tool_locked
 async def api_tools_vehicle_post(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request, "tools.vehicle")
     if fehler is not None:
@@ -15203,7 +15220,8 @@ async def api_tools_deployment_npc_delete(request: web.Request) -> web.Response:
 
 
 def _deployment_eventnamen(conn: ServerConnection) -> Set[str]:
-    return {str(d.get("event_name")) for d in _deployments(conn) if d.get("event_name")}
+    return {str(d.get("event_name")) for d in _deployments(conn) + _airstrikes(conn)
+            if d.get("event_name")}
 
 
 def _deploy_presets_fuer(conn: ServerConnection) -> Dict[str, Dict[str, Any]]:
@@ -15299,6 +15317,7 @@ def _deploy_freie_koerper(conn: ServerConnection, st_text: Optional[str]) -> Lis
             if k not in belegt and _tool_finde_benannten_block(st_text, "type", k) is None]
 
 
+@_gameplay_tool_locked
 async def api_tools_deployment_deploy(request: web.Request) -> web.Response:
     conn, fehler = await _deploy_vorbereiten(request, "edit")
     if fehler is not None:
@@ -15411,6 +15430,7 @@ async def api_tools_deployment_deploy(request: web.Request) -> web.Response:
     return ok({"event_name": event_name, "id": dep_id, "generated": generated})
 
 
+@_gameplay_tool_locked
 async def api_tools_deployment_remove(request: web.Request) -> web.Response:
     conn, fehler = await _deploy_vorbereiten(request, "edit")
     if fehler is not None:
@@ -15443,6 +15463,246 @@ async def api_tools_deployment_remove(request: web.Request) -> web.Response:
     _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Einsatz entfernt",
                f"{eintrag.get('event_name')} · {conn.name}")
     return ok({"entfernt": dep_id})
+
+
+# Airstrike evidence: BohemiaInteractive/DayZ-Script-Diff,
+# scripts/4_world/classes/explosion.c (86974a0): ExplosionTest starts a 1-second timer
+# and uses Explosion_NonLethal. Official CE types/events do not establish its
+# CE-spawnability. No candidate satisfies all three required proofs; use the
+# explicitly requested validated-classname fallback, never claim live support.
+TOOL_AIRSTRIKE_TYPEN: Tuple[Dict[str, str], ...] = ()
+_AIRSTRIKE_CLASS_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
+
+
+def _airstrikes(conn: ServerConnection) -> List[Dict[str, Any]]:
+    values = conn.data.get("airstrikes", [])
+    return copy.deepcopy([v for v in values if isinstance(v, dict)]) if isinstance(values, list) else []
+
+
+def _airstrike_input(data: Any, conn: ServerConnection):
+    if not isinstance(data, dict) or type(data.get("commit", False)) is not bool:
+        raise ValueError("Ungültige Airstrike-Anfrage.")
+    suffix = data.get("suffix")
+    if not isinstance(suffix, str) or not _DEPLOY_SUFFIX_RE.fullmatch(suffix):
+        raise ValueError("Airstrike-Name: 1–24 Buchstaben, Ziffern oder _ verwenden.")
+    klasse = data.get("klasse")
+    if not isinstance(klasse, str) or not _AIRSTRIKE_CLASS_RE.fullmatch(klasse):
+        raise ValueError("Explosionsklasse: 1–64 Buchstaben, Ziffern oder _ verwenden.")
+    if TOOL_AIRSTRIKE_TYPEN and klasse not in {t["klasse"] for t in TOOL_AIRSTRIKE_TYPEN}:
+        raise ValueError("Diese Explosionsklasse ist nicht freigeschaltet.")
+    size = DEFAULT_MAP_SIZES.get(_canonical_map_name(str(conn.data.get("map_name") or "")))
+    if size is None:
+        raise ValueError("Karte unbekannt – zuerst die Serververbindung prüfen.")
+    raw = data.get("positions")
+    if not isinstance(raw, list) or not 1 <= len(raw) <= 50:
+        raise ValueError("Bitte 1–50 Einschlagpunkte setzen.")
+    points = []
+    for point in raw:
+        if not isinstance(point, dict):
+            raise ValueError("Ungültiger Einschlagpunkt.")
+        x, z = point.get("x"), point.get("z")
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= size
+               or not math.isfinite(v) for v in (x, z)):
+            raise ValueError("Ein Einschlagpunkt liegt außerhalb der Karte oder ist keine gültige Zahl.")
+        points.append({"x": round(x, 1), "z": round(z, 1), "a": 0})
+    parameters = {"nominal": len(points), "min": 1, "max": len(points), "lifetime": 60,
+                  "restock": 300, "saferadius": 0, "distanceradius": 0, "cleanupradius": 0,
+                  "child_min": 1, "child_max": 1, "lootmin": 0, "lootmax": 0}
+    raw_parameters = data.get("parameters", {})
+    if (not isinstance(raw_parameters, dict)
+            or set(raw_parameters) - (set(parameters) | {"flags"})):
+        raise ValueError("Ungültige Airstrike-Parameter.")
+    parameters.update({k: v for k, v in raw_parameters.items() if k != "flags"})
+    if any(type(v) is not int or not 0 <= v <= 2147483647 for v in parameters.values()):
+        raise ValueError("Airstrike-Parameter müssen ganze Zahlen ab 0 sein (höchstens 2147483647).")
+    if not 1 <= parameters["lifetime"] <= 86400 or not 0 <= parameters["restock"] <= 86400:
+        raise ValueError("Lifetime: 1–86400 Sekunden. Restock: 0–86400 Sekunden.")
+    if (parameters["max"] < parameters["min"] or parameters["nominal"] > parameters["max"]
+            or parameters["child_max"] < parameters["child_min"]
+            or parameters["lootmax"] < parameters["lootmin"]):
+        raise ValueError("Max muss mindestens Min sein; Nominal darf Max nicht überschreiten. Auch Kind- und Loot-Grenzen prüfen.")
+    flags = {"deletable": 0, "init_random": 1, "remove_damaged": 1}
+    raw_flags = raw_parameters.get("flags", {})
+    if not isinstance(raw_flags, dict) or set(raw_flags) - set(flags):
+        raise ValueError("Ungültige Airstrike-Flags.")
+    flags.update(raw_flags)
+    if any(type(v) is not int or v not in (0, 1) for v in flags.values()):
+        raise ValueError("Airstrike-Flags müssen 0 oder 1 sein.")
+    parameters["flags"] = flags
+    return f"Airstrike_{suffix}", klasse, points, parameters
+
+
+async def _airstrike_prepare(request: web.Request, action: str):
+    conn, error = _session_conn(request, "tools.airstrike")
+    if error is not None:
+        return None, error
+    error = await _modul_pruefen("tools.airstrike", request, conn)
+    if error is None:
+        error = await _dash_gate(request, conn, "tools", action)
+    return conn, error
+
+
+async def _airstrike_files(conn: ServerConnection, loop):
+    files = []
+    for name, root_tag in (("db/events.xml", "events"), ("cfgeventspawns.xml", "eventposdef")):
+        raw, status = await _tools_datei_lesen(conn, name, loop)
+        if status != "ok":
+            raise ValueError("Die Airstrike-Serverdateien sind nicht lesbar.")
+        try:
+            if ET.fromstring(raw).tag != root_tag:
+                raise ValueError("Falsches XML-Wurzelelement.")
+            _dayzcode_segmente(raw)
+        except (ET.ParseError, ValueError) as exc:
+            raise ValueError("Die Airstrike-Serverdateien enthalten ungültiges XML oder beschädigte Marker.") from exc
+        files.append((name, root_tag, raw))
+    return files
+
+
+async def _airstrike_transaction(conn: ServerConnection, changes, manifest, loop):
+    """Compensate all attempted writes, including partial writes and manifest failure."""
+    attempted = []
+    had_manifest = "airstrikes" in conn.data
+    before_manifest = copy.deepcopy(conn.data.get("airstrikes"))
+    saving_manifest = False
+    try:
+        for name, before, after in changes:
+            attempted.append((name, before))
+            if not await _tools_datei_schreiben(conn, name, after, loop):
+                raise OSError(name)
+        saving_manifest = True
+        _conn_store(conn, "airstrikes", manifest, strict=True)
+    except Exception:
+        failed = []
+        for name, before in reversed(attempted):
+            try:
+                if not await _tools_datei_schreiben(conn, name, before, loop):
+                    failed.append(name)
+            except Exception:
+                failed.append(name)
+        if saving_manifest:
+            if had_manifest:
+                conn.data["airstrikes"] = before_manifest
+            else:
+                conn.data.pop("airstrikes", None)
+            try:
+                connections.save(strict=True)
+            except OSError:
+                failed.append("connections.json")
+        if failed:
+            return err("Rollback unvollständig – folgende Dateien prüfen: " + ", ".join(failed), 502)
+        return err("Speichern fehlgeschlagen – Änderungen wurden zurückgesetzt.", 502)
+    return None
+
+
+async def api_tools_airstrike_get(request: web.Request) -> web.Response:
+    conn, error = await _airstrike_prepare(request, "view")
+    if error is not None:
+        return error
+    missing = not bool(_mission_dir_of(conn))
+    async with _schaden_lock(conn.service_id):
+        entries = _airstrikes(conn)
+        ev_text, sp_text = None, None
+        if not missing:
+            loop = asyncio.get_running_loop()
+            ev_text, ev_status = await _tools_datei_lesen(conn, "db/events.xml", loop)
+            sp_text, sp_status = await _tools_datei_lesen(conn, "cfgeventspawns.xml", loop)
+            if ev_status != "ok":
+                ev_text = None
+            if sp_status != "ok":
+                sp_text = None
+        for entry in entries:
+            entry["status"] = _deploy_status(str(entry.get("id")), ev_text, sp_text)
+    return ok({"typen": list(TOOL_AIRSTRIKE_TYPEN), "deployments": entries,
+               "kein_mission_ordner": missing})
+
+
+async def api_tools_airstrike_deploy(request: web.Request) -> web.Response:
+    conn, error = await _airstrike_prepare(request, "edit")
+    if error is not None:
+        return error
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    try:
+        name, klasse, points, parameters = _airstrike_input(data, conn)
+    except ValueError as exc:
+        return err(str(exc))
+    commit = data.get("commit", False)
+    if commit:
+        error = _dash_rate_limited(request, "tools.airstrike", 5)
+        if error is not None:
+            return error
+    async with _schaden_lock(conn.service_id):
+        loop = asyncio.get_running_loop()
+        try:
+            files = await _airstrike_files(conn, loop)
+        except ValueError as exc:
+            return err(str(exc), 502)
+        entries = _airstrikes(conn)
+        if any(e.get("event_name") == name for e in entries) or any(
+                _tool_finde_benannten_block(raw, "event", name) is not None for _f, _tag, raw in files):
+            return err("Dieser Eventname ist bereits vorhanden – bitte einen anderen Airstrike-Namen wählen.", 409)
+        types, status = await _tools_xml_lesen(conn, "db/types.xml", loop)
+        if status != "ok" or types.tag != "types":
+            return err("Die types.xml ist nicht lesbar oder ungültig.", 502)
+        if not any(t.get("name") == klasse for t in types.findall("type")):
+            return err("Klasse muss in deiner types.xml vorhanden sein.")
+        dep_id = f"as_{uuid.uuid4().hex[:12]}"
+        blocks = [_dayzcode_event_xml(name, klasse, len(points), parameters=parameters),
+                  _dayzcode_spawn_xml(name, points)]
+        changes, generated = [], []
+        try:
+            for (filename, root_tag, raw), block in zip(files, blocks):
+                updated = _dayzcode_einfuegen(raw, root_tag, dep_id, block)
+                ET.fromstring(updated)
+                _dayzcode_segmente(updated)
+                changes.append((filename, raw, updated))
+                generated.append({"filename": filename, "content": block})
+        except (ET.ParseError, ValueError) as exc:
+            return err(str(exc))
+        if not commit:
+            return ok({"event_name": name, "generated": generated})
+        entry = {"id": dep_id, "event_name": name, "klasse": klasse,
+                 "punkte": points, "parameters": parameters, "erstellt": time.time()}
+        error = await _airstrike_transaction(conn, changes, entries + [entry], loop)
+        if error is not None:
+            return error
+        return ok({"id": dep_id, "event_name": name, "generated": generated})
+
+
+async def api_tools_airstrike_remove(request: web.Request) -> web.Response:
+    conn, error = await _airstrike_prepare(request, "edit")
+    if error is not None:
+        return error
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    dep_id = data.get("id") if isinstance(data, dict) else None
+    if not isinstance(dep_id, str) or not re.fullmatch(r"as_[a-f0-9]{12}", dep_id):
+        return err("Ungültige Airstrike-ID.")
+    async with _schaden_lock(conn.service_id):
+        entries = _airstrikes(conn)
+        if not any(e.get("id") == dep_id for e in entries):
+            return err("Diesen Airstrike gibt es nicht (mehr).", 404)
+        error = _dash_rate_limited(request, "tools.airstrike", 5)
+        if error is not None:
+            return error
+        loop = asyncio.get_running_loop()
+        try:
+            files = await _airstrike_files(conn, loop)
+            changes = []
+            for filename, _root, raw in files:
+                updated, found = _dayzcode_entfernen(raw, dep_id)
+                if found:
+                    ET.fromstring(updated)
+                    changes.append((filename, raw, updated))
+        except (ET.ParseError, ValueError) as exc:
+            return err(str(exc), 502)
+        error = await _airstrike_transaction(conn, changes,
+                                             [e for e in entries if e.get("id") != dep_id], loop)
+        if error is not None:
+            return error
+        return ok({"entfernt": dep_id})
 
 
 # PRA schema: BohemiaInteractive/DayZ-Script-Diff,
@@ -15853,6 +16113,7 @@ async def api_tools_event_get(request: web.Request) -> web.Response:
     return ok({"events": events})
 
 
+@_gameplay_tool_locked
 async def api_tools_event_post(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request, "tools.event")
     if fehler is not None:
@@ -15941,6 +16202,7 @@ async def api_tools_event_post(request: web.Request) -> web.Response:
     return ok({"name": name, "generated": generated})
 
 
+@_gameplay_tool_locked
 async def api_tools_event_batch_post(request: web.Request) -> web.Response:
     """Tabellen-Editor der Event-Vorlagen: mehrere Events in einem Rutsch anlegen,
     aendern, umbenennen oder loeschen. Anders als api_tools_event_post (die bleibt
@@ -34208,6 +34470,9 @@ def build_app() -> web.Application:
     r.add_get("/api/tools/vehicle", api_tools_vehicle_get)
     r.add_post("/api/tools/vehicle", api_tools_vehicle_post)
     r.add_get("/api/tools/deployment", api_tools_deployment_get)
+    r.add_get("/api/tools/airstrike", api_tools_airstrike_get)
+    r.add_post("/api/tools/airstrike/deploy", api_tools_airstrike_deploy)
+    r.add_post("/api/tools/airstrike/remove", api_tools_airstrike_remove)
     r.add_get("/api/tools/npcgenerator", api_tools_npcgenerator_get)
     r.add_post("/api/tools/npcgenerator/preview", api_tools_npcgenerator_preview)
     r.add_post("/api/tools/deployment/npc-import", api_tools_deployment_npc_import)
@@ -34932,6 +35197,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "bc9b1f429e1765965d0af7e8b819e1e1a14457f3be745c23135148fffed790f0",
         "4bfe17542e2b17f771b9ed4fc044b1d5bb413372db5032ead65d48df43312e4f",
         "602647f608782bed3c19225ff631a01e310841a64993430e92f8f2649206769d",
         "e2e59818c4288f6e591c6ffc52f285f519da46ba72029a1f6e42c60294269a48",
