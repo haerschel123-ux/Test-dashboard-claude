@@ -320,7 +320,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # ── Server-Seite „Generell“ (Vorbild DayZ++) ──
     "map_link_provider":        "izurvive",   # izurvive | xam
     "map_link_style":           "sat",        # sat | topo | tourist
-    "map_image_style":          "topo",       # sat | topo (Kacheln Dashboard/Kartenbilder)
+    "map_image_style":          "sat",        # sat | topo (Kacheln Dashboard/Kartenbilder)
     "keep_server_running":      False,
     "keep_server_running_haenger": False,
     "combat_log_seconds":       60,
@@ -10695,7 +10695,7 @@ async def faction_map(interaction: discord.Interaction, faction: Optional[str] =
             f"on **{conn.name}**."))
     map_name = conn.get("map_name", "ChernarusPlus")
     base = await _build_faction_map_base(
-        map_name, _karten_einstellung("map_image_style", "topo", _MAP_IMAGE_STYLES, conn))
+        map_name, _karten_einstellung("map_image_style", "sat", _MAP_IMAGE_STYLES, conn))
     if base is None:
         return await interaction.followup.send(_t(
             interaction,
@@ -12446,7 +12446,7 @@ async def cmd_heatmap(interaction: discord.Interaction, typ: app_commands.Choice
             f"ℹ️ No points collected yet for **{typ.name}**."))
     map_name = conn.get("map_name", "ChernarusPlus")
     base = await _build_faction_map_base(
-        map_name, _karten_einstellung("map_image_style", "topo", _MAP_IMAGE_STYLES, conn))
+        map_name, _karten_einstellung("map_image_style", "sat", _MAP_IMAGE_STYLES, conn))
     if base is None:
         return await interaction.followup.send(_t(
             interaction,
@@ -34976,7 +34976,9 @@ def _draw_heatmap(base: Any, world_size: int, punkte: List[Tuple[float, float]],
                 pixel.append((farbe[0], farbe[1], farbe[2], int(70 + 170 * w)))
         heat.putdata(pixel)
     canvas_px = base.size[0]
-    heat = heat.resize((canvas_px, canvas_px), _PILImage.BILINEAR)
+    # Pillow >= 9.1: Image.Resampling, aeltere Fassungen: Image.BILINEAR
+    bilinear = getattr(getattr(_PILImage, "Resampling", _PILImage), "BILINEAR")
+    heat = heat.resize((canvas_px, canvas_px), bilinear)
     img = base.convert("RGBA")
     img.alpha_composite(heat)
     draw = _PILImageDraw.Draw(img)
@@ -35184,7 +35186,7 @@ async def api_server_general_copy(request: web.Request) -> web.Response:
     quelle = _general_payload(conn)
     ergebnis = []
     for ziel in ziele:
-        zc = connections.get(ziel["service_id"])
+        zc = connections.for_service(ziel["service_id"])
         if zc is None:
             continue
         guild_gebunden = any(k in _GENERAL_GUILD_GEBUNDEN for k in schluessel)
@@ -35325,7 +35327,7 @@ async def api_map_meta(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     map_name = _c.get("map_name", "ChernarusPlus")
-    stil = _karten_einstellung("map_image_style", "topo", _MAP_IMAGE_STYLES, _c)
+    stil = _karten_einstellung("map_image_style", "sat", _MAP_IMAGE_STYLES, _c)
     return ok({
         "map_name": map_name,
         "world_size": _world_size(map_name),
@@ -37593,6 +37595,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "a61fc96c21dddb92c93105af4c08ae2969dffa924bc23492ab641a18f551ffd7",
         "a527a86116a2dea94b7b1d270c2a0df12d32e3438778869c3b1942f49b38e4c9",
         "67e8e05e0a8c1f15b98c59b64eabf598f6bd283b40023448e777f72f7bd9c9ba",
         "ac0b7a72181f26afe830aef3c0e28ce2cf2199c623ca9c9e640fb2ce401c2214",
