@@ -331,6 +331,24 @@ class DayZLogParser:
         self._set_position(name, player_id, pos)
         return pos
 
+    def _zeilen_positionen(self, line: str) -> Dict[str, str]:
+        """Alle ``Player "Name" (id=... pos=<x, y, z>)``-Nennungen EINER Zeile
+        als ``{Name: "x, y, z"}``.
+
+        Das Konsolen-ADM schreibt die Position jedes genannten Spielers in
+        seine eigene id-Klammer - bei einem Treffer also Opfer UND Angreifer.
+        PLAYER erfasst die Klammer bewusst ohne den pos-Anteil, deshalb
+        kannten kill_pvp/damage/connect bisher nur das alte ``at pos=<...>``
+        am Zeilenende und lieferten fuer Konsolenzeilen ``position = None``;
+        die Zonen-Pruefung musste dann auf den Positions-Cache ausweichen,
+        den eine spaetere Zeile desselben Lesedurchgangs schon ueberschrieben
+        haben konnte. Mit dieser Zuordnung bekommt jedes Ereignis die
+        Position aus GENAU seiner Zeile - auch die des Angreifers."""
+        gefunden: Dict[str, str] = {}
+        for pm in self.P["position"].finditer(line):
+            gefunden.setdefault(pm.group(1), pm.group(3).strip())
+        return gefunden
+
     def _set_gesehen(self, name: str, player_id: Optional[str]):
         """Der Spieler ist NACHWEISLICH online, aber die Zeile nennt keine
         Position (die Konsole schreibt ``Player "X"(id=...) is connected``
@@ -388,9 +406,13 @@ class DayZLogParser:
         if m_dist:
             distance = m_dist.group(1)
 
-        pos_m = re.search(r'pos=<([\d., \-]+)>', line, re.IGNORECASE)
-        if pos_m:
-            self._set_position(victim["name"], victim["id"], pos_m.group(1))
+        zeilen_pos = self._zeilen_positionen(line)
+        pos = zeilen_pos.get(victim["name"])
+        if not pos:
+            pos_m = re.search(r'pos=<([\d., \-]+)>', line, re.IGNORECASE)
+            if pos_m:
+                pos = pos_m.group(1).strip()
+                self._set_position(victim["name"], victim["id"], pos)
 
         return {
             "type": "kill_pvp",
@@ -401,6 +423,8 @@ class DayZLogParser:
             "killer_id": killer["id"] or "Unbekannt",
             "weapon": weapon,
             "distance": distance,
+            "position": pos,
+            "killer_position": zeilen_pos.get(killer["name"]),
             "raw": line,
         }
 
@@ -433,9 +457,13 @@ class DayZLogParser:
         if m_dist:
             distance = m_dist.group(1)
 
-        pos_m = re.search(r'pos=<([\d., \-]+)>', line, re.IGNORECASE)
-        if pos_m:
-            self._set_position(victim["name"], victim["id"], pos_m.group(1))
+        zeilen_pos = self._zeilen_positionen(line)
+        pos = zeilen_pos.get(victim["name"])
+        if not pos:
+            pos_m = re.search(r'pos=<([\d., \-]+)>', line, re.IGNORECASE)
+            if pos_m:
+                pos = pos_m.group(1).strip()
+                self._set_position(victim["name"], victim["id"], pos)
 
         return {
             "type": "damage",
@@ -448,6 +476,8 @@ class DayZLogParser:
             "damage": damage,
             "weapon": weapon,
             "distance": distance,
+            "position": pos,
+            "attacker_position": zeilen_pos.get(attacker["name"]),
             "raw": line,
         }
 
@@ -715,8 +745,10 @@ class DayZLogParser:
         # Positionen immer tracken – Konsolen-Format zuerst (pro Spieler in
         # der eigenen id-Klammer), sonst altes Format als Fallback
         tracked = False
+        zeilen_pos: Dict[str, str] = {}
         for pm in self.P["position"].finditer(line):
             self._set_position(pm.group(1), pm.group(2), pm.group(3))
+            zeilen_pos.setdefault(pm.group(1), pm.group(3).strip())
             tracked = True
         if not tracked:
             pm = self.P["position_legacy"].search(line)
@@ -734,6 +766,10 @@ class DayZLogParser:
             pos = m.group(7)
             if pos:
                 self._set_position(m.group(1), m.group(2), pos)
+            else:
+                # Konsolen-Format: Position steht in der id-Klammer des
+                # Opfers (siehe _zeilen_positionen).
+                pos = zeilen_pos.get(m.group(1))
             return {
                 "type": "kill_pvp",
                 "timestamp": ts,
@@ -744,6 +780,7 @@ class DayZLogParser:
                 "weapon": (m.group(5) or "Unbekannt").strip(),
                 "distance": (m.group(6) or "?").strip(),
                 "position": pos.strip() if pos else None,
+                "killer_position": zeilen_pos.get(m.group(3)),
                 "raw": line,
             }
 
@@ -805,6 +842,8 @@ class DayZLogParser:
             pos = m.group(9)
             if pos:
                 self._set_position(m.group(1), m.group(2), pos)
+            else:
+                pos = zeilen_pos.get(m.group(1))
             return {
                 "type": "damage",
                 "timestamp": ts,
@@ -817,6 +856,7 @@ class DayZLogParser:
                 "weapon": (m.group(7) or "Unbekannt").strip(),
                 "distance": (m.group(8) or "?").strip(),
                 "position": pos.strip() if pos else None,
+                "attacker_position": zeilen_pos.get(m.group(3)),
                 "raw": line,
             }
 
@@ -831,6 +871,10 @@ class DayZLogParser:
                 # in der Online-Liste, dessen Server keine Positions-Zeilen
                 # schreibt (siehe _set_gesehen).
                 self._set_gesehen(m.group(1), m.group(2))
+                # Die Konsole schreibt die Position bei "is connected" in die
+                # id-Klammer; _set_gesehen behaelt sie im Cache, hier wandert
+                # sie zusaetzlich ins Ereignis.
+                pos = zeilen_pos.get(m.group(1))
             return {
                 "type": "connect",
                 "timestamp": ts,

@@ -290,6 +290,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "delivery_online_wait_max_seconds": 2700,
     "zones": [],
     "zone_ping_cooldown_seconds": 300,
+    # ── Server-Seite „Generell“ (Vorbild DayZ++) ──
+    "map_link_provider":        "izurvive",   # izurvive | xam
+    "map_link_style":           "sat",        # sat | topo | tourist
+    "map_image_style":          "topo",       # sat | topo (Kacheln Dashboard/Kartenbilder)
+    "keep_server_running":      False,
+    "keep_server_running_haenger": False,
+    "combat_log_seconds":       60,
+    "rage_quit_seconds":        30,
+    "killstreak_min":           3,
+    "killstreak_step":          1,
+    "link_set_nickname":        False,
+    "heatmap_limits":           {},
     "max_backlog_minutes":            10,
     "max_events_per_cycle":           30,
     "ftp_fail_warn_cycles":           10,
@@ -682,6 +694,15 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
                            "emoji": "🚩", "farbe": 0x2ECC71},
     "flag_lower":         {"label": "Flag Lower",          "gruppe": "Bau",
                            "emoji": "🏳️", "farbe": 0x95A5A6},
+    # ── Verhalten (vom Bot aus Treffer/Kill/Disconnect abgeleitet) ────
+    # Schwellen je Server: combat_log_seconds, rage_quit_seconds,
+    # killstreak_min/killstreak_step (Server-Seite → Generell → Feed-Schwellen).
+    "combat_log":         {"label": "Combat Log",          "gruppe": "Verhalten",
+                           "emoji": "🏃", "farbe": 0xE67E22},
+    "rage_quit":          {"label": "Rage Quit",           "gruppe": "Verhalten",
+                           "emoji": "😡", "farbe": 0xC0392B},
+    "killstreak":         {"label": "Killstreak",          "gruppe": "Verhalten",
+                           "emoji": "🔥", "farbe": 0xF1C40F},
     # ── Sonstiges ────────────────────────────────────────────
     # "chat" und "loot" bewusst NICHT als waehlbare Feeds: DayZ-Server
     # protokollieren beides in aller Regel gar nicht in der ADM-Datei, die
@@ -737,6 +758,70 @@ FEED_TYPES: Dict[str, Dict[str, Any]] = {
     "ce_events":          {"label": "CE-Events",             "gruppe": "Bot",
                            "emoji": "🚁", "farbe": 0x2E86C1},
 }
+
+# Offline-Waechter („Server am Laufen halten“), siehe DayZBot._offline_waechter.
+_WAECHTER_OFFLINE_SEKUNDEN = 600       # erst nach 10 Min ohne A2S-Antwort
+_WAECHTER_SCHONFRIST_SEKUNDEN = 900    # 15 Min nach jedem absichtlichen Neustart
+_WAECHTER_ABSTAND_SEKUNDEN = 1800      # hoechstens ein Start je 30 Min
+
+# Heatmaps (Server-Seite „Generell“, /heatmap): (key, Label_de, Label_en, Emoji)
+HEATMAP_TYPEN: Tuple[Tuple[str, str, str, str], ...] = (
+    ("pvp_kill", "PvP-Kills", "PvP kills", "☠️"),
+    ("pvp_hit", "PvP-Treffer", "PvP hits", "🩸"),
+    ("suicide", "Selbstmorde", "Suicides", "💀"),
+    ("env_death", "Umwelttode", "Environment deaths", "🪂"),
+    ("zombie_death", "Zombie-Tode", "Zombie deaths", "🧟"),
+    ("animal_death", "Tier-Tode", "Animal deaths", "🐻"),
+    ("build", "Bauen", "Build", "🏗️"),
+    ("dismantle", "Abbauen", "Dismantle", "🔨"),
+    ("place", "Platzieren", "Place", "📦"),
+    ("flag_raise", "Flagge hissen", "Flag raise", "🚩"),
+    ("flag_lower", "Flagge senken", "Flag lower", "🏳️"),
+    ("bury", "Vergraben", "Bury", "⛏️"),
+    ("connect", "Verbindungen", "Connects", "🟢"),
+    ("disconnect", "Trennungen", "Disconnects", "🔴"),
+)
+HEATMAP_KEYS = frozenset(k for k, *_ in HEATMAP_TYPEN)
+_HEATMAP_LIMIT_VORGABE = 50
+_HEATMAP_LIMIT_MAX = 5000
+_HEATMAP_BAU = {"build": "build", "repair": "build", "mount": "build", "unmount": "build",
+                "dismantle": "dismantle", "pack": "dismantle", "fold": "dismantle",
+                "place": "place", "flag_raise": "flag_raise", "flag_lower": "flag_lower",
+                "bury": "bury", "unbury": "bury"}
+
+
+def _heatmap_typ(ev: Dict[str, Any]) -> Optional[str]:
+    """Welcher Heatmap-Typ zaehlt dieses Log-Ereignis (None = keiner)."""
+    t = str(ev.get("type", ""))
+    if t == "kill_pvp":
+        return "pvp_kill"
+    if t == "damage":
+        if str(ev.get("attacker_id") or "") == "Umgebung" or not ev.get("attacker"):
+            return None
+        return "pvp_hit"
+    if t == "suicide":
+        return "suicide"
+    if t == "kill_env":
+        key = _feed_key(ev)
+        if key == "zombie_death":
+            return "zombie_death"
+        if key in ("wolf_death", "bear_death"):
+            return "animal_death"
+        return "env_death"
+    if t == "basebuild":
+        return _HEATMAP_BAU.get(_feed_key(ev) or "")
+    if t in ("connect", "disconnect"):
+        return t
+    return None
+
+
+def _heatmap_limit(conn: Optional["ServerConnection"], typ: str) -> int:
+    limits = (conn.get("heatmap_limits") if conn is not None else None) or {}
+    try:
+        return max(0, min(_HEATMAP_LIMIT_MAX, int(limits.get(typ, _HEATMAP_LIMIT_VORGABE))))
+    except (TypeError, ValueError):
+        return _HEATMAP_LIMIT_VORGABE
+
 
 # Zuordnung der tatsaechlichen DayZ-CE-Event-Typnamen (wie sie im RPT-
 # Zaehler-Dump stehen) zu den Sub-Schaltern des ce_events-Feeds. Die ersten
@@ -2862,8 +2947,141 @@ def _izurvive_url(x: float, y: float, map_name: str = "ChernarusPlus",
     <karte>/#location=X;Y;Z). Das alte Format (?m=<karte>#l=X;Y) zentrierte
     iZurvive nur auf die Koordinate, setzte aber keine Markierung – man
     musste die Stelle auf der Karte erst wieder suchen."""
-    slug = _IZURVIVE_MAP_SLUG.get(map_name, map_name.lower().replace(" ", ""))
+    # Seit der Server-Seite „Generell“ entscheidet der Kunde ueber Anbieter
+    # und Stil - dieser Name bleibt fuer die bestehenden Aufrufer.
+    return _karten_link(x, y, map_name, z)
+
+def _verhalten_auswerten(ev: Dict[str, Any], conn: "ServerConnection") -> List[Dict[str, Any]]:
+    """Regeln fuer Combat-Log, Rage-Quit und Killstreak - reine Zustands-
+    fortschreibung auf ``conn.kampf_zustand``/``conn.killstreaks``, Rueckgabe
+    die abzuleitenden Ereignisse. Zeitbasis sind die ADM-Zeitstempel
+    (``HH:MM:SS``) der Zeilen, NICHT die Wanduhr: Ereignisse kommen
+    gebuendelt je Poll an, mit der Wanduhr saehe jeder Disconnect im selben
+    Chunk wie „sofort“ aus."""
+    t = str(ev.get("type", ""))
+    ts = str(ev.get("timestamp") or "")
+    kz = conn.kampf_zustand
+    ks = conn.killstreaks
+    out: List[Dict[str, Any]] = []
+
+    def _lk(n: Any) -> str:
+        return str(n or "").strip().lower()
+
+    def _ganz(key: str, vorgabe: int, lo: int, hi: int) -> int:
+        try:
+            return max(lo, min(hi, int(conn.get(key, vorgabe) or vorgabe)))
+        except (TypeError, ValueError):
+            return vorgabe
+
+    if t == "damage":
+        opfer, angreifer = ev.get("victim"), ev.get("attacker")
+        if not opfer or not angreifer or str(ev.get("attacker_id") or "") == "Umgebung":
+            return out
+        if _lk(opfer) == _lk(angreifer):
+            return out
+        for a, b in ((opfer, angreifer), (angreifer, opfer)):
+            kz.setdefault(_lk(a), {}).update({"treffer_ts": ts, "gegner": str(b)})
+    elif t == "kill_pvp":
+        opfer, killer = ev.get("victim"), ev.get("killer")
+        if opfer:
+            kz.setdefault(_lk(opfer), {}).update({"tod_ts": ts, "killer": str(killer or "?")})
+            if ks.pop(_lk(opfer), None) is not None:
+                _killstreak_sichern(conn)
+        if killer and opfer and _lk(killer) != _lk(opfer):
+            streak = ks.get(_lk(killer), 0) + 1
+            ks[_lk(killer)] = streak
+            _killstreak_sichern(conn)
+            mindest = _ganz("killstreak_min", 3, 2, 50)
+            schritt = _ganz("killstreak_step", 1, 1, 50)
+            if streak >= mindest and (streak - mindest) % schritt == 0:
+                out.append({"type": "killstreak", "timestamp": ts, "player": str(killer),
+                            "player_id": ev.get("killer_id") or "Unbekannt",
+                            "streak": streak, "victim": str(opfer),
+                            "position": ev.get("killer_position"),
+                            "raw": ev.get("raw", "")})
+    elif t in ("kill_env", "suicide"):
+        spieler = ev.get("player")
+        if spieler:
+            kz.setdefault(_lk(spieler), {}).update(
+                {"tod_ts": ts, "killer": str(ev.get("cause") or "Umgebung")})
+            if ks.pop(_lk(spieler), None) is not None:
+                _killstreak_sichern(conn)
+    elif t == "disconnect":
+        spieler = ev.get("player")
+        if not spieler:
+            return out
+        zustand = kz.pop(_lk(spieler), None)
+        if ks.pop(_lk(spieler), None) is not None:
+            _killstreak_sichern(conn)
+        if not zustand:
+            return out
+        basis = {"timestamp": ts, "player": str(spieler),
+                 "player_id": ev.get("player_id") or "Unbekannt",
+                 "position": ev.get("position"), "raw": ev.get("raw", "")}
+        if zustand.get("tod_ts"):
+            diff = DayZLogParser._ts_diff_sekunden(ts, zustand["tod_ts"])
+            if diff <= _ganz("rage_quit_seconds", 30, 5, 3600):
+                out.append(dict(basis, type="rage_quit", sekunden=int(diff),
+                                killer=zustand.get("killer", "?")))
+                return out
+        if zustand.get("treffer_ts"):
+            diff = DayZLogParser._ts_diff_sekunden(ts, zustand["treffer_ts"])
+            if diff <= _ganz("combat_log_seconds", 60, 5, 3600):
+                out.append(dict(basis, type="combat_log", sekunden=int(diff),
+                                gegner=zustand.get("gegner", "?")))
+    return out
+
+
+def _killstreak_sichern(conn: "ServerConnection") -> None:
+    """Killstreak-Stand in die Verbindung schreiben (ueberlebt Bot-Neustarts)."""
+    try:
+        conn.data["killstreak_stand"] = {k: int(v) for k, v in conn.killstreaks.items() if int(v) > 0}
+        connections.save()
+    except Exception:  # noqa: BLE001 – Sichern ist Komfort, kein Muss
+        pass
+
+
+# ── Kartenlinks (Mapping & Location, Server-Seite „Generell“) ──
+# Geprueft (HTTP 200): iZurvive-Slugs je Karte und Stil; Sakhal hat keine
+# Touristen-Karte -> topo. XAM: https://dayz.xam.nu/<karte>/<satmap|topographic>
+# #location=X;Z;ZOOM (drei Zahlen, setzt den Marker).
+_IZURVIVE_SLUGS: Dict[str, Dict[str, str]] = {
+    "ChernarusPlus": {"topo": "chernarusplus", "sat": "chernarusplussatmap",
+                      "tourist": "chernarusplushiking"},
+    "Livonia": {"topo": "livonia", "sat": "livoniaSat", "tourist": "livoniaHiking"},
+    "Sakhal": {"topo": "sakhal", "sat": "sakhalSat", "tourist": "sakhal"},
+}
+_MAP_LINK_PROVIDER = ("izurvive", "xam")
+_MAP_LINK_STYLES = ("sat", "topo", "tourist")
+_MAP_IMAGE_STYLES = ("sat", "topo")
+
+
+def _karten_einstellung(key: str, vorgabe: str, erlaubt: Tuple[str, ...],
+                        conn: Optional["ServerConnection"] = None) -> str:
+    conn = conn if conn is not None else _AKTUELLER_SERVER.get()
+    wert = str((conn.get(key, vorgabe) if conn is not None
+                else cfg.config.get(key, vorgabe)) or vorgabe).strip().lower()
+    return wert if wert in erlaubt else vorgabe
+
+
+def _karten_link(x: float, y: float, map_name: str = "ChernarusPlus", z: float = 0.0,
+                 conn: Optional["ServerConnection"] = None) -> str:
+    """Deep-Link mit Markierung beim gewaehlten Anbieter/Stil DIESES Servers
+    (``map_link_provider``/``map_link_style``). ``y`` ist hier die Nord-
+    Koordinate (DayZ pos = <Ost, Nord, Hoehe>)."""
+    anbieter = _karten_einstellung("map_link_provider", "izurvive", _MAP_LINK_PROVIDER, conn)
+    stil = _karten_einstellung("map_link_style", "sat", _MAP_LINK_STYLES, conn)
+    if anbieter == "xam":
+        folder = _XAM_FOLDER.get(map_name, "chernarusplus")
+        pfad = "satmap" if stil == "sat" else "topographic"
+        return f"https://dayz.xam.nu/{folder}/{pfad}#location={x:.0f};{y:.0f};5"
+    slugs = _IZURVIVE_SLUGS.get(map_name)
+    if slugs:
+        slug = slugs.get(stil) or slugs["topo"]
+    else:
+        slug = map_name.lower().replace(" ", "")
     return f"https://www.izurvive.com/{slug}/#location={x:.0f};{y:.0f};{z:.0f}"
+
 
 def _location_field_value(pos_str: Optional[str]) -> Optional[str]:
     """
@@ -2935,6 +3153,8 @@ def _add_location_field(e: discord.Embed, ev: Dict, player_key: str,
     Connect/Disconnect): Position aus dem Event selbst oder die zuletzt
     getrackte Position des Spielers, als klickbarer iZurvive-Link."""
     name = ev.get(player_key) or ""
+    if _position_privat(_AKTUELLER_SERVER.get(), str(name)):
+        return      # Location Privacy: Position dieses Spielers nie zeigen
     pos = ev.get("position") or (positions or {}).get(name, {}).get("position")
     loc_val = _location_field_value(pos)
     if loc_val:
@@ -2955,6 +3175,8 @@ def _add_named_location_field(e: discord.Embed, name: str, eigene_position: Opti
     """Wie _add_location_field, aber mit eigenem Feldnamen (z.B. "Killer-
     Standort" statt des generischen "Player Location") - fuer Ereignisse mit
     ZWEI beteiligten Spielern, die je einen eigenen Standort-Link brauchen."""
+    if _position_privat(_AKTUELLER_SERVER.get(), str(name)):
+        return      # Location Privacy
     pos = eigene_position or (positions or {}).get(name, {}).get("position")
     loc_val = _location_field_value(pos)
     if loc_val:
@@ -3128,6 +3350,50 @@ class EmbedBuilder:
                 description=ev["raw"],
                 color=0xFF8C00
             )
+
+        elif t == "combat_log":
+            e = discord.Embed(
+                title=_tx(sprache, "🏃 COMBAT LOG", "🏃 COMBAT LOG"),
+                description=_tx(
+                    sprache,
+                    f"**{ev['player']}** hat **{ev.get('sekunden', '?')} s** nach einem "
+                    f"Kampf mit **{ev.get('gegner', '?')}** die Verbindung getrennt.",
+                    f"**{ev['player']}** disconnected **{ev.get('sekunden', '?')} s** after "
+                    f"fighting **{ev.get('gegner', '?')}**."),
+                color=0xE67E22
+            )
+            _add_location_field(e, ev, "player", positions)
+            e.add_field(name=_tx(sprache, "Steam-ID", "Steam ID"),
+                       value=f"`{ev.get('player_id', '?')}`", inline=False)
+
+        elif t == "rage_quit":
+            e = discord.Embed(
+                title=_tx(sprache, "😡 RAGE QUIT", "😡 RAGE QUIT"),
+                description=_tx(
+                    sprache,
+                    f"**{ev['player']}** hat **{ev.get('sekunden', '?')} s** nach dem Tod "
+                    f"durch **{ev.get('killer', '?')}** die Verbindung getrennt.",
+                    f"**{ev['player']}** disconnected **{ev.get('sekunden', '?')} s** after "
+                    f"being killed by **{ev.get('killer', '?')}**."),
+                color=0xC0392B
+            )
+            _add_location_field(e, ev, "player", positions)
+            e.add_field(name=_tx(sprache, "Steam-ID", "Steam ID"),
+                       value=f"`{ev.get('player_id', '?')}`", inline=False)
+
+        elif t == "killstreak":
+            e = discord.Embed(
+                title=_tx(sprache, "🔥 KILLSTREAK", "🔥 KILLSTREAK"),
+                description=_tx(
+                    sprache,
+                    f"**{ev['player']}** ist auf **{ev.get('streak', '?')} Kills** in Folge "
+                    f"– zuletzt **{ev.get('victim', '?')}**.",
+                    f"**{ev['player']}** is on a **{ev.get('streak', '?')} kill** streak "
+                    f"– latest victim **{ev.get('victim', '?')}**."),
+                color=0xF1C40F
+            )
+            _add_location_field(e, ev, "player", positions)
+            e.add_field(name="Killer ID", value=f"`{ev.get('player_id', '?')}`", inline=False)
 
         elif t == "loot":
             action_icons = {"spawned":"✅", "despawned":"❌", "created":"✅", "deleted":"❌"}
@@ -3371,6 +3637,19 @@ class ServerConnection:
         self.roster_quelle_datei: Optional[str] = None
         self.roster_quelle_ts: float = 0.0
         self.hydrate_versuch_ts: float = 0.0
+        # ── Offline-Waechter („Server am Laufen halten“) ──
+        # Seit wann antwortet A2S nicht mehr (None = online/unbekannt) und
+        # wann zuletzt ein absichtlicher Neustart ausgeloest wurde (Schonfrist).
+        self.offline_seit: Optional[float] = None
+        self.neustart_erwartet_ts: float = 0.0
+        # ── Verhaltens-Feeds (Combat-Log / Rage-Quit / Killstreak) ──
+        # Letzter Treffer/Tod je Spieler (ADM-Zeitstempel) - bewusst nur im
+        # Arbeitsspeicher, die Fenster sind Sekunden. Killstreaks ueberleben
+        # einen Bot-Neustart (killstreak_stand in connections.json).
+        self.kampf_zustand: Dict[str, Dict[str, str]] = {}
+        stand = data.get("killstreak_stand")
+        self.killstreaks: Dict[str, int] = (
+            {str(k): int(v) for k, v in stand.items()} if isinstance(stand, dict) else {})
         # Serialisiert Hydrierung gegen den normalen Poll dieser EINEN
         # Verbindung. Ohne das konnte eine lange laufende Hydrierung (mehrere
         # await-Punkte im FTP-Read) am Ende einen Roster zurueckschreiben, der
@@ -3429,7 +3708,42 @@ class ServerConnection:
         # 0.0 statt "jetzt": der naechste Zyklus soll SOFORT neu hydrieren
         # duerfen, nicht erst nach Ablauf der Wiederholsperre.
         self.hydrate_versuch_ts = 0.0
+        # Ein Neustart trennt jeden: Kampffenster und Killstreaks sind damit
+        # hinfaellig (sonst zaehlte ein Streak ueber den Neustart hinweg).
+        self.verhalten_zuruecksetzen()
         log.debug(f"[HYDRATE] {self.name}: Online-Zustand zurueckgesetzt ({grund}).")
+
+    def verhalten_zuruecksetzen(self) -> None:
+        """Kampffenster und Killstreaks leeren (Server-Neustart)."""
+        self.kampf_zustand.clear()
+        if self.killstreaks:
+            self.killstreaks.clear()
+            self.data["killstreak_stand"] = {}
+            try:
+                connections.save()
+            except Exception:  # noqa: BLE001 – Sichern ist Komfort, kein Muss
+                pass
+
+    def stopp_markieren(self, quelle: str) -> None:
+        """Der Server wurde ABSICHTLICH gestoppt (Dashboard, /stoppen,
+        Backup) - der Offline-Waechter darf ihn nicht wieder starten."""
+        self.data["server_absichtlich_gestoppt"] = {"ts": time.time(), "quelle": str(quelle)[:60]}
+        self.offline_seit = None
+        try:
+            connections.save()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def neustart_markieren(self) -> None:
+        """Ein absichtlicher Neustart laeuft: Schonfrist fuer den Waechter,
+        ein frueheres Stopp-Flag ist damit hinfaellig."""
+        self.neustart_erwartet_ts = time.time()
+        self.offline_seit = None
+        if self.data.pop("server_absichtlich_gestoppt", None) is not None:
+            try:
+                connections.save()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ── Stammdaten ──
     @property
@@ -3548,6 +3862,15 @@ class ServerConnection:
         # Gast-Zugaenge zum Dashboard: aus demselben Grund strikt ohne
         # Rueckfall.
         "dashboard_perms",
+        # Rollen, deren verknuepfte Spieler nie automatisch gebannt werden
+        # (Zonen-Auto-Bans) - Rollen-IDs gelten nur in der eigenen Guild.
+        "ban_immune_role_ids",
+        # Spieler, deren Position nirgends gezeigt wird (Location Privacy).
+        "location_privacy_names",
+        # Username Hooks: Rollen-IDs gelten nur in der eigenen Guild.
+        "link_add_role_ids", "link_remove_role_ids",
+        # Zustand des Offline-Waechters und Killstreak-Stand dieses Servers.
+        "server_absichtlich_gestoppt", "watchdog_letzter_start_ts", "killstreak_stand",
     })
 
     # Einstellungen, die jeder Kunde selbst festlegt. Rueckfallebene ist hier
@@ -3569,6 +3892,13 @@ class ServerConnection:
         "restart_cooldown_seconds", "zone_ping_cooldown_seconds",
         "log_poll_interval_seconds", "ftp_fail_warn_cycles",
         "admin_role_ids", "admin_role_name", "economy_admin_role_ids",
+        # Server-Seite „Generell“: jeder Kunde stellt das selbst ein - der
+        # Betreiberwert darf nicht mitwandern (long_range_kill_meter fiel
+        # bisher auf cfg.config zurueck).
+        "long_range_kill_meter", "map_link_provider", "map_link_style", "map_image_style",
+        "keep_server_running", "keep_server_running_haenger",
+        "combat_log_seconds", "rage_quit_seconds", "killstreak_min", "killstreak_step",
+        "link_set_nickname", "heatmap_limits",
     })
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -4615,6 +4945,15 @@ class DayZBot(discord.Client):
         # Wer schon MIT Live-Daten (nicht nur mit dem beim Hydrieren
         # vorbelegten last_seen) ausgewertet wurde - siehe _check_zones.
         self._zone_bestaetigt: Set[Tuple[str, str]] = set()           # (Server, Spieler)
+        # Wer steht gerade in welcher Zone (Entry/Leave-Erkennung) -
+        # (Server, Zone, Spieler) -> Zeitpunkt des Betretens.
+        self._zone_drin: Dict[Tuple[str, str, str], float] = {}
+        # Letzter Auto-Ban je (Server, Spieler) - ein Ban reicht, auch wenn
+        # derselbe Treffer-Hagel mehrere Zeilen erzeugt.
+        self._zone_ban_zuletzt: Dict[Tuple[str, str], float] = {}
+        # Letzter Ereignis-Ping je (Server, Zone, Spieler, Ereignis) - daempft
+        # z. B. zehn Treffer in zwei Sekunden auf einen Ping.
+        self._zone_ev_ping: Dict[Tuple[str, str, str, str], float] = {}
         # Der Discovery-Retry haengt jetzt an der jeweiligen Verbindung
         # (ServerConnection.discover_retry_ts), nicht mehr am Bot.
 
@@ -4946,6 +5285,8 @@ class DayZBot(discord.Client):
             self.scheduled_tasks_loop.start()
         if not self.giveaways_loop.is_running():
             self.giveaways_loop.start()
+        if not self.temp_unban_loop.is_running():
+            self.temp_unban_loop.start()
         if not announcement_scheduler.is_running():
             announcement_scheduler.start()
         if not self.abandoned_bases_digest.is_running():
@@ -5668,6 +6009,7 @@ class DayZBot(discord.Client):
                 conn.online_since = time.time()
         else:
             conn.online_since = None
+        await self._offline_waechter(conn, info)
         embed = self._build_status_embed(info, conn)
         # Nur die Guild dieses Servers – sonst saehe jeder Discord-Server den
         # Status aller Kunden.
@@ -5702,6 +6044,73 @@ class DayZBot(discord.Client):
     @status_update.before_loop
     async def _before_status(self):
         await self.wait_until_ready()
+
+    async def _offline_waechter(self, conn: ServerConnection, info: Optional[Dict]) -> None:
+        """„Server am Laufen halten“: startet einen Server, der laut A2S und
+        Nitrado ungewollt steht. Schutz gegen Fehlstarts: mindestens 10 Min
+        offline, kein absichtlicher Stopp (``server_absichtlich_gestoppt``),
+        15 Min Schonfrist nach jedem absichtlichen Neustart, hoechstens ein
+        Start je 30 Min (persistiert), Nitrado-Status nicht gerade in einem
+        Uebergang. Die Stufe „haengt“ (Nitrado sagt gestartet, A2S schweigt)
+        ist ein eigener Schalter und standardmaessig aus - ein Netzproblem
+        zwischen Bot und Server waere sonst ein Neustart fuer alle Spieler."""
+        try:
+            jetzt = time.time()
+            if info:
+                conn.offline_seit = None
+                if conn.data.get("server_absichtlich_gestoppt") is not None:
+                    # Er laeuft wieder (von Hand gestartet) - Flag erledigt.
+                    conn.data.pop("server_absichtlich_gestoppt", None)
+                    connections.save()
+                return
+            if conn.offline_seit is None:
+                conn.offline_seit = jetzt
+                return
+            if not conn.get("keep_server_running", False) or conn.api is None:
+                return
+            if jetzt - conn.offline_seit < _WAECHTER_OFFLINE_SEKUNDEN:
+                return
+            if conn.data.get("server_absichtlich_gestoppt") is not None:
+                return
+            if jetzt - conn.neustart_erwartet_ts < _WAECHTER_SCHONFRIST_SEKUNDEN:
+                return
+            try:
+                letzter = float(conn.data.get("watchdog_letzter_start_ts") or 0.0)
+            except (TypeError, ValueError):
+                letzter = 0.0
+            if jetzt - letzter < _WAECHTER_ABSTAND_SEKUNDEN:
+                return
+            try:
+                ninfo = await conn.api.get_info()
+            except Exception:  # noqa: BLE001
+                ninfo = None
+            status = str((ninfo or {}).get("status") or (ninfo or {}).get("state") or "").lower()
+            if status == "stopped":
+                grund = "Nitrado meldet „gestoppt“, kein absichtlicher Stopp bekannt"
+            elif status == "started" and conn.get("keep_server_running_haenger", False):
+                grund = "Nitrado meldet „gestartet“, aber keine A2S-Antwort (hängt)"
+            else:
+                return      # Uebergang (stopping/restarting), gesperrt oder unbekannt
+            _conn_store(conn, "watchdog_letzter_start_ts", jetzt)
+            try:
+                ok_, msg = await conn.api.restart()
+            except Exception as ex:  # noqa: BLE001
+                ok_, msg = False, str(ex)
+            conn.neustart_erwartet_ts = jetzt
+            minuten = int((jetzt - conn.offline_seit) // 60)
+            e = discord.Embed(
+                title="🛠️ Server automatisch gestartet" if ok_ else "❌ Automatischer Start fehlgeschlagen",
+                description=(f"**{conn.name}** war seit {minuten} Min offline.\n{grund}.\n"
+                             f"Nitrado: {msg}"),
+                color=0x2ECC71 if ok_ else 0xE74C3C)
+            e.set_footer(text="„Server am Laufen halten“ · Server-Seite → Generell")
+            e.timestamp = datetime.now(timezone.utc)
+            await _post_feed(conn.guild_ids, "adminlog", e, service_id=conn.service_id)
+            _audit_add("system", conn.name, "Offline-Wächter: Start ausgelöst",
+                      f"{grund}; Nitrado: {msg}", success=bool(ok_))
+            log.info(f"[WÄCHTER] {conn.name}: Start ausgelöst ({grund}) ok={ok_} – {msg}")
+        except Exception as e:  # noqa: BLE001 – darf die Status-Schleife nie kippen
+            log.error(f"[WÄCHTER] {conn.name}: {e}")
 
     def _build_status_embed(self, info: Optional[Dict],
                             conn: Optional[ServerConnection] = None) -> discord.Embed:
@@ -5739,23 +6148,33 @@ class DayZBot(discord.Client):
         der Poll-Zyklus (Spielzeit-Gutschrift etc.) nie daran scheitert."""
         try:
             _src = conn if conn is not None else connections.primary()
-            zones = [z for z in (_zones(_src) if _src else (cfg.config.get("zones") or []))
-                     if isinstance(z, dict) and z.get("name")]
-            if not zones:
+            alle_zonen = [z for z in (_zones(_src) if _src else (cfg.config.get("zones") or []))
+                          if isinstance(z, dict) and z.get("name")]
+            zones = [z for z in alle_zonen if _zone_aktiv(z)]
+            if not alle_zonen:
                 return
             # Zustände entfernter Zonen entsorgen – aber NUR die dieses
             # Servers. Frueher loeschte jeder Poll-Durchlauf die Cooldowns der
             # anderen Kunden, deren Zonen dann alle 10 s erneut pingten.
             _sid = _src.service_id if _src is not None else ""
-            zone_keys = {str(z["name"]).strip().lower() for z in zones}
+            zone_keys = {str(z["name"]).strip().lower() for z in alle_zonen}
             self._zone_last_ping = {k: v for k, v in self._zone_last_ping.items()
                                     if k[0] != _sid or k[1] in zone_keys}
+            self._zone_drin = {k: v for k, v in self._zone_drin.items()
+                               if k[0] != _sid or k[1] in zone_keys}
             cooldown = max(0, int((_src.get("zone_ping_cooldown_seconds", 300) if _src
                                    else cfg.config.get("zone_ping_cooldown_seconds", 300))))
             now = time.time()
             _p = (conn.parser if conn is not None
                   else (_src.parser if _src is not None else self.parser))
-            for pname, info in list((_p.player_positions if _p else {}).items()):
+            positionen = dict(_p.player_positions) if _p else {}
+            # Wer aus dem Tracking verschwunden ist (Disconnect, neuer
+            # PlayerList-Block ohne ihn), ist nicht "hinausgegangen" - die
+            # Mitgliedschaft wird still entsorgt, das Disconnect-Ereignis
+            # selbst zaehlt ueber _zonen_ereignis mit seiner eigenen Position.
+            for k in [k for k in self._zone_drin if k[0] == _sid and k[2] not in positionen]:
+                self._zone_drin.pop(k, None)
+            for pname, info in list(positionen.items()):
                 # Eine rein beim Hydrieren vorbelegte last_seen (siehe
                 # _hydrate_lesen) ist Vergangenheit - die wird noch NICHT
                 # bewertet, sonst gaebe es sofort nach einem Bot-Neustart einen
@@ -5781,20 +6200,25 @@ class DayZBot(discord.Client):
                 except ValueError:
                     continue
                 for zone in zones:
-                    if zone.get("type") == "polygon":
-                        pts = zone.get("points")
-                        inside = isinstance(pts, list) and _point_in_polygon(px, pz, pts)
-                    else:
-                        try:
-                            zx = float(zone.get("x", 0.0))
-                            zz = float(zone.get("z", 0.0))
-                            zr = float(zone.get("radius", 0.0))
-                        except (TypeError, ValueError):
-                            continue
-                        inside = (px - zx) ** 2 + (pz - zz) ** 2 <= zr * zr
-                    if not inside:
-                        continue
                     zkey = (_sid, str(zone["name"]).strip().lower(), pname)
+                    drin = _zone_enthaelt(zone, px, pz)
+                    war_drin = zkey in self._zone_drin
+                    if not drin:
+                        if war_drin:
+                            self._zone_drin.pop(zkey, None)
+                            await self._zone_ereignis_verarbeiten(
+                                _src, zone, "leave", pname, info.get("position"), None)
+                        continue
+                    if not war_drin:
+                        self._zone_drin[zkey] = now
+                        # Betreten: Ereignis-Filter/Bans/Ping laufen ueber den
+                        # Ereignis-Pfad; ein erfolgreicher Ping setzt dort den
+                        # Cooldown, damit die Wiederholung unten nicht sofort
+                        # ein zweites Mal pingt.
+                        await self._zone_ereignis_verarbeiten(
+                            _src, zone, "entry", pname, info.get("position"), None)
+                    if not _zone_wert(zone, "ping_on_detect"):
+                        continue
                     if _player_in_allowlist(zone, pname):
                         continue     # Namens-Allowlist: nie pingen
                     if await _player_hat_allowlist_rolle(zone, pname):
@@ -5810,18 +6234,233 @@ class DayZBot(discord.Client):
         except Exception as e:
             log.error(f"[ZONE] Zonen-Prüfung fehlgeschlagen: {e}")
 
+    async def _zonen_ereignis(self, ev: Dict, conn: Optional[ServerConnection],
+                              kopfgeld_offen: bool = False) -> None:
+        """Ein Log-Ereignis gegen die Zonen dieses Servers bewerten (aus
+        ``_dispatch``, nur mit Nebenwirkungen): Ereignis-Filter, Ereignis-
+        Pings, Auto-Bans innerhalb der Zone und "Hit/Kill zone" (Auto-Ban
+        AUSSERHALB aller Zonen). Faengt eigene Fehler ab."""
+        try:
+            if conn is None or not isinstance(getattr(conn, "data", None), dict):
+                return
+            zonen = [z for z in _zones(conn) if isinstance(z, dict) and z.get("name")
+                     and _zone_aktiv(z)]
+            if not zonen:
+                return
+            schluessel = _zone_ereignis_schluessel(ev, kopfgeld_offen)
+            if not schluessel:
+                return
+            etype = str(ev.get("type", ""))
+            # Handelnder: bei Kill/Treffer der Killer/Angreifer (seine
+            # Position entscheidet), sonst der genannte Spieler.
+            if etype in _ANGREIFER_KEYS:
+                pname = str(ev.get(_ANGREIFER_KEYS[etype][0]) or "")
+                xz = (_ev_position_xz(ev, conn.parser, "attacker")
+                      or _ev_position_xz(ev, conn.parser))
+                pos_str = ev.get(_ANGREIFER_KEYS[etype][1]) or ev.get("position")
+            else:
+                pname = str(ev.get("player") or "")
+                xz = _ev_position_xz(ev, conn.parser)
+                pos_str = ev.get("position")
+            if not pname or xz is None:
+                return
+            px, pz = xz
+            sid = conn.service_id
+            in_irgendeiner = False
+            for zone in zonen:
+                if not _zone_enthaelt(zone, px, pz):
+                    continue
+                in_irgendeiner = True
+                zkey = (sid, str(zone["name"]).strip().lower(), pname)
+                if zkey not in self._zone_drin and etype != "disconnect":
+                    # Ereignis in der Zone ohne vorheriges Positions-Sample:
+                    # zaehlt zugleich als Betreten.
+                    self._zone_drin[zkey] = time.time()
+                    await self._zone_ereignis_verarbeiten(conn, zone, "entry", pname,
+                                                          pos_str, ev)
+                for key in sorted(schluessel):
+                    await self._zone_ereignis_verarbeiten(conn, zone, key, pname, pos_str, ev)
+            if in_irgendeiner:
+                return
+            # Ausserhalb ALLER aktiven Zonen: "Hit zone"/"Kill zone".
+            flag = ("kill_outside_ban" if etype == "kill_pvp"
+                    else "hit_outside_ban" if etype == "damage" else None)
+            if flag is None:
+                return
+            if etype == "damage" and str(ev.get("attacker_id") or "") == "Umgebung":
+                return
+            waechter = [z for z in zonen if _zone_wert(z, flag)]
+            if not waechter:
+                return
+            for zone in waechter:
+                if _player_in_allowlist(zone, pname) or await _player_hat_allowlist_rolle(zone, pname):
+                    return      # in dieser Zone freigestellt -> kein Ban
+            grund = ("Kill außerhalb der Zonen" if etype == "kill_pvp"
+                     else "Treffer außerhalb der Zonen")
+            await self._zone_auto_ban(conn, waechter[0], pname, grund, ev, pos_str,
+                                      ereignis=("kill" if etype == "kill_pvp" else "hit"))
+        except Exception as e:  # noqa: BLE001 – darf den Dispatch nie stoeren
+            log.error(f"[ZONE] Ereignis-Prüfung fehlgeschlagen: {e}")
+
+    async def _zone_ereignis_verarbeiten(self, conn: Optional[ServerConnection], zone: Dict,
+                                         key: str, pname: str, pos_str: Optional[str],
+                                         ev: Optional[Dict]) -> None:
+        """Ein Zonen-Ereignis (``entry``/``leave``/``kill``/``hit``/...) fuer
+        EINE Zone: Filter anwenden, ggf. pingen, ggf. bannen."""
+        if not _zone_aktiv(zone):
+            return
+        if not _zone_ereignis_erlaubt(zone, key, pname, ev):
+            return
+        if _player_in_allowlist(zone, pname) or await _player_hat_allowlist_rolle(zone, pname):
+            return
+        sid = conn.service_id if conn is not None else ""
+        zk = str(zone["name"]).strip().lower()
+        now = time.time()
+        # Ping: Betreten immer (sofern Ping an), Verlassen nur bei Verbose,
+        # alle anderen Ereignisse mit 5-s-Daempfung je Spieler und Ereignis.
+        pingen = bool(_zone_wert(zone, "ping_on_detect"))
+        if key == "leave" and not _zone_wert(zone, "verbose"):
+            pingen = False
+        if pingen:
+            dk = (sid, zk, pname, key)
+            if now - self._zone_ev_ping.get(dk, 0.0) >= 5.0:
+                info = {"position": pos_str}
+                if await self._post_zone_ping(zone, pname, info, conn, ereignis=key, ev=ev):
+                    self._zone_ev_ping[dk] = now
+                    if key == "entry":
+                        self._zone_last_ping[(sid, zk, pname)] = now
+        if key in _zone_liste(zone, "ban_events"):
+            await self._zone_auto_ban(conn, zone, pname, f"Zone {zone['name']}: {key}",
+                                      ev, pos_str, ereignis=key)
+
+    async def _zone_auto_ban(self, conn: Optional[ServerConnection], zone: Dict, pname: str,
+                             grund: str, ev: Optional[Dict], pos_str: Optional[str],
+                             ereignis: str = "") -> bool:
+        """Automatischer Ban durch eine Zone - Immunitaet, Dedupe, Nitrado-
+        Banliste, Embed in den Zonen-Channel, Adminlog, Audit."""
+        if conn is None or conn.api is None or not pname:
+            return False
+        sid = conn.service_id
+        dk = (sid, pname.lower())
+        now = time.time()
+        if now - self._zone_ban_zuletzt.get(dk, 0.0) < 600:
+            return False
+        if await _spieler_ban_immun(conn, pname):
+            _audit_add("system", conn.name, "Zonen-Ban übersprungen",
+                      f"{pname}: Ban-Immunität ({grund}).")
+            return False
+        self._zone_ban_zuletzt[dk] = now
+        stunden = 0
+        expires_at = None
+        if _zone_wert(zone, "temp_ban"):
+            try:
+                stunden = max(1, int(_zone_wert(zone, "temp_ban_hours") or 24))
+            except (TypeError, ValueError):
+                stunden = 24
+            expires_at = now + stunden * 3600
+        hinzu, schon, fehler = await _ban_namen_hinzufuegen(
+            conn, [pname], grund, f"Zone {zone['name']}",
+            expires_at=expires_at, zone=str(zone["name"]), ereignis=ereignis)
+        farbe = _zone_farbe(zone)
+        if fehler:
+            e = discord.Embed(title="❌ Auto-Ban fehlgeschlagen",
+                              description=f"**{pname}** · {grund}\n`{fehler}`", color=0xE74C3C)
+            _audit_add("system", conn.name, "Zonen-Ban fehlgeschlagen",
+                      f"{pname}: {grund} – {fehler}", success=False)
+        else:
+            titel = "🔨 Auto-Ban (zeitlich)" if expires_at else "🔨 Auto-Ban"
+            e = discord.Embed(title=titel, description=f"**{pname}** wurde automatisch gebannt.",
+                              color=farbe)
+            e.add_field(name="Grund", value=grund, inline=False)
+            if expires_at:
+                e.add_field(name="Dauer", value=f"{stunden} h · endet <t:{int(expires_at)}:R>",
+                            inline=True)
+            if schon and not hinzu:
+                e.add_field(name="Nitrado", value="ℹ️ stand bereits auf der Banliste", inline=True)
+            if _zone_wert(zone, "verbose") and ev is not None:
+                roh = str(ev.get("raw") or "")[:300]
+                if roh:
+                    e.add_field(name="Logzeile", value=f"`{roh}`", inline=False)
+            e.set_footer(text="Änderung greift ggf. erst nach einem Server-Neustart.")
+            _audit_add("system", conn.name, "Zonen-Auto-Ban",
+                      f"{pname}: {grund}" + (f" ({stunden} h)" if expires_at else ""))
+        e.timestamp = datetime.now(timezone.utc)
+        gid = None
+        try:
+            gid = int(zone.get("guild_id") or 0) or None
+        except (TypeError, ValueError):
+            gid = None
+        if gid is None or gid not in conn.guild_ids:
+            gid = int(conn.guild_id) if conn.guild_ids else None
+        if gid is not None:
+            zone_ch = zone.get("channel_id")
+            if zone_ch:
+                await _post_feed(gid, "zone", e, channel_id=int(zone_ch), service_id=sid)
+            await _post_feed(gid, "adminlog", e, service_id=sid)
+        return not fehler
+
     async def _post_zone_ping(self, zone: Dict, player: str, info: Dict,
-                              conn: Optional[ServerConnection] = None) -> bool:
+                              conn: Optional[ServerConnection] = None,
+                              ereignis: Optional[str] = None,
+                              ev: Optional[Dict] = None) -> bool:
         # Damit der iZurvive-Link die Karte DIESES Servers benutzt und nicht
         # die global eingestellte (siehe _aktuelle_karte).
         _setze_aktuellen_server(conn)
-        e = discord.Embed(
-            title="🛡️ • Ping On Detection",
-            description=f"**{player}** was located within the zone **{zone['name']}**.",
-            color=0x9B59B6)
-        loc = _location_field_value(info.get("position"))
+        if ereignis and ereignis != "entry":
+            label = _ZONE_EREIGNIS_LABEL.get(ereignis, (ereignis, ereignis))[0]
+            titel = f"🛡️ • Zone: {label}"
+            beschreibung = (f"**{player}** · **{label}** in Zone **{zone['name']}**.")
+        else:
+            titel = "🛡️ • Ping On Detection"
+            beschreibung = f"**{player}** was located within the zone **{zone['name']}**."
+        e = discord.Embed(title=titel, description=beschreibung, color=_zone_farbe(zone))
+        loc = None
+        if _zone_wert(zone, "ping_location") and not _position_privat(conn, player):
+            loc = _location_field_value(info.get("position"))
         if loc:
             e.add_field(name="📍 • Player Location", value=loc, inline=False)
+        if _zone_wert(zone, "verbose") and ev is not None:
+            details = []
+            for feld, name in (("weapon", "Waffe"), ("distance", "Distanz"), ("item", "Gegenstand"),
+                               ("victim", "Opfer"), ("attacker", "Angreifer"), ("killer", "Killer"),
+                               ("cause", "Ursache"), ("emote", "Emote"), ("hit_zone", "Körperteil")):
+                wert = ev.get(feld)
+                if wert and str(wert) not in ("?", "Unbekannt"):
+                    details.append(f"**{name}:** {wert}")
+            if details:
+                e.add_field(name="🔎 Details", value="\n".join(details)[:1000], inline=False)
+            roh = str(ev.get("raw") or "")[:300]
+            if roh:
+                e.add_field(name="Logzeile", value=f"`{roh}`", inline=False)
+        # Ping-Auszahlung: Geld an den erkannten, in dieser Guild verknuepften
+        # Spieler (0 = keine).
+        try:
+            betrag = int(_zone_wert(zone, "ping_payout") or 0)
+        except (TypeError, ValueError):
+            betrag = 0
+        if betrag > 0 and zone.get("guild_id") and conn is not None:
+            try:
+                gid_pay = int(zone["guild_id"])
+                loop = asyncio.get_running_loop()
+                links = await loop.run_in_executor(None, db.links_for_name, player, gid_pay)
+                for lk in links:
+                    uid = int(lk["user_id"])
+                    await loop.run_in_executor(None, db.add_wallet, gid_pay, uid, betrag)
+                    e.add_field(name="💰 Ping-Auszahlung",
+                                value=f"+{_fmt_money(betrag, conn)} → <@{uid}>", inline=False)
+                    break
+            except Exception as ex:  # noqa: BLE001
+                log.warning(f"[ZONE] Ping-Auszahlung fehlgeschlagen: {ex}")
+        # Kopfgeld in der Zone: eigener Hinweis, wenn auf den Spieler ein
+        # offenes Kopfgeld >= Mindestbetrag liegt.
+        if _zone_wert(zone, "bounty_ping") and zone.get("guild_id"):
+            try:
+                summe = _offenes_kopfgeld(int(zone["guild_id"]), player)
+                if summe >= max(0, int(_zone_wert(zone, "bounty_min") or 0)) and summe > 0:
+                    e.add_field(name="🎯 Kopfgeld", value=f"**{_fmt_money(summe, conn)}** offen auf **{player}**",
+                                inline=False)
+            except Exception as ex:  # noqa: BLE001
+                log.warning(f"[ZONE] Kopfgeld-Prüfung fehlgeschlagen: {ex}")
         if zone.get("type") == "polygon":
             zone_val = f"Polygon · {len(zone.get('points') or [])} Punkte"
         else:
@@ -5978,6 +6617,8 @@ class DayZBot(discord.Client):
                 ok, msg = await conn.api.restart()
             except Exception as ex:  # noqa: BLE001
                 ok, msg = False, str(ex)
+            if ok:
+                conn.neustart_markieren()
             log.info(f"[AUTO-RESTART] {conn.name}: Neustart ausgelöst: ok={ok} – {msg}")
             e = discord.Embed(
                 title="🔄 Server wird jetzt neu gestartet" if ok
@@ -6095,6 +6736,8 @@ class DayZBot(discord.Client):
                 return False, "Keine Nitrado-Verbindung.", None
             try:
                 ok_, msg = await conn.api.restart()
+                if ok_:
+                    conn.neustart_markieren()
                 return ok_, msg, None
             except Exception as e:  # noqa: BLE001
                 return False, str(e), None
@@ -6296,6 +6939,55 @@ class DayZBot(discord.Client):
     @giveaways_loop.before_loop
     async def _before_giveaways_loop(self):
         await self.wait_until_ready()
+
+    @tasks.loop(minutes=5)
+    async def temp_unban_loop(self):
+        """Zeitlich begrenzte Bans (Zonen-Auto-Ban mit ``temp_ban``) wieder
+        aufheben, sobald ``expires_at`` erreicht ist. Laeuft nur, solange der
+        Bot laeuft - ein abgelaufener Ban wird beim naechsten Durchlauf nach
+        dem Start nachgeholt."""
+        try:
+            await self._temp_unban_once()
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stoppen
+            log.error(f"[TEMP-BAN] Fehler: {e}")
+
+    @temp_unban_loop.before_loop
+    async def _before_temp_unban_loop(self):
+        await self.wait_until_ready()
+
+    async def _temp_unban_once(self):
+        jetzt = time.time()
+        for conn in connections.all():
+            if conn.api is None:
+                continue
+            eimer = _bans_of(conn)
+            faellig = [k for k, v in eimer.items()
+                       if isinstance(v, dict) and v.get("expires_at")
+                       and float(v.get("expires_at") or 0) <= jetzt]
+            if not faellig:
+                continue
+            try:
+                entfernt, _nicht, fehler = await _ban_namen_entfernen(conn, faellig)
+            except Exception as e:  # noqa: BLE001 – ein Server darf die anderen nicht stoppen
+                log.error(f"[TEMP-BAN] {conn.name}: {e}")
+                continue
+            if fehler:
+                log.warning(f"[TEMP-BAN] {conn.name}: {fehler}")
+                continue
+            # Metadaten auch fuer Namen loeschen, die Nitrado gar nicht mehr
+            # kannte (von Hand entfernt) - sonst bliebe der Eintrag ewig.
+            for k in faellig:
+                eimer.pop(k, None)
+            cfg.save_bans()
+            e = discord.Embed(
+                title="⏳ Zeitlicher Ban abgelaufen",
+                description="\n".join(f"`{n}`" for n in faellig),
+                color=0x2ECC71)
+            e.set_footer(text=f"{conn.name} · Änderung greift ggf. erst nach einem Server-Neustart.")
+            e.timestamp = datetime.now(timezone.utc)
+            if conn.guild_ids:
+                await _post_feed(conn.guild_ids, "adminlog", e, service_id=conn.service_id)
+            _audit_add("system", conn.name, "Temp-Ban aufgehoben", ", ".join(faellig))
 
     async def _giveaways_once(self):
         for conn in connections.all():
@@ -6990,8 +7682,24 @@ class DayZBot(discord.Client):
                            service_id=(conn.service_id if conn is not None else None))
             except Exception:
                 pass
+            # Offenes Kopfgeld auf das Opfer VOR den Rewards festhalten - die
+            # loesen es sofort ein, danach waere "Kill ohne Kopfgeld" nicht
+            # mehr von "Kill mit Kopfgeld" zu unterscheiden (Zonen-Filter).
+            kopfgeld_offen = False
+            if ev.get("type") == "kill_pvp" and conn is not None and ev.get("victim"):
+                try:
+                    kopfgeld_offen = any(_offenes_kopfgeld(int(g), str(ev["victim"])) > 0
+                                         for g in conn.guild_ids)
+                except Exception:  # noqa: BLE001
+                    kopfgeld_offen = False
             # Kill-Statistik, Sessions, Kill-Belohnung & Bounties verarbeiten
             rewards = await self._process_event_rewards(ev, conn)
+            # Zonen: Ereignis-Filter, Ereignis-Pings, Auto-Bans
+            await self._zonen_ereignis(ev, conn, kopfgeld_offen)
+            # Heatmap-Punkte (SQLite, je Typ gedeckelt)
+            await self._heatmap_aufzeichnen(ev, conn)
+            # Combat-Log / Rage-Quit / Killstreak als abgeleitete Ereignisse
+            await self._feed_erweiterungen(ev, conn)
         _p = conn.parser if conn is not None else self.parser
         embed = EmbedBuilder.build(ev, _p.player_positions if _p else None)
         if not embed:
@@ -7052,6 +7760,43 @@ class DayZBot(discord.Client):
                 log.warning(f"[DISPATCH] Channel {ch_id} in Guild {gid_str} nicht gefunden")
                 self._dispatch_merken(conn, ev, "Channel nicht gefunden (ID veraltet?)",
                                      feed_typ=treffer_schluessel, channel=str(ch_id))
+
+    async def _feed_erweiterungen(self, ev: Dict, conn: Optional[ServerConnection]) -> None:
+        """Combat-Log, Rage-Quit und Killstreak aus der Ereignisfolge ableiten
+        und als eigene Ereignisse posten (ohne Nebenwirkungen - kein doppeltes
+        Buchen). Die Regeln stehen in ``_verhalten_auswerten``."""
+        if conn is None or not hasattr(conn, "kampf_zustand"):
+            return
+        try:
+            abgeleitet = _verhalten_auswerten(ev, conn)
+        except Exception as e:  # noqa: BLE001
+            log.error(f"[VERHALTEN] {conn.name}: {e}")
+            return
+        for synth in abgeleitet:
+            try:
+                await self._dispatch(synth, conn, nebenwirkungen=False)
+            except Exception as e:  # noqa: BLE001
+                log.error(f"[VERHALTEN] {conn.name}: Posten von {synth.get('type')}: {e}")
+
+    async def _heatmap_aufzeichnen(self, ev: Dict, conn: Optional[ServerConnection]) -> None:
+        if conn is None:
+            return
+        try:
+            typ = _heatmap_typ(ev)
+            if not typ:
+                return
+            xz = _ev_position_xz(ev, conn.parser)
+            if xz is None:
+                return
+            limit = _heatmap_limit(conn, typ)
+            if limit <= 0:
+                return
+            spieler = (ev.get("player") or ev.get("victim") or "")
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, db.heatmap_add, conn.service_id, typ,
+                                       xz[0], xz[1], str(spieler), limit)
+        except Exception as e:  # noqa: BLE001 – darf den Dispatch nie stoeren
+            log.error(f"[HEATMAP] {conn.name}: {e}")
 
     async def _process_event_rewards(self, ev: Dict,
                                      conn: Optional[ServerConnection] = None) -> Dict[int, str]:
@@ -7340,6 +8085,8 @@ _SUBCMD_DEFS: Tuple[Tuple[str, str, str, str, str], ...] = (
     ("ticket_clear_stale", "Discord Management", "Discord Management", "/ticket clear_stale – Räumt verwaiste Ticket-Sperren auf (zusätzlich zu Administrator)", "/ticket clear_stale – Clears stale ticket locks (in addition to Administrator)"),
     ("hackban", "Bans & Whitelist", "Bans & Whitelist", "/hackban – Bannt per Discord User-ID", "/hackban – Bans by Discord user ID"),
     ("admin_position", "Diagnose", "Diagnostics", "/admin_position – Letzte Spieler-Positionen", "/admin_position – Last known player positions"),
+    ("location", "Diagnose", "Diagnostics", "/location – Letzte Position eines Spielers", "/location – Last known position of a player"),
+    ("heatmap", "Diagnose", "Diagnostics", "/heatmap – Heatmap eines Ereignistyps als Kartenbild", "/heatmap – Heatmap of an event type as a map image"),
     ("spieler_suche", "Diagnose", "Diagnostics", "/spieler_suche – Sucht einen Spieler in den Logs", "/spieler_suche – Searches for a player in the logs"),
     ("raw_log", "Diagnose", "Diagnostics", "/raw_log – Zeigt die letzten Log-Zeilen", "/raw_log – Shows the latest log lines"),
     ("change_damage_settings", "Einstellungen", "Settings", "/change_damage_settings – Schaltet Base-/Container-Schaden", "/change_damage_settings – Toggles base/container damage"),
@@ -7821,6 +8568,8 @@ async def cmd_neustart(interaction: discord.Interaction,
         return
     await interaction.response.defer()
     ok, msg = await conn.api.restart()
+    if ok:
+        conn.neustart_markieren()
     embed = discord.Embed(
         title=_t(interaction, "🔄 Server Neustart", "🔄 Server Restart"),
         description=msg,
@@ -7846,6 +8595,8 @@ async def cmd_stoppen(interaction: discord.Interaction,
         return
     await interaction.response.defer()
     ok, msg = await conn.api.stop()
+    if ok:
+        conn.stopp_markieren(f"/stoppen {interaction.user}")
     embed = discord.Embed(
         title=_t(interaction, "⏹️ Server gestoppt", "⏹️ Server Stopped"),
         description=msg,
@@ -8677,7 +9428,7 @@ def _allowlist_aus_anfrage(data: Dict) -> Optional[List[str]]:
             continue
         gesehen.add(name.lower())
         namen.append(name)
-        if len(namen) >= 200:
+        if len(namen) >= _ZONE_MAX_WHITELIST:
             break
     return namen
 
@@ -8765,6 +9516,13 @@ def _zone_payload(z: Dict) -> Dict:
     if out["type"] == "polygon":
         pts = z.get("points")
         out["points"] = pts if isinstance(pts, list) else []
+    for feld, vorgabe in _ZONE_FELD_VORGABEN.items():
+        out[feld] = _zone_wert(z, feld)
+    for feld in _ZONE_LISTEN_FELDER:
+        out[feld] = _zone_liste(z, feld)
+    manager = z.get("manager_ids")
+    out["manager_ids"] = [str(m) for m in manager] if isinstance(manager, list) else []
+    out["lists"] = _zone_listen(z)
     return out
 
 
@@ -8802,7 +9560,23 @@ def _point_in_polygon(px: float, pz: float, points: List[Dict]) -> bool:
     return inside
 
 
-def _validate_zone_points(points: Any) -> Optional[str]:
+def _zone_enthaelt(zone: Dict, px: float, pz: float) -> bool:
+    """Liegt der Punkt (Ost ``px``, Nord ``pz``) in der Zone? Kreis
+    (``x``/``z``/``radius``) oder Polygon (``type == "polygon"``, ``points``).
+    Unbrauchbare Zonenwerte zaehlen als "nicht drin" statt zu werfen."""
+    if zone.get("type") == "polygon":
+        pts = zone.get("points")
+        return isinstance(pts, list) and _point_in_polygon(px, pz, pts)
+    try:
+        zx = float(zone.get("x", 0.0))
+        zz = float(zone.get("z", 0.0))
+        zr = float(zone.get("radius", 0.0))
+    except (TypeError, ValueError):
+        return False
+    return (px - zx) ** 2 + (pz - zz) ** 2 <= zr * zr
+
+
+def _validate_zone_points(points: Any, welt: float = 20000.0) -> Optional[str]:
     """Gibt eine Fehlermeldung zurück oder None, wenn die Polygon-Punkte ok sind."""
     if not isinstance(points, list) or len(points) < 3:
         return "❌ Ein Polygon braucht mindestens 3 Koordinatenpunkte."
@@ -8813,7 +9587,7 @@ def _validate_zone_points(points: Any) -> Optional[str]:
             px, pz = float(p.get("x")), float(p.get("z"))
         except (TypeError, ValueError):
             return "❌ Jeder Polygon-Punkt braucht Zahlen für `x` und `z`."
-        if not (0.0 <= px <= 20000.0 and 0.0 <= pz <= 20000.0):
+        if not (0.0 <= px <= welt and 0.0 <= pz <= welt):
             return "❌ Ein Polygon-Punkt liegt außerhalb der Map."
     return None
 
@@ -8844,14 +9618,393 @@ async def _zone_name_autocomplete(interaction: discord.Interaction, current: str
                 name=f"{nm} – {c.name}"[:100] if mehrere else nm, value=nm))
     return out[:25]
 
-def _validate_zone_geometry(x: float, z: float, radius: float) -> Optional[str]:
-    """Gibt eine Fehlermeldung zurück oder None, wenn alles ok ist."""
-    if not (0.0 <= x <= 20000.0 and 0.0 <= z <= 20000.0):
+def _validate_zone_geometry(x: float, z: float, radius: float,
+                            welt: float = 20000.0) -> Optional[str]:
+    """Gibt eine Fehlermeldung zurück oder None, wenn alles ok ist.
+    ``welt`` ist die Kantenlaenge der Karte (``_world_size``)."""
+    if not (0.0 <= x <= welt and 0.0 <= z <= welt):
         return ("❌ Koordinaten außerhalb der Map. Gib die beiden iZurvive-Zahlen "
                 "als `x` (Ost) und `z` (Nord) an, z. B. `x: 4522` `z: 9638`.")
-    if not (10.0 <= radius <= 10000.0):
-        return "❌ Radius muss zwischen **10** und **10000** Metern liegen."
+    if not (1.0 <= radius <= 15000.0):
+        return "❌ Radius muss zwischen **1** und **15000** Metern liegen."
     return None
+
+
+# ══════════════════════════════════════════════════════════════
+#  Zonen-Editor: Ereignisse, Filter, Auto-Bans (Vorbild DayZ++)
+# ══════════════════════════════════════════════════════════════
+# (key, Gruppe, Label_de, Label_en, im Konsolen-ADM erkennbar?)
+ZONE_EREIGNISSE: Tuple[Tuple[str, str, str, str, bool], ...] = (
+    ("entry", "presence", "Betreten", "Entry", True),
+    ("leave", "presence", "Verlassen", "Leave", True),
+    ("login", "presence", "Login", "Login", True),
+    ("connect", "presence", "Verbindung", "Connect", True),
+    ("disconnect", "presence", "Trennung", "Disconnect", True),
+    ("kill", "presence", "Kill (ohne Kopfgeld)", "Kill (no bounty)", True),
+    ("kill_ignore_bounty", "presence", "Kill (auch mit Kopfgeld)", "Kill (incl. bounty)", True),
+    ("hit", "presence", "Treffer", "Hit", True),
+    ("npc_kill", "presence", "NPC-Kill", "NPC kill", False),
+    ("emote", "presence", "Emote", "Emote", True),
+    ("unconscious", "presence", "Bewusstlos", "Unconscious", True),
+    ("build", "build", "Bauen", "Build", True),
+    ("dismantle", "build", "Abbauen", "Dismantle", True),
+    ("place", "build", "Platzieren", "Place", True),
+    ("pack", "build", "Einpacken", "Pack", True),
+    ("fold", "build", "Zusammenfalten", "Fold", True),
+    ("repair", "build", "Reparieren", "Repair", True),
+    ("mount", "build", "Anbringen", "Mount", True),
+    ("unmount", "build", "Abnehmen", "Unmount", True),
+    ("bury", "build", "Vergraben", "Bury", True),
+    ("unbury", "build", "Ausgraben", "Unbury", True),
+    ("flag_raise", "build", "Flagge hissen", "Flag raise", True),
+    ("flag_lower", "build", "Flagge senken", "Flag lower", True),
+    ("respawn", "deaths", "Respawn", "Respawn", False),
+    ("pvp_respawn", "deaths", "PvP-Respawn", "PvP respawn", False),
+    ("suicide_death", "deaths", "Selbstmord", "Suicide", True),
+    ("explosion_suicide_death", "deaths", "Selbstmord (Explosion)", "Explosion suicide", True),
+    ("zombie_death", "deaths", "Zombie-Tod", "Zombie death", True),
+    ("wolf_death", "deaths", "Wolf-Tod", "Wolf death", True),
+    ("bear_death", "deaths", "Bären-Tod", "Bear death", True),
+    ("fall_death", "deaths", "Sturz-Tod", "Fall death", True),
+    ("fire_death", "deaths", "Feuer-Tod", "Fire death", True),
+    ("explosion_death", "deaths", "Explosions-Tod", "Explosion death", True),
+    ("trap_death", "deaths", "Fallen-Tod", "Trap death", True),
+    ("barbed_wire_death", "deaths", "Stacheldraht-Tod", "Barbed wire death", True),
+    ("vehicle_death", "deaths", "Fahrzeug-Tod", "Vehicle death", True),
+    ("bleed_out_death", "deaths", "Verblutet", "Bleed out", True),
+    ("unknown_death", "deaths", "Unbekannter Tod", "Unknown death", True),
+)
+ZONE_EREIGNIS_KEYS = frozenset(k for k, *_ in ZONE_EREIGNISSE)
+_ZONE_EREIGNIS_LABEL: Dict[str, Tuple[str, str]] = {k: (de, en) for k, _g, de, en, _v in ZONE_EREIGNISSE}
+_ZONE_GRUPPEN = (("presence", "Präsenz & Kampf", "Presence & Combat"),
+                 ("build", "Bau & Interaktion", "Build & Interaction"),
+                 ("deaths", "Tode", "Deaths"))
+
+# Auslieferungs-Vorgaben der Editor-Felder. Gespeicherte Altzonen werden
+# NICHT umgeschrieben - _zone_payload/_zone_wert lesen die Vorgabe.
+_ZONE_FELD_VORGABEN: Dict[str, Any] = {
+    "active": True, "verbose": False, "color": "9B59B6",
+    "ping_on_detect": True, "ping_payout": 0, "ping_location": True,
+    "bounty_ping": False, "bounty_min": 0,
+    "hit_outside_ban": False, "kill_outside_ban": False,
+    "temp_ban": False, "temp_ban_hours": 24,
+}
+_ZONE_BOOL_FELDER = ("active", "verbose", "ping_on_detect", "ping_location", "bounty_ping",
+                     "hit_outside_ban", "kill_outside_ban", "temp_ban")
+_ZONE_LISTEN_FELDER = ("ban_events", "ignored_events", "allowed_events")
+_ZONE_LISTEN_FELD_WERTE = ("player", "weapon", "item", "attacker")
+_ZONE_MAX_ROLLEN = 5
+_ZONE_MAX_VERWALTER = 5
+_ZONE_MAX_WHITELIST = 5000
+_ZONE_MAX_LISTEN = 5
+_ZONE_MAX_LISTENWERTE = 200
+_ZONE_MAX_NAME = 20
+_HEX_FARBE_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
+
+
+def _zone_wert(zone: Dict, feld: str) -> Any:
+    """Editor-Feld einer Zone mit Auslieferungs-Vorgabe fuer Altbestand."""
+    wert = zone.get(feld)
+    if wert is None:
+        return _ZONE_FELD_VORGABEN.get(feld)
+    return wert
+
+
+def _zone_aktiv(zone: Dict) -> bool:
+    return bool(_zone_wert(zone, "active"))
+
+
+def _zone_liste(zone: Dict, feld: str) -> List[str]:
+    wert = zone.get(feld)
+    return [str(v) for v in wert] if isinstance(wert, list) else []
+
+
+def _zone_farbe(zone: Dict) -> int:
+    m = _HEX_FARBE_RE.match(str(_zone_wert(zone, "color") or ""))
+    try:
+        return int(m.group(1), 16) if m else 0x9B59B6
+    except ValueError:
+        return 0x9B59B6
+
+
+def _zone_listen(zone: Dict) -> List[Dict[str, Any]]:
+    roh = zone.get("lists")
+    out: List[Dict[str, Any]] = []
+    if not isinstance(roh, list):
+        return out
+    for l in roh:
+        if isinstance(l, dict) and isinstance(l.get("values"), list):
+            out.append(l)
+    return out
+
+
+def _position_privat(conn: Optional[ServerConnection], name: str) -> bool:
+    """Location Privacy: Position dieses Spielers nirgends zeigen."""
+    if conn is None or not name:
+        return False
+    daten = getattr(conn, "data", None)
+    namen = daten.get("location_privacy_names") if isinstance(daten, dict) else None
+    if not isinstance(namen, list):
+        return False
+    key = name.strip().lower()
+    return any(str(n).strip().lower() == key for n in namen)
+
+
+def _offenes_kopfgeld(guild_id: int, name: str) -> int:
+    """Summe offener Kopfgelder auf einen Spielernamen in dieser Guild."""
+    key = (name or "").strip().lower()
+    if not key:
+        return 0
+    for row in db.open_bounties(int(guild_id)):
+        if str(row["target_name"]).strip().lower() == key:
+            return int(row["total"] or 0)
+    return 0
+
+
+def _zone_ereignis_schluessel(ev: Dict, kopfgeld_offen: bool = False) -> Set[str]:
+    """Welche Zonen-Ereignis-Schluessel (``ZONE_EREIGNISSE``) ein geparstes
+    Log-Ereignis ausloest. Leere Menge = kein Zonen-Ereignis."""
+    t = str(ev.get("type", ""))
+    if t == "kill_pvp":
+        out = {"kill_ignore_bounty"}
+        if not kopfgeld_offen:
+            out.add("kill")
+        return out
+    if t == "damage":
+        if str(ev.get("attacker_id") or "") == "Umgebung" or not ev.get("attacker"):
+            return set()
+        return {"hit"}
+    if t == "suicide":
+        out = {"suicide_death"}
+        roh = str(ev.get("raw") or "").lower()
+        if "blew" in roh or "explo" in roh or "grenade" in roh:
+            out.add("explosion_suicide_death")
+        return out
+    if t in ("kill_env", "basebuild"):
+        key = _feed_key(ev)
+        return {key} if key in ZONE_EREIGNIS_KEYS else set()
+    if t == "connect":
+        return {"login", "connect"}
+    if t in ("disconnect", "emote", "unconscious"):
+        return {t}
+    return set()
+
+
+def _zone_ereignis_erlaubt(zone: Dict, key: str, pname: str, ev: Optional[Dict]) -> bool:
+    """Ereignis-Filter einer Zone: ignorierte/erlaubte Ereignisse und die
+    Include-/Exclude-Listen (Spieler, Waffe, Gegenstand, Angreifer)."""
+    if key in _zone_liste(zone, "ignored_events"):
+        return False
+    erlaubt = _zone_liste(zone, "allowed_events")
+    if erlaubt and key not in erlaubt:
+        return False
+    for l in _zone_listen(zone):
+        feld = str(l.get("field") or "player")
+        if feld == "player":
+            wert = pname
+        elif ev is None:
+            continue
+        elif feld == "attacker":
+            wert = ev.get("attacker") or ev.get("killer") or ""
+        else:
+            wert = ev.get(feld) or ""
+        wert = str(wert).strip().lower()
+        werte = {str(v).strip().lower() for v in l.get("values") or []}
+        drin = wert in werte
+        modus = str(l.get("mode") or "exclude")
+        if modus == "include" and not drin:
+            return False
+        if modus == "exclude" and drin:
+            return False
+    return True
+
+
+async def _spieler_ban_immun(conn: ServerConnection, pname: str) -> bool:
+    """Ban-Immunitaet: der Spieler ist in einer Guild dieses Servers mit einem
+    Discord-Konto verknuepft, das eine der ``ban_immune_role_ids`` traegt."""
+    daten = getattr(conn, "data", None)
+    rollen = daten.get("ban_immune_role_ids") if isinstance(daten, dict) else None
+    if not isinstance(rollen, list) or not rollen:
+        return False
+    for gid in conn.guild_ids:
+        try:
+            rows = db.links_for_name(pname, int(gid))
+        except Exception:  # noqa: BLE001
+            continue
+        for row in rows:
+            try:
+                uid = int(row["user_id"])
+            except (TypeError, ValueError, KeyError, IndexError):
+                continue
+            for rid in rollen:
+                try:
+                    if await _user_hat_rolle(int(gid), uid, int(rid)):
+                        return True
+                except (TypeError, ValueError):
+                    continue
+    return False
+
+
+async def _ban_namen_hinzufuegen(conn: ServerConnection, namen: List[str], grund: str,
+                                 von: str, *, expires_at: Optional[float] = None,
+                                 zone: Optional[str] = None, ereignis: Optional[str] = None
+                                 ) -> Tuple[List[str], List[str], Optional[str]]:
+    """Kern von ``/ban`` und der Zonen-Auto-Bans: Nitrado-Banliste lesen,
+    fehlende Namen anhaengen, schreiben, lokale Metadaten pflegen.
+    Rueckgabe ``(hinzugefuegt, bereits_drauf, fehler)`` - bei ``fehler`` wurde
+    NICHTS geschrieben (Read-before-write: nie eine unlesbare Liste leeren)."""
+    try:
+        current, category, key = await _read_banlist(conn)
+    except Exception as e:  # noqa: BLE001
+        return [], [], f"Nitrado-Banliste konnte nicht gelesen werden: {e}"
+    existing_lower = {n.lower() for n in current}
+    hinzu = [n for n in namen if n.lower() not in existing_lower]
+    schon = [n for n in namen if n.lower() in existing_lower]
+    if hinzu:
+        ok_, msg = await _write_banlist(conn, current + hinzu, category, key)
+        if not ok_:
+            return [], schon, f"Nitrado-Banliste konnte nicht gespeichert werden: {msg}"
+    now = datetime.now(timezone.utc).isoformat()
+    eimer = _bans_of(conn)
+    for n in hinzu:
+        eintrag: Dict[str, Any] = {"name": n, "reason": grund, "banned_by": von, "banned_at": now}
+        if expires_at:
+            eintrag["expires_at"] = float(expires_at)
+        if zone:
+            eintrag["zone"] = zone
+        if ereignis:
+            eintrag["ereignis"] = ereignis
+        eimer[n] = eintrag
+    if hinzu:
+        cfg.save_bans()
+    return hinzu, schon, None
+
+
+async def _ban_namen_entfernen(conn: ServerConnection, namen: List[str]
+                               ) -> Tuple[List[str], List[str], Optional[str]]:
+    """Kern von ``/ban_entfernen`` und der Temp-Unban-Schleife.
+    Rueckgabe ``(entfernt, nicht_gefunden, fehler)``."""
+    try:
+        current, category, key = await _read_banlist(conn)
+    except Exception as e:  # noqa: BLE001
+        return [], [], f"Nitrado-Banliste konnte nicht gelesen werden: {e}"
+    wanted_lower = {n.lower() for n in namen}
+    new_list = [n for n in current if n.lower() not in wanted_lower]
+    removed = [n for n in current if n.lower() in wanted_lower]
+    not_found = [n for n in namen if n.lower() not in {r.lower() for r in removed}]
+    if removed:
+        ok_, msg = await _write_banlist(conn, new_list, category, key)
+        if not ok_:
+            return [], not_found, f"Nitrado-Banliste konnte nicht gespeichert werden: {msg}"
+        eimer = _bans_of(conn)
+        for local_key in [k for k in eimer if k.lower() in wanted_lower]:
+            eimer.pop(local_key, None)
+        cfg.save_bans()
+    return removed, not_found, None
+
+
+def _zone_verwalter(interaction: discord.Interaction, zone: Dict) -> bool:
+    """Darf dieser Discord-Nutzer die Whitelist dieser Zone per Befehl
+    pflegen (``manager_ids`` im Zonen-Editor)?"""
+    ids = zone.get("manager_ids")
+    if not isinstance(ids, list):
+        return False
+    uid = str(interaction.user.id)
+    return any(str(i) == uid for i in ids)
+
+
+def _zone_felder_uebernehmen(zone: Dict, data: Dict) -> Optional[str]:
+    """Die Editor-Felder (Detection, Access, Bans, Ereignis-Filter, Listen)
+    aus dem Formular pruefen und in ``zone`` schreiben. Nur mitgeschickte
+    Felder werden geaendert. Rueckgabe: Fehlermeldung oder None."""
+    for feld in _ZONE_BOOL_FELDER:
+        if feld in data:
+            if not isinstance(data[feld], bool):
+                return f"{feld} muss true oder false sein."
+            zone[feld] = data[feld]
+    for feld, lo, hi in (("ping_payout", 0, 1_000_000_000), ("bounty_min", 0, 1_000_000_000),
+                         ("temp_ban_hours", 1, 8760)):
+        if feld in data and data[feld] is not None:
+            try:
+                wert = int(data[feld])
+            except (TypeError, ValueError):
+                return f"{feld} muss eine ganze Zahl sein."
+            if not (lo <= wert <= hi):
+                return f"{feld} muss zwischen {lo} und {hi} liegen."
+            zone[feld] = wert
+    if "color" in data:
+        m = _HEX_FARBE_RE.match(str(data.get("color") or ""))
+        if not m:
+            return "Farbe muss ein Hex-Wert wie #9B59B6 sein."
+        zone["color"] = m.group(1).upper()
+    for feld in _ZONE_LISTEN_FELDER:
+        if feld in data:
+            roh = data[feld]
+            if not isinstance(roh, list):
+                return f"{feld} muss eine Liste sein."
+            keys: List[str] = []
+            for k in roh:
+                k = str(k).strip()
+                if k not in ZONE_EREIGNIS_KEYS:
+                    return f"Unbekanntes Ereignis '{k}' in {feld}."
+                if k not in keys:
+                    keys.append(k)
+            zone[feld] = keys
+    if "manager_ids" in data:
+        roh = data["manager_ids"]
+        if not isinstance(roh, list):
+            return "manager_ids muss eine Liste sein."
+        if len(roh) > _ZONE_MAX_VERWALTER:
+            return f"Höchstens {_ZONE_MAX_VERWALTER} Verwalter."
+        ids: List[str] = []
+        for r in roh:
+            try:
+                wert = str(int(r))
+            except (TypeError, ValueError):
+                return "Verwalter-ID muss eine Zahl sein."
+            if wert not in ids:
+                ids.append(wert)
+        zone["manager_ids"] = ids
+    if "lists" in data:
+        roh = data["lists"]
+        if not isinstance(roh, list):
+            return "lists muss eine Liste sein."
+        if len(roh) > _ZONE_MAX_LISTEN:
+            return f"Höchstens {_ZONE_MAX_LISTEN} Listen."
+        listen: List[Dict[str, Any]] = []
+        for l in roh:
+            if not isinstance(l, dict):
+                return "Jede Liste braucht name, mode, field und values."
+            name = str(l.get("name") or "").strip()[:40]
+            modus = str(l.get("mode") or "exclude").strip().lower()
+            feld = str(l.get("field") or "player").strip().lower()
+            werte_roh = l.get("values")
+            if modus not in ("include", "exclude"):
+                return "mode muss include oder exclude sein."
+            if feld not in _ZONE_LISTEN_FELD_WERTE:
+                return "field muss player, weapon, item oder attacker sein."
+            if not isinstance(werte_roh, list):
+                return "values muss eine Liste sein."
+            werte: List[str] = []
+            gesehen: set = set()
+            for w in werte_roh:
+                w = str(w).strip()[:64]
+                if w and w.lower() not in gesehen:
+                    gesehen.add(w.lower())
+                    werte.append(w)
+                if len(werte) >= _ZONE_MAX_LISTENWERTE:
+                    break
+            listen.append({"name": name or f"Liste {len(listen) + 1}", "mode": modus,
+                           "field": feld, "values": werte})
+        zone["lists"] = listen
+    return None
+
+
+def _zone_ereignisse_payload() -> List[Dict[str, Any]]:
+    """Fuer das Formular: alle Zonen-Ereignisse mit Gruppe, Labels und
+    ``verfuegbar`` (False = im Konsolen-ADM nicht erkennbar, ausgegraut)."""
+    return [{"key": k, "gruppe": g, "label_de": de, "label_en": en, "verfuegbar": v}
+            for k, g, de, en, v in ZONE_EREIGNISSE]
 
 
 @zone_group.command(name="list", description=app_commands.locale_str("📋 Alle aktiven Zonen anzeigen (Admin)"))
@@ -8895,8 +10048,6 @@ allowlist_group = app_commands.Group(
     server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def zone_allowlist_add(interaction: discord.Interaction, zone: str, spieler: str,
                              server: Optional[str] = None):
-    if not _subcmd_allowed(interaction, "zone_allowlist_add"):
-        return await _deny_subcmd(interaction)
     _c, _fehler = _conn_waehlen(interaction, server)
     if _c is None:
         return await interaction.response.send_message(_fehler, ephemeral=True)
@@ -8907,6 +10058,10 @@ async def zone_allowlist_add(interaction: discord.Interaction, zone: str, spiele
             f"❌ Keine Zone namens **{zone.strip()}** gefunden – `/zone list` zeigt alle.",
             f"❌ No zone named **{zone.strip()}** found – `/zone list` shows all of them."),
             ephemeral=True)
+    # Zusaetzlich zu den Subcommand-Permissions: die im Zonen-Editor
+    # eingetragenen Verwalter (manager_ids) dieser Zone.
+    if not (_subcmd_allowed(interaction, "zone_allowlist_add") or _zone_verwalter(interaction, z)):
+        return await _deny_subcmd(interaction)
     spieler = spieler.strip()
     if not spieler:
         return await interaction.response.send_message(_t(
@@ -8938,8 +10093,6 @@ zone_allowlist_add.autocomplete("zone")(_zone_name_autocomplete)
     server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def zone_allowlist_remove(interaction: discord.Interaction, zone: str, spieler: str,
                                 server: Optional[str] = None):
-    if not _subcmd_allowed(interaction, "zone_allowlist_remove"):
-        return await _deny_subcmd(interaction)
     _c, _fehler = _conn_waehlen(interaction, server)
     if _c is None:
         return await interaction.response.send_message(_fehler, ephemeral=True)
@@ -8950,6 +10103,10 @@ async def zone_allowlist_remove(interaction: discord.Interaction, zone: str, spi
             f"❌ Keine Zone namens **{zone.strip()}** gefunden – `/zone list` zeigt alle.",
             f"❌ No zone named **{zone.strip()}** found – `/zone list` shows all of them."),
             ephemeral=True)
+    # Zusaetzlich zu den Subcommand-Permissions: die im Zonen-Editor
+    # eingetragenen Verwalter (manager_ids) dieser Zone.
+    if not (_subcmd_allowed(interaction, "zone_allowlist_remove") or _zone_verwalter(interaction, z)):
+        return await _deny_subcmd(interaction)
     key = spieler.strip().lower()
     al = _zone_allowlist(z)
     matches = [n for n in al if str(n).strip().lower() == key]
@@ -8977,8 +10134,6 @@ zone_allowlist_remove.autocomplete("zone")(_zone_name_autocomplete)
                        server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def zone_allowlist_show(interaction: discord.Interaction, zone: str,
                               server: Optional[str] = None):
-    if not _subcmd_allowed(interaction, "zone_allowlist_show"):
-        return await _deny_subcmd(interaction)
     _c, _fehler = _conn_waehlen(interaction, server)
     if _c is None:
         return await interaction.response.send_message(_fehler, ephemeral=True)
@@ -8989,6 +10144,10 @@ async def zone_allowlist_show(interaction: discord.Interaction, zone: str,
             f"❌ Keine Zone namens **{zone.strip()}** gefunden – `/zone list` zeigt alle.",
             f"❌ No zone named **{zone.strip()}** found – `/zone list` shows all of them."),
             ephemeral=True)
+    # Zusaetzlich zu den Subcommand-Permissions: die im Zonen-Editor
+    # eingetragenen Verwalter (manager_ids) dieser Zone.
+    if not (_subcmd_allowed(interaction, "zone_allowlist_show") or _zone_verwalter(interaction, z)):
+        return await _deny_subcmd(interaction)
     al = _zone_allowlist(z)
     if not al:
         return await interaction.response.send_message(_t(
@@ -9508,7 +10667,8 @@ async def faction_map(interaction: discord.Interaction, faction: Optional[str] =
             f"> **Error**\nNobody from the faction **{f['name']}** is currently online "
             f"on **{conn.name}**."))
     map_name = conn.get("map_name", "ChernarusPlus")
-    base = await _build_faction_map_base(map_name)
+    base = await _build_faction_map_base(
+        map_name, _karten_einstellung("map_image_style", "topo", _MAP_IMAGE_STYLES, conn))
     if base is None:
         return await interaction.followup.send(_t(
             interaction,
@@ -9814,39 +10974,20 @@ async def cmd_ban(interaction: discord.Interaction, spieler: str,
         grund = _t(interaction, grund, "No reason given")
 
     # Erst lesen – bei API-Fehler NICHT schreiben, sonst würde die
-    # bestehende Nitrado-Banliste überschrieben/geleert
-    try:
-        current, category, key = await _read_banlist(conn)
-    except Exception as e:
+    # bestehende Nitrado-Banliste überschrieben/geleert (_ban_namen_hinzufuegen).
+    added, already, fehler = await _ban_namen_hinzufuegen(conn, names, grund,
+                                                           str(interaction.user))
+    if fehler:
         return await interaction.followup.send(_t(
             interaction,
-            f"❌ Nitrado-Banliste konnte nicht gelesen werden – nichts geändert.\n`{e}`",
-            f"❌ Could not read the Nitrado ban list – nothing changed.\n`{e}`"))
-
-    existing_lower = {n.lower() for n in current}
-    added   = [n for n in names if n.lower() not in existing_lower]
-    already = [n for n in names if n.lower() in existing_lower]
+            f"❌ {fehler} – nichts geändert.",
+            f"❌ {fehler} – nothing changed."))
 
     sv = _t(interaction, "ℹ️ Alle Namen standen bereits auf der Banliste",
            "ℹ️ All names were already on the ban list")
     if added:
-        ok, msg = await _write_banlist(conn, current + added, category, key)
-        if not ok:
-            return await interaction.followup.send(_t(
-                interaction,
-                f"❌ Nitrado-Banliste konnte nicht gespeichert werden – nichts geändert.\n`{msg}`",
-                f"❌ Could not save the Nitrado ban list – nothing changed.\n`{msg}`"))
         sv = _t(interaction, "✅ In der Nitrado-Banliste gespeichert",
                "✅ Saved in the Nitrado ban list")
-
-    # Lokale Metadaten (nur für die Anzeige in /banlist)
-    now = datetime.now(timezone.utc).isoformat()
-    _eimer = _bans_of(conn)
-    for n in added:
-        _eimer[n] = {"name": n, "reason": grund,
-                     "banned_by": str(interaction.user), "banned_at": now}
-    if added:
-        cfg.save_bans()
 
     embed = discord.Embed(title=_t(interaction, "🔨 Spieler gebannt", "🔨 Player(s) Banned"),
                           color=0xE74C3C)
@@ -9885,35 +11026,18 @@ async def cmd_unban(interaction: discord.Interaction, spieler: str,
         return await interaction.followup.send(_t(
             interaction, "❌ Keinen gültigen Namen angegeben.", "❌ No valid name given."))
 
-    try:
-        current, category, key = await _read_banlist(conn)
-    except Exception as e:
+    removed, not_found, fehler = await _ban_namen_entfernen(conn, names)
+    if fehler:
         return await interaction.followup.send(_t(
             interaction,
-            f"❌ Nitrado-Banliste konnte nicht gelesen werden – nichts geändert.\n`{e}`",
-            f"❌ Could not read the Nitrado ban list – nothing changed.\n`{e}`"))
-
-    wanted_lower = {n.lower() for n in names}
-    new_list  = [n for n in current if n.lower() not in wanted_lower]
-    removed   = [n for n in current if n.lower() in wanted_lower]
-    not_found = [n for n in names if n.lower() not in {r.lower() for r in removed}]
+            f"❌ {fehler} – nichts geändert.",
+            f"❌ {fehler} – nothing changed."))
 
     sv = _t(interaction, "ℹ️ Keiner der Namen stand auf der Banliste",
            "ℹ️ None of the names were on the ban list")
     if removed:
-        ok, msg = await _write_banlist(conn, new_list, category, key)
-        if not ok:
-            return await interaction.followup.send(_t(
-                interaction,
-                f"❌ Nitrado-Banliste konnte nicht gespeichert werden – nichts geändert.\n`{msg}`",
-                f"❌ Could not save the Nitrado ban list – nothing changed.\n`{msg}`"))
         sv = _t(interaction, "✅ Von der Nitrado-Banliste entfernt",
                "✅ Removed from the Nitrado ban list")
-        # Lokale Metadaten aufräumen (case-insensitive)
-        _eimer = _bans_of(conn)
-        for local_key in [k for k in _eimer if k.lower() in wanted_lower]:
-            _eimer.pop(local_key, None)
-        cfg.save_bans()
 
     embed = discord.Embed(title=_t(interaction, "✅ Ban aufgehoben", "✅ Ban Removed"), color=0x2ECC71)
     embed.add_field(name=_t(interaction, "Entfernt", "Removed"),
@@ -11184,6 +12308,8 @@ async def cmd_positions(interaction: discord.Interaction, server: Optional[str] 
     zuletzt_wort = _t(interaction, "zuletzt", "last seen")
     lines = []
     for name, data in sorted(positions.items()):
+        if _position_privat(_conn, str(name)):
+            continue        # Location Privacy
         ts = data.get("last_seen", "")
         ts_fmt = ts[:16].replace("T", " ") if ts else "?"
         lines.append(f"**{name}** → `{data['position']}` *({zuletzt_wort}: {ts_fmt} UTC)*")
@@ -11208,6 +12334,110 @@ async def cmd_positions(interaction: discord.Interaction, server: Optional[str] 
         interaction, "⚠️ Positionen stammen aus Log-Events – nicht live in Echtzeit",
         "⚠️ Positions come from log events – not real-time"))
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /location – letzte bekannte Position EINES Spielers
+# ══════════════════════════════════════════════════════════════
+async def _location_name_ac(interaction: discord.Interaction, current: str):
+    # Weiterleitung zur Laufzeit: _player_name_ac steht erst weiter unten.
+    return await _player_name_ac(interaction, current)
+
+
+@bot.tree.command(name="location",
+                  description=app_commands.locale_str("📍 Letzte bekannte Position eines Spielers"))
+@app_commands.describe(spieler="Ingame-Name (Autocomplete)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+@app_commands.autocomplete(spieler=_location_name_ac)
+async def cmd_location(interaction: discord.Interaction, spieler: str,
+                       server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "location"):
+        return await _deny_subcmd(interaction)
+    _conn = await _require_conn(interaction, server=server)
+    if _conn is None:
+        return
+    name = spieler.strip()
+    positions = (_conn.parser.player_positions if _conn.parser else {})
+    treffer = next(((n, d) for n, d in positions.items()
+                    if str(n).strip().lower() == name.lower()), None)
+    if _position_privat(_conn, name):
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"🔒 Die Position von **{name}** ist privat (Location Privacy).",
+            f"🔒 The position of **{name}** is private (location privacy)."), ephemeral=True)
+    if treffer is None or not (treffer[1] or {}).get("position"):
+        return await interaction.response.send_message(_t(
+            interaction,
+            f"❌ Für **{name}** ist keine Position bekannt – er muss zuerst in den Logs auftauchen.",
+            f"❌ No position known for **{name}** – they must appear in the logs first."),
+            ephemeral=True)
+    _setze_aktuellen_server(_conn)
+    info = treffer[1]
+    e = discord.Embed(title=_t(interaction, f"📍 Position – {treffer[0]}",
+                               f"📍 Location – {treffer[0]}"), color=0x3498DB)
+    loc = _location_field_value(info.get("position"))
+    if loc:
+        e.add_field(name="📍 • Player Location", value=loc, inline=False)
+    ts = str(info.get("last_seen") or "")
+    if ts:
+        e.add_field(name=_t(interaction, "Zuletzt gesehen", "Last seen"),
+                    value=f"{ts[:16].replace('T', ' ')} UTC", inline=True)
+    e.set_footer(text=_t(interaction, "Aus den Server-Logs – nicht live in Echtzeit",
+                         "From the server logs – not real-time"))
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+# ══════════════════════════════════════════════════════════════
+#  /heatmap – Kartenbild mit den gesammelten Punkten eines Typs
+# ══════════════════════════════════════════════════════════════
+@bot.tree.command(name="heatmap",
+                  description=app_commands.locale_str("🔥 Heatmap eines Ereignistyps als Kartenbild"))
+@app_commands.describe(typ="Welche Ereignisse?",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+@app_commands.choices(typ=[app_commands.Choice(name=f"{em} {de}", value=k)
+                           for k, de, _en, em in HEATMAP_TYPEN])
+async def cmd_heatmap(interaction: discord.Interaction, typ: app_commands.Choice[str],
+                      server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "heatmap"):
+        return await _deny_subcmd(interaction)
+    conn = await _require_conn(interaction, server=server)
+    if conn is None:
+        return
+    if not _PIL_AVAILABLE:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Kartenbilder brauchen das Python-Paket „Pillow“ – der Bot-Betreiber muss es "
+            "auf dem Server nachinstallieren (`pip install Pillow`).",
+            "❌ Map images need the Python package „Pillow“ – the bot operator needs to "
+            "install it on the server (`pip install Pillow`)."), ephemeral=True)
+    await interaction.response.defer()
+    loop = asyncio.get_running_loop()
+    punkte = await loop.run_in_executor(None, db.heatmap_points, conn.service_id, typ.value)
+    if not punkte:
+        return await interaction.followup.send(_t(
+            interaction, f"ℹ️ Für **{typ.name}** sind noch keine Punkte gesammelt.",
+            f"ℹ️ No points collected yet for **{typ.name}**."))
+    map_name = conn.get("map_name", "ChernarusPlus")
+    base = await _build_faction_map_base(
+        map_name, _karten_einstellung("map_image_style", "topo", _MAP_IMAGE_STYLES, conn))
+    if base is None:
+        return await interaction.followup.send(_t(
+            interaction,
+            "❌ Kartenbild konnte nicht geladen werden (Kachel-Server nicht erreichbar).",
+            "❌ Could not load the map image (tile server unreachable)."))
+    img = await loop.run_in_executor(None, _draw_heatmap, base, _world_size(map_name),
+                                     punkte, typ.name)
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    buf.seek(0)
+    e = discord.Embed(title=_t(interaction, f"🔥 Heatmap – {typ.name}", f"🔥 Heatmap – {typ.name}"),
+                      description=_t(interaction, f"{len(punkte)} Punkte · Limit "
+                                     f"{_heatmap_limit(conn, typ.value)} · {conn.name}",
+                                     f"{len(punkte)} points · limit "
+                                     f"{_heatmap_limit(conn, typ.value)} · {conn.name}"),
+                      color=0xE67E22)
+    e.set_image(url="attachment://heatmap.png")
+    await interaction.followup.send(embed=e, file=discord.File(buf, filename="heatmap.png"))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -19963,6 +21193,26 @@ class EconomyDB:
             # kommt nicht hier rein, sondern wird beim Lesen aus der
             # links-Tabelle dazugejoint - sonst liefen beide Tabellen
             # auseinander, sobald jemand /unlink macht.
+            c.execute("""CREATE TABLE IF NOT EXISTS heatmap_punkte (
+                service_id TEXT NOT NULL,
+                typ        TEXT NOT NULL,
+                x          REAL NOT NULL,
+                z          REAL NOT NULL,
+                spieler    TEXT,
+                created_at REAL NOT NULL)""")
+            c.execute("""CREATE INDEX IF NOT EXISTS idx_heatmap_sid_typ
+                         ON heatmap_punkte (service_id, typ, created_at)""")
+            # Username Hooks: was /link bei einem Mitglied veraendert hat, damit
+            # /unlink EXAKT den Vorzustand wiederherstellen kann.
+            c.execute("""CREATE TABLE IF NOT EXISTS link_hook_zustand (
+                guild_id      INTEGER NOT NULL,
+                user_id       INTEGER NOT NULL,
+                added_roles   TEXT NOT NULL DEFAULT '[]',
+                removed_roles TEXT NOT NULL DEFAULT '[]',
+                alter_nick    TEXT,
+                nick_gesetzt  INTEGER NOT NULL DEFAULT 0,
+                created_at    REAL NOT NULL,
+                PRIMARY KEY (guild_id, user_id))""")
             c.execute("""CREATE TABLE IF NOT EXISTS player_roster (
                 guild_id     INTEGER NOT NULL,
                 service_id   TEXT    NOT NULL DEFAULT '',
@@ -20483,6 +21733,86 @@ class EconomyDB:
                 bester = r["site_id"]
                 beste_distanz = d
         return bester
+
+    # ── Heatmaps ──────────────────────────────────────────────
+    def heatmap_add(self, service_id: str, typ: str, x: float, z: float,
+                    spieler: str, limit: int) -> None:
+        """Punkt aufnehmen und den Typ auf ``limit`` neueste Punkte kuerzen."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO heatmap_punkte (service_id, typ, x, z, spieler, created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (str(service_id), typ, float(x), float(z), (spieler or "")[:64], time.time()))
+            self._heatmap_trim_locked(str(service_id), typ, int(limit))
+            self._conn.commit()
+
+    def _heatmap_trim_locked(self, service_id: str, typ: str, limit: int) -> None:
+        self._conn.execute(
+            "DELETE FROM heatmap_punkte WHERE rowid IN ("
+            "SELECT rowid FROM heatmap_punkte WHERE service_id=? AND typ=? "
+            "ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET ?)",
+            (service_id, typ, max(0, limit)))
+
+    def heatmap_trim(self, service_id: str, typ: str, limit: int) -> None:
+        with self._lock:
+            self._heatmap_trim_locked(str(service_id), typ, int(limit))
+            self._conn.commit()
+
+    def heatmap_points(self, service_id: str, typ: str) -> List[Tuple[float, float]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT x, z FROM heatmap_punkte WHERE service_id=? AND typ=? "
+                "ORDER BY created_at DESC", (str(service_id), typ)).fetchall()
+        return [(float(r["x"]), float(r["z"])) for r in rows]
+
+    def heatmap_counts(self, service_id: str) -> Dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT typ, COUNT(*) AS n FROM heatmap_punkte WHERE service_id=? GROUP BY typ",
+                (str(service_id),)).fetchall()
+        return {str(r["typ"]): int(r["n"]) for r in rows}
+
+    def heatmap_reset(self, service_id: str, typ: Optional[str] = None) -> None:
+        with self._lock:
+            if typ:
+                self._conn.execute("DELETE FROM heatmap_punkte WHERE service_id=? AND typ=?",
+                                   (str(service_id), typ))
+            else:
+                self._conn.execute("DELETE FROM heatmap_punkte WHERE service_id=?",
+                                   (str(service_id),))
+            self._conn.commit()
+
+    # ── Username Hooks ────────────────────────────────────────
+    def link_hook_set(self, guild_id: int, user_id: int, added: List[str], removed: List[str],
+                      alter_nick: Optional[str], nick_gesetzt: bool) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO link_hook_zustand (guild_id, user_id, added_roles, "
+                "removed_roles, alter_nick, nick_gesetzt, created_at) VALUES (?,?,?,?,?,?,?)",
+                (int(guild_id), int(user_id), json.dumps(list(added)), json.dumps(list(removed)),
+                 alter_nick, 1 if nick_gesetzt else 0, time.time()))
+            self._conn.commit()
+
+    def link_hook_get(self, guild_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM link_hook_zustand WHERE guild_id=? AND user_id=?",
+                (int(guild_id), int(user_id))).fetchone()
+        if not row:
+            return None
+        try:
+            added = json.loads(row["added_roles"] or "[]")
+            removed = json.loads(row["removed_roles"] or "[]")
+        except ValueError:
+            added, removed = [], []
+        return {"added": [str(a) for a in added], "removed": [str(r) for r in removed],
+                "alter_nick": row["alter_nick"], "nick_gesetzt": bool(row["nick_gesetzt"])}
+
+    def link_hook_delete(self, guild_id: int, user_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM link_hook_zustand WHERE guild_id=? AND user_id=?",
+                               (int(guild_id), int(user_id)))
+            self._conn.commit()
 
     def abandoned_bases_record_build(self, service_id: str, x: float, z: float,
                                      account_id: str, gamertag: str, aktion: str,
@@ -21257,6 +22587,115 @@ async def _post_feed(guild_id: Union[int, str, List[int], List[str], None],
     return erfolg_gesamt, letzter_grund
 
 
+async def _link_hooks_anwenden(conn: Optional[ServerConnection], guild_id: int, user_id: int,
+                               name: str) -> str:
+    """Username Hooks nach dem ERSTEN /link eines Mitglieds: Rollen geben/
+    entziehen, Nickname setzen. Was veraendert wurde, landet in
+    ``link_hook_zustand`` und wird bei /unlink exakt zurueckgedreht.
+    Rueckgabe: Hinweise (leer = alles ohne Befund)."""
+    if conn is None or bot is None:
+        return ""
+    daten = getattr(conn, "data", None)
+    if not isinstance(daten, dict):
+        return ""
+    add_ids = [str(r) for r in (daten.get("link_add_role_ids") or [])]
+    remove_ids = [str(r) for r in (daten.get("link_remove_role_ids") or [])]
+    set_nick = bool(conn.get("link_set_nickname", False))
+    if not (add_ids or remove_ids or set_nick):
+        return ""
+    guild = bot.get_guild(int(guild_id))
+    if guild is None:
+        return "Username Hooks: Bot erreicht die Guild nicht."
+    try:
+        member = guild.get_member(int(user_id)) or await guild.fetch_member(int(user_id))
+    except Exception:  # noqa: BLE001
+        return "Username Hooks: Mitglied nicht gefunden."
+    hinweise: List[str] = []
+    added: List[str] = []
+    removed: List[str] = []
+    eigene = {str(r.id) for r in getattr(member, "roles", [])}
+    for rid in add_ids:
+        rolle = guild.get_role(int(rid))
+        if rolle is None or rid in eigene:
+            continue
+        try:
+            await member.add_roles(rolle, reason="Username Hook (/link)")
+            added.append(rid)
+        except discord.Forbidden:
+            hinweise.append(f"Rolle „{rolle.name}“ konnte nicht vergeben werden (Rechte/Hierarchie).")
+        except discord.HTTPException as e:
+            hinweise.append(f"Rolle „{rolle.name}“: {e}")
+    for rid in remove_ids:
+        rolle = guild.get_role(int(rid))
+        if rolle is None or rid not in eigene:
+            continue
+        try:
+            await member.remove_roles(rolle, reason="Username Hook (/link)")
+            removed.append(rid)
+        except discord.Forbidden:
+            hinweise.append(f"Rolle „{rolle.name}“ konnte nicht entfernt werden (Rechte/Hierarchie).")
+        except discord.HTTPException as e:
+            hinweise.append(f"Rolle „{rolle.name}“: {e}")
+    alter_nick = None
+    nick_gesetzt = False
+    if set_nick and (member.nick or "") != name[:32]:
+        if getattr(guild, "owner_id", None) == int(user_id):
+            hinweise.append("Nickname des Server-Eigentümers kann nicht geändert werden.")
+        else:
+            alter_nick = member.nick
+            try:
+                await member.edit(nick=name[:32], reason="Username Hook (/link)")
+                nick_gesetzt = True
+            except discord.Forbidden:
+                hinweise.append("Nickname konnte nicht gesetzt werden (Recht „Nicknames verwalten“).")
+            except discord.HTTPException as e:
+                hinweise.append(f"Nickname: {e}")
+    if added or removed or nick_gesetzt:
+        db.link_hook_set(int(guild_id), int(user_id), added, removed, alter_nick, nick_gesetzt)
+    return " ".join(hinweise)
+
+
+async def _link_hooks_zuruecknehmen(guild_id: int, user_id: int) -> str:
+    """Gegenstueck zu _link_hooks_anwenden, sobald der LETZTE Link faellt."""
+    if bot is None:
+        return ""
+    zustand = db.link_hook_get(int(guild_id), int(user_id))
+    if not zustand:
+        return ""
+    guild = bot.get_guild(int(guild_id))
+    if guild is None:
+        return "Username Hooks: Bot erreicht die Guild nicht."
+    try:
+        member = guild.get_member(int(user_id)) or await guild.fetch_member(int(user_id))
+    except Exception:  # noqa: BLE001
+        db.link_hook_delete(int(guild_id), int(user_id))
+        return ""
+    hinweise: List[str] = []
+    for rid in zustand["added"]:
+        rolle = guild.get_role(int(rid))
+        if rolle is None:
+            continue
+        try:
+            await member.remove_roles(rolle, reason="Username Hook (/unlink)")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            hinweise.append(f"Rolle „{rolle.name}“ nicht entfernt: {e}")
+    for rid in zustand["removed"]:
+        rolle = guild.get_role(int(rid))
+        if rolle is None:
+            continue
+        try:
+            await member.add_roles(rolle, reason="Username Hook (/unlink)")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            hinweise.append(f"Rolle „{rolle.name}“ nicht zurückgegeben: {e}")
+    if zustand["nick_gesetzt"]:
+        try:
+            await member.edit(nick=zustand["alter_nick"], reason="Username Hook (/unlink)")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            hinweise.append(f"Nickname nicht zurückgesetzt: {e}")
+    db.link_hook_delete(int(guild_id), int(user_id))
+    return " ".join(hinweise)
+
+
 async def _notify_link_change(guild_id: Optional[int], embed: discord.Embed):
     """Meldet /link- und /unlink-Aktionen an die Admins:
     bevorzugt im adminlog-Feed, sonst im economy_log-Feed.
@@ -21560,6 +22999,8 @@ class ShopManager:
         self._last_restart_ts = time.time()
         try:
             ok, msg = await self.conn.api.restart()
+            if ok and hasattr(self.conn, "neustart_markieren"):
+                self.conn.neustart_markieren()
             log.info(f"[SHOP] Auto-Restart nach Kauf ausgelöst: ok={ok} – {msg}")
         except Exception as e:
             log.error(f"[SHOP] Auto-Restart fehlgeschlagen: {e}")
@@ -22423,10 +23864,15 @@ async def cmd_link(interaction: discord.Interaction, playstation_name: str):
             f"☠️ Per PvP kill: **{_fmt_money(reward)}**{pt_line}{online_line}"),
         color=0x2ECC71)
     await interaction.response.send_message(embed=e)
+    hook_hinweis = ""
+    if ist_haupt:
+        hook_hinweis = await _link_hooks_anwenden(_conn, interaction.guild_id,
+                                                  interaction.user.id, name)
     note = discord.Embed(
         title="🔗 /link verwendet",
         description=(f"{interaction.user.mention} (`{interaction.user}`) hat sich mit **{name}** "
-                     f"verknüpft ({'Hauptaccount' if ist_haupt else 'Zusatz-Account'})."),
+                     f"verknüpft ({'Hauptaccount' if ist_haupt else 'Zusatz-Account'})."
+                     + (f"\n⚠️ {hook_hinweis}" if hook_hinweis else "")),
         color=0x2ECC71)
     await _notify_link_change(interaction.guild_id, note)
 
@@ -22472,9 +23918,13 @@ async def cmd_unlink(interaction: discord.Interaction, playstation_name: Optiona
     await interaction.response.send_message(_t(
         interaction, f"🔓 Verknüpfung mit **{ziel}** entfernt.",
         f"🔓 Link to **{ziel}** removed."), ephemeral=True)
+    hook_hinweis = ""
+    if not db.get_links_by_user(interaction.guild_id, interaction.user.id):
+        hook_hinweis = await _link_hooks_zuruecknehmen(interaction.guild_id, interaction.user.id)
     note = discord.Embed(
         title="🔓 /unlink verwendet",
-        description=f"{interaction.user.mention} (`{interaction.user}`) hat die Verknüpfung mit **{ziel}** entfernt.",
+        description=(f"{interaction.user.mention} (`{interaction.user}`) hat die Verknüpfung mit **{ziel}** entfernt."
+                     + (f"\n⚠️ {hook_hinweis}" if hook_hinweis else "")),
         color=0xE67E22)
     await _notify_link_change(interaction.guild_id, note)
 
@@ -22499,10 +23949,15 @@ async def cmd_forcelink(interaction: discord.Interaction,
     await interaction.response.send_message(_t(
         interaction, f"🔗 **{name}** ↔ {user.mention} verknüpft (Admin).",
         f"🔗 **{name}** ↔ {user.mention} linked (admin)."), ephemeral=True)
+    hook_hinweis = ""
+    if len(db.get_links_by_user(interaction.guild_id, user.id)) == 1:
+        hook_hinweis = await _link_hooks_anwenden(_conn_of(interaction), interaction.guild_id,
+                                                  user.id, name)
     note = discord.Embed(
         title="🔗 /forcelink verwendet",
         description=(f"{interaction.user.mention} hat {user.mention} "
-                     f"mit **{name}** verknüpft."),
+                     f"mit **{name}** verknüpft."
+                     + (f"\n⚠️ {hook_hinweis}" if hook_hinweis else "")),
         color=0x2ECC71)
     await _notify_link_change(interaction.guild_id, note)
 
@@ -22555,10 +24010,14 @@ async def cmd_forceunlink(interaction: discord.Interaction, user: discord.Member
     await interaction.response.send_message(_t(
         interaction, f"🔓 Verknüpfung {user.mention} ↔ **{ziel}** entfernt (Admin).",
         f"🔓 Link {user.mention} ↔ **{ziel}** removed (admin)."), ephemeral=True)
+    hook_hinweis = ""
+    if not db.get_links_by_user(interaction.guild_id, user.id):
+        hook_hinweis = await _link_hooks_zuruecknehmen(interaction.guild_id, user.id)
     note = discord.Embed(
         title="🔓 /forceunlink verwendet",
         description=(f"{interaction.user.mention} hat die Verknüpfung "
-                     f"{user.mention} ↔ **{ziel}** entfernt."),
+                     f"{user.mention} ↔ **{ziel}** entfernt."
+                     + (f"\n⚠️ {hook_hinweis}" if hook_hinweis else "")),
         color=0xE67E22)
     await _notify_link_change(interaction.guild_id, note)
 
@@ -25278,6 +26737,12 @@ _PRIMARY_PLAYER_KEYS = {
     "chat":         "player",
     "admin_action": "admin",
     "basebuild":    "player",
+    "emote":        "player",
+    "unconscious":  "player",
+    "conscious":    "player",
+    "combat_log":   "player",
+    "rage_quit":    "player",
+    "killstreak":   "player",
 }
 
 _EV_LOCK = threading.Lock()
@@ -25300,6 +26765,43 @@ def _ev_parse_pos(pos_str: Optional[str]):
         except ValueError:
             return None
     return None
+
+
+# Welcher Spielername im Ereignis ist der Angreifer/Killer (Gegenstueck zu
+# _PRIMARY_PLAYER_KEYS) und in welchem Feld steht seine Position?
+_ANGREIFER_KEYS = {
+    "kill_pvp": ("killer", "killer_position"),
+    "damage":   ("attacker", "attacker_position"),
+}
+
+
+def _ev_position_xz(ev: Dict[str, Any], parser: Any = None,
+                    rolle: str = "victim") -> Optional[Tuple[float, float]]:
+    """(Ost, Nord) des Spielers in einem Ereignis - ``rolle`` ``"victim"``
+    (Opfer bzw. der handelnde Spieler) oder ``"attacker"`` (Killer/Angreifer).
+
+    Zuerst zaehlt die Position aus der Ereigniszeile selbst
+    (``position`` bzw. ``killer_position``/``attacker_position`` aus dem
+    Parser), erst dann der Positions-Cache ``parser.player_positions`` -
+    der kann durch eine spaetere Zeile desselben Lesedurchgangs schon
+    weitergewandert sein. Ohne brauchbare Angabe ``None``."""
+    etype = str(ev.get("type", ""))
+    if rolle == "attacker":
+        keys = _ANGREIFER_KEYS.get(etype)
+        if not keys:
+            return None
+        pname, posfeld = ev.get(keys[0]), ev.get(keys[1])
+    else:
+        pkey = _PRIMARY_PLAYER_KEYS.get(etype)
+        pname = ev.get(pkey) if pkey else None
+        posfeld = ev.get("pos") or ev.get("position")
+    xz = _ev_parse_pos(posfeld)
+    if xz is None and pname and parser is not None:
+        positionen = getattr(parser, "player_positions", None) or {}
+        entry = positionen.get(pname) or positionen.get(str(pname))
+        if isinstance(entry, dict):
+            xz = _ev_parse_pos(entry.get("position"))
+    return xz
 
 
 def _ev_classify(ev: Dict[str, Any]) -> str:
@@ -26232,6 +27734,10 @@ def _audit_load() -> None:
 _AUDIT_LABELS = {
     ("POST", "/api/server/restart"): "Server neu gestartet",
     ("POST", "/api/server/stop"): "Server gestoppt",
+    ("POST", "/api/server/damage"): "Base-/Container-Schaden umgestellt",
+    ("POST", "/api/server/general"): "Server-Einstellungen (Generell) geändert",
+    ("POST", "/api/server/general/copy"): "Server-Einstellungen auf andere Server kopiert",
+    ("POST", "/api/heatmap/reset"): "Heatmap zurückgesetzt",
     ("POST", "/api/auth/token"): "Nitrado-Token eingegeben",
     ("POST", "/api/auth/select-server"): "Nitrado-Server ausgewählt",
     ("POST", "/api/auth/guild"): "Discord-Server verbunden",
@@ -26594,6 +28100,8 @@ async def _backup_server_stoppen(conn: ServerConnection) -> Tuple[bool, str]:
     ok_, meldung = await conn.api.stop()
     if not ok_:
         return False, f"Der Server konnte nicht gestoppt werden: {meldung}"
+    if hasattr(conn, "stopp_markieren"):
+        conn.stopp_markieren("backup")
     gewartet = 0
     while gewartet < _BACKUP_STOP_TIMEOUT:
         await asyncio.sleep(_BACKUP_STOP_INTERVALL)
@@ -26667,6 +28175,8 @@ async def _backup_wiederherstellen_worker(conn: ServerConnection,
         # 4. Wieder starten.
         _backup_job_setzen(conn, phase="starten", datei="")
         start_ok, start_meldung = await conn.api.restart()
+        if start_ok and hasattr(conn, "neustart_markieren"):
+            conn.neustart_markieren()
         _backup_job_setzen(conn, fertig=True, phase="fertig",
                           ergebnis=(f"{len(namen)} Dateien zurückgespielt. "
                                     + ("Der Server startet neu."
@@ -29930,6 +31440,8 @@ def _zonen_ziel(request: web.Request, conn: ServerConnection,
                 werte.append(int(roh_id))
             except (TypeError, ValueError):
                 return None, err(f"{feld}-ID muss eine Zahl sein.")
+        if len(werte) > _ZONE_MAX_ROLLEN:
+            return None, err(f"Höchstens {_ZONE_MAX_ROLLEN} {feld}n je Zone.")
         alt_liste = (alt or {}).get(schluessel)
         unveraendert = (isinstance(alt_liste, list) and sorted(alt_liste) == sorted(werte)
                        and int((alt or {}).get("guild_id") or 0) == gid)
@@ -29963,8 +31475,12 @@ async def list_zones(request: web.Request) -> web.Response:
     zones = [z for z in _zones(_c) if isinstance(z, dict) and z.get("name")]
     if _ensure_zone_ids(zones):
         _zones_save(_c)
+    karte = _c.get("map_name", "ChernarusPlus")
     return ok({"zones": [_zone_payload(z) for z in zones],
-               "map_name": _c.get("map_name", "ChernarusPlus"),
+               "map_name": karte,
+               "world_size": _world_size(karte),
+               "ereignisse": _zone_ereignisse_payload(),
+               "gruppen": [{"key": k, "label_de": de, "label_en": en} for k, de, en in _ZONE_GRUPPEN],
                "kategorie_stufe": _module_tier("zones")})
 
 
@@ -29983,8 +31499,8 @@ async def create_zone(request: web.Request) -> web.Response:
         return denied
     data = await body(request)
     name = str(data.get("name", "")).strip()
-    if not name or len(name) > 60:
-        return err("Zonen-Name fehlt oder ist länger als 60 Zeichen.")
+    if not name or len(name) > _ZONE_MAX_NAME:
+        return err(f"Zonen-Name fehlt oder ist länger als {_ZONE_MAX_NAME} Zeichen.")
     if _find(name, _c):
         return err(f"Zone '{name}' existiert bereits.")
 
@@ -29992,10 +31508,11 @@ async def create_zone(request: web.Request) -> web.Response:
     if ztype not in ("circular", "polygon"):
         return err("type muss 'circular' oder 'polygon' sein.")
 
+    welt = float(_world_size(_c.get("map_name", "ChernarusPlus")))
     zone: Dict[str, Any] = {"name": name, "type": ztype}
     if ztype == "polygon":
         points = data.get("points")
-        pts_err = _validate_zone_points(points)
+        pts_err = _validate_zone_points(points, welt)
         if pts_err:
             return err(pts_err.replace("❌", "").strip())
         zone["points"] = [{"x": round(float(p["x"]), 1), "z": round(float(p["z"]), 1)}
@@ -30005,7 +31522,7 @@ async def create_zone(request: web.Request) -> web.Response:
             x = float(data["x"]); z = float(data["z"]); radius = float(data["radius"])
         except (KeyError, TypeError, ValueError):
             return err("x, z und radius müssen Zahlen sein.")
-        geo_err = _validate_zone_geometry(x, z, radius)
+        geo_err = _validate_zone_geometry(x, z, radius, welt)
         if geo_err:
             return err(geo_err.replace("❌", "").strip())
         zone["x"], zone["z"], zone["radius"] = round(x, 1), round(z, 1), round(radius, 1)
@@ -30013,6 +31530,11 @@ async def create_zone(request: web.Request) -> web.Response:
     ziel, denied = _zonen_ziel(request, _c, data)
     if denied is not None:
         return denied
+    if not ziel.get("channel_id"):
+        return err("Ein Channel ist Pflicht – dort landen Pings und Auto-Ban-Meldungen.")
+    feld_fehler = _zone_felder_uebernehmen(zone, data)
+    if feld_fehler:
+        return err(feld_fehler)
     zone["channel_id"] = ziel.get("channel_id")
     zone["ping_role_ids"] = ziel.get("ping_role_ids", [])
     zone["manage_role_ids"] = ziel.get("manage_role_ids", [])
@@ -30045,8 +31567,12 @@ async def update_zone(request: web.Request) -> web.Response:
     data = await body(request)
 
     new_name = str(data.get("name", zone["name"])).strip() or zone["name"]
-    if new_name.lower() != str(zone["name"]).lower() and _find(new_name, _c):
-        return err(f"Zone '{new_name}' existiert bereits.")
+    if new_name.lower() != str(zone["name"]).lower():
+        if _find(new_name, _c):
+            return err(f"Zone '{new_name}' existiert bereits.")
+        if len(new_name) > _ZONE_MAX_NAME:
+            return err(f"Zonen-Name ist länger als {_ZONE_MAX_NAME} Zeichen.")
+    welt = float(_world_size(_c.get("map_name", "ChernarusPlus")))
 
     ztype = str(data.get("type") or zone.get("type") or "circular").strip().lower()
     if ztype not in ("circular", "polygon"):
@@ -30055,7 +31581,7 @@ async def update_zone(request: web.Request) -> web.Response:
     new_points = None
     if ztype == "polygon":
         points = data.get("points", zone.get("points"))
-        pts_err = _validate_zone_points(points)
+        pts_err = _validate_zone_points(points, welt)
         if pts_err:
             return err(pts_err.replace("❌", "").strip())
         new_points = [{"x": round(float(p["x"]), 1), "z": round(float(p["z"]), 1)}
@@ -30067,13 +31593,22 @@ async def update_zone(request: web.Request) -> web.Response:
             radius = float(data.get("radius", zone.get("radius", 0.0)))
         except (TypeError, ValueError):
             return err("x, z und radius müssen Zahlen sein.")
-        geo_err = _validate_zone_geometry(x, z, radius)
+        geo_err = _validate_zone_geometry(x, z, radius, welt)
         if geo_err:
             return err(geo_err.replace("❌", "").strip())
 
     ziel, denied = _zonen_ziel(request, _c, data, zone)
     if denied is not None:
         return denied
+    if "channel_id" in ziel and not ziel.get("channel_id"):
+        return err("Ein Channel ist Pflicht – dort landen Pings und Auto-Ban-Meldungen.")
+    # Erst in eine Kopie, damit ein Fehler die gespeicherte Zone nicht halb
+    # veraendert zuruecklaesst.
+    probe = dict(zone)
+    feld_fehler = _zone_felder_uebernehmen(probe, data)
+    if feld_fehler:
+        return err(feld_fehler)
+    zone.update(probe)
 
     old_name = str(zone["name"])
     zone["name"] = new_name
@@ -31558,6 +33093,32 @@ async def add_allowlist(request: web.Request) -> web.Response:
     return ok({"allowlist": al})
 
 
+async def set_allowlist(request: web.Request) -> web.Response:
+    """Whitelist einer Zone komplett ersetzen (Bulk-Edit / Leeren)."""
+    _c, denied = _session_conn(request, "zones")
+    if denied is not None:
+        return denied
+    denied = await _modul_pruefen("zones", request, _c)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, _c, "zones", "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "zones.allowlist", 3)
+    if denied is not None:
+        return denied
+    zone = _find(request.match_info["name"], _c)
+    if not zone:
+        return err("Zone nicht gefunden.", 404)
+    data = await body(request)
+    if "allowlist" not in data:
+        return err("allowlist fehlt.")
+    neue = _allowlist_aus_anfrage(data)
+    zone["allowlist"] = neue if neue is not None else []
+    _zones_save(_c)
+    return ok({"allowlist": zone["allowlist"]})
+
+
 async def remove_allowlist(request: web.Request) -> web.Response:
     _c, denied = _session_conn(request, "zones")
     if denied is not None:
@@ -33001,13 +34562,20 @@ def _world_size(map_name: str) -> int:
     return int(sizes.get(map_name, 15360))
 
 
-def _tile_url(map_name: str) -> str:
-    """Kachel-URL je Karte: config-Override → xam.nu-Default → '' (dann Fallback)."""
+def _tile_url(map_name: str, stil: str = "topo") -> str:
+    """Kachel-URL je Karte und Stil (``topo``/``sat``): config-Override →
+    xam.nu-Default → '' (dann Fallback). Satellit-Pfad ``satellite`` an
+    static.xam.nu geprueft (HTTP 200)."""
     override = (cfg.config.get("dashboard_map_tiles") or {}).get(map_name)
     if override:
         return str(override)
     folder = _XAM_FOLDER.get(map_name)
-    return _XAM_TEMPLATE.format(folder=folder) if folder else ""
+    if not folder:
+        return ""
+    url = _XAM_TEMPLATE.format(folder=folder)
+    if stil == "sat":
+        url = url.replace("/topographic/", "/satellite/")
+    return url
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -33049,7 +34617,7 @@ async def _fetch_tile(session: "aiohttp.ClientSession", url: str) -> Optional[by
         return None
 
 
-async def _build_faction_map_base(map_name: str) -> Optional[Any]:
+async def _build_faction_map_base(map_name: str, stil: str = "topo") -> Optional[Any]:
     """Setzt das Basis-Kartenbild fuer /faction map zusammen (Kacheln von
     static.xam.nu bei Zoom _FACTION_MAP_ZOOM) und cacht es auf Platte UND im
     Prozessspeicher – ein /faction map lädt die Kacheln nur beim allerersten
@@ -33057,22 +34625,25 @@ async def _build_faction_map_base(map_name: str) -> Optional[Any]:
     nutzt die gespeicherte Fassung."""
     if not _PIL_AVAILABLE:
         return None
-    cached = _faction_map_base_cache.get(map_name)
+    stil = stil if stil in _MAP_IMAGE_STYLES else "topo"
+    cache_key = f"{map_name}|{stil}"
+    cached = _faction_map_base_cache.get(cache_key)
     if cached is not None:
         return cached
     try:
         os.makedirs(_FACTION_MAP_CACHE_DIR, exist_ok=True)
     except OSError:
         pass
-    disk_path = os.path.join(_FACTION_MAP_CACHE_DIR, f"{map_name}_z{_FACTION_MAP_ZOOM}.webp")
+    suffix = "" if stil == "topo" else f"_{stil}"
+    disk_path = os.path.join(_FACTION_MAP_CACHE_DIR, f"{map_name}{suffix}_z{_FACTION_MAP_ZOOM}.webp")
     if os.path.exists(disk_path):
         try:
             img = _PILImage.open(disk_path).convert("RGB")
-            _faction_map_base_cache[map_name] = img
+            _faction_map_base_cache[cache_key] = img
             return img
         except Exception:  # noqa: BLE001 – beschaedigte Cache-Datei: neu laden statt abstuerzen
             pass
-    template = _tile_url(map_name)
+    template = _tile_url(map_name, stil)
     if not template:
         return None
     n = 2 ** _FACTION_MAP_ZOOM
@@ -33098,7 +34669,7 @@ async def _build_faction_map_base(map_name: str) -> Optional[Any]:
         canvas.save(disk_path, "WEBP", quality=85)
     except Exception:  # noqa: BLE001 – Cache ist nur eine Beschleunigung, kein Muss
         pass
-    _faction_map_base_cache[map_name] = canvas
+    _faction_map_base_cache[cache_key] = canvas
     return canvas
 
 
@@ -33190,6 +34761,385 @@ def _locations(map_name: str):
     return out
 
 
+def _draw_heatmap(base: Any, world_size: int, punkte: List[Tuple[float, float]],
+                  titel: str = "") -> Any:
+    """Dichte-Heatmap ueber eine Kopie des Basisbilds legen (PIL, blockierend –
+    ueber run_in_executor aufrufen). Raster 128x128, jeder Punkt streut auf
+    die Nachbarzellen, Farbverlauf blau → gruen → gelb → rot, Deckkraft mit
+    der Dichte."""
+    n = 128
+    grid = [[0.0] * n for _ in range(n)]
+    for x, z in punkte:
+        gx = int(max(0.0, min(1.0 - 1e-9, x / world_size)) * n)
+        gz = int(max(0.0, min(1.0 - 1e-9, 1.0 - z / world_size)) * n)
+        for dx in range(-3, 4):
+            for dz in range(-3, 4):
+                cx, cz = gx + dx, gz + dz
+                if 0 <= cx < n and 0 <= cz < n:
+                    grid[cz][cx] += 1.0 / (1.0 + dx * dx + dz * dz)
+    maximum = max((v for zeile in grid for v in zeile), default=0.0)
+    heat = _PILImage.new("RGBA", (n, n), (0, 0, 0, 0))
+    if maximum > 0:
+        pixel = []
+        for zeile in grid:
+            for v in zeile:
+                if v <= 0:
+                    pixel.append((0, 0, 0, 0))
+                    continue
+                w = (v / maximum) ** 0.6
+                if w < 0.33:
+                    f = w / 0.33
+                    farbe = (0, int(120 + 135 * f), int(255 - 120 * f))
+                elif w < 0.66:
+                    f = (w - 0.33) / 0.33
+                    farbe = (int(255 * f), 255, int(135 - 135 * f))
+                else:
+                    f = (w - 0.66) / 0.34
+                    farbe = (255, int(255 - 200 * f), 0)
+                pixel.append((farbe[0], farbe[1], farbe[2], int(70 + 170 * w)))
+        heat.putdata(pixel)
+    canvas_px = base.size[0]
+    heat = heat.resize((canvas_px, canvas_px), _PILImage.BILINEAR)
+    img = base.convert("RGBA")
+    img.alpha_composite(heat)
+    draw = _PILImageDraw.Draw(img)
+    try:
+        font = _PILImageFont.load_default(size=22)
+    except TypeError:
+        font = _PILImageFont.load_default()
+    text = f"{titel} · {len(punkte)} Punkte" if titel else f"{len(punkte)} Punkte"
+    draw.rectangle([8, canvas_px - 40, 24 + draw.textlength(text, font=font), canvas_px - 8],
+                   fill=(0, 0, 0, 170))
+    draw.text((16, canvas_px - 34), text, font=font, fill=(255, 255, 255))
+    return img.convert("RGB")
+
+
+# ── Server-Seite „Generell“: ein Endpunkt fuer alle Karten ──
+_GENERAL_KARTEN_SCHLUESSEL: Dict[str, Tuple[str, ...]] = {
+    "mapping": ("map_link_provider", "map_link_style", "map_image_style"),
+    "game_server": ("keep_server_running", "keep_server_running_haenger"),
+    "feed_thresholds": ("combat_log_seconds", "rage_quit_seconds", "killstreak_min",
+                        "killstreak_step", "long_range_kill_meter"),
+    "location_privacy": ("location_privacy_names",),
+    "username_hooks": ("link_add_role_ids", "link_remove_role_ids", "link_set_nickname"),
+    "heatmap_limits": ("heatmap_limits",),
+    "ban_immunity": ("ban_immune_role_ids",),
+}
+# Rollen-IDs gelten nur in der eigenen Guild - beim Kopieren auf einen Server
+# mit anderer Guild werden diese Karten uebersprungen.
+_GENERAL_GUILD_GEBUNDEN = frozenset({"link_add_role_ids", "link_remove_role_ids",
+                                     "ban_immune_role_ids"})
+_GENERAL_ZAHLEN: Dict[str, Tuple[int, int]] = {
+    "combat_log_seconds": (5, 3600), "rage_quit_seconds": (5, 3600),
+    "killstreak_min": (2, 50), "killstreak_step": (1, 50),
+    "long_range_kill_meter": (50, 5000),
+}
+_GENERAL_BOOLS = ("keep_server_running", "keep_server_running_haenger", "link_set_nickname")
+_GENERAL_ROLLENLISTEN = ("link_add_role_ids", "link_remove_role_ids", "ban_immune_role_ids")
+
+
+def _general_payload(conn: ServerConnection) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for schluessel in _GENERAL_KARTEN_SCHLUESSEL.values():
+        for key in schluessel:
+            if key in _GENERAL_ROLLENLISTEN or key == "location_privacy_names":
+                wert = conn.data.get(key)
+                out[key] = [str(v) for v in wert] if isinstance(wert, list) else []
+            else:
+                out[key] = conn.get(key)
+    out["heatmap_limits"] = {k: _heatmap_limit(conn, k) for k in HEATMAP_KEYS}
+    return out
+
+
+def _general_andere_server(conn: ServerConnection) -> List[Dict[str, Any]]:
+    """Die uebrigen Server desselben Eigentuemers (Ziel fuer „Auf andere
+    Server kopieren“) samt Hinweis, ob sie dieselbe Guild teilen."""
+    owner = str(conn.data.get("owner_discord_id") or "")
+    if not owner:
+        return []
+    out = []
+    for c in connections.for_owner(owner):
+        if c.service_id == conn.service_id:
+            continue
+        out.append({"service_id": c.service_id, "name": c.name,
+                    "gleiche_guild": bool(set(c.guild_ids) & set(conn.guild_ids))})
+    return out
+
+
+def _general_wert_pruefen(key: str, wert: Any) -> Tuple[Any, Optional[str]]:
+    """Einen General-Schluessel validieren → (bereinigter Wert, Fehler)."""
+    if key in _GENERAL_BOOLS:
+        if not isinstance(wert, bool):
+            return None, f"{key} muss true oder false sein."
+        return wert, None
+    if key in _GENERAL_ZAHLEN:
+        lo, hi = _GENERAL_ZAHLEN[key]
+        try:
+            z = int(wert)
+        except (TypeError, ValueError):
+            return None, f"{key} muss eine ganze Zahl sein."
+        if not (lo <= z <= hi):
+            return None, f"{key} muss zwischen {lo} und {hi} liegen."
+        return z, None
+    if key == "map_link_provider":
+        if wert not in _MAP_LINK_PROVIDER:
+            return None, "map_link_provider muss izurvive oder xam sein."
+        return wert, None
+    if key == "map_link_style":
+        if wert not in _MAP_LINK_STYLES:
+            return None, "map_link_style muss sat, topo oder tourist sein."
+        return wert, None
+    if key == "map_image_style":
+        if wert not in _MAP_IMAGE_STYLES:
+            return None, "map_image_style muss sat oder topo sein."
+        return wert, None
+    if key in _GENERAL_ROLLENLISTEN:
+        if not isinstance(wert, list):
+            return None, f"{key} muss eine Liste sein."
+        if len(wert) > 5:
+            return None, f"Höchstens 5 Rollen bei {key}."
+        rollen: List[str] = []
+        for r in wert:
+            try:
+                rid = str(int(r))
+            except (TypeError, ValueError):
+                return None, f"{key} darf nur Rollen-IDs enthalten."
+            if rid not in rollen:
+                rollen.append(rid)
+        return rollen, None
+    if key == "location_privacy_names":
+        if not isinstance(wert, list):
+            return None, "location_privacy_names muss eine Liste sein."
+        namen: List[str] = []
+        gesehen: set = set()
+        for n in wert:
+            name = str(n).strip()[:64]
+            if name and name.lower() not in gesehen:
+                gesehen.add(name.lower())
+                namen.append(name)
+            if len(namen) >= 500:
+                break
+        return namen, None
+    if key == "heatmap_limits":
+        if not isinstance(wert, dict):
+            return None, "heatmap_limits muss ein Objekt sein."
+        limits: Dict[str, int] = {}
+        for typ, grenze in wert.items():
+            if typ not in HEATMAP_KEYS:
+                return None, f"Unbekannter Heatmap-Typ '{typ}'."
+            try:
+                g = int(grenze)
+            except (TypeError, ValueError):
+                return None, f"Limit für {typ} muss eine ganze Zahl sein."
+            if not (0 <= g <= _HEATMAP_LIMIT_MAX):
+                return None, f"Limit für {typ} muss zwischen 0 und {_HEATMAP_LIMIT_MAX} liegen."
+            limits[typ] = g
+        return limits, None
+    return None, f"Unbekannter Schlüssel {key}."
+
+
+async def api_server_general_get(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "server", "view")
+    if denied is not None:
+        return denied
+    return ok({"general": _general_payload(conn),
+               "andere_server": _general_andere_server(conn),
+               "heatmap_typen": [{"key": k, "label_de": de, "label_en": en, "emoji": em}
+                                 for k, de, en, em in HEATMAP_TYPEN],
+               "heatmap_counts": await _dash_run(db.heatmap_counts, conn.service_id)})
+
+
+async def api_server_general_set(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "server", "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "server.general", 5)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    erlaubt = {k for schluessel in _GENERAL_KARTEN_SCHLUESSEL.values() for k in schluessel}
+    neu: Dict[str, Any] = {}
+    for key, wert in data.items():
+        if key not in erlaubt:
+            return err(f"Unbekannter Schlüssel {key}.")
+        bereinigt, fehler = _general_wert_pruefen(key, wert)
+        if fehler:
+            return err(fehler)
+        neu[key] = bereinigt
+    if "heatmap_limits" in neu:
+        # Teil-Update: nur die mitgeschickten Typen aendern.
+        alt = dict(conn.get("heatmap_limits") or {})
+        alt.update(neu["heatmap_limits"])
+        neu["heatmap_limits"] = alt
+    for key, wert in neu.items():
+        _conn_store(conn, key, wert)
+    if "heatmap_limits" in neu:
+        for typ, grenze in neu["heatmap_limits"].items():
+            await _dash_run(db.heatmap_trim, conn.service_id, typ, int(grenze))
+    return ok({"general": _general_payload(conn)})
+
+
+async def api_server_general_copy(request: web.Request) -> web.Response:
+    """Eine General-Karte auf die anderen Server desselben Eigentuemers kopieren."""
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "server", "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "server.general.copy", 10)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    karte = str(data.get("karte") or "")
+    schluessel = _GENERAL_KARTEN_SCHLUESSEL.get(karte)
+    if not schluessel:
+        return err("Unbekannte Karte.")
+    ziele = _general_andere_server(conn)
+    if not ziele:
+        return err("Du hast keine weiteren Server, auf die kopiert werden könnte.", 409)
+    quelle = _general_payload(conn)
+    ergebnis = []
+    for ziel in ziele:
+        zc = connections.get(ziel["service_id"])
+        if zc is None:
+            continue
+        guild_gebunden = any(k in _GENERAL_GUILD_GEBUNDEN for k in schluessel)
+        if guild_gebunden and not ziel["gleiche_guild"]:
+            ergebnis.append({"service_id": zc.service_id, "name": zc.name, "kopiert": False,
+                             "grund": "andere Discord-Guild – Rollen-IDs gelten dort nicht"})
+            continue
+        for key in schluessel:
+            _conn_store(zc, key, copy.deepcopy(quelle.get(key)))
+        ergebnis.append({"service_id": zc.service_id, "name": zc.name, "kopiert": True})
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "General-Einstellungen kopiert",
+              f"{karte} von {conn.name} auf {len([e for e in ergebnis if e['kopiert']])} Server")
+    return ok({"ergebnis": ergebnis})
+
+
+# ── Schaden (Base/Container) – Utilities-Reiter ──
+async def _schaden_zustand_lesen(conn: ServerConnection) -> Dict[str, Any]:
+    """Aktuellen Stand von ``disableBaseDamage``/``disableContainerDamage``
+    aus der cfggameplay.json lesen - zurueck als „Schaden an?“ (invertiert).
+    ``None`` = Schluessel nicht in der Datei (DayZ-Vorgabe: Schaden an)."""
+    out: Dict[str, Any] = {"base": None, "container": None, "pfad": None, "code": "ok"}
+    if conn.ftp is None:
+        out["code"] = "kein_ftp"
+        return out
+    pfad = _cfggameplay_pfad(conn)
+    out["pfad"] = pfad
+    if not pfad:
+        out["code"] = "kein_pfad"
+        return out
+    loop = asyncio.get_running_loop()
+    async with _schaden_lock(conn.service_id):
+        roh, status = await loop.run_in_executor(None, conn.ftp.read_file_ex, pfad)
+    if status == "error":
+        out["code"] = "lesefehler"
+        return out
+    if status == "missing":
+        out["code"] = "fehlt"
+        return out
+    try:
+        daten = json.loads(roh or "")
+        if not isinstance(daten, dict):
+            raise ValueError("Wurzel-Element ist kein JSON-Objekt")
+    except Exception:  # noqa: BLE001
+        out["code"] = "kaputt"
+        return out
+    for bereich, schluessel in _SCHADEN_SCHLUESSEL.items():
+        fundort = _json_schluessel_finden(daten, schluessel)
+        if fundort is None:
+            out[bereich] = True       # nicht gesetzt = DayZ-Vorgabe: Schaden an
+            continue
+        wert = _json_unterobjekt(daten, fundort).get(schluessel)
+        out[bereich] = not bool(wert)
+    return out
+
+
+async def api_server_damage_get(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "server", "view")
+    if denied is not None:
+        return denied
+    return ok({"schaden": await _schaden_zustand_lesen(conn)})
+
+
+async def api_server_damage_set(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "server", "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "server.damage", 10)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    bereich = str(data.get("bereich") or "")
+    if bereich not in ("base", "container", "both"):
+        return err("bereich muss base, container oder both sein.")
+    if not isinstance(data.get("an"), bool):
+        return err("an muss true oder false sein.")
+    an = bool(data["an"])
+    bereiche = ["base", "container"] if bereich == "both" else [bereich]
+    ergebnisse = []
+    for b in bereiche:
+        # Umkehrung: Schaden AN = disableXxxDamage FALSE
+        code, infos = await _schaden_datei_setzen(conn, _SCHADEN_SCHLUESSEL[b], not an)
+        ergebnisse.append({"bereich": b, "code": code, "pfad": infos.get("pfad"),
+                           "fehler": infos.get("fehler", "")})
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+              "Schaden umgestellt",
+              f"{conn.name}: {bereich} → {'an' if an else 'aus'} "
+              f"({', '.join(e['code'] for e in ergebnisse)})",
+              success=all(e["code"] in ("ok", "unveraendert") for e in ergebnisse))
+    return ok({"ergebnisse": ergebnisse, "schaden": await _schaden_zustand_lesen(conn)})
+
+
+# ── Heatmaps ──
+async def api_heatmap_points(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "map", "view")
+    if denied is not None:
+        return denied
+    typ = str(request.query.get("typ") or "")
+    if typ not in HEATMAP_KEYS:
+        return err("Unbekannter Heatmap-Typ.")
+    punkte = await _dash_run(db.heatmap_points, conn.service_id, typ)
+    return ok({"typ": typ, "points": [{"x": x, "z": z} for x, z in punkte]})
+
+
+async def api_heatmap_reset(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "server", "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "server.heatmap.reset", 5)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    typ = data.get("typ")
+    if typ is not None and typ not in HEATMAP_KEYS:
+        return err("Unbekannter Heatmap-Typ.")
+    await _dash_run(db.heatmap_reset, conn.service_id, typ)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Heatmap zurückgesetzt",
+              f"{conn.name}: {typ or 'alle Typen'}")
+    return ok({"heatmap_counts": await _dash_run(db.heatmap_counts, conn.service_id)})
+
+
 async def api_map_meta(request: web.Request) -> web.Response:
     _c, denied = _session_conn(request)
     if denied is not None:
@@ -33198,14 +35148,18 @@ async def api_map_meta(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     map_name = _c.get("map_name", "ChernarusPlus")
+    stil = _karten_einstellung("map_image_style", "topo", _MAP_IMAGE_STYLES, _c)
     return ok({
         "map_name": map_name,
         "world_size": _world_size(map_name),
-        "tile_url": _tile_url(map_name),      # XYZ-Template ({z}/{x}/{y}), Browser lädt es
+        "tile_url": _tile_url(map_name, stil),      # XYZ-Template ({z}/{x}/{y}), Browser lädt es
+        "tile_style": stil,
         "tile_max_native_zoom": TILE_MAX_NATIVE_ZOOM,
         "image": f"/maps/{map_name}.jpg",     # optionales eigenes Bild (ImageOverlay), falls vorhanden
         "locations": _locations(map_name),
         "izurvive": f"https://www.izurvive.com/?m={map_name}",
+        "heatmap_typen": [{"key": k, "label_de": de, "label_en": en, "emoji": em}
+                          for k, de, en, em in HEATMAP_TYPEN],
     })
 
 
@@ -33227,6 +35181,8 @@ async def api_map_players(request: web.Request) -> web.Response:
     for name, entry in list(positions.items()):
         if not isinstance(entry, dict):
             continue
+        if _position_privat(_c, str(name)):
+            continue        # Location Privacy
         nums = _MAP_POS_RE.findall(str(entry.get("position", "")))
         if len(nums) < 2:
             continue
@@ -33888,12 +35844,20 @@ async def api_server_status(request: web.Request) -> web.Response:
                 }
         except Exception:
             nit_info = None
+    gestoppt = conn.data.get("server_absichtlich_gestoppt")
     return ok({
         "online": bool(live),
         "a2s": live,
         "nitrado": nit_info,
         "map_name": conn.get("map_name"),
         "server_ip": ip or None,
+        "watchdog": {
+            "aktiv": bool(conn.get("keep_server_running", False)),
+            "haenger": bool(conn.get("keep_server_running_haenger", False)),
+            "offline_seit": conn.offline_seit,
+            "letzter_autostart": conn.data.get("watchdog_letzter_start_ts"),
+            "absichtlich_gestoppt": gestoppt if isinstance(gestoppt, dict) else None,
+        },
     })
 
 
@@ -33908,6 +35872,10 @@ async def api_server_restart(request: web.Request) -> web.Response:
     if e:
         return e
     okflag, msg = await nit.restart()
+    if okflag:
+        _c = _conn_for_session(_sess_get(request))
+        if _c is not None:
+            _c.neustart_markieren()
     return (ok({"message": msg}) if okflag else err(msg or "Neustart fehlgeschlagen.", 502))
 
 
@@ -33922,6 +35890,10 @@ async def api_server_stop(request: web.Request) -> web.Response:
     if e:
         return e
     okflag, msg = await nit.stop()
+    if okflag:
+        _c = _conn_for_session(_sess_get(request))
+        if _c is not None:
+            _c.stopp_markieren("dashboard")
     return (ok({"message": msg}) if okflag else err(msg or "Stopp fehlgeschlagen.", 502))
 
 
@@ -34608,6 +36580,7 @@ def build_app() -> web.Application:
     r.add_delete("/api/zones/{name}", delete_zone)
     r.add_get("/api/zones/{name}/allowlist", get_allowlist)
     r.add_post("/api/zones/{name}/allowlist", add_allowlist)
+    r.add_put("/api/zones/{name}/allowlist", set_allowlist)
     r.add_delete("/api/zones/{name}/allowlist/{player}", remove_allowlist)
     # ── Factions ──
     r.add_get("/api/factions", list_factions)
@@ -34749,6 +36722,8 @@ def build_app() -> web.Application:
     # ── Karte / Events ──
     r.add_get("/api/map/meta", api_map_meta)
     r.add_get("/api/map/players", api_map_players)
+    r.add_get("/api/heatmap/points", api_heatmap_points)
+    r.add_post("/api/heatmap/reset", api_heatmap_reset)
     r.add_get("/api/events", api_events)
     r.add_get("/api/events/types", api_event_types)
 
@@ -34781,6 +36756,11 @@ def build_app() -> web.Application:
     r.add_get("/api/server/status", api_server_status)
     r.add_post("/api/server/restart", api_server_restart)
     r.add_post("/api/server/stop", api_server_stop)
+    r.add_get("/api/server/damage", api_server_damage_get)
+    r.add_post("/api/server/damage", api_server_damage_set)
+    r.add_get("/api/server/general", api_server_general_get)
+    r.add_post("/api/server/general", api_server_general_set)
+    r.add_post("/api/server/general/copy", api_server_general_copy)
 
     return app
 
@@ -35391,6 +37371,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "ed353c1afacead0c5c54291a1665ec5078ab0dfc09b2bbe0e1977784f100a214",
     ),
     "styles.css": (
+        "854cd5c0116ef9230d2534c486b88c6dff38df66194defb0c429309ea4add035",
         "0dcb70fa1bee603d45b9b0dca4a0b8437f1b7ae65182c15d242f9eb625a3cfee",
         "f68b843465b48dbe4d294a2f319a1c391eb1b43eed1fea7db39a916c1c1ad804",
         "c178de8eafdc34b2f5bce14ad45a309cf694479c6a2697e9fb52d448347e9e2b",
@@ -35435,6 +37416,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "a527a86116a2dea94b7b1d270c2a0df12d32e3438778869c3b1942f49b38e4c9",
         "67e8e05e0a8c1f15b98c59b64eabf598f6bd283b40023448e777f72f7bd9c9ba",
         "ac0b7a72181f26afe830aef3c0e28ce2cf2199c623ca9c9e640fb2ce401c2214",
         "aa9340060d6001f8e3368d8d446f665a884cb8768e5908b54893d523ecb9bbc0",
@@ -35639,6 +37621,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "391ff9f9dad38e7fa6e74efb6968d754e84251df3a41f30cebeddfd65d8c08eb",
     ),
     "map.js": (
+        "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
         "4599bc6a735552954b49f115b39748b418553d44ec8d3bbe3ea67c5beb3ac0da",
         "13052daa06af52e48146d9683438088ff94f759ff72c414b78104e0be4e4abc3",
         "64943377eafacf935e323f8ec082273daa81ebe27983061e12eee1e706831977",
