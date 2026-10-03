@@ -99,6 +99,7 @@ def _install_deps():
         print("[SETUP] Fertig – starte Bot neu...\n")
         os.execv(sys.executable, [sys.executable] + sys.argv)
     _install_optional_deps()
+    _install_pillow()
 
 def _can_import(name: str) -> bool:
     try:
@@ -148,6 +149,32 @@ def _install_optional_deps():
         print("[SETUP] cryptography installiert – das Dashboard nimmt jetzt auch https:// an.")
     else:
         print("[SETUP] cryptography weiterhin nicht nutzbar – Dashboard läuft nur über http://.")
+
+
+def _install_pillow():
+    """Pillow nachziehen - gebraucht fuer /faction map und /heatmap (Kartenbilder).
+
+    Optional wie cryptography: ein Fehlschlag blockiert den Start nicht, die
+    beiden Befehle melden dann weiter, dass das Paket fehlt. Gelingt die
+    Installation, startet der Bot sich neu, weil der PIL-Import ganz oben
+    (``_PIL_AVAILABLE``) sonst bis zum naechsten Neustart False bliebe.
+    """
+    if _can_import("PIL"):
+        return
+    import subprocess
+    print("[SETUP] Installiere optionales Paket für Kartenbilder: Pillow")
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
+                        "Pillow>=10.0"], check=True, timeout=300)
+    except Exception as e:  # noqa: BLE001 – optional, darf fehlschlagen
+        print(f"[SETUP] Pillow nicht installierbar ({e}) – /faction map und /heatmap bleiben gesperrt.")
+        return
+    import importlib
+    importlib.invalidate_caches()
+    if _can_import("PIL"):
+        print("[SETUP] Pillow installiert – starte Bot neu...\n")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    print("[SETUP] Pillow weiterhin nicht importierbar – Kartenbilder bleiben gesperrt.")
 
 _install_deps()
 
@@ -1280,7 +1307,7 @@ def _create_helper_files():
     req = ("discord.py>=2.3.0\naiohttp>=3.9.0\nrequests>=2.31.0\n"
            "# optional – nur für HTTPS im Dashboard (selbstsigniertes Zertifikat)\n"
            "cryptography>=41.0\n"
-           "# optional – nur für /faction map (Kartenbild mit Online-Mitgliedern)\n"
+           "# für /faction map und /heatmap (Kartenbilder) – wird beim Start nachinstalliert\n"
            "Pillow>=10.0\n")
     if not os.path.exists("requirements.txt"):
         with open("requirements.txt", "w", encoding="utf-8") as f:
