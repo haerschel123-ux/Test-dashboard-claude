@@ -125,8 +125,8 @@ class _StubResponse:
     def is_done(self):
         return self.deferred or bool(self.sent)
 
-    async def send_message(self, content=None, embed=None, ephemeral=False):
-        self.sent.append({"content": content, "embed": embed, "ephemeral": ephemeral})
+    async def send_message(self, content=None, embed=None, ephemeral=False, file=None):
+        self.sent.append({"content": content, "embed": embed, "ephemeral": ephemeral, "file": file})
 
     async def send_modal(self, modal):
         self.modal = modal

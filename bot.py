@@ -621,6 +621,11 @@ LOG_TYPES: Dict[str, str] = {
 #  "gruppe" ordnet nur die Anzeige im Dropdown, "farbe" ist die Vorgabe, die
 #  der Kunde je Feed ueberschreiben kann.
 # ══════════════════════════════════════════════════════════════
+# Eigenes Server-Emoji „Brigarde Killfeed“ (Logo) für Embeds wie /hilfe.
+_BRIGARDE_EMOJI = "<:Brigardekillfeed:1546617539730083870>"
+# Logo-Bild (eingebettetes Asset, wird beim Start nach dashboard_web/static/ entpackt)
+_HILFE_LOGO_DATEI = "brigarde_killfeed.jpg"
+
 FEED_TYPES: Dict[str, Dict[str, Any]] = {
     # ── Kills ────────────────────────────────────────────────
     "kill":               {"label": "Kill",                "gruppe": "Kills",
@@ -1006,6 +1011,8 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.daynight":                     {"label": "Day/Night Config", "gruppe": "Tools"},
     "tools.deployment":                   {"label": "NPC + Vehicle Deployment", "gruppe": "Tools"},
     "tools.airstrike":                    {"label": "Airstrike Generator", "gruppe": "Tools"},
+    "tools.airdrop":                      {"label": "Airdrop Configurator", "gruppe": "Tools"},
+    "tools.underground":                  {"label": "Underground Area Generator", "gruppe": "Tools"},
     "tools.weather":                      {"label": "Weather Manager", "gruppe": "Tools"},
     "tools.globals":                      {"label": "Globals Configurator", "gruppe": "Tools"},
     "tools.economy":                      {"label": "Economy Editor", "gruppe": "Tools"},
@@ -14323,6 +14330,8 @@ _TOOL_LISTE = (
     ("daynight", "🌗", "Day/Night Config"),
     ("deployment", "🚚", "NPC + Vehicle Deployment"),
     ("airstrike", "💥", "Airstrike Generator"),
+    ("airdrop", "🪂", "Airdrop Configurator"),
+    ("underground", "🕳️", "Underground Area Generator"),
     ("weather", "🌦️", "Weather Manager"),
     ("globals", "⚙️", "Globals Configurator"),
     ("economy", "🧮", "Economy Editor"),
@@ -17557,6 +17566,422 @@ async def api_tools_airstrike_remove(request: web.Request) -> web.Response:
         return ok({"entfernt": dep_id})
 
 
+# Airdrop: Belegtes CE-Muster aus DayZ-Central-Economy,
+# dayzOffline.chernarusplus/db/events.xml (StaticAirplaneCrate).  Kein
+# cfgspawnabletypes.xml: die drei SupplyBoxen haben dort keinen Vanilla-Eintrag.
+_AIRDROP_SUFFIX_RE = re.compile(r"[A-Za-z0-9_]{1,32}")
+_AIRDROP_BOXES = ("StaticObj_Misc_SupplyBox1_DE", "StaticObj_Misc_SupplyBox2_DE",
+                  "StaticObj_Misc_SupplyBox3_DE")
+
+
+def _tool_world_size(conn: ServerConnection) -> Tuple[Optional[str], Optional[int]]:
+    map_name = _canonical_map_name(str(conn.data.get("map_name") or ""))
+    return map_name, DEFAULT_MAP_SIZES.get(map_name) if map_name else None
+
+
+def _airdrops(conn: ServerConnection) -> List[Dict[str, Any]]:
+    values = conn.data.get("airdrops", [])
+    return copy.deepcopy([v for v in values if isinstance(v, dict)]) if isinstance(values, list) else []
+
+
+def _airdrop_status(conn: ServerConnection) -> Dict[str, Any]:
+    map_name, world_size = _tool_world_size(conn)
+    if map_name == "Livonia":
+        return {"karte": map_name, "world_size": world_size, "freigegeben": False,
+                "hinweis": "Auf Livonia fehlen die Vanilla-Kistenklassen."}
+    if map_name == "Sakhal":
+        return {"karte": map_name, "world_size": world_size, "freigegeben": True,
+                "hinweis": "Auf Sakhal ist der Vanilla-Airdrop deaktiviert; Funktion auf dem Server nicht bestätigt."}
+    if map_name == "ChernarusPlus":
+        return {"karte": map_name, "world_size": world_size, "freigegeben": True, "hinweis": None}
+    return {"karte": map_name, "world_size": world_size, "freigegeben": False,
+            "hinweis": "Karte unbekannt – zuerst die Serververbindung prüfen."}
+
+
+def _airdrop_number(value: Any, label: str, low: int, high: int) -> int:
+    if type(value) is not int or not low <= value <= high:
+        raise ValueError(f"{label}: {low}–{high} als ganze Zahl angeben.")
+    return value
+
+
+def _airdrop_input(data: Any, conn: ServerConnection) -> Tuple[str, str, List[Dict[str, int]], Dict[str, Any]]:
+    if not isinstance(data, dict) or type(data.get("vorschau", False)) is not bool:
+        raise ValueError("Ungültige Airdrop-Anfrage.")
+    suffix = data.get("suffix")
+    if not isinstance(suffix, str) or not _AIRDROP_SUFFIX_RE.fullmatch(suffix):
+        raise ValueError("Suffix: 1–32 Buchstaben, Ziffern oder _ verwenden.")
+    status = _airdrop_status(conn)
+    if not status["freigegeben"]:
+        raise ValueError(status["hinweis"])
+    size = status["world_size"]
+    if not isinstance(size, int):
+        raise ValueError("Karte unbekannt – zuerst die Serververbindung prüfen.")
+    defaults = {"nominal": 9, "min": 0, "max": 0, "lifetime": 1800, "restock": 0,
+                "saferadius": 1000, "distanceradius": 1, "cleanupradius": 1000, "active": True,
+                "box_min": 2, "box_max": 4, "loot_min": 4, "loot_max": 8}
+    raw_values = data.get("werte", {})
+    if not isinstance(raw_values, dict) or set(raw_values) - set(defaults):
+        raise ValueError("Ungültige Airdrop-Werte.")
+    values = dict(defaults)
+    values.update(raw_values)
+    limits = {"nominal": (0, 50), "min": (0, 50), "max": (0, 50),
+              "lifetime": (60, 86400), "restock": (0, 86400),
+              "saferadius": (0, 5000), "distanceradius": (0, 5000), "cleanupradius": (0, 5000),
+              "box_min": (0, 20), "box_max": (0, 20), "loot_min": (0, 50), "loot_max": (0, 50)}
+    for key, (low, high) in limits.items():
+        values[key] = _airdrop_number(values[key], key, low, high)
+    if type(values["active"]) is not bool:
+        raise ValueError("Aktiv muss ein Schalter sein.")
+    if values["min"] > values["max"] or values["box_min"] > values["box_max"] or values["loot_min"] > values["loot_max"]:
+        raise ValueError("Min darf nicht größer als Max sein.")
+    positions = data.get("positionen")
+    if not isinstance(positions, list) or not 1 <= len(positions) <= 15:
+        raise ValueError("Bitte 1–15 Positionen setzen.")
+    points = []
+    for point in positions:
+        if not isinstance(point, dict):
+            raise ValueError("Ungültige Position.")
+        raw = (point.get("x"), point.get("z"), point.get("a", 0))
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in raw):
+            raise ValueError("Positionen und Winkel müssen Zahlen sein.")
+        x, z, angle = raw
+        if not 0 <= x <= size or not 0 <= z <= size or not 0 <= angle <= 360:
+            raise ValueError("Eine Position oder ein Winkel liegt außerhalb des erlaubten Bereichs.")
+        points.append({"x": round(x, 3), "z": round(z, 3), "a": round(angle, 3)})
+    return suffix, "StaticAirdrop_" + suffix, points, values
+
+
+def _airdrop_event_xml(name: str, values: Dict[str, Any]) -> str:
+    rows = [f'<event name="{_tool_esc_xml(name)}">']
+    for key in ("nominal", "min", "max", "lifetime", "restock", "saferadius", "distanceradius", "cleanupradius"):
+        rows.append(f'    <{key}>{values[key]}</{key}>')
+    rows += ['    <flags deletable="0" init_random="0" remove_damaged="1"/>',
+             '    <position>fixed</position>', '    <limit>child</limit>',
+             f'    <active>{1 if values["active"] else 0}</active>', '    <children>']
+    for box in _AIRDROP_BOXES:
+        rows.append(f'        <child lootmax="{values["loot_max"]}" lootmin="{values["loot_min"]}" max="{values["box_max"]}" min="{values["box_min"]}" type="{box}"/>')
+    rows += ['    </children>', '</event>']
+    return "\n".join(rows)
+
+
+async def _airdrop_prepare(request: web.Request, action: str):
+    conn, error = _session_conn(request, "tools.airdrop")
+    if error is None:
+        error = await _modul_pruefen("tools.airdrop", request, conn)
+    if error is None:
+        error = await _dash_gate(request, conn, "tools", action)
+    return conn, error
+
+
+async def _airdrop_files(conn: ServerConnection, loop):
+    result = []
+    for filename, root_tag in (("db/events.xml", "events"), ("cfgeventspawns.xml", "eventposdef")):
+        raw, status = await _tools_datei_lesen(conn, filename, loop)
+        if status != "ok":
+            raise ValueError("Die Airdrop-Serverdateien sind nicht lesbar.")
+        try:
+            if ET.fromstring(raw).tag != root_tag:
+                raise ValueError("Falsches XML-Wurzelelement.")
+            _dayzcode_segmente(raw)
+        except (ET.ParseError, ValueError) as exc:
+            raise ValueError("Die Airdrop-Serverdateien enthalten ungültiges XML oder beschädigte Marker.") from exc
+        result.append((filename, root_tag, raw))
+    return result
+
+
+async def _airdrop_transaction(conn: ServerConnection, changes, manifest, loop):
+    attempted, before = [], copy.deepcopy(conn.data.get("airdrops"))
+    existed = "airdrops" in conn.data
+    try:
+        for filename, original, changed in changes:
+            attempted.append((filename, original))
+            if not await _tools_datei_schreiben(conn, filename, changed, loop):
+                raise OSError(filename)
+        _conn_store(conn, "airdrops", manifest, strict=True)
+    except Exception:
+        failed = [filename for filename, original in reversed(attempted)
+                  if not await _tools_datei_schreiben(conn, filename, original, loop)]
+        if existed:
+            conn.data["airdrops"] = before
+        else:
+            conn.data.pop("airdrops", None)
+        try:
+            connections.save(strict=True)
+        except OSError:
+            failed.append("connections.json")
+        return err("Rollback unvollständig – folgende Dateien prüfen: " + ", ".join(failed), 502) if failed else err("Speichern fehlgeschlagen – Änderungen wurden zurückgesetzt.", 502)
+    return None
+
+
+async def api_tools_airdrop_get(request: web.Request) -> web.Response:
+    conn, error = await _airdrop_prepare(request, "view")
+    if error is not None:
+        return error
+    status = _airdrop_status(conn)
+    return ok({**status, "airdrops": _airdrops(conn), "kein_mission_ordner": not bool(_mission_dir_of(conn))})
+
+
+async def api_tools_airdrop_post(request: web.Request) -> web.Response:
+    conn, error = await _airdrop_prepare(request, "edit")
+    if error is not None:
+        return error
+    data = await body(request)
+    try:
+        suffix, name, points, values = _airdrop_input(data, conn)
+    except ValueError as exc:
+        return err(str(exc), 400)
+    preview = data.get("vorschau", False)
+    if not preview and not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    if not preview:
+        error = _dash_rate_limited(request, "tools.airdrop", 5)
+        if error is not None:
+            return error
+    async with _schaden_lock(conn.service_id):
+        loop = asyncio.get_running_loop()
+        try:
+            files = await _airdrop_files(conn, loop)
+        except ValueError as exc:
+            return err(str(exc), 502)
+        entries = _airdrops(conn)
+        if any(e.get("suffix") == suffix for e in entries) or any(_tool_finde_benannten_block(raw, "event", name) for _f, _r, raw in files):
+            return err("Dieser Eventname ist bereits vorhanden.", 409)
+        dep_id = "airdrop_" + suffix
+        blocks = [_airdrop_event_xml(name, values), _dayzcode_spawn_xml(name, points)]
+        try:
+            changes = [(filename, raw, _dayzcode_einfuegen(raw, root_tag, dep_id, block))
+                       for (filename, root_tag, raw), block in zip(files, blocks)]
+            for _filename, _raw, changed in changes:
+                ET.fromstring(changed)
+        except (ET.ParseError, ValueError) as exc:
+            return err(str(exc), 400)
+        generated = [{"filename": filename, "content": block} for (filename, _root, _raw), block in zip(files, blocks)]
+        if preview:
+            return ok({"event_name": name, "generated": generated})
+        entry = {"id": dep_id, "suffix": suffix, "event_name": name, "werte": values,
+                 "positionen": points, "erstellt": time.time()}
+        error = await _airdrop_transaction(conn, changes, entries + [entry], loop)
+        if error is not None:
+            return error
+        return ok({"id": dep_id, "event_name": name, "generated": generated,
+                   "meldung": "Wirkt nach dem nächsten Server-Neustart."})
+
+
+async def api_tools_airdrop_remove(request: web.Request) -> web.Response:
+    conn, error = await _airdrop_prepare(request, "edit")
+    if error is not None:
+        return error
+    data = await body(request)
+    suffix = data.get("suffix") if isinstance(data, dict) else None
+    if not isinstance(suffix, str) or not _AIRDROP_SUFFIX_RE.fullmatch(suffix):
+        return err("Ungültiger Airdrop-Suffix.", 400)
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    error = _dash_rate_limited(request, "tools.airdrop", 5)
+    if error is not None:
+        return error
+    async with _schaden_lock(conn.service_id):
+        entries = _airdrops(conn)
+        if not any(e.get("suffix") == suffix for e in entries):
+            return err("Diesen Airdrop gibt es nicht.", 404)
+        loop = asyncio.get_running_loop()
+        try:
+            files = await _airdrop_files(conn, loop)
+            changes = []
+            for filename, _root, raw in files:
+                changed, found = _dayzcode_entfernen(raw, "airdrop_" + suffix)
+                if found:
+                    ET.fromstring(changed)
+                    changes.append((filename, raw, changed))
+        except (ET.ParseError, ValueError) as exc:
+            return err(str(exc), 502)
+        error = await _airdrop_transaction(conn, changes, [e for e in entries if e.get("suffix") != suffix], loop)
+        return error or ok({"entfernt": suffix})
+
+
+# Underground schema: BohemiaInteractive/DayZ-Script-Diff,
+# scripts/3_game/undergroundarealoader.c and undergroundtrigger.c.
+_UNDERGROUND_FILE = "cfgundergroundtriggers.json"
+
+
+def _underground_number(value: Any, label: str, low: Optional[float] = None,
+                       high: Optional[float] = None) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{label} muss eine gültige Zahl sein.")
+    value = float(value)
+    if low is not None and value < low or high is not None and value > high:
+        raise ValueError(f"{label} liegt außerhalb des erlaubten Bereichs.")
+    return value
+
+
+def _underground_vector(value: Any, label: str, size: int, world_size: Optional[int] = None) -> List[float]:
+    if not isinstance(value, list) or len(value) != size:
+        raise ValueError(f"{label} muss aus {size} Zahlen bestehen.")
+    result = [_underground_number(part, label) for part in value]
+    if world_size is not None and not (0 <= result[0] <= world_size and 0 <= result[2] <= world_size):
+        raise ValueError(f"{label}: X/Z liegen außerhalb der Karte.")
+    return result
+
+
+def _underground_schalter(value: Any, label: str) -> Any:
+    """bool oder 0/1 – Bohemias eigene Dateien (Livonia, Sakhal) nutzen Zahlen."""
+    if type(value) is bool or (type(value) is int and value in (0, 1)):
+        return value
+    raise ValueError(f"{label} muss ein Schalter sein.")
+
+
+def _underground_breadcrumb(value: Any, world_size: int) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("Ungültiger Breadcrumb.")
+    result = {"Position": _underground_vector(value.get("Position"), "Breadcrumb-Position", 3, world_size)}
+    if "EyeAccommodation" in value:
+        result["EyeAccommodation"] = _underground_number(value["EyeAccommodation"], "Breadcrumb EyeAccommodation", 0, 1)
+    if "UseRaycast" in value:
+        result["UseRaycast"] = _underground_schalter(value["UseRaycast"], "Breadcrumb UseRaycast")
+    if "Radius" in value:
+        radius = _underground_number(value["Radius"], "Breadcrumb Radius")
+        if radius != -1 and radius <= 0:
+            raise ValueError("Breadcrumb Radius muss -1 oder größer als 0 sein.")
+        result["Radius"] = radius
+    if "LightLerp" in value:
+        result["LightLerp"] = _underground_schalter(value["LightLerp"], "Breadcrumb LightLerp")
+    known = set(result)
+    for key, item in value.items():
+        if key not in known:
+            result[key] = copy.deepcopy(item)
+    return result
+
+
+def _underground_trigger(value: Any, world_size: int) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("Ungültiger Trigger.")
+    result = {
+        "Position": _underground_vector(value.get("Position"), "Position", 3, world_size),
+        "Orientation": _underground_vector(value.get("Orientation", [0, 0, 0]), "Orientation", 3),
+        "Size": _underground_vector(value.get("Size"), "Size", 3),
+        "EyeAccommodation": _underground_number(value.get("EyeAccommodation"), "EyeAccommodation", 0, 1),
+    }
+    if any(component <= 0 for component in result["Size"]):
+        raise ValueError("Jede Size-Komponente muss größer als 0 sein.")
+    crumbs = value.get("Breadcrumbs", [])
+    if not isinstance(crumbs, list) or len(crumbs) > 32:
+        raise ValueError("Breadcrumbs: höchstens 32 Einträge erlaubt.")
+    if "Breadcrumbs" in value:  # Sakhal lässt das Feld bei Innen-/Außenzonen weg
+        result["Breadcrumbs"] = [_underground_breadcrumb(item, world_size) for item in crumbs]
+    # Nur übernehmen, wenn vorhanden: Bohemias Dateien lassen das Feld oft weg
+    # und Sakhal nutzt 0.0 – ein erzwungener Standard würde den Roundtrip ändern.
+    if "InterpolationSpeed" in value:
+        result["InterpolationSpeed"] = _underground_number(value["InterpolationSpeed"], "InterpolationSpeed", 0)
+    if "UseLinePointFade" in value:
+        result["UseLinePointFade"] = _underground_schalter(value["UseLinePointFade"], "UseLinePointFade")
+    for key in ("AmbientSoundType", "AmbientSoundSet"):
+        if key in value:
+            if not isinstance(value[key], str):
+                raise ValueError(f"{key} muss Text sein.")
+            result[key] = value[key]
+    known = set(result)
+    for key, item in value.items():
+        if key not in known:
+            result[key] = copy.deepcopy(item)
+    return result
+
+
+def _underground_payload(value: Any, world_size: int) -> Dict[str, Any]:
+    if not isinstance(value, list):
+        raise ValueError("Triggers muss eine Liste sein.")
+    return {"Triggers": [_underground_trigger(item, world_size) for item in value]}
+
+
+def _underground_parse(raw: str) -> Dict[str, Any]:
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cfgundergroundtriggers.json enthält ungültiges JSON.") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("Triggers"), list):
+        raise ValueError("cfgundergroundtriggers.json braucht ein Wurzelobjekt mit Triggers-Liste.")
+    return value
+
+
+async def _underground_prepare(request: web.Request, action: str):
+    conn, error = _session_conn(request, "tools.underground")
+    if error is None:
+        error = await _modul_pruefen("tools.underground", request, conn)
+    if error is None:
+        error = await _dash_gate(request, conn, "tools", action)
+    return conn, error
+
+
+async def api_tools_underground_get(request: web.Request) -> web.Response:
+    conn, error = await _underground_prepare(request, "view")
+    if error is not None:
+        return error
+    map_name, world_size = _tool_world_size(conn)
+    if world_size is None:
+        return err("Karte unbekannt – zuerst die Serververbindung prüfen.", 400)
+    result = {"triggers": [], "fehler": None, "world_size": world_size, "karte": map_name,
+              "hash": None, "kein_mission_ordner": not bool(_mission_dir_of(conn))}
+    if not _mission_dir_of(conn):
+        return ok(result)
+    async with _schaden_lock(conn.service_id):
+        raw, status = await _tools_datei_lesen(conn, _UNDERGROUND_FILE, asyncio.get_running_loop())
+        if status == "missing":
+            result["hinweis"] = "Datei fehlt – gestartet wird mit einer leeren Triggers-Liste."
+        elif status != "ok":
+            result["fehler"] = "Datei konnte nicht gelesen werden."
+        else:
+            try:
+                parsed = _underground_parse(raw)
+                result["triggers"] = parsed["Triggers"]
+                result["hash"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            except ValueError as exc:
+                result["fehler"] = str(exc)
+    return ok(result)
+
+
+async def api_tools_underground_post(request: web.Request) -> web.Response:
+    conn, error = await _underground_prepare(request, "edit")
+    if error is not None:
+        return error
+    data = await body(request)
+    if not isinstance(data, dict) or type(data.get("vorschau", False)) is not bool:
+        return err("Ungültige Underground-Anfrage.", 400)
+    _map_name, world_size = _tool_world_size(conn)
+    if world_size is None:
+        return err("Karte unbekannt – zuerst die Serververbindung prüfen.", 400)
+    try:
+        content = _underground_payload(data.get("triggers"), world_size)
+    except ValueError as exc:
+        return err(str(exc), 400)
+    preview = data["vorschau"]
+    if not preview and not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    if not preview:
+        error = _dash_rate_limited(request, "tools.underground", 5)
+        if error is not None:
+            return error
+    rendered = json.dumps(content, indent=4, ensure_ascii=False) + "\n"
+    if preview:
+        return ok({"generated": [{"filename": _UNDERGROUND_FILE, "content": rendered}]})
+    async with _schaden_lock(conn.service_id):
+        loop = asyncio.get_running_loop()
+        raw, status = await _tools_datei_lesen(conn, _UNDERGROUND_FILE, loop)
+        if status == "ok":
+            try:
+                _underground_parse(raw)
+            except ValueError as exc:
+                return err(str(exc), 409)
+            if data.get("hash") != hashlib.sha256(raw.encode("utf-8")).hexdigest():
+                return err("Datei wurde zwischenzeitlich geändert.", 409)
+            if not await _tools_datei_schreiben(conn, _UNDERGROUND_FILE + ".bak", raw, loop):
+                return err("Backup konnte nicht gespeichert werden. Hochladen abgebrochen.", 502)
+        elif status != "missing":
+            return err("Datei konnte nicht sicher gelesen werden.", 502)
+        if not await _tools_datei_schreiben(conn, _UNDERGROUND_FILE, rendered, loop):
+            return err("Datei konnte nicht gespeichert werden.", 502)
+    return ok({"generated": [{"filename": _UNDERGROUND_FILE, "content": rendered}], "geschrieben": True,
+               "meldung": "Wirkt nach dem nächsten Server-Neustart."})
+
+
 # PRA schema: BohemiaInteractive/DayZ-Script-Diff,
 # scripts/3_game/cfgplayerrestrictedareajsondata.c and
 # DayZ-Central-Economy/dayzOffline.sakhal/pra/warheadstorage.json.
@@ -19968,9 +20393,12 @@ async def cmd_hilfe(interaction: discord.Interaction):
     db.set_cooldown(gid, interaction.user.id, "hilfe",
                     int(cfg.config.get("hilfe_cooldown_seconds", 30)))
     embed = discord.Embed(
-        title=_t(interaction, "🎮 DayZ Bot – Befehlsübersicht", "🎮 DayZ Bot – Command Overview"),
-        description=_t(interaction, "Alle Befehle (Admin-Rolle erforderlich, außer /hilfe)",
-                       "All commands (admin role required, except /help)"),
+        # Eigene Emojis werden im Embed-Titel von Discord nicht gerendert
+        # (nur in Beschreibung/Feldern) – deshalb steht das Logo in der Beschreibung.
+        title=_t(interaction, "Brigarde Killfeed – Befehlsübersicht", "Brigarde Killfeed – Command Overview"),
+        description=_BRIGARDE_EMOJI + " " + _t(
+            interaction, "Alle Befehle (Admin-Rolle erforderlich, außer /hilfe)",
+            "All commands (admin role required, except /help)"),
         color=0x5865F2
     )
     embed.add_field(name=_t(interaction, "⚙️ Server-Verwaltung", "⚙️ Server Management"), value=_t(
@@ -20200,6 +20628,13 @@ async def cmd_hilfe(interaction: discord.Interaction):
             f"Admin-Rolle: {admin_name} (admin_role_ids stehen in der connections.json des Servers)",
             f"Admin role: {admin_name} (admin_role_ids is set in the server's connections.json)")
     embed.set_footer(text=footer)
+    # Logo „Brigarde Killfeed“ als großes Bild – liegt in den eingebetteten
+    # Assets, deshalb kein Hosting nötig (attachment:// statt externer URL).
+    logo = _read_asset(_HILFE_LOGO_DATEI)
+    if logo:
+        embed.set_image(url="attachment://" + _HILFE_LOGO_DATEI)
+        return await interaction.response.send_message(
+            embed=embed, file=discord.File(io.BytesIO(logo), filename=_HILFE_LOGO_DATEI))
     await interaction.response.send_message(embed=embed)
 
 
@@ -28287,6 +28722,9 @@ _AUDIT_LABELS = {
     ("POST", "/api/economy/config"): "Economy-Einstellungen geändert",
     ("POST", "/api/tools/globals"): "Globals Configurator gespeichert",
     ("POST", "/api/tools/economy"): "Economy Editor gespeichert",
+    ("POST", "/api/tools/airdrop"): "Airdrop Configurator gespeichert",
+    ("POST", "/api/tools/airdrop/remove"): "Airdrop entfernt",
+    ("POST", "/api/tools/underground"): "Underground Area gespeichert",
     ("POST", "/api/bans"): "Spieler gebannt",
     ("POST", "/api/whitelist"): "Whitelist-Eintrag hinzugefügt",
     ("POST", "/api/announcements"): "Ankündigung angelegt",
@@ -37220,6 +37658,11 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/vehicle", api_tools_vehicle_post)
     r.add_get("/api/tools/deployment", api_tools_deployment_get)
     r.add_get("/api/tools/airstrike", api_tools_airstrike_get)
+    r.add_get("/api/tools/airdrop", api_tools_airdrop_get)
+    r.add_post("/api/tools/airdrop", api_tools_airdrop_post)
+    r.add_post("/api/tools/airdrop/remove", api_tools_airdrop_remove)
+    r.add_get("/api/tools/underground", api_tools_underground_get)
+    r.add_post("/api/tools/underground", api_tools_underground_post)
     r.add_get("/api/tools/weather", api_tools_weather_get)
     r.add_post("/api/tools/weather", api_tools_weather_post)
     r.add_get("/api/tools/globals", api_tools_globals_get)
@@ -37960,6 +38403,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "d68abb8f966f9297f38ac73c6d0218fc9fe499847fcc63a8ce7687593718a911",
         "16be51d3a3621e4dae8d824867e9de4b820040dcf8e0b386fadb03b2b223d12c",
         "a61fc96c21dddb92c93105af4c08ae2969dffa924bc23492ab641a18f551ffd7",
         "a527a86116a2dea94b7b1d270c2a0df12d32e3438778869c3b1942f49b38e4c9",
