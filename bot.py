@@ -1007,6 +1007,8 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.deployment":                   {"label": "NPC + Vehicle Deployment", "gruppe": "Tools"},
     "tools.airstrike":                    {"label": "Airstrike Generator", "gruppe": "Tools"},
     "tools.weather":                      {"label": "Weather Manager", "gruppe": "Tools"},
+    "tools.globals":                      {"label": "Globals Configurator", "gruppe": "Tools"},
+    "tools.economy":                      {"label": "Economy Editor", "gruppe": "Tools"},
     "tools.teleports":                    {"label": "Teleport Generator", "gruppe": "Tools"},
     "backup":                             {"label": "Backup der Server-Dateien",
                                            "gruppe": "Verbindung"},
@@ -14322,6 +14324,8 @@ _TOOL_LISTE = (
     ("deployment", "🚚", "NPC + Vehicle Deployment"),
     ("airstrike", "💥", "Airstrike Generator"),
     ("weather", "🌦️", "Weather Manager"),
+    ("globals", "⚙️", "Globals Configurator"),
+    ("economy", "🧮", "Economy Editor"),
     ("npcgenerator", "🧍", "NPC Generator"),
     ("teleports", "🚚", "Teleport Generator"),
 )
@@ -16956,6 +16960,361 @@ async def api_tools_weather_post(request):
             return err("cfgweather.xml konnte nicht gespeichert werden.", 502)
     _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Wetter gespeichert", conn.name)
     return ok({"generated": generated})
+
+
+# Vanilla source: BohemiaInteractive/DayZ-Central-Economy, mission db/globals.xml.
+# Bounds below are conservative editor limits, not documented engine limits.
+_GLOBALS_DEFAULTS = (
+    ("AnimalMaxCount", 0, 200), ("CleanupAvoidance", 0, 100),
+    ("CleanupLifetimeDeadAnimal", 0, 1200), ("CleanupLifetimeDeadInfected", 0, 330),
+    ("CleanupLifetimeDeadPlayer", 0, 3600), ("CleanupLifetimeDefault", 0, 45),
+    ("CleanupLifetimeLimit", 0, 50), ("CleanupLifetimeRuined", 0, 330),
+    ("FlagRefreshFrequency", 0, 432000), ("FlagRefreshMaxDuration", 0, 3456000),
+    ("FoodDecay", 0, 1), ("IdleModeCountdown", 0, 60), ("IdleModeStartup", 0, 1),
+    ("InitialSpawn", 0, 100), ("LootDamageMax", 1, .82), ("LootDamageMin", 1, 0.0),
+    ("LootProxyPlacement", 0, 1), ("LootSpawnAvoidance", 0, 100),
+    ("RespawnAttempt", 0, 2), ("RespawnLimit", 0, 20), ("RespawnTypes", 0, 12),
+    ("RestartSpawn", 0, 0), ("SpawnInitial", 0, 1200), ("TimeHopping", 0, 60),
+    ("TimeLogin", 0, 15), ("TimeLogout", 0, 15), ("TimePenalty", 0, 20),
+    ("WorldWetTempUpdate", 0, 1), ("ZombieMaxCount", 0, 1000), ("ZoneSpawnDist", 0, 300),
+)
+_GLOBALS_SWITCHES = frozenset(("FoodDecay", "IdleModeStartup", "LootProxyPlacement", "RestartSpawn", "WorldWetTempUpdate"))
+# Field meanings: https://community.bohemia.net/wiki/DayZ%3ACentral_Economy_Configuration
+# The live wiki denies this environment (403); its indexed revision 339041
+# supplies the documented meanings. Official mission XML supplies current defaults.
+_GLOBALS_INFO = {
+    "AnimalMaxCount": "Tierlimit ohne Ambient-Tiere.",
+    "CleanupAvoidance": "Mindestabstand zum Spieler beim Löschen von Entitäten.",
+    "CleanupLifetimeDeadAnimal": "Haltbarkeit toter Tiere.",
+    "CleanupLifetimeDeadInfected": "Haltbarkeit toter Infizierter.",
+    "CleanupLifetimeDeadPlayer": "Haltbarkeit von Spielerleichen.",
+    "CleanupLifetimeDefault": "Haltbarkeit unkonfigurierter, vollständig beschädigter Entitäten.",
+    "CleanupLifetimeLimit": "Maximale Anzahl gelöschter Entitäten pro Aufräumvorgang.",
+    "CleanupLifetimeRuined": "Haltbarkeit zerstörten Loots.",
+    "FlagRefreshFrequency": "Intervall der Haltbarkeitsauffrischung durch eine Flagge.",
+    "FlagRefreshMaxDuration": "Maximale Auffrischungsdauer durch eine Flagge.",
+    "FoodDecay": "Lebensmittelverfall. Benötigt aktiviertes WorldWetTempUpdate.",
+    "IdleModeCountdown": "Verzögerung bis zum Leerlaufmodus bei leerem Server.",
+    "IdleModeStartup": "Erlaubt den Leerlaufmodus beim Serverstart.",
+    "InitialSpawn": "Initiale Lootmenge in Prozent.",
+    "LootDamageMax": "Maximaler Schaden neu gespawnter Gegenstände (0–1).",
+    "LootDamageMin": "Minimaler Schaden neu gespawnter Gegenstände (0–1).",
+    "LootProxyPlacement": "Erlaubt Loot in Dispatch-Containern.",
+    "LootSpawnAvoidance": "Mindestabstand zum Spieler für Lootspawn.",
+    "RespawnAttempt": "Anzahl der Versuche pro Gegenstandsrespawn.",
+    "RespawnLimit": "Gleichzeitiges Respawnlimit pro Gegenstandstyp.",
+    "RespawnTypes": "Anzahl gleichzeitig bearbeiteter Gegenstandstypen beim Respawn.",
+    "RestartSpawn": "Prozentualer Neustart-Spawn (0–100). Dieser Schalter wählt 0 oder 1 Prozent; gelesene größere Werte bleiben bis zur Änderung erhalten.",
+    "SpawnInitial": "Anzahl anfänglicher Spawnversuche.",
+    "TimeHopping": "Strafzeit beim Serverwechsel.",
+    "TimeLogin": "Wartezeit bei der Anmeldung.",
+    "TimeLogout": "Wartezeit bei der Abmeldung.",
+    "TimePenalty": "Strafzeit bei bestehender Spielsitzung.",
+    "WorldWetTempUpdate": "Aktualisiert Nässe und Temperatur von Gegenständen.",
+    "ZombieMaxCount": "Limit der Infizierten.",
+    "ZoneSpawnDist": "Aktivierungsabstand dynamischer Infiziertenzonen.",
+}
+
+
+def _globals_vanilla():
+    return {name: value for name, _kind, value in _GLOBALS_DEFAULTS}
+
+
+def _globals_fields():
+    fields = []
+    for name, kind, default in _GLOBALS_DEFAULTS:
+        group, unit, maximum = "Sonstiges", "Anzahl", 1000000
+        if name in ("AnimalMaxCount", "ZombieMaxCount"):
+            group, maximum = "Tiere & Infizierte", 5000
+        elif name.startswith("Cleanup"):
+            group = "Aufräumen (Cleanup)"
+            unit = "Meter" if name == "CleanupAvoidance" else "Sekunden"
+            maximum = 10000 if unit == "Meter" else 31536000
+            if name == "CleanupLifetimeLimit":
+                unit, maximum = "Anzahl", 10000
+        elif name.startswith("Flag"):
+            group, unit, maximum = "Flaggen / Basis-Bestand", "Sekunden", 31536000
+        elif name.startswith("Time"):
+            group, unit, maximum = "Zeiten", "Sekunden", 65536
+        elif name.startswith("Loot") or name == "FoodDecay":
+            group, unit = "Loot", "Faktor" if kind == 1 else "Anzahl"
+            if kind == 1:
+                maximum = 1
+            elif name == "LootSpawnAvoidance":
+                unit, maximum = "Meter", 10000
+        elif "Spawn" in name or name.startswith("Respawn"):
+            group = "Spawn"
+            if name == "ZoneSpawnDist":
+                unit, maximum = "Meter", 10000
+            elif name == "InitialSpawn":
+                unit, maximum = "Prozent", 100
+        if name == "IdleModeCountdown":
+            unit, maximum = "Sekunden", 86400
+        if name in _GLOBALS_SWITCHES:
+            unit, maximum = "Schalter", 1
+        if name == "RestartSpawn":
+            unit, maximum = "Prozent", 100
+        fields.append({"name": name, "type": kind, "vanilla": default, "min": 0,
+                       "max": maximum, "schalter": name in _GLOBALS_SWITCHES,
+                       "label": name, "unit": unit, "info": _GLOBALS_INFO.get(name, "Wirkung nicht dokumentiert"),
+                       "group": group})
+    return fields
+
+
+def _globals_validate(values):
+    if not isinstance(values, dict) or set(values) != set(_globals_vanilla()):
+        raise ValueError("Globals-Werte sind unvollständig oder enthalten unbekannte Felder.")
+    for field in _globals_fields():
+        value, name = values[field["name"]], field["name"]
+        if type(value) not in ((int,) if field["type"] == 0 else (int, float)):
+            raise ValueError(f"{name}: Ganzzahl erforderlich." if field["type"] == 0 else f"{name}: Zahl erforderlich.")
+        if not math.isfinite(value) or not field["min"] <= value <= field["max"]:
+            raise ValueError(f"{name}: Wert muss zwischen {field['min']} und {field['max']} liegen.")
+    if values["LootDamageMin"] > values["LootDamageMax"]:
+        raise ValueError("LootDamageMin darf LootDamageMax nicht überschreiten.")
+    return values
+
+
+def _editor_root(raw, tag):
+    root = ET.fromstring(raw, parser=ET.XMLParser(target=ET.TreeBuilder(insert_comments=True)))
+    if root.tag != tag:
+        raise ValueError("Falsches XML-Wurzelelement.")
+    return root
+
+
+def _globals_parse(raw):
+    values, seen = _globals_vanilla(), set()
+    root = _editor_root(raw, "variables")
+    kinds = {name: kind for name, kind, _value in _GLOBALS_DEFAULTS}
+    for node in root:
+        name = node.get("name")
+        if node.tag != "var" or name not in values:
+            continue
+        if name in seen or node.get("type") != str(kinds[name]):
+            raise ValueError("Doppelter Globals-Eintrag oder falscher Typ.")
+        seen.add(name)
+        values[name] = int(node.get("value", "")) if kinds[name] == 0 else float(node.get("value", ""))
+    return _globals_validate(values)
+
+
+def _editor_xml(root, title, created_at=None):
+    stamp = created_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    root.insert(0, ET.Comment(f" Brigarde Killfeed {title} – {stamp} "))
+    ET.indent(root, space="    ")
+    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' + ET.tostring(root, encoding="unicode") + "\n"
+
+
+def _globals_xml(values, created_at=None, original_raw=None):
+    _globals_validate(values)
+    root = _editor_root(original_raw, "variables") if original_raw is not None else ET.Element("variables")
+    known = {name: node for node in root if node.tag == "var" and (name := node.get("name")) in values}
+    extras = [node for node in root if not (node.tag == "var" and node.get("name") in values)]
+    root[:] = []
+    for name, kind, _default in _GLOBALS_DEFAULTS:
+        node = known.get(name)
+        if node is None:
+            node = ET.Element("var")
+        value = str(values[name]) if kind == 0 else str(float(values[name]))
+        node.attrib.update(name=name, type=str(kind), value=value)
+        root.append(node)
+    root.extend(extras)
+    return _editor_xml(root, "Globals Configurator", created_at)
+
+
+def _globals_presets():
+    # Performance reduces actors and corpse lifetimes; base durability uses 60 days;
+    # PvP retains corpses for two hours and uses a five-second login delay.
+    changes = (
+        ("performance", "Leistung", {"AnimalMaxCount": 100, "ZombieMaxCount": 500,
+                                     "CleanupLifetimeDeadAnimal": 600, "CleanupLifetimeDeadInfected": 180,
+                                     "CleanupLifetimeDeadPlayer": 1800, "CleanupLifetimeDefault": 30,
+                                     "CleanupLifetimeRuined": 180}),
+        ("base", "Lange Basis-Haltbarkeit", {"FlagRefreshFrequency": 864000, "FlagRefreshMaxDuration": 2592000 * 2}),
+        ("hardcore", "Hardcore/PvP", {"CleanupLifetimeDeadAnimal": 2400,
+                                     "CleanupLifetimeDeadInfected": 660, "CleanupLifetimeDeadPlayer": 7200,
+                                     "TimeLogin": 5, "ZombieMaxCount": 2000}),
+        ("vanilla", "Vanilla", {}),
+    )
+    return [{"key": key, "label": label, "werte": {**_globals_vanilla(), **updates}}
+            for key, label, updates in changes]
+
+
+_ECONOMY_COLUMNS = ("init", "load", "respawn", "save")
+_ECONOMY_DEFAULTS = (
+    ("dynamic", (1, 1, 1, 1)), ("animals", (1, 0, 1, 0)),
+    ("zombies", (1, 0, 1, 0)), ("vehicles", (1, 1, 1, 1)),
+    ("randoms", (0, 0, 1, 0)), ("custom", (0, 0, 0, 0)),
+    ("building", (1, 1, 0, 1)), ("player", (1, 1, 1, 1)),
+)
+# Flag semantics: https://community.bohemia.net/wiki/DayZ:Central_Economy_setup_for_custom_terrains
+# init initializes entities at startup without forcing replacement of persisted state;
+# load reads persistence, respawn replenishes,
+# save persists entities. Disabled load can discard previous saved state at restart.
+_ECONOMY_LABELS = {
+    "dynamic": "Dynamischer Loot", "animals": "Tiere", "zombies": "Infizierte",
+    "vehicles": "Fahrzeuge", "randoms": "Zufallsereignisse", "custom": "Eigene Entitäten",
+    "building": "Gebäude / Türzustände", "player": "Spieler",
+}
+
+
+def _economy_vanilla():
+    return {name: dict(zip(_ECONOMY_COLUMNS, flags)) for name, flags in _ECONOMY_DEFAULTS}
+
+
+def _economy_validate(values):
+    if not isinstance(values, dict) or set(values) != set(_economy_vanilla()):
+        raise ValueError("Economy-Werte sind unvollständig oder enthalten unbekannte Abschnitte.")
+    for name, flags in values.items():
+        if not isinstance(flags, dict) or set(flags) != set(_ECONOMY_COLUMNS):
+            raise ValueError(f"{name}: Vier Economy-Schalter erforderlich.")
+        if any(type(value) is not int or value not in (0, 1) for value in flags.values()):
+            raise ValueError(f"{name}: Economy-Schalter müssen 0 oder 1 sein.")
+    return values
+
+
+def _economy_parse(raw):
+    values, seen = _economy_vanilla(), set()
+    for node in _editor_root(raw, "economy"):
+        if node.tag not in values:
+            continue
+        if node.tag in seen:
+            raise ValueError("Doppelter Economy-Abschnitt.")
+        seen.add(node.tag)
+        for key in _ECONOMY_COLUMNS:
+            if node.get(key) is not None:
+                values[node.tag][key] = int(node.get(key))
+    return _economy_validate(values)
+
+
+def _economy_xml(values, created_at=None, original_raw=None):
+    _economy_validate(values)
+    root = _editor_root(original_raw, "economy") if original_raw is not None else ET.Element("economy")
+    known = {node.tag: node for node in root if node.tag in values}
+    extras = [node for node in root if node.tag not in values]
+    root[:] = []
+    for name, _flags in _ECONOMY_DEFAULTS:
+        node = known.get(name)
+        if node is None:
+            node = ET.Element(name)
+        node.attrib.update({key: str(values[name][key]) for key in _ECONOMY_COLUMNS})
+        root.append(node)
+    root.extend(extras)
+    return _editor_xml(root, "Economy Editor", created_at)
+
+
+def _economy_presets():
+    # Composable: change only load=0 in these rows, retaining all other flags.
+    return [{"key": key, "label": label, "zeilen": list(rows)} for key, label, rows in (
+        ("soft", "Soft Wipe", ("dynamic",)), ("loot", "Loot Wipe", ("dynamic", "randoms")),
+        ("building", "Building Wipe", ("building",)), ("vehicle", "Vehicle Wipe", ("vehicles",)),
+        ("player", "Player Wipe", ("player",)), ("full", "Full Wipe", tuple(_economy_vanilla())),
+        ("vanilla", "Vanilla", ()),
+    )]
+
+
+async def _config_editor_prepare(request, kind, action):
+    conn, error = _session_conn(request, "tools")
+    if error is None:
+        error = await _modul_pruefen("tools." + kind, request, conn)
+    if error is None:
+        error = await _dash_gate(request, conn, "tools", action)
+    return conn, error
+
+
+async def _config_editor_get(request, kind):
+    conn, error = await _config_editor_prepare(request, kind, "view")
+    if error is not None:
+        return error
+    vanilla = _globals_vanilla if kind == "globals" else _economy_vanilla
+    parse = _globals_parse if kind == "globals" else _economy_parse
+    values, source, warning = vanilla(), "vanilla", None
+    missing = not _mission_dir_of(conn)
+    if not missing:
+        async with _schaden_lock(conn.service_id):
+            try:
+                raw, status = await _tools_datei_lesen(conn, "db/" + kind + ".xml", asyncio.get_running_loop())
+                if status == "ok":
+                    values, source = parse(raw), "server"
+                else:
+                    warning = "Datei fehlt oder ist unlesbar – Vanilla-Werte geladen."
+            except (ET.ParseError, ValueError, TypeError, OverflowError, OSError):
+                warning = "Datei fehlt oder ist unlesbar – Vanilla-Werte geladen."
+    result = {"werte": values, "vanilla": vanilla(), "quelle": source,
+              "kein_mission_ordner": missing, "warnung": warning}
+    if kind == "globals":
+        result.update(felder=_globals_fields(), presets=_globals_presets())
+    else:
+        result.update(felder=[{"name": name, "label": _ECONOMY_LABELS[name]} for name, _flags in _ECONOMY_DEFAULTS],
+                      spalten=list(_ECONOMY_COLUMNS), presets=_economy_presets())
+    return ok(result)
+
+
+async def _config_editor_post(request, kind):
+    conn, error = await _config_editor_prepare(request, kind, "edit")
+    if error is not None:
+        return error
+    data = await body(request)
+    validate = _globals_validate if kind == "globals" else _economy_validate
+    parse = _globals_parse if kind == "globals" else _economy_parse
+    serialize = _globals_xml if kind == "globals" else _economy_xml
+    try:
+        if not isinstance(data, dict) or type(data.get("vorschau", False)) is not bool:
+            raise ValueError("Ungültige Editor-Anfrage.")
+        if "commit" in data and type(data["commit"]) is not bool:
+            raise ValueError("Ungültige Editor-Anfrage.")
+        values = data.get("werte")
+        validate(values)
+    except (ValueError, TypeError, OverflowError) as exc:
+        return err(str(exc), 400)
+    preview = data.get("vorschau", False) or data.get("commit") is False
+    if not preview and not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    if not preview:
+        error = _dash_rate_limited(request, "tools." + kind, 5)
+        if error is not None:
+            return error
+    filename, raw = "db/" + kind + ".xml", None
+    loop = asyncio.get_running_loop()
+    async with _schaden_lock(conn.service_id):
+        try:
+            status = "missing"
+            if _mission_dir_of(conn):
+                raw, status = await _tools_datei_lesen(conn, filename, loop)
+            if status == "ok":
+                parse(raw)  # Never overwrite an invalid original or drop its unknown fields.
+            elif status != "missing":
+                return err("Serverdatei konnte nicht sicher gelesen werden. Hochladen abgebrochen.", 502)
+            content = serialize(values, original_raw=raw if status == "ok" else None)
+            if not preview:
+                if status == "ok" and not await _tools_datei_schreiben(conn, filename + ".bak", raw, loop):
+                    return err("Backup konnte nicht gespeichert werden. Hochladen abgebrochen.", 502)
+                if not await _tools_datei_schreiben(conn, filename, content, loop):
+                    return err("Datei konnte nicht gespeichert werden.", 502)
+        except (ET.ParseError, ValueError, TypeError, OverflowError):
+            return err("Serverdatei ist ungültig. Hochladen abgebrochen, damit Zusatzdaten erhalten bleiben.", 409)
+        except OSError:
+            return err("FTP-Zugriff fehlgeschlagen. Hochladen abgebrochen.", 502)
+    generated = [{"filename": filename, "content": content}]
+    return ok({"generated": generated, "geschrieben": not preview,
+               "meldung": "Wirkt nach dem nächsten Server-Neustart." if not preview else "",
+               "betroffene_abschnitte": [name for name, flags in values.items() if flags["load"] == 0]
+               if kind == "economy" else []})
+
+
+async def api_tools_globals_get(request):
+    return await _config_editor_get(request, "globals")
+
+
+async def api_tools_globals_post(request):
+    return await _config_editor_post(request, "globals")
+
+
+async def api_tools_economy_get(request):
+    return await _config_editor_get(request, "economy")
+
+
+async def api_tools_economy_post(request):
+    return await _config_editor_post(request, "economy")
 
 
 # Airstrike evidence: BohemiaInteractive/DayZ-Script-Diff,
@@ -27926,6 +28285,8 @@ _AUDIT_LABELS = {
     ("POST", "/api/shop/reset"): "Shop-Katalog komplett geleert",
     ("POST", "/api/economy/money"): "Guthaben geändert",
     ("POST", "/api/economy/config"): "Economy-Einstellungen geändert",
+    ("POST", "/api/tools/globals"): "Globals Configurator gespeichert",
+    ("POST", "/api/tools/economy"): "Economy Editor gespeichert",
     ("POST", "/api/bans"): "Spieler gebannt",
     ("POST", "/api/whitelist"): "Whitelist-Eintrag hinzugefügt",
     ("POST", "/api/announcements"): "Ankündigung angelegt",
@@ -36861,6 +37222,10 @@ def build_app() -> web.Application:
     r.add_get("/api/tools/airstrike", api_tools_airstrike_get)
     r.add_get("/api/tools/weather", api_tools_weather_get)
     r.add_post("/api/tools/weather", api_tools_weather_post)
+    r.add_get("/api/tools/globals", api_tools_globals_get)
+    r.add_post("/api/tools/globals", api_tools_globals_post)
+    r.add_get("/api/tools/economy", api_tools_economy_get)
+    r.add_post("/api/tools/economy", api_tools_economy_post)
     r.add_post("/api/tools/airstrike/deploy", api_tools_airstrike_deploy)
     r.add_post("/api/tools/airstrike/remove", api_tools_airstrike_remove)
     r.add_get("/api/tools/npcgenerator", api_tools_npcgenerator_get)
@@ -37595,6 +37960,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "16be51d3a3621e4dae8d824867e9de4b820040dcf8e0b386fadb03b2b223d12c",
         "a61fc96c21dddb92c93105af4c08ae2969dffa924bc23492ab641a18f551ffd7",
         "a527a86116a2dea94b7b1d270c2a0df12d32e3438778869c3b1942f49b38e4c9",
         "67e8e05e0a8c1f15b98c59b64eabf598f6bd283b40023448e777f72f7bd9c9ba",
