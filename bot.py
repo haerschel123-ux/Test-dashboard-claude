@@ -19693,13 +19693,13 @@ async def cmd_hilfe(interaction: discord.Interaction):
     ), inline=False)
     embed.add_field(name=_t(interaction, "📊 Kill-Stats & Belohnungen", "📊 Kill Stats & Rewards"), value=_t(
         interaction,
-        "`/stats <spieler>` — Kills, Tode, K/D, Lieblingswaffe, weitester Kill\n"
+        "`/stats` — Deine Statistik · `/stats username:<name>` oder `/stats user:<@user>` — die eines anderen\n"
         "`/leaderboard` — Top 10 PvP-Killer\n"
         "`/link <playstation-name>` / `/unlink` — Account verknüpfen (Kill- & Spielzeit-Geld)\n"
         "`/username list` — Eigene Verknüpfung anzeigen (Admins: alle, 🟢 = online)\n"
         "`/forcelink <name> <@user>` / `/forceunlink <@user>` *(Admin)*\n"
         "`/bounty <spieler> <betrag>` — Kopfgeld aussetzen · `/bounties` — aktive Kopfgelder",
-        "`/stats <player>` — Kills, deaths, K/D, favorite weapon, longest kill\n"
+        "`/stats` — Your stats · `/stats username:<name>` or `/stats user:<@user>` — someone else's\n"
         "`/leaderboard` — Top 10 PvP killers\n"
         "`/link <playstation-name>` / `/unlink` — Link your account (kill & playtime money)\n"
         "`/username list` — Show your own link (admins: all, 🟢 = online)\n"
@@ -22022,6 +22022,77 @@ class EconomyDB:
             "longest": float(longest) if longest is not None else None,
         }
 
+    def player_stats_erweitert(self, service_id: str, name: str,
+                               guild_id: Optional[int] = None) -> Optional[Dict]:
+        """Ausfuehrliche Statistik fuer /stats (Vorbild DayZ++): Kills nach
+        Zeitraum, Long-Range-Kills, Tode, K/D, Streaks, Waffen, zuletzt
+        getoetet / getoetet von, Spielzeit (aus player_roster der Guild).
+        ``None``, wenn es zu dem Namen weder Kills noch Tode noch Spielzeit gibt."""
+        sid = str(service_id or "")
+        now = time.time()
+        tag = now - 86400
+        woche = now - 7 * 86400
+        monat = now - 30 * 86400
+        with self._lock:
+            def anzahl(sql: str, *args) -> int:
+                return int(self._conn.execute(sql, args).fetchone()["n"])
+            k_basis = "SELECT COUNT(*) AS n FROM kills WHERE service_id=? AND killer_name=? COLLATE NOCASE"
+            kills = anzahl(k_basis, sid, name)
+            kills_tag = anzahl(k_basis + " AND created_at>=?", sid, name, tag)
+            kills_woche = anzahl(k_basis + " AND created_at>=?", sid, name, woche)
+            kills_monat = anzahl(k_basis + " AND created_at>=?", sid, name, monat)
+            deaths = anzahl("SELECT COUNT(*) AS n FROM kills WHERE service_id=? AND victim_name=? COLLATE NOCASE",
+                            sid, name)
+            spielzeit = 0
+            if guild_id is not None:
+                row = self._conn.execute(
+                    "SELECT total_playtime_seconds AS s FROM player_roster "
+                    "WHERE guild_id=? AND service_id=? AND ingame_name=? COLLATE NOCASE",
+                    (int(guild_id), sid, name)).fetchone()
+                spielzeit = int(row["s"] or 0) if row else 0
+            if kills == 0 and deaths == 0 and spielzeit == 0:
+                return None
+            fav = self._conn.execute(
+                "SELECT weapon, COUNT(*) AS n FROM kills "
+                "WHERE service_id=? AND killer_name=? COLLATE NOCASE AND weapon IS NOT NULL "
+                "AND weapon NOT IN ('', 'Unbekannt') "
+                "GROUP BY weapon ORDER BY n DESC LIMIT 1", (sid, name)).fetchone()
+            weitester = self._conn.execute(
+                "SELECT weapon, distance FROM kills WHERE service_id=? AND killer_name=? COLLATE NOCASE "
+                "AND distance IS NOT NULL ORDER BY distance DESC LIMIT 1", (sid, name)).fetchone()
+            zuletzt_getoetet = self._conn.execute(
+                "SELECT victim_name FROM kills WHERE service_id=? AND killer_name=? COLLATE NOCASE "
+                "ORDER BY created_at DESC LIMIT 1", (sid, name)).fetchone()
+            zuletzt_von = self._conn.execute(
+                "SELECT killer_name FROM kills WHERE service_id=? AND victim_name=? COLLATE NOCASE "
+                "ORDER BY created_at DESC LIMIT 1", (sid, name)).fetchone()
+            # Streaks aus der zeitlichen Folge aller Kills/Tode dieses Spielers
+            folge = self._conn.execute(
+                "SELECT CASE WHEN killer_name=? COLLATE NOCASE THEN 1 ELSE 0 END AS kill "
+                "FROM kills WHERE service_id=? AND (killer_name=? COLLATE NOCASE OR victim_name=? COLLATE NOCASE) "
+                "ORDER BY created_at ASC, id ASC", (name, sid, name, name)).fetchall()
+        kill_streak = best_kill = death_streak = worst_death = 0
+        for r in folge:
+            if int(r["kill"]):
+                kill_streak += 1; death_streak = 0
+                best_kill = max(best_kill, kill_streak)
+            else:
+                death_streak += 1; kill_streak = 0
+                worst_death = max(worst_death, death_streak)
+        return {
+            "kills": kills, "kills_tag": kills_tag, "kills_woche": kills_woche, "kills_monat": kills_monat,
+            "deaths": deaths, "kd": (kills / deaths) if deaths else float(kills),
+            "fav_weapon": fav["weapon"] if fav else None,
+            "fav_weapon_kills": int(fav["n"]) if fav else 0,
+            "longest": float(weitester["distance"]) if weitester else None,
+            "longest_weapon": weitester["weapon"] if weitester else None,
+            "last_killed": zuletzt_getoetet["victim_name"] if zuletzt_getoetet else None,
+            "last_killed_by": zuletzt_von["killer_name"] if zuletzt_von else None,
+            "kill_streak": kill_streak, "best_kill_streak": best_kill,
+            "death_streak": death_streak, "worst_death_streak": worst_death,
+            "playtime_seconds": spielzeit,
+        }
+
     def leaderboard(self, service_id: str, limit: int = 10) -> List[Dict]:
         sid = str(service_id or "")
         with self._lock:
@@ -23717,37 +23788,116 @@ async def _player_name_ac(interaction: discord.Interaction,
     return out
 
 
-@bot.tree.command(name="stats", description=app_commands.locale_str("📊 Kill-Statistiken eines Spielers (Kills, Tode, K/D, Waffe)"))
-@app_commands.describe(spieler="Ingame-/PlayStation-Name")
-@app_commands.autocomplete(spieler=_player_name_ac)
-async def cmd_stats(interaction: discord.Interaction, spieler: str):
+def _dauer_text(sekunden: int, sprache: str = "de") -> str:
+    """Spielzeit lesbar: '1 Wo 4 Tg 9 Std 40 Min' bzw. '1w 4d 9h 40m'."""
+    sekunden = max(0, int(sekunden or 0))
+    wochen, rest = divmod(sekunden, 7 * 86400)
+    tage, rest = divmod(rest, 86400)
+    stunden, rest = divmod(rest, 3600)
+    minuten = rest // 60
+    teile = []
+    if sprache == "en":
+        for wert, einheit in ((wochen, "w"), (tage, "d"), (stunden, "h"), (minuten, "m")):
+            if wert:
+                teile.append(f"{wert}{einheit}")
+        return " ".join(teile) or "0m"
+    for wert, einheit in ((wochen, "Wo"), (tage, "Tg"), (stunden, "Std"), (minuten, "Min")):
+        if wert:
+            teile.append(f"{wert} {einheit}")
+    return " ".join(teile) or "0 Min"
+
+
+@bot.tree.command(name="stats", description=app_commands.locale_str(
+    "📊 Spieler-Statistik – ohne Angabe deine eigene"))
+@app_commands.describe(username="Ingame-/PlayStation-Name (auch ohne Verknüpfung)",
+                       user="Discord-Mitglied (nur mit /link-Verknüpfung)")
+@app_commands.autocomplete(username=_player_name_ac)
+async def cmd_stats(interaction: discord.Interaction, username: Optional[str] = None,
+                    user: Optional[discord.Member] = None):
     conn = _conn_of(interaction)
     if conn is None:
         return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
-    st = db.player_stats(conn.service_id, spieler.strip())
+    if username and user:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Gib entweder einen **username** oder einen **user** an, nicht beides.",
+            "❌ You need to either provide a **username** or a **user**, not both."), ephemeral=True)
+    gid = interaction.guild_id
+    name: Optional[str] = None
+    if username:
+        name = username.strip()
+    else:
+        ziel = user or interaction.user
+        row = db.get_main_link_by_user(gid, ziel.id) if gid else None
+        if not row:
+            if user is None:
+                return await interaction.response.send_message(_t(
+                    interaction,
+                    "❌ Du bist mit keinem Ingame-Namen verknüpft. Verknüpfe dich mit `/link` "
+                    "oder gib `username:` an.",
+                    "❌ You are not linked to any in-game name. Link with `/link` or "
+                    "provide `username:`."), ephemeral=True)
+            return await interaction.response.send_message(_t(
+                interaction,
+                f"❌ {ziel.mention} ist mit keinem Ingame-Namen verknüpft.",
+                f"❌ {ziel.mention} is not linked to any in-game name."), ephemeral=True)
+        name = str(row["ingame_name"])
+    loop = asyncio.get_running_loop()
+    st = await loop.run_in_executor(None, db.player_stats_erweitert, conn.service_id, name, gid)
     if not st:
         return await interaction.response.send_message(_t(
             interaction,
-            f"❌ Keine PvP-Daten für **{spieler}** gefunden. Statistiken werden "
-            f"ab jetzt automatisch aus dem Killfeed aufgezeichnet.",
-            f"❌ No PvP data found for **{spieler}**. Stats are recorded "
-            f"automatically from the kill feed from now on."), ephemeral=True)
-    e = discord.Embed(title=_t(interaction, f"📊 Statistiken – {spieler}", f"📊 Stats – {spieler}"),
+            f"❌ Keine Daten für **{name}** auf **{conn.name}** gefunden. Statistiken werden "
+            f"automatisch aus dem Killfeed und den Verbindungen aufgezeichnet.",
+            f"❌ No data found for **{name}** on **{conn.name}**. Stats are recorded "
+            f"automatically from the kill feed and connections."), ephemeral=True)
+    sprache = "en" if _t(interaction, "de", "en") == "en" else "de"
+    grenze = _long_range_grenze()
+    lr_kills = await loop.run_in_executor(
+        None, lambda: int(db._conn.execute(
+            "SELECT COUNT(*) AS n FROM kills WHERE service_id=? AND killer_name=? COLLATE NOCASE "
+            "AND distance>=?", (conn.service_id, name, grenze)).fetchone()["n"]))
+    kd_gesamt = st["kd"]
+    e = discord.Embed(title=_t(interaction, f"📊 Statistik – {name}", f"📊 Statistics – {name}"),
                       color=0x5865F2)
-    e.add_field(name="☠️ Kills", value=str(st["kills"]), inline=True)
-    e.add_field(name=_t(interaction, "💀 Tode", "💀 Deaths"), value=str(st["deaths"]), inline=True)
-    e.add_field(name="⚖️ K/D",   value=f"{st['kd']:.2f}", inline=True)
-    e.add_field(name=_t(interaction, "🔫 Lieblingswaffe", "🔫 Favorite Weapon"),
-                value=(f"{st['fav_weapon']} ({st['fav_weapon_kills']} "
-                      f"{_t(interaction, 'Kills', 'kills')})"
-                      if st["fav_weapon"] else "–"), inline=True)
-    e.add_field(name=_t(interaction, "🎯 Weitester Kill", "🎯 Longest Kill"),
-                value=(f"{st['longest']:.0f} m" if st["longest"] else "–"), inline=True)
-    if interaction.guild_id:
-        links = db.links_for_name(spieler.strip(), interaction.guild_id)
+    e.add_field(name="⚔️ PvP", inline=False, value=_t(
+        interaction,
+        f"• **Kills:** Heute **{st['kills_tag']}** · Woche **{st['kills_woche']}** · "
+        f"Monat **{st['kills_monat']}** · Gesamt **{st['kills']}**\n"
+        f"• **Long Range Kills (≥ {grenze:.0f} m):** {lr_kills}\n"
+        f"• **PvP-Tode:** {st['deaths']}\n"
+        f"• **PvP K/D:** {kd_gesamt:.2f}",
+        f"• **Kills:** Today **{st['kills_tag']}** · Week **{st['kills_woche']}** · "
+        f"Month **{st['kills_monat']}** · Total **{st['kills']}**\n"
+        f"• **Long Range Kills (≥ {grenze:.0f} m):** {lr_kills}\n"
+        f"• **PvP Deaths:** {st['deaths']}\n"
+        f"• **PvP K/D:** {kd_gesamt:.2f}"))
+    e.add_field(name=_t(interaction, "🔥 Serien", "🔥 Streaks"), inline=False, value=_t(
+        interaction,
+        f"• **Kill-Serie:** Aktuell **{st['kill_streak']}** · Beste **{st['best_kill_streak']}**\n"
+        f"• **Todes-Serie:** Aktuell **{st['death_streak']}** · Schlechteste **{st['worst_death_streak']}**",
+        f"• **Kill Streak:** Current **{st['kill_streak']}** · Best **{st['best_kill_streak']}**\n"
+        f"• **Death Streak:** Current **{st['death_streak']}** · Worst **{st['worst_death_streak']}**"))
+    waffe = (f"{st['fav_weapon']} · {st['fav_weapon_kills']} Kills" if st["fav_weapon"] else "–")
+    weitester = (f"{st['longest_weapon'] or '?'} · {st['longest']:.1f} m" if st["longest"] else "–")
+    e.add_field(name=_t(interaction, "🔫 Waffen", "🔫 Weapons"), inline=False, value=_t(
+        interaction,
+        f"• **Meiste Kills:** {waffe}\n• **Weitester Kill:** {weitester}",
+        f"• **Most Kills:** {waffe}\n• **Longest Kill:** {weitester}"))
+    e.add_field(name=_t(interaction, "📎 Sonstiges", "📎 Misc"), inline=False, value=_t(
+        interaction,
+        f"• **Zuletzt getötet:** {st['last_killed'] or '–'}\n"
+        f"• **Zuletzt getötet von:** {st['last_killed_by'] or '–'}\n"
+        f"• **Spielzeit:** {_dauer_text(st['playtime_seconds'], 'de')}",
+        f"• **Last killed:** {st['last_killed'] or '–'}\n"
+        f"• **Last killed by:** {st['last_killed_by'] or '–'}\n"
+        f"• **Playtime:** {_dauer_text(st['playtime_seconds'], 'en')}"))
+    if gid:
+        links = db.links_for_name(name, gid)
         if links:
-            e.add_field(name=_t(interaction, "🔗 Verknüpft mit", "🔗 Linked To"),
-                        value=f"<@{int(links[0]['user_id'])}>", inline=True)
+            e.add_field(name=_t(interaction, "🔗 Verknüpft mit", "🔗 Linked to"),
+                        value=f"<@{int(links[0]['user_id'])}>", inline=False)
+    e.set_footer(text=f"Brigarde Killfeed • {conn.name}")
     await interaction.response.send_message(embed=e)
 
 
