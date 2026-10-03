@@ -894,6 +894,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.daynight":                     {"label": "Day/Night Config", "gruppe": "Tools"},
     "tools.deployment":                   {"label": "NPC + Vehicle Deployment", "gruppe": "Tools"},
     "tools.airstrike":                    {"label": "Airstrike Generator", "gruppe": "Tools"},
+    "tools.weather":                      {"label": "Weather Manager", "gruppe": "Tools"},
     "tools.teleports":                    {"label": "Teleport Generator", "gruppe": "Tools"},
     "backup":                             {"label": "Backup der Server-Dateien",
                                            "gruppe": "Verbindung"},
@@ -13063,6 +13064,7 @@ _TOOL_LISTE = (
     ("daynight", "🌗", "Day/Night Config"),
     ("deployment", "🚚", "NPC + Vehicle Deployment"),
     ("airstrike", "💥", "Airstrike Generator"),
+    ("weather", "🌦️", "Weather Manager"),
     ("npcgenerator", "🧍", "NPC Generator"),
     ("teleports", "🚚", "Teleport Generator"),
 )
@@ -15466,6 +15468,237 @@ async def api_tools_deployment_remove(request: web.Request) -> web.Response:
     _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Einsatz entfernt",
                f"{eintrag.get('event_name')} · {conn.name}")
     return ok({"entfernt": dep_id})
+
+
+# Vanilla: BohemiaInteractive/DayZ-Central-Economy, 9a21bb9, cfgweather.xml.
+def _weather_block(actual, time, duration, limits, timelimits, changelimits, thresholds=None):
+    value = {"current": dict(zip(("actual", "time", "duration"), (actual, time, duration))),
+             "limits": dict(zip(("min", "max"), limits)),
+             "timelimits": dict(zip(("min", "max"), timelimits)),
+             "changelimits": dict(zip(("min", "max"), changelimits))}
+    if thresholds is not None:
+        value["thresholds"] = dict(zip(("min", "max", "end"), thresholds))
+    return value
+
+
+def _weather_vanilla(karte):
+    values = {
+        "enable": 0, "reset": 0,
+        "overcast": _weather_block(.45, 120, 240, (0, 1), (600, 900), (0, 1)),
+        "fog": _weather_block(.05, 120, 240, (.02, .13 if karte == "Livonia" else .08), (900, 900), (0, 1)),
+        "rain": _weather_block(0, 60, 120, (0, 1), (60, 120), (0, 1), (.6, 1, 60)),
+        "windMagnitude": _weather_block(8, 120, 240, (0, 20), (120, 240), (0, 20)),
+        "windDirection": _weather_block(0, 120, 240, (-3.14, 3.14), (60, 120), (-1, 1)),
+        "snowfall": _weather_block(0, 0, 32768, (0, 0), (300, 3600), (0, 0), (1, 1, 120)),
+        "storm": {"density": 1, "threshold": .7 if karte == "Livonia" else .9,
+                  "timeout": 20 if karte == "Livonia" else 45}}
+    if karte == "Sakhal":
+        values["overcast"]["limits"]["min"] = .07
+        values["fog"] = _weather_block(0, 0, 32768, (0, 0), (300, 3600), (1, 1))
+        values["rain"] = _weather_block(0, 0, 32768, (0, 0), (300, 3600), (0, 0), (1, 1, 120))
+        values["snowfall"] = _weather_block(0, 60, 120, (0, 1), (60, 120), (0, 1), (.3, 1, 60))
+        values["storm"]["threshold"] = .98
+    return values
+
+
+# Fixed, map-aware targets; all remaining fields come from the verified Vanilla table.
+TOOL_WEATHER_PRESETS = (
+    {"key": "snowstorm", "label": "Schneesturm", "overcast": 1, "fog": .05, "windMagnitude": 20, "precipitation": 1},
+    {"key": "sunny", "label": "Immer sonnig", "overcast": 0, "fog": 0, "windMagnitude": 2, "precipitation": 0},
+    {"key": "cloudy", "label": "Bewölkt", "overcast": .7, "fog": .05, "windMagnitude": 5, "precipitation": 0},
+    {"key": "foggy", "label": "Neblig", "overcast": .5, "fog": .6, "windMagnitude": 2, "precipitation": 0},
+    {"key": "rain", "label": "Leichter Regen", "overcast": .7, "fog": .05, "windMagnitude": 4, "precipitation": .25},
+    {"key": "storm", "label": "Sturm", "overcast": 1, "fog": .05, "windMagnitude": 15, "precipitation": .8})
+
+
+def _weather_presets(karte):
+    presets = []
+    for preset in TOOL_WEATHER_PRESETS:
+        values = _weather_vanilla(karte)
+        values["enable"] = 1
+        for block in ("overcast", "fog", "windMagnitude"):
+            target = max(.07, preset[block]) if block == "overcast" and karte == "Sakhal" else preset[block]
+            values[block]["current"]["actual"] = target
+            values[block]["limits"] = {"min": target, "max": target}
+        precipitation = "snowfall" if karte == "Sakhal" else "rain"
+        target = preset["precipitation"]
+        values[precipitation]["current"]["actual"] = target
+        values[precipitation]["limits"] = {"min": target, "max": target}
+        disabled = (preset["key"] == "snowstorm" and karte != "Sakhal"
+                    or preset["key"] == "rain" and karte == "Sakhal")
+        presets.append({"key": preset["key"], "label": preset["label"], "werte": values,
+                        "disabled": disabled,
+                        "hinweis": "Schnee gibt es nur auf Sakhal" if preset["key"] == "snowstorm" and disabled
+                        else "Regen gibt es nicht auf Sakhal" if disabled else ""})
+    return presets
+
+
+def _weather_validate(values, karte):
+    template = _weather_vanilla(karte)
+    def number(value, low, high, path):
+        # Check bounds before isfinite so huge Python integers cannot overflow.
+        if type(value) not in (int, float) or not low <= value <= high or not math.isfinite(value):
+            raise ValueError(f"{path}: endliche Zahl im erlaubten Bereich erforderlich ({low}..{high}).")
+    def shape(value, expected):
+        if not isinstance(value, dict) or set(value) != set(expected):
+            raise ValueError("Unvollständige oder unbekannte Wetterfelder.")
+    shape(values, template)
+    for attribute in ("enable", "reset"):
+        if type(values[attribute]) is not int or values[attribute] not in (0, 1):
+            raise ValueError("Wetter-Schalter müssen 0 oder 1 sein.")
+    for block, groups in template.items():
+        if block in ("enable", "reset"):
+            continue
+        shape(values[block], groups)
+        if block == "storm":
+            for key in groups:
+                number(values[block][key], 0, 86400 if key == "timeout" else 1, f"storm.{key}")
+            continue
+        low, high = (-3.15, 3.15) if block == "windDirection" else (0, 50) if block == "windMagnitude" else (0, 1)
+        for group, fields in groups.items():
+            actual = values[block][group]
+            shape(actual, fields)
+            for key, value in actual.items():
+                timed = group == "timelimits" or key in ("time", "duration", "end")
+                bounds = (0, 86400) if timed else (0, 1) if group == "thresholds" else (low, high)
+                number(value, *bounds, f"{block}.{group}.{key}")
+            if "min" in actual and actual["min"] > actual["max"]:
+                raise ValueError(f"{block}.{group}: Min darf Max nicht überschreiten.")
+    forbidden = "rain" if karte == "Sakhal" else "snowfall"
+    block = values[forbidden]
+    if any(v > 0 for v in (block["current"]["actual"], *block["limits"].values(), *block["changelimits"].values())):
+        raise ValueError("Regen gibt es nicht auf Sakhal" if karte == "Sakhal" else "Schnee gibt es nur auf Sakhal")
+
+
+def _weather_parse(raw, karte):
+    values = _weather_vanilla(karte)
+    root = ET.fromstring(raw)
+    if root.tag != "weather":
+        raise ValueError("Falsches Wetter-Wurzelelement.")
+    for attribute in ("enable", "reset"):
+        text = root.get(attribute)
+        if text is not None:
+            normalized = text.strip().lower()
+            if normalized not in ("0", "1", "true", "false", "yes", "no"):
+                raise ValueError("Ungültiger Wetter-Schalter.")
+            values[attribute] = int(normalized in ("1", "true", "yes"))
+    for block, groups in values.items():
+        if block in ("enable", "reset"):
+            continue
+        node = root.find(block)
+        if node is None:
+            continue
+        if block == "storm":
+            for key in groups:
+                text = node.get(key) if node.get(key) is not None else node.findtext(key)
+                if text is not None:
+                    groups[key] = float(text)
+        else:
+            for group, fields in groups.items():
+                child = node.find(group)
+                if child is not None:
+                    for key in fields:
+                        text = child.get(key) if child.get(key) is not None else child.findtext(key)
+                        if text is not None:
+                            fields[key] = float(text)
+    _weather_validate(values, karte)
+    return values
+
+
+def _weather_xml(values, created_at=None):
+    def formatted(value):
+        return f"{value:.2f}".rstrip("0").rstrip(".") if value != 0 else "0"
+    timestamp = created_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+             f'<!-- Brigarde Killfeed Weather Manager – {timestamp} -->',
+             '<!-- enable=1 aktiviert die Datei. reset=1 lädt gespeichertes Wetter beim Start nicht. -->',
+             f'<weather reset="{values["reset"]}" enable="1">']
+    descriptions = {"overcast": "Bewölkung (0..1)", "fog": "Nebel (0..1)", "rain": "Regen (0..1)",
+                    "windMagnitude": "Windstärke (m/s, 0..50)", "windDirection": "Windrichtung (Radiant, -3.15..3.15)",
+                    "snowfall": "Schneefall (0..1)"}
+    for block, description in descriptions.items():
+        lines.extend([f"    <!-- {description}. current: Zielwert, Übergangszeit und Mindesthaltedauer in Sekunden.",
+                      "         limits: Wertgrenzen; timelimits: Übergangszeiten; changelimits: Änderungsgrenzen. -->",
+                      f"    <{block}>"])
+        for group, fields in values[block].items():
+            if group == "thresholds":
+                lines.append("        <!-- Erlaubtes Bewölkungsfenster; end: Sekunden bis zum Ende außerhalb des Fensters. -->")
+            attrs = " ".join(f'{key}="{formatted(value)}"' for key, value in fields.items())
+            lines.append(f"        <{group} {attrs} />")
+        lines.append(f"    </{block}>")
+    lines.append("    <!-- Gewitter: Blitzdichte, Bewölkungsschwelle und minimaler Blitzabstand in Sekunden. -->")
+    attrs = " ".join(f'{key}="{formatted(value)}"' for key, value in values["storm"].items())
+    lines.extend([f"    <storm {attrs} />", "</weather>", ""])
+    result = "\n".join(lines)
+    ET.fromstring(result)
+    return result
+
+
+async def _weather_prepare(request, action):
+    conn, error = _session_conn(request, "tools.weather")
+    if error is not None:
+        return None, None, error
+    error = await _modul_pruefen("tools.weather", request, conn)
+    if error is None:
+        error = await _dash_gate(request, conn, "tools", action)
+    karte = _canonical_map_name(str(conn.data.get("map_name") or ""))
+    if error is None and karte is None:
+        error = err("Karte unbekannt – zuerst die Serververbindung prüfen.", 400)
+    return conn, karte, error
+
+
+async def api_tools_weather_get(request):
+    conn, karte, error = await _weather_prepare(request, "view")
+    if error is not None:
+        return error
+    values, source, warning = _weather_vanilla(karte), "vanilla", None
+    missing_mission = not _mission_dir_of(conn)
+    if not missing_mission:
+        async with _schaden_lock(conn.service_id):
+            raw, status = await _tools_datei_lesen(conn, "cfgweather.xml", asyncio.get_running_loop())
+        if status == "ok":
+            try:
+                values, source = _weather_parse(raw, karte), "server"
+            except (ET.ParseError, ValueError, TypeError, OverflowError):
+                warning = "cfgweather.xml unlesbar – Vanilla-Werte geladen."
+        elif status != "missing":
+            warning = "cfgweather.xml unlesbar – Vanilla-Werte geladen."
+    defaults = _weather_vanilla(karte)
+    defaults["enable"] = 1
+    return ok({"werte": values, "quelle": source, "karte": karte, "presets": _weather_presets(karte),
+               "vanilla": defaults, "kein_mission_ordner": missing_mission, "warnung": warning})
+
+
+async def api_tools_weather_post(request):
+    conn, karte, error = await _weather_prepare(request, "edit")
+    if error is not None:
+        return error
+    data = await body(request)
+    try:
+        if not isinstance(data, dict) or type(data.get("commit", False)) is not bool:
+            raise ValueError("Ungültige Wetter-Anfrage.")
+        values = data.get("werte")
+        _weather_validate(values, karte)
+        content = _weather_xml(values)
+    except (ValueError, TypeError, OverflowError) as exc:
+        return err(str(exc), 400)
+    generated = [{"filename": "cfgweather.xml", "content": content}]
+    if not data.get("commit", False):
+        return ok({"generated": generated})
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    error = _dash_rate_limited(request, "tools.weather", 5)
+    if error is not None:
+        return error
+    async with _schaden_lock(conn.service_id):
+        try:
+            written = await _tools_datei_schreiben(conn, "cfgweather.xml", content, asyncio.get_running_loop())
+        except OSError:
+            written = False
+        if not written:
+            return err("cfgweather.xml konnte nicht gespeichert werden.", 502)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Wetter gespeichert", conn.name)
+    return ok({"generated": generated})
 
 
 # Airstrike evidence: BohemiaInteractive/DayZ-Script-Diff,
@@ -34474,6 +34707,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/vehicle", api_tools_vehicle_post)
     r.add_get("/api/tools/deployment", api_tools_deployment_get)
     r.add_get("/api/tools/airstrike", api_tools_airstrike_get)
+    r.add_get("/api/tools/weather", api_tools_weather_get)
+    r.add_post("/api/tools/weather", api_tools_weather_post)
     r.add_post("/api/tools/airstrike/deploy", api_tools_airstrike_deploy)
     r.add_post("/api/tools/airstrike/remove", api_tools_airstrike_remove)
     r.add_get("/api/tools/npcgenerator", api_tools_npcgenerator_get)
@@ -35200,6 +35435,11 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "67e8e05e0a8c1f15b98c59b64eabf598f6bd283b40023448e777f72f7bd9c9ba",
+        "ac0b7a72181f26afe830aef3c0e28ce2cf2199c623ca9c9e640fb2ce401c2214",
+        "aa9340060d6001f8e3368d8d446f665a884cb8768e5908b54893d523ecb9bbc0",
+        "c83dc21d1106dbe871afaae5915a518234c076ea89c5ae90a6fb8f9bdac95795",
+        "2f7c02f5dfb3ae418b16810d7af66718b4f68fb09b5f99709e78849c77488153",
         "a48da8dd1fa46db2f54c06e40d4446413da13d2087bf65af37f156c812f1fa1e",
         "82b69830d3348e4e067a57ed2e5f51965c8536cb3a91455a5f00a9334b8c73c1",
         "bc9b1f429e1765965d0af7e8b819e1e1a14457f3be745c23135148fffed790f0",
@@ -35228,7 +35468,6 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "9f6ec3db818579ea6ffabd99408a90463437f4ba5ebd4a992f224726cd897983",
         "60db1ecc03e138a333c3f04ab3f2a740b351835cf2bef6639f1d58d0be6f5900",
         "6f68a543ecadb6d3eeb89c4c6d97d79ec0841a1abc413df34ae02bf2fa491cf4",
-        "60db1ecc03e138a333c3f04ab3f2a740b351835cf2bef6639f1d58d0be6f5900",
         "afc1cb97d5f7f2949b3b0354aef47454b18cbea7a5598f0ea9bc0b8428182d8e",
         "168a82fc136dc875fb0a633759b6951ca31bd9086784d022f2ecfbeedcf7dc11",
         "02d7f10fd28fc2a6c2de1c5eb9901cc055c49ddfeffd985c67638da16137bb1e",
@@ -35395,7 +35634,6 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "aca029422e2780b263e70d4e8ac69704814894d47acd829abd7ae7657eb93f4f",
         "1eeffa7f5de28ebe32fc885dc8a5c5e9317e00a167ca97459fb6190ebce36c4d",
         "66a8cced120d446e3fdbb016c00e08a1b0a9401b0d56cf45b574ca71c4ebbd4a",
-        "9b92dbf482bccaa106187aa84be254ff499f285c76c013b7901e478a8f5659ee",
         "9644668e5481d94af80b959a1131de882b92db1b76a3b3891b4aedccb21c6ecc",
         "b12926671fd9df53b9d277b8903403fdc4202d633db02d2a170afa7f1f8b13c7",
         "391ff9f9dad38e7fa6e74efb6968d754e84251df3a41f30cebeddfd65d8c08eb",
