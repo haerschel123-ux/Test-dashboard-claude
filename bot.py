@@ -3909,6 +3909,8 @@ class ServerConnection:
         "link_add_role_ids", "link_remove_role_ids",
         # Zustand des Offline-Waechters und Killstreak-Stand dieses Servers.
         "server_absichtlich_gestoppt", "watchdog_letzter_start_ts", "killstreak_stand",
+        # Logging-Channels (Server → Logging): Channel-IDs gelten nur in der eigenen Guild.
+        "log_ban_temp_channel_id", "log_ban_perm_channel_id", "log_unban_channel_id",
     })
 
     # Einstellungen, die jeder Kunde selbst festlegt. Rueckfallebene ist hier
@@ -7005,7 +7007,8 @@ class DayZBot(discord.Client):
             if not faellig:
                 continue
             try:
-                entfernt, _nicht, fehler = await _ban_namen_entfernen(conn, faellig)
+                entfernt, _nicht, fehler = await _ban_namen_entfernen(
+                    conn, faellig, von="Zeitlicher Ban abgelaufen", grund="Ban-Dauer abgelaufen")
             except Exception as e:  # noqa: BLE001 – ein Server darf die anderen nicht stoppen
                 log.error(f"[TEMP-BAN] {conn.name}: {e}")
                 continue
@@ -9883,6 +9886,51 @@ async def _spieler_ban_immun(conn: ServerConnection, pname: str) -> bool:
     return False
 
 
+_BAN_LOG_KANAL = {"temp": "log_ban_temp_channel_id", "perm": "log_ban_perm_channel_id",
+                  "unban": "log_unban_channel_id"}
+
+
+async def _ban_log_senden(conn: ServerConnection, art: str, namen: List[str], grund: str,
+                          von: str, expires_at: Optional[float] = None,
+                          zone: Optional[str] = None, ereignis: Optional[str] = None) -> bool:
+    """Server → Logging: Ban/Entbannung in den dafuer gewaehlten Channel melden
+    (Spielername + Grund + Quelle). Ohne gesetzten Channel passiert nichts; ein
+    Versandfehler darf den Ban selbst nie scheitern lassen."""
+    try:
+        key = _BAN_LOG_KANAL[art]
+        kanal = conn.data.get(key) if hasattr(conn, "data") else None
+        if not kanal or not namen:
+            return False
+        if art == "temp":
+            titel, farbe = "🔨 Zeitlicher Ban", 0xE67E22
+        elif art == "perm":
+            titel, farbe = "🔨 Permanenter Ban", 0xE74C3C
+        else:
+            titel, farbe = "✅ Entbannt", 0x2ECC71
+        e = discord.Embed(title=titel, color=farbe)
+        e.add_field(name="Spieler", value="\n".join(f"`{n}`" for n in namen[:25]), inline=False)
+        if grund:
+            e.add_field(name="Grund", value=str(grund)[:1000], inline=False)
+        e.add_field(name="Von", value=str(von)[:200] or "–", inline=True)
+        if zone:
+            e.add_field(name="Zone", value=str(zone)[:100], inline=True)
+        if ereignis:
+            e.add_field(name="Ereignis", value=str(ereignis)[:100], inline=True)
+        if expires_at:
+            e.add_field(name="Endet", value=f"<t:{int(expires_at)}:R>", inline=True)
+        e.set_footer(text=f"{conn.name} · Änderung greift ggf. erst nach einem Server-Neustart.")
+        e.timestamp = datetime.now(timezone.utc)
+        gid = int(conn.guild_id) if getattr(conn, "guild_ids", None) else None
+        if gid is None:
+            return False
+        geschickt, _grund = await _post_feed(gid, "adminlog", e, channel_id=int(kanal),
+                                             service_id=conn.service_id)
+        return bool(geschickt)
+    except Exception as exc:  # noqa: BLE001 – Logging darf den Ban nie blockieren
+        log.warning(f"[BAN-LOG] {getattr(conn, 'name', '?')}: {exc}")
+        return False
+
+
 async def _ban_namen_hinzufuegen(conn: ServerConnection, namen: List[str], grund: str,
                                  von: str, *, expires_at: Optional[float] = None,
                                  zone: Optional[str] = None, ereignis: Optional[str] = None
@@ -9915,10 +9963,13 @@ async def _ban_namen_hinzufuegen(conn: ServerConnection, namen: List[str], grund
         eimer[n] = eintrag
     if hinzu:
         cfg.save_bans()
+        await _ban_log_senden(conn, "temp" if expires_at else "perm", hinzu, grund, von,
+                              expires_at=expires_at, zone=zone, ereignis=ereignis)
     return hinzu, schon, None
 
 
-async def _ban_namen_entfernen(conn: ServerConnection, namen: List[str]
+async def _ban_namen_entfernen(conn: ServerConnection, namen: List[str], *,
+                               von: str = "System", grund: str = ""
                                ) -> Tuple[List[str], List[str], Optional[str]]:
     """Kern von ``/ban_entfernen`` und der Temp-Unban-Schleife.
     Rueckgabe ``(entfernt, nicht_gefunden, fehler)``."""
@@ -9938,6 +9989,7 @@ async def _ban_namen_entfernen(conn: ServerConnection, namen: List[str]
         for local_key in [k for k in eimer if k.lower() in wanted_lower]:
             eimer.pop(local_key, None)
         cfg.save_bans()
+        await _ban_log_senden(conn, "unban", removed, grund, von)
     return removed, not_found, None
 
 
@@ -11064,7 +11116,7 @@ async def cmd_unban(interaction: discord.Interaction, spieler: str,
         return await interaction.followup.send(_t(
             interaction, "❌ Keinen gültigen Namen angegeben.", "❌ No valid name given."))
 
-    removed, not_found, fehler = await _ban_namen_entfernen(conn, names)
+    removed, not_found, fehler = await _ban_namen_entfernen(conn, names, von=str(interaction.user))
     if fehler:
         return await interaction.followup.send(_t(
             interaction,
@@ -36486,11 +36538,15 @@ _GENERAL_KARTEN_SCHLUESSEL: Dict[str, Tuple[str, ...]] = {
     "username_hooks": ("link_add_role_ids", "link_remove_role_ids", "link_set_nickname"),
     "heatmap_limits": ("heatmap_limits",),
     "ban_immunity": ("ban_immune_role_ids",),
+    "logging": ("log_ban_temp_channel_id", "log_ban_perm_channel_id", "log_unban_channel_id"),
 }
+_GENERAL_CHANNELS = ("log_ban_temp_channel_id", "log_ban_perm_channel_id", "log_unban_channel_id")
 # Rollen-IDs gelten nur in der eigenen Guild - beim Kopieren auf einen Server
 # mit anderer Guild werden diese Karten uebersprungen.
 _GENERAL_GUILD_GEBUNDEN = frozenset({"link_add_role_ids", "link_remove_role_ids",
-                                     "ban_immune_role_ids"})
+                                     "ban_immune_role_ids",
+                                     "log_ban_temp_channel_id", "log_ban_perm_channel_id",
+                                     "log_unban_channel_id"})
 _GENERAL_ZAHLEN: Dict[str, Tuple[int, int]] = {
     "combat_log_seconds": (5, 3600), "rage_quit_seconds": (5, 3600),
     "killstreak_min": (2, 50), "killstreak_step": (1, 50),
@@ -36555,6 +36611,14 @@ def _general_wert_pruefen(key: str, wert: Any) -> Tuple[Any, Optional[str]]:
         if wert not in _MAP_IMAGE_STYLES:
             return None, "map_image_style muss sat oder topo sein."
         return wert, None
+    if key in _GENERAL_CHANNELS:
+        # leer = kein Log; sonst eine Discord-Channel-ID
+        if wert in (None, "", 0):
+            return "", None
+        try:
+            return str(int(wert)), None
+        except (TypeError, ValueError):
+            return None, f"{key} muss eine Channel-ID sein."
     if key in _GENERAL_ROLLENLISTEN:
         if not isinstance(wert, list):
             return None, f"{key} muss eine Liste sein."
@@ -36944,6 +37008,10 @@ def _make_add(kind: str, dash_cat: str):
             good, msg = await _write(kind, conn, names, cat, key)
             if not good:
                 return err(msg or "Speichern fehlgeschlagen.", 502)
+            if kind == "banlist":
+                grund = str(data.get("reason") or data.get("grund") or "").strip()[:500]
+                await _ban_log_senden(conn, "perm", [player], grund or "Dashboard",
+                                      "Dashboard · " + _audit_actor(_sess_get(request)))
         return ok({"names": names})
     return handler
 
@@ -36969,6 +37037,9 @@ def _make_remove(kind: str, dash_cat: str):
             good, msg = await _write(kind, conn, new, cat, key)
             if not good:
                 return err(msg or "Speichern fehlgeschlagen.", 502)
+            if kind == "banlist":
+                await _ban_log_senden(conn, "unban", [player], "",
+                                      "Dashboard · " + _audit_actor(_sess_get(request)))
         return ok({"names": new})
     return handler
 
@@ -39093,6 +39164,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "52d7e767c2a64d4ad36ad0d8d666af2f72c7c563f05b5ef0d7ec80c6b22a3997",
         "7940e9064a30763a0e36a96acb1e46c4d6c456c4f1e837b830cbf07fc99cd380",
         "8061e139fd901e077cd5c7b7e519bf5cd90af8074b1e1680b6d5853ebae3c9ab",
         "d68abb8f966f9297f38ac73c6d0218fc9fe499847fcc63a8ce7687593718a911",
