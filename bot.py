@@ -17570,8 +17570,49 @@ async def api_tools_airstrike_remove(request: web.Request) -> web.Response:
 # dayzOffline.chernarusplus/db/events.xml (StaticAirplaneCrate).  Kein
 # cfgspawnabletypes.xml: die drei SupplyBoxen haben dort keinen Vanilla-Eintrag.
 _AIRDROP_SUFFIX_RE = re.compile(r"[A-Za-z0-9_]{1,32}")
-_AIRDROP_BOXES = ("StaticObj_Misc_SupplyBox1_DE", "StaticObj_Misc_SupplyBox2_DE",
-                  "StaticObj_Misc_SupplyBox3_DE")
+# Loot-Träger: die drei Vanilla-SupplyBoxen von StaticAirplaneCrate. Ihr Loot
+# kommt aus mapgroupproto.xml (Container lootFloor, 11 Punkte) – dieser Block
+# existiert auf Chernarus, Livonia und Sakhal. Livonia hat nur keinen
+# types.xml-Eintrag; den liefert das Tool bei Bedarf mit (_AIRDROP_TYPES).
+# Relative Lage in der Gruppe (x, z, Winkel) wie bei Bohemias Konvoi-Gruppen.
+_AIRDROP_BOXES = (("StaticObj_Misc_SupplyBox1_DE", 0.0, 0.0, 0),
+                  ("StaticObj_Misc_SupplyBox2_DE", 2.5, 1.0, 35),
+                  ("StaticObj_Misc_SupplyBox3_DE", -2.2, 1.6, 300))
+# Szene: Mi-8 ist ein belegter Loot-Container (types + mapgroupproto auf allen
+# Karten). Die übrigen Klassen sind statische Vanilla-Objekte (structures_bliss),
+# kommen aber in keiner Bohemia-CE-Datei vor – in der Oberfläche als
+# „ungetestet“ gekennzeichnet. Reihenfolge = Reihenfolge in der Gruppe.
+_AIRDROP_DEKOR = (
+    ("mi8", "Wreck_Mi8_Crashed", 0.0, 9.0, 0, True),
+    ("krater", "StaticObj_ShellCrater2_Large", 0.5, 0.5, 0, False),
+    ("leichen", "StaticObj_Dead_pile2", 3.5, -2.0, 120, False),
+    ("munition", "StaticObj_ammoboxes_stacked", -3.5, -1.5, 40, False),
+    ("c130", "Land_Wreck_C130J", -40.0, -40.0, 45, False),
+)
+# Gaszone: NICHT als Gruppen-Kind (dafür gibt es keinen Beleg), sondern als
+# eigenes CE-Event nach Bohemias StaticContaminatedArea (events.xml Chernarus:
+# nominal 0, min 2, max 4, lifetime 2100, limit parent, Kind
+# ContaminatedArea_Dynamic min 2 max 4; cfgeventspawns mit zone r=80).
+_AIRDROP_KONTAMINATION = "ContaminatedArea_Dynamic"
+# Zombies laufen wie bei StaticMilitaryConvoy über <secondary>: ein Vanilla-
+# Infected-Event, das die CE um die Loot-Kinder herum startet. Nur Events, die
+# in allen drei Karten vorkommen; beim Anwenden zusätzlich gegen die echte
+# events.xml des Servers geprüft.
+_AIRDROP_SECONDARY = ("InfectedArmy", "InfectedArmyHard", "InfectedCity", "InfectedFirefighter",
+                      "InfectedIndustrial", "InfectedMedic", "InfectedNBC", "InfectedNBCYellow",
+                      "InfectedPolice", "InfectedPoliceHard", "InfectedPrisoner", "InfectedReligious",
+                      "InfectedSolitude", "InfectedSpooky", "InfectedVillage")
+_AIRDROP_DATEIEN = (("db/events.xml", "events"), ("cfgeventspawns.xml", "eventposdef"),
+                    ("cfgeventgroups.xml", "eventgroupdef"), ("db/types.xml", "types"))
+_AIRDROP_LEERE_GRUPPEN = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<eventgroupdef>\n</eventgroupdef>\n'
+_AIRDROP_DEFAULTS = {"nominal": 1, "min": 0, "max": 0, "lifetime": 1800, "restock": 0,
+                     "saferadius": 1000, "distanceradius": 1000, "cleanupradius": 1000,
+                     "active": True, "kisten": 3, "loot_min": 4, "loot_max": 8,
+                     "gaszone": False, "secondary": "", "dekor": []}
+_AIRDROP_LIMITS = {"nominal": (0, 50), "min": (0, 50), "max": (0, 50),
+                   "lifetime": (60, 86400), "restock": (0, 86400),
+                   "saferadius": (0, 5000), "distanceradius": (0, 5000), "cleanupradius": (0, 5000),
+                   "kisten": (1, 3), "loot_min": (0, 50), "loot_max": (0, 50)}
 
 
 def _tool_world_size(conn: ServerConnection) -> Tuple[Optional[str], Optional[int]]:
@@ -17586,16 +17627,17 @@ def _airdrops(conn: ServerConnection) -> List[Dict[str, Any]]:
 
 def _airdrop_status(conn: ServerConnection) -> Dict[str, Any]:
     map_name, world_size = _tool_world_size(conn)
-    if map_name == "Livonia":
-        return {"karte": map_name, "world_size": world_size, "freigegeben": False,
-                "hinweis": "Auf Livonia fehlen die Vanilla-Kistenklassen."}
-    if map_name == "Sakhal":
-        return {"karte": map_name, "world_size": world_size, "freigegeben": True,
-                "hinweis": "Auf Sakhal ist der Vanilla-Airdrop deaktiviert; Funktion auf dem Server nicht bestätigt."}
-    if map_name == "ChernarusPlus":
-        return {"karte": map_name, "world_size": world_size, "freigegeben": True, "hinweis": None}
+    if map_name in ("ChernarusPlus", "Livonia", "Sakhal"):
+        hinweis = None
+        if map_name == "Livonia":
+            hinweis = ("Livonia hat keinen types.xml-Eintrag für die SupplyBoxen – "
+                       "das Tool ergänzt ihn beim Anwenden automatisch.")
+        return {"karte": map_name, "world_size": world_size, "freigegeben": True, "hinweis": hinweis,
+                "secondary": list(_AIRDROP_SECONDARY),
+                "dekor": [{"key": k, "klasse": kl, "belegt": b} for k, kl, _x, _z, _a, b in _AIRDROP_DEKOR]}
     return {"karte": map_name, "world_size": world_size, "freigegeben": False,
-            "hinweis": "Karte unbekannt – zuerst die Serververbindung prüfen."}
+            "hinweis": "Karte unbekannt – zuerst die Serververbindung prüfen.",
+            "secondary": [], "dekor": []}
 
 
 def _airdrop_number(value: Any, label: str, low: int, high: int) -> int:
@@ -17604,7 +17646,7 @@ def _airdrop_number(value: Any, label: str, low: int, high: int) -> int:
     return value
 
 
-def _airdrop_input(data: Any, conn: ServerConnection) -> Tuple[str, str, List[Dict[str, int]], Dict[str, Any]]:
+def _airdrop_input(data: Any, conn: ServerConnection) -> Tuple[str, str, List[Dict[str, float]], Dict[str, Any]]:
     if not isinstance(data, dict) or type(data.get("vorschau", False)) is not bool:
         raise ValueError("Ungültige Airdrop-Anfrage.")
     suffix = data.get("suffix")
@@ -17616,24 +17658,23 @@ def _airdrop_input(data: Any, conn: ServerConnection) -> Tuple[str, str, List[Di
     size = status["world_size"]
     if not isinstance(size, int):
         raise ValueError("Karte unbekannt – zuerst die Serververbindung prüfen.")
-    defaults = {"nominal": 9, "min": 0, "max": 0, "lifetime": 1800, "restock": 0,
-                "saferadius": 1000, "distanceradius": 1, "cleanupradius": 1000, "active": True,
-                "box_min": 2, "box_max": 4, "loot_min": 4, "loot_max": 8}
     raw_values = data.get("werte", {})
-    if not isinstance(raw_values, dict) or set(raw_values) - set(defaults):
+    if not isinstance(raw_values, dict) or set(raw_values) - set(_AIRDROP_DEFAULTS):
         raise ValueError("Ungültige Airdrop-Werte.")
-    values = dict(defaults)
+    values = copy.deepcopy(_AIRDROP_DEFAULTS)
     values.update(raw_values)
-    limits = {"nominal": (0, 50), "min": (0, 50), "max": (0, 50),
-              "lifetime": (60, 86400), "restock": (0, 86400),
-              "saferadius": (0, 5000), "distanceradius": (0, 5000), "cleanupradius": (0, 5000),
-              "box_min": (0, 20), "box_max": (0, 20), "loot_min": (0, 50), "loot_max": (0, 50)}
-    for key, (low, high) in limits.items():
+    for key, (low, high) in _AIRDROP_LIMITS.items():
         values[key] = _airdrop_number(values[key], key, low, high)
-    if type(values["active"]) is not bool:
-        raise ValueError("Aktiv muss ein Schalter sein.")
-    if values["min"] > values["max"] or values["box_min"] > values["box_max"] or values["loot_min"] > values["loot_max"]:
+    if type(values["active"]) is not bool or type(values["gaszone"]) is not bool:
+        raise ValueError("Aktiv und Gaszone müssen Schalter sein.")
+    if values["min"] > values["max"] or values["loot_min"] > values["loot_max"]:
         raise ValueError("Min darf nicht größer als Max sein.")
+    if values["secondary"] not in ("",) + _AIRDROP_SECONDARY:
+        raise ValueError("Unbekanntes Zombie-Event.")
+    dekor_keys = [k for k, *_rest in _AIRDROP_DEKOR]
+    if not isinstance(values["dekor"], list) or any(d not in dekor_keys for d in values["dekor"]):
+        raise ValueError("Unbekanntes Szenen-Objekt.")
+    values["dekor"] = [k for k in dekor_keys if k in values["dekor"]]
     positions = data.get("positionen")
     if not isinstance(positions, list) or not 1 <= len(positions) <= 15:
         raise ValueError("Bitte 1–15 Positionen setzen.")
@@ -17652,15 +17693,73 @@ def _airdrop_input(data: Any, conn: ServerConnection) -> Tuple[str, str, List[Di
 
 
 def _airdrop_event_xml(name: str, values: Dict[str, Any]) -> str:
+    """Gruppen-Event nach dem Muster StaticMilitaryConvoy / StaticScientist:
+    leere <children/>, Inhalt kommt aus cfgeventgroups.xml."""
     rows = [f'<event name="{_tool_esc_xml(name)}">']
     for key in ("nominal", "min", "max", "lifetime", "restock", "saferadius", "distanceradius", "cleanupradius"):
         rows.append(f'    <{key}>{values[key]}</{key}>')
-    rows += ['    <flags deletable="0" init_random="0" remove_damaged="1"/>',
+    if values.get("secondary"):
+        rows.append(f'    <secondary>{_tool_esc_xml(values["secondary"])}</secondary>')
+    rows += ['    <flags deletable="1" init_random="0" remove_damaged="0"/>',
              '    <position>fixed</position>', '    <limit>child</limit>',
-             f'    <active>{1 if values["active"] else 0}</active>', '    <children>']
-    for box in _AIRDROP_BOXES:
-        rows.append(f'        <child lootmax="{values["loot_max"]}" lootmin="{values["loot_min"]}" max="{values["box_max"]}" min="{values["box_min"]}" type="{box}"/>')
-    rows += ['    </children>', '</event>']
+             f'    <active>{1 if values["active"] else 0}</active>', '    <children/>', '</event>']
+    return "\n".join(rows)
+
+
+def _airdrop_group_xml(group: str, values: Dict[str, Any]) -> str:
+    loot = f'deloot="1" lootmax="{values["loot_max"]}" lootmin="{values["loot_min"]}"'
+    rows = [f'<group name="{_tool_esc_xml(group)}">']
+    for klasse, x, z, a in _AIRDROP_BOXES[:values["kisten"]]:
+        rows.append(f'    <child type="{klasse}" {loot} x="{_tool_fmt_zahl(x)}" z="{_tool_fmt_zahl(z)}" a="{a}"/>')
+    for key, klasse, x, z, a, belegt in _AIRDROP_DEKOR:
+        if key not in values["dekor"]:
+            continue
+        attrs = loot if belegt else 'spawnsecondary="false"'
+        rows.append(f'    <child type="{klasse}" {attrs} x="{_tool_fmt_zahl(x)}" z="{_tool_fmt_zahl(z)}" a="{a}"/>')
+    rows.append('</group>')
+    return "\n".join(rows)
+
+
+def _airdrop_gas_event_xml(name: str) -> str:
+    """Wörtlich Bohemias StaticContaminatedArea (Chernarus), nur mit eigenem Namen."""
+    return "\n".join([
+        f'<event name="{_tool_esc_xml(name)}">', '    <nominal>0</nominal>', '    <min>2</min>', '    <max>4</max>',
+        '    <lifetime>2100</lifetime>', '    <restock>0</restock>', '    <saferadius>0</saferadius>',
+        '    <distanceradius>120</distanceradius>', '    <cleanupradius>0</cleanupradius>',
+        '    <flags deletable="1" init_random="1" remove_damaged="0"/>', '    <position>fixed</position>',
+        '    <limit>parent</limit>', '    <active>1</active>', '    <children>',
+        f'        <child lootmax="0" lootmin="0" max="4" min="2" type="{_AIRDROP_KONTAMINATION}"/>',
+        '    </children>', '</event>'])
+
+
+def _airdrop_gas_spawn_xml(name: str, punkte: List[Dict[str, float]]) -> str:
+    rows = [f'<event name="{_tool_esc_xml(name)}">', '    <zone smin="0" smax="0" dmin="5" dmax="8" r="80"/>']
+    for p in punkte:
+        rows.append(f'    <pos x="{_tool_fmt_zahl(p["x"])}" z="{_tool_fmt_zahl(p["z"])}"/>')
+    rows.append('</event>')
+    return "\n".join(rows)
+
+
+def _airdrop_spawn_xml(name: str, group: str, punkte: List[Dict[str, float]]) -> str:
+    rows = [f'<event name="{_tool_esc_xml(name)}">']
+    for p in punkte:
+        rows.append(f'    <pos x="{_tool_fmt_zahl(p["x"])}" z="{_tool_fmt_zahl(p["z"])}" '
+                    f'a="{_tool_fmt_zahl(p["a"])}" group="{_tool_esc_xml(group)}"/>')
+    rows.append('</event>')
+    return "\n".join(rows)
+
+
+def _airdrop_types_xml(klassen: List[str]) -> str:
+    """types.xml-Einträge wie Bohemias Chernarus-Fassung der SupplyBoxen
+    (nominal 0, lifetime 3, count_in_map) – nur für Klassen, die auf dem
+    Server fehlen (Livonia)."""
+    rows = []
+    for klasse in klassen:
+        rows += [f'<type name="{_tool_esc_xml(klasse)}">', '    <nominal>0</nominal>', '    <lifetime>3</lifetime>',
+                 '    <restock>0</restock>', '    <min>0</min>', '    <quantmin>-1</quantmin>',
+                 '    <quantmax>-1</quantmax>', '    <cost>100</cost>',
+                 '    <flags count_in_cargo="0" count_in_hoarder="0" count_in_map="1" count_in_player="0" crafted="0" deloot="0"/>',
+                 '</type>']
     return "\n".join(rows)
 
 
@@ -17675,16 +17774,18 @@ async def _airdrop_prepare(request: web.Request, action: str):
 
 async def _airdrop_files(conn: ServerConnection, loop):
     result = []
-    for filename, root_tag in (("db/events.xml", "events"), ("cfgeventspawns.xml", "eventposdef")):
+    for filename, root_tag in _AIRDROP_DATEIEN:
         raw, status = await _tools_datei_lesen(conn, filename, loop)
-        if status != "ok":
-            raise ValueError("Die Airdrop-Serverdateien sind nicht lesbar.")
+        if status == "missing" and filename == "cfgeventgroups.xml":
+            raw = _AIRDROP_LEERE_GRUPPEN  # fehlt nur auf alten Missionen – wird neu angelegt
+        elif status != "ok":
+            raise ValueError(f"{filename} ist auf dem Server nicht lesbar.")
         try:
             if ET.fromstring(raw).tag != root_tag:
                 raise ValueError("Falsches XML-Wurzelelement.")
             _dayzcode_segmente(raw)
         except (ET.ParseError, ValueError) as exc:
-            raise ValueError("Die Airdrop-Serverdateien enthalten ungültiges XML oder beschädigte Marker.") from exc
+            raise ValueError(f"{filename} enthält ungültiges XML oder beschädigte Marker.") from exc
         result.append((filename, root_tag, raw))
     return result
 
@@ -17737,33 +17838,60 @@ async def api_tools_airdrop_post(request: web.Request) -> web.Response:
         error = _dash_rate_limited(request, "tools.airdrop", 5)
         if error is not None:
             return error
+    group = "Airdrop_" + suffix
+    gas_name = "StaticAirdropGas_" + suffix
     async with _schaden_lock(conn.service_id):
         loop = asyncio.get_running_loop()
         try:
             files = await _airdrop_files(conn, loop)
         except ValueError as exc:
             return err(str(exc), 502)
+        raw_by_name = {filename: raw for filename, _root, raw in files}
         entries = _airdrops(conn)
-        if any(e.get("suffix") == suffix for e in entries) or any(_tool_finde_benannten_block(raw, "event", name) for _f, _r, raw in files):
+        if (any(e.get("suffix") == suffix for e in entries)
+                or _tool_finde_benannten_block(raw_by_name["db/events.xml"], "event", name)
+                or _tool_finde_benannten_block(raw_by_name["cfgeventspawns.xml"], "event", name)
+                or _tool_finde_benannten_block(raw_by_name["cfgeventgroups.xml"], "group", group)
+                or _tool_finde_benannten_block(raw_by_name["db/events.xml"], "event", gas_name)):
             return err("Dieser Eventname ist bereits vorhanden.", 409)
+        if values["secondary"] and not _tool_finde_benannten_block(raw_by_name["db/events.xml"], "event", values["secondary"]):
+            return err(f"Das Zombie-Event {values['secondary']} gibt es in der events.xml dieses Servers nicht.", 400)
+        # types.xml nur anfassen, wenn dem Server Klassen fehlen (Livonia: SupplyBoxen)
+        benoetigt = [k for k, *_r in _AIRDROP_BOXES[:values["kisten"]]]
+        benoetigt += [kl for key, kl, _x, _z, _a, belegt in _AIRDROP_DEKOR if belegt and key in values["dekor"]]
+        if values["gaszone"]:
+            benoetigt.append(_AIRDROP_KONTAMINATION)
+        fehlende_typen = [k for k in benoetigt if not _tool_finde_benannten_block(raw_by_name["db/types.xml"], "type", k)]
         dep_id = "airdrop_" + suffix
-        blocks = [_airdrop_event_xml(name, values), _dayzcode_spawn_xml(name, points)]
+        blocks = {"db/events.xml": _airdrop_event_xml(name, values),
+                  "cfgeventspawns.xml": _airdrop_spawn_xml(name, group, points),
+                  "cfgeventgroups.xml": _airdrop_group_xml(group, values)}
+        if values["gaszone"]:
+            blocks["db/events.xml"] += "\n" + _airdrop_gas_event_xml(gas_name)
+            blocks["cfgeventspawns.xml"] += "\n" + _airdrop_gas_spawn_xml(gas_name, points)
+        if fehlende_typen:
+            blocks["db/types.xml"] = _airdrop_types_xml(fehlende_typen)
         try:
-            changes = [(filename, raw, _dayzcode_einfuegen(raw, root_tag, dep_id, block))
-                       for (filename, root_tag, raw), block in zip(files, blocks)]
-            for _filename, _raw, changed in changes:
-                ET.fromstring(changed)
+            changes = []
+            for filename, root_tag, raw in files:
+                if filename in blocks:
+                    changed = _dayzcode_einfuegen(raw, root_tag, dep_id, blocks[filename])
+                    ET.fromstring(changed)
+                    changes.append((filename, raw, changed))
         except (ET.ParseError, ValueError) as exc:
             return err(str(exc), 400)
-        generated = [{"filename": filename, "content": block} for (filename, _root, _raw), block in zip(files, blocks)]
+        generated = [{"filename": filename, "content": blocks[filename]}
+                     for filename, _root in _AIRDROP_DATEIEN if filename in blocks]
         if preview:
-            return ok({"event_name": name, "generated": generated})
-        entry = {"id": dep_id, "suffix": suffix, "event_name": name, "werte": values,
-                 "positionen": points, "erstellt": time.time()}
+            return ok({"event_name": name, "group_name": group, "generated": generated,
+                       "types_ergaenzt": fehlende_typen, "gas_event": gas_name if values["gaszone"] else None})
+        entry = {"id": dep_id, "suffix": suffix, "event_name": name, "group_name": group, "werte": values,
+                 "gas_event": gas_name if values["gaszone"] else None,
+                 "positionen": points, "types_ergaenzt": fehlende_typen, "erstellt": time.time()}
         error = await _airdrop_transaction(conn, changes, entries + [entry], loop)
         if error is not None:
             return error
-        return ok({"id": dep_id, "event_name": name, "generated": generated,
+        return ok({"id": dep_id, "event_name": name, "group_name": group, "generated": generated,
                    "meldung": "Wirkt nach dem nächsten Server-Neustart."})
 
 
