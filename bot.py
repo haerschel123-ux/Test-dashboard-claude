@@ -328,6 +328,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "killstreak_min":           3,
     "killstreak_step":          1,
     "link_set_nickname":        False,
+    # Username Hooks – was beim /unlink zurueckgedreht wird (Vorbild DayZ++)
+    "link_revert_added_roles":  True,
+    "link_revert_removed_roles": True,
+    "link_revert_nickname":     True,
     "heatmap_limits":           {},
     "max_backlog_minutes":            10,
     "max_events_per_cycle":           30,
@@ -3939,6 +3943,7 @@ class ServerConnection:
         "keep_server_running", "keep_server_running_haenger",
         "combat_log_seconds", "rage_quit_seconds", "killstreak_min", "killstreak_step",
         "link_set_nickname", "heatmap_limits",
+        "link_revert_added_roles", "link_revert_removed_roles", "link_revert_nickname",
     })
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -24280,12 +24285,24 @@ async def _link_hooks_anwenden(conn: Optional[ServerConnection], guild_id: int, 
 
 
 async def _link_hooks_zuruecknehmen(guild_id: int, user_id: int) -> str:
-    """Gegenstueck zu _link_hooks_anwenden, sobald der LETZTE Link faellt."""
+    """Gegenstueck zu _link_hooks_anwenden, sobald der LETZTE Link faellt.
+    Welche Teile zurueckgedreht werden, bestimmen die Schalter
+    link_revert_added_roles / link_revert_removed_roles / link_revert_nickname
+    des Leitservers der Guild (Standard: alles)."""
     if bot is None:
         return ""
     zustand = db.link_hook_get(int(guild_id), int(user_id))
     if not zustand:
         return ""
+    leit = connections.for_guild(int(guild_id))
+    def _schalter(key: str) -> bool:
+        return bool(leit.get(key, True)) if leit is not None else True
+    if not _schalter("link_revert_added_roles"):
+        zustand["added"] = []
+    if not _schalter("link_revert_removed_roles"):
+        zustand["removed"] = []
+    if not _schalter("link_revert_nickname"):
+        zustand["nick_gesetzt"] = False
     guild = bot.get_guild(int(guild_id))
     if guild is None:
         return "Username Hooks: Bot erreicht die Guild nicht."
@@ -36535,7 +36552,9 @@ _GENERAL_KARTEN_SCHLUESSEL: Dict[str, Tuple[str, ...]] = {
     "feed_thresholds": ("combat_log_seconds", "rage_quit_seconds", "killstreak_min",
                         "killstreak_step", "long_range_kill_meter"),
     "location_privacy": ("location_privacy_names",),
-    "username_hooks": ("link_add_role_ids", "link_remove_role_ids", "link_set_nickname"),
+    "username_hooks": ("link_add_role_ids", "link_remove_role_ids", "link_set_nickname",
+                       "max_linked_accounts", "link_revert_added_roles",
+                       "link_revert_removed_roles", "link_revert_nickname"),
     "heatmap_limits": ("heatmap_limits",),
     "ban_immunity": ("ban_immune_role_ids",),
     "logging": ("log_ban_temp_channel_id", "log_ban_perm_channel_id", "log_unban_channel_id"),
@@ -36551,8 +36570,11 @@ _GENERAL_ZAHLEN: Dict[str, Tuple[int, int]] = {
     "combat_log_seconds": (5, 3600), "rage_quit_seconds": (5, 3600),
     "killstreak_min": (2, 50), "killstreak_step": (1, 50),
     "long_range_kill_meter": (50, 5000),
+    # Hauptaccount + Zusatz-Accounts (Optionen-Seite klemmt ebenfalls auf 100)
+    "max_linked_accounts": (1, 100),
 }
-_GENERAL_BOOLS = ("keep_server_running", "keep_server_running_haenger", "link_set_nickname")
+_GENERAL_BOOLS = ("keep_server_running", "keep_server_running_haenger", "link_set_nickname",
+                  "link_revert_added_roles", "link_revert_removed_roles", "link_revert_nickname")
 _GENERAL_ROLLENLISTEN = ("link_add_role_ids", "link_remove_role_ids", "ban_immune_role_ids")
 
 
@@ -39164,6 +39186,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "295465571cec655662628f1da92a2f79c1c380235f9f367551004001f5fc67bb",
         "52d7e767c2a64d4ad36ad0d8d666af2f72c7c563f05b5ef0d7ec80c6b22a3997",
         "7940e9064a30763a0e36a96acb1e46c4d6c456c4f1e837b830cbf07fc99cd380",
         "8061e139fd901e077cd5c7b7e519bf5cd90af8074b1e1680b6d5853ebae3c9ab",
