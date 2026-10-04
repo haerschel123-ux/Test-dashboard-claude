@@ -74,7 +74,7 @@ def test_altzone_bekommt_vorgaben_ohne_umschreiben():
     p = bot._zone_payload(alt)
     assert p["active"] is True and p["color"] == "9B59B6" and p["ping_on_detect"] is True
     assert p["ban_events"] == [] and p["lists"] == [] and p["manager_ids"] == []
-    assert p["temp_ban_hours"] == 24 and p["ping_role_ids"] == [5]
+    assert p["temp_ban_hours"] == 24 and p["ping_role_ids"] == ["5"]
     assert "active" not in alt     # gespeicherter Eintrag unveraendert
 
 
@@ -282,3 +282,19 @@ def test_zonen_von_kunde_a_nicht_bei_kunde_b(_ruhe):
     _run(bot.bot._zonen_ereignis(ev, b))
     assert not b.api.written and not bot._bans_of(b)
     assert bot._zones(b) == []
+
+
+def test_payload_liefert_discord_ids_als_strings():
+    """Snowflakes > 2^53 wuerden in JavaScript gerundet (…000) – die API gibt
+    Channel-, Guild- und Rollen-IDs deshalb als Strings aus."""
+    z = {"name": "Groß", "channel_id": 1521459827031675123, "guild_id": 1398765432109876543,
+         "ping_role_ids": [1521459827031675999, "7"], "manage_role_ids": [1521459827031676001],
+         "role_id": 1521459827031675555}
+    p = bot._zone_payload(z)
+    assert p["channel_id"] == "1521459827031675123" and p["guild_id"] == "1398765432109876543"
+    assert p["ping_role_ids"] == ["1521459827031675999", "7"]
+    assert p["manage_role_ids"] == ["1521459827031676001"] and p["role_id"] == "1521459827031675555"
+    # intern bleibt die Zone unveraendert (int)
+    assert z["channel_id"] == 1521459827031675123
+    # Altbestand ohne Channel bleibt ohne Channel
+    assert "channel_id" not in bot._zone_payload({"name": "Alt"})

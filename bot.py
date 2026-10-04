@@ -9555,9 +9555,16 @@ def _zone_payload(z: Dict) -> Dict:
     `ping_role_ids`. Der gespeicherte Eintrag wird dabei NICHT umgeschrieben."""
     out = dict(z)
     out["type"] = z.get("type") or "circular"
-    out["ping_role_ids"] = _zone_ping_role_ids(z)
+    # Discord-IDs als STRINGS ausliefern: JavaScript rundet Zahlen oberhalb
+    # von 2^53 (Snowflakes seit 2022 liegen darueber) – der Picker fand dann
+    # den Channel/die Rolle nicht mehr und speicherte eine verfaelschte ID
+    # (…000) zurueck.
+    for feld in ("channel_id", "guild_id", "role_id"):
+        if z.get(feld) not in (None, "", 0):
+            out[feld] = str(z[feld])
+    out["ping_role_ids"] = [str(r) for r in _zone_ping_role_ids(z)]
     manage = z.get("manage_role_ids")
-    out["manage_role_ids"] = manage if isinstance(manage, list) else []
+    out["manage_role_ids"] = [str(r) for r in manage] if isinstance(manage, list) else []
     out["allowlist"] = _zone_allowlist(z)
     if out["type"] == "polygon":
         pts = z.get("points")
@@ -39186,6 +39193,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "b271994e632e82bf8705d36f6cddd1ff6336bda1e62475f76d13210367e96681",
         "295465571cec655662628f1da92a2f79c1c380235f9f367551004001f5fc67bb",
         "52d7e767c2a64d4ad36ad0d8d666af2f72c7c563f05b5ef0d7ec80c6b22a3997",
         "7940e9064a30763a0e36a96acb1e46c4d6c456c4f1e837b830cbf07fc99cd380",
