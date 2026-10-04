@@ -1013,6 +1013,8 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.airstrike":                    {"label": "Airstrike Generator", "gruppe": "Tools"},
     "tools.airdrop":                      {"label": "Airdrop Configurator", "gruppe": "Tools"},
     "tools.underground":                  {"label": "Underground Area Generator", "gruppe": "Tools"},
+    "tools.battleroyale":                 {"label": "Battle Royale Builder", "gruppe": "Tools"},
+    "tools.lockedcontainer":              {"label": "Locked Container Builder", "gruppe": "Tools"},
     "tools.weather":                      {"label": "Weather Manager", "gruppe": "Tools"},
     "tools.globals":                      {"label": "Globals Configurator", "gruppe": "Tools"},
     "tools.economy":                      {"label": "Economy Editor", "gruppe": "Tools"},
@@ -14332,6 +14334,8 @@ _TOOL_LISTE = (
     ("airstrike", "💥", "Airstrike Generator"),
     ("airdrop", "🪂", "Airdrop Configurator"),
     ("underground", "🕳️", "Underground Area Generator"),
+    ("battleroyale", "🎯", "Battle Royale Builder"),
+    ("lockedcontainer", "🔒", "Locked Container Builder"),
     ("weather", "🌦️", "Weather Manager"),
     ("globals", "⚙️", "Globals Configurator"),
     ("economy", "🧮", "Economy Editor"),
@@ -18108,6 +18112,554 @@ async def api_tools_underground_post(request: web.Request) -> web.Response:
             return err("Datei konnte nicht gespeichert werden.", 502)
     return ok({"generated": [{"filename": _UNDERGROUND_FILE, "content": rendered}], "geschrieben": True,
                "meldung": "Wirkt nach dem nächsten Server-Neustart."})
+
+
+# ── Battle Royale / Locked Container ──────────────────────────────────────
+# Battle Royale: Die Vanilla-Engine kennt keine schrumpfende Zone. Das Tool
+# legt deshalb feste Gas-Ringe (ContaminatedArea_Static in cfgEffectArea.json,
+# Format wie der Gas-Zonen Builder) um einen Mittelpunkt und optional eigene
+# Fresh-Spawn-Blasen in cfgplayerspawnpoints.xml an. Eine neue Runde wird erst
+# durch Anwenden einer anderen Runde + Server-Neustart aktiv.
+_BRLC_SUFFIX_RE = re.compile(r"[A-Za-z0-9_]{1,32}")
+
+
+def _brlc_number(value: Any, label: str, low: float, high: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{label} muss eine gültige Zahl sein.")
+    if not low <= float(value) <= high:
+        raise ValueError(f"{label} liegt außerhalb des erlaubten Bereichs ({low:g}–{high:g}).")
+    return round(float(value), 3)
+
+
+def _brlc_suffix(value: Any) -> str:
+    if not isinstance(value, str) or not _BRLC_SUFFIX_RE.fullmatch(value):
+        raise ValueError("Suffix: 1–32 Buchstaben, Ziffern oder _ verwenden.")
+    return value
+
+
+def _brlc_entries(conn: ServerConnection, key: str) -> List[Dict[str, Any]]:
+    values = conn.data.get(key, [])
+    return copy.deepcopy([row for row in values if isinstance(row, dict)]) if isinstance(values, list) else []
+
+
+async def _brlc_prepare(request: web.Request, module: str, action: str):
+    conn, error = _session_conn(request, module)
+    if error is None:
+        error = await _modul_pruefen(module, request, conn)
+    if error is None:
+        error = await _dash_gate(request, conn, "tools", action)
+    return conn, error
+
+
+async def _brlc_transaction(conn: ServerConnection, key: str, changes, manifest, loop):
+    """Mehrdatei-Änderung mit Rücknahme jeder Teiländerung (Muster Airdrop).
+    ``changes`` = [(pfad, vorher, nachher)]; ``vorher`` None = Datei gab es
+    nicht (wird beim Rollback gelöscht)."""
+    attempted, old = [], copy.deepcopy(conn.data.get(key))
+    existed, saving = key in conn.data, False
+    try:
+        for path, before, after in changes:
+            attempted.append((path, before))
+            if not await _tools_datei_schreiben(conn, path, after, loop):
+                raise OSError(path)
+        saving = True
+        _conn_store(conn, key, manifest, strict=True)
+    except Exception:
+        failed = []
+        for path, before in reversed(attempted):
+            try:
+                restored = (await _tools_datei_loeschen(conn, path, loop) if before is None
+                            else await _tools_datei_schreiben(conn, path, before, loop))
+                if not restored:
+                    failed.append(path)
+            except Exception:  # noqa: BLE001
+                failed.append(path)
+        if saving:
+            try:
+                if existed:
+                    _conn_store(conn, key, old, strict=True)
+                else:
+                    conn.data.pop(key, None)
+                    connections.save(strict=True)
+            except OSError:
+                failed.append("connections.json")
+        return err("Rollback unvollständig – folgende Dateien prüfen: " + ", ".join(failed), 502) if failed else err("Speichern fehlgeschlagen – Änderungen wurden zurückgesetzt.", 502)
+    return None
+
+
+def _br_effect_area(name: str, x: float, z: float, radius: int) -> Dict[str, Any]:
+    """Statische Gaszone – Felder wie im Gas-Zonen Builder (api_tools_gaszone_post)."""
+    return {"AreaName": name, "Type": "ContaminatedArea_Static", "TriggerType": "ContaminatedTrigger",
+            "Data": {"Pos": [x, 0, z], "Radius": radius, "PosHeight": 15, "NegHeight": 15,
+                     "InnerPartDist": 100, "OuterOffset": 20,
+                     "ParticleName": "graphics/particles/contaminated_area_gas_big"},
+            "PlayerData": {"AroundPartName": "graphics/particles/contaminated_area_gas_around",
+                           "TinyPartName": "graphics/particles/contaminated_area_gas_around_tiny",
+                           "PPERequesterType": "PPERequester_ContaminatedAreaTint"}}
+
+
+def _br_spawn_insert(text: str, dep_id: str, points: List[Dict[str, float]]) -> str:
+    """Eigene Blasen in die VORHANDENE <generator_posbubbles> der <fresh>-Gruppe
+    einfügen (Vanilla hat genau eine; eine zweite Liste ist nicht belegt).
+    Fehlt die Liste, wird sie innerhalb der Marker neu angelegt."""
+    fresh = _tool_finde_einzigen_block(text, "fresh")
+    if fresh is None or fresh["block"].rstrip().endswith("/>"):
+        raise ValueError("cfgplayerspawnpoints.xml braucht eine <fresh>-Gruppe.")
+    nl = _tool_eol(text)
+    pos_rows = [f'<pos x="{_tool_fmt_zahl(p["x"])}" z="{_tool_fmt_zahl(p["z"])}"/>' for p in points]
+    ende_liste = text.rfind("</generator_posbubbles", fresh["start"], fresh["end"])
+    if ende_liste >= 0:
+        rows = [f"<!-- {_DAYZCODE_MARKER}:START {dep_id} -->"] + pos_rows + [f"<!-- {_DAYZCODE_MARKER}:END {dep_id} -->"]
+        einfuegen = ende_liste
+        einzug = "            "
+    else:
+        rows = ([f"<!-- {_DAYZCODE_MARKER}:START {dep_id} -->", "<generator_posbubbles>"]
+                + ["    " + r for r in pos_rows]
+                + ["</generator_posbubbles>", f"<!-- {_DAYZCODE_MARKER}:END {dep_id} -->"])
+        einfuegen = text.rfind("</fresh", fresh["start"], fresh["end"])
+        einzug = "        "
+    segment = "".join(einzug + row + nl for row in rows)
+    zeilenanfang = text.rfind("\n", 0, einfuegen) + 1
+    if text[zeilenanfang:einfuegen].strip():
+        # schließender Tag steht nicht allein auf der Zeile (kompaktes XML)
+        return text[:einfuegen] + nl + segment + text[einfuegen:]
+    return text[:zeilenanfang] + segment + text[zeilenanfang:]
+
+
+def _battleroyale_input(data: Any, conn: ServerConnection):
+    if not isinstance(data, dict) or type(data.get("vorschau", False)) is not bool:
+        raise ValueError("Ungültige Battle-Royale-Anfrage.")
+    suffix = _brlc_suffix(data.get("suffix"))
+    _map, size = _tool_world_size(conn)
+    if size is None:
+        raise ValueError("Karte unbekannt – zuerst die Serververbindung prüfen.")
+    center = data.get("mittelpunkt")
+    if not isinstance(center, dict):
+        raise ValueError("Bitte einen Mittelpunkt auf der Karte setzen.")
+    x = _brlc_number(center.get("x"), "Mittelpunkt X", 0, size)
+    z = _brlc_number(center.get("z"), "Mittelpunkt Z", 0, size)
+    radius = _brlc_number(data.get("radius"), "Rundenradius", 50, size / 2)
+    zone_radius = int(_brlc_number(data.get("zonenradius", 80), "Gaszonenradius", 10, 500))
+    spacing = _brlc_number(data.get("abstand", 250), "Zonenabstand", 50, 2000)
+    count = max(1, math.ceil((2 * math.pi * radius) / spacing))
+    if count > 100:
+        raise ValueError("Zu viele Gaszonen – Abstand erhöhen oder Rundenradius verkleinern.")
+    spawns = data.get("spawnpunkte", [])
+    if not isinstance(spawns, list) or len(spawns) > 100:
+        raise ValueError("Bitte höchstens 100 Spawnpunkte angeben.")
+    points = []
+    for point in spawns:
+        if not isinstance(point, dict):
+            raise ValueError("Ungültiger Spawnpunkt.")
+        points.append({"x": _brlc_number(point.get("x"), "Spawn X", 0, size),
+                       "z": _brlc_number(point.get("z"), "Spawn Z", 0, size)})
+    zones = [_br_effect_area(f"BrigardeBR_{suffix}_{i + 1:03d}",
+                             round(x + math.cos(2 * math.pi * i / count) * radius, 3),
+                             round(z + math.sin(2 * math.pi * i / count) * radius, 3), zone_radius)
+             for i in range(count)]
+    return suffix, zones, points, {"x": x, "z": z, "radius": radius, "zonenradius": zone_radius, "abstand": spacing}
+
+
+async def _battleroyale_files(conn: ServerConnection, loop):
+    raw_effect, status = await _tools_datei_lesen(conn, "cfgEffectArea.json", loop)
+    if status not in ("ok", "missing"):
+        raise ValueError("cfgEffectArea.json ist nicht lesbar.")
+    try:
+        effect, areas_key = ShopManager._parse_effect_area(raw_effect if status == "ok" else None)
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("cfgEffectArea.json enthält ungültiges JSON.") from exc
+    raw_spawn, spawn_status = await _tools_datei_lesen(conn, "cfgplayerspawnpoints.xml", loop)
+    if spawn_status not in ("ok", "missing"):
+        raise ValueError("cfgplayerspawnpoints.xml ist nicht lesbar.")
+    spawn = raw_spawn if spawn_status == "ok" else "<playerspawnpoints>\n    <fresh>\n    </fresh>\n</playerspawnpoints>\n"
+    try:
+        if ET.fromstring(spawn).tag != "playerspawnpoints":
+            raise ValueError("Falsches XML-Wurzelelement.")
+        _dayzcode_segmente(spawn)
+    except (ET.ParseError, ValueError) as exc:
+        raise ValueError("cfgplayerspawnpoints.xml enthält ungültiges XML oder beschädigte Marker.") from exc
+    return raw_effect if status == "ok" else None, effect, areas_key, raw_spawn if spawn_status == "ok" else None, spawn
+
+
+_BR_HINWEIS = ("Vanilla hat keine schrumpfende Zone: Eine Runde ist ein fester Gas-Ring. "
+               "Eine andere Runde wird erst nach Anwenden und Server-Neustart aktiv.")
+
+
+async def api_tools_battleroyale_get(request: web.Request) -> web.Response:
+    conn, error = await _brlc_prepare(request, "tools.battleroyale", "view")
+    if error is not None:
+        return error
+    _map, size = _tool_world_size(conn)
+    return ok({"runden": _brlc_entries(conn, "battleroyale"), "world_size": size, "hinweis": _BR_HINWEIS,
+               "kein_mission_ordner": not bool(_mission_dir_of(conn))})
+
+
+async def api_tools_battleroyale_post(request: web.Request) -> web.Response:
+    conn, error = await _brlc_prepare(request, "tools.battleroyale", "edit")
+    if error is not None:
+        return error
+    data = await body(request)
+    try:
+        suffix, zones, points, center = _battleroyale_input(data, conn)
+    except ValueError as exc:
+        return err(str(exc), 400)
+    preview = data["vorschau"]
+    if not preview and not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    if not preview:
+        error = _dash_rate_limited(request, "tools.battleroyale", 5)
+        if error is not None:
+            return error
+    async with _schaden_lock(conn.service_id):
+        loop = asyncio.get_running_loop()
+        try:
+            before_effect, effect, areas_key, before_spawn, spawn = await _battleroyale_files(conn, loop)
+        except ValueError as exc:
+            return err(str(exc), 502)
+        entries = _brlc_entries(conn, "battleroyale")
+        names = {a["AreaName"] for a in zones}
+        if any(e.get("suffix") == suffix for e in entries) or any(isinstance(a, dict) and a.get("AreaName") in names for a in effect.get(areas_key, [])):
+            return err("Dieser Battle-Royale-Suffix ist bereits vorhanden.", 409)
+        effect[areas_key] = list(effect.get(areas_key, [])) + zones
+        updated_effect = json.dumps(effect, indent=2, ensure_ascii=False) + "\n"
+        dep_id = "battleroyale_" + suffix
+        try:
+            updated_spawn = _br_spawn_insert(spawn, dep_id, points) if points else spawn
+            if points:
+                ET.fromstring(updated_spawn)
+        except (ET.ParseError, ValueError) as exc:
+            return err(str(exc), 400)
+        generated = [{"filename": "cfgEffectArea.json", "content": json.dumps(zones, indent=2, ensure_ascii=False)}]
+        if points:
+            generated.append({"filename": "cfgplayerspawnpoints.xml",
+                              "content": "\n".join(f'<pos x="{_tool_fmt_zahl(p["x"])}" z="{_tool_fmt_zahl(p["z"])}"/>' for p in points)})
+        if preview:
+            return ok({"generated": generated, "zonen": len(zones)})
+        entry = {"id": dep_id, "suffix": suffix, "areas": sorted(names), "spawnpoints": bool(points),
+                 "center": center, "zonen": len(zones), "created": time.time()}
+        changes = [("cfgEffectArea.json", before_effect, updated_effect)]
+        if points:
+            changes.append(("cfgplayerspawnpoints.xml", before_spawn, updated_spawn))
+        error = await _brlc_transaction(conn, "battleroyale", changes, entries + [entry], loop)
+        return error or ok({"id": dep_id, "generated": generated, "zonen": len(zones),
+                            "meldung": "Runde gespeichert – wirkt nach dem nächsten Server-Neustart."})
+
+
+async def api_tools_battleroyale_remove(request: web.Request) -> web.Response:
+    conn, error = await _brlc_prepare(request, "tools.battleroyale", "edit")
+    if error is not None:
+        return error
+    data = await body(request)
+    try:
+        suffix = _brlc_suffix(data.get("suffix") if isinstance(data, dict) else None)
+    except ValueError as exc:
+        return err(str(exc), 400)
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    error = _dash_rate_limited(request, "tools.battleroyale", 5)
+    if error is not None:
+        return error
+    async with _schaden_lock(conn.service_id):
+        entries = _brlc_entries(conn, "battleroyale")
+        entry = next((item for item in entries if item.get("suffix") == suffix), None)
+        if entry is None:
+            return err("Diese Battle-Royale-Runde gibt es nicht.", 404)
+        loop = asyncio.get_running_loop()
+        try:
+            before_effect, effect, areas_key, before_spawn, spawn = await _battleroyale_files(conn, loop)
+        except ValueError as exc:
+            return err(str(exc), 502)
+        effect[areas_key] = [a for a in effect.get(areas_key, []) if not isinstance(a, dict) or a.get("AreaName") not in entry.get("areas", [])]
+        updated_effect = json.dumps(effect, indent=2, ensure_ascii=False) + "\n"
+        changes = [("cfgEffectArea.json", before_effect, updated_effect)]
+        if entry.get("spawnpoints"):
+            updated_spawn, found = _dayzcode_entfernen(spawn, entry["id"])
+            if found:
+                changes.append(("cfgplayerspawnpoints.xml", before_spawn, updated_spawn))
+        error = await _brlc_transaction(conn, "battleroyale", changes,
+                                        [item for item in entries if item is not entry], loop)
+        return error or ok({"entfernt": suffix})
+
+
+# Locked Container: Vanilla-Schiffscontainer Land_ContainerLocked_<Farbe>_DE
+# (Sakhal: Event StaticContainerLocked, Proto-Block, types.xml) mit farbgleichem
+# Schlüssel ShippingContainerKeys_<Farbe>. Auf Chernarus/Livonia fehlen
+# Container-Typ, Proto-Block und (Rot) der Schlüssel-Typ – das Tool ergänzt sie
+# nur dann. Werte wörtlich aus dayzOffline.sakhal (events.xml Z. 846ff.,
+# mapgroupproto.xml Z. 21776ff., types.xml).
+_LOCKED_FARBEN = {
+    "blue": ("Land_ContainerLocked_Blue_DE", "ShippingContainerKeys_Blue"),
+    "yellow": ("Land_ContainerLocked_Yellow_DE", "ShippingContainerKeys_Yellow"),
+    "orange": ("Land_ContainerLocked_Orange_DE", "ShippingContainerKeys_Orange"),
+    "red": ("Land_ContainerLocked_Red_DE", "ShippingContainerKeys_Red"),
+}
+_LOCKED_PROTO_PUNKTE = (  # identisch für alle vier Farben (geprüft)
+    ("1.280762 -1.087738 0.534241", "0.339402", "1.312256"),
+    ("-2.489868 -1.087738 -0.568787", "0.479492", "1.198730"),
+    ("1.435303 -1.087738 -0.435181", "0.492053", "1.533203"),
+    ("-1.784058 -1.087738 0.510315", "0.548584", "1.371460"),
+    ("2.228149 -1.087738 0.369354", "0.622205", "1.669312"),
+    ("-0.109009 -1.087738 -0.011322", "0.913440", "2.000000"),
+    ("-1.440674 -1.087740 -0.539337", "0.509003", "1.272507"),
+    ("-2.695191 -1.087740 0.466858", "0.363585", "0.999451"),
+    ("2.449341 -1.087740 -0.670532", "0.377808", "0.944519"),
+)
+_LOCKED_DATEIEN = (("db/events.xml", "events"), ("cfgeventspawns.xml", "eventposdef"),
+                   ("mapgroupproto.xml", "mapgroupproto"), ("db/types.xml", "types"))
+_LOCKED_HINWEIS = ("Vanilla-Schiffscontainer, verschlossen mit dem farbgleichen Schlüssel. "
+                   "Der Schlüssel spawnt nur, wenn sein types.xml-Eintrag nominal > 0 hat.")
+
+
+def _locked_container_input(data: Any, conn: ServerConnection):
+    if not isinstance(data, dict) or type(data.get("vorschau", False)) is not bool:
+        raise ValueError("Ungültige Locked-Container-Anfrage.")
+    suffix = _brlc_suffix(data.get("suffix"))
+    farbe = data.get("farbe")
+    if farbe not in _LOCKED_FARBEN:
+        raise ValueError("Bitte eine Containerfarbe wählen (blau, gelb, orange, rot).")
+    _map, size = _tool_world_size(conn)
+    if size is None:
+        raise ValueError("Karte unbekannt – zuerst die Serververbindung prüfen.")
+    pos = data.get("position")
+    if not isinstance(pos, dict):
+        raise ValueError("Bitte eine Containerposition setzen.")
+    point = {"x": _brlc_number(pos.get("x"), "X", 0, size), "z": _brlc_number(pos.get("z"), "Z", 0, size),
+             "a": _brlc_number(pos.get("a", 0), "Ausrichtung", 0, 360)}
+    loot_min = int(_brlc_number(data.get("loot_min", 5), "Loot min", 0, 20))
+    loot_max = int(_brlc_number(data.get("loot_max", 9), "Loot max", 0, 20))
+    if loot_min > loot_max:
+        raise ValueError("Loot min darf nicht größer als Loot max sein.")
+    key_nominal = int(_brlc_number(data.get("schluessel_nominal", 0), "Schlüssel nominal", 0, 50))
+    key_min = int(_brlc_number(data.get("schluessel_min", 0), "Schlüssel min", 0, 50))
+    if key_min > key_nominal:
+        raise ValueError("Schlüssel min darf nicht größer als nominal sein.")
+    items = data.get("inhalt", [])
+    if not isinstance(items, list) or len(items) > len(_LOCKED_PROTO_PUNKTE):
+        raise ValueError(f"Bitte höchstens {len(_LOCKED_PROTO_PUNKTE)} feste Items angeben.")
+    klassen = []
+    for item in items:
+        name = item.get("item") if isinstance(item, dict) else item
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,64}", name):
+            raise ValueError("Ungültiger Item-Klassenname.")
+        klassen.append(name)
+    return suffix, farbe, point, {"loot_min": loot_min, "loot_max": loot_max,
+                                  "schluessel_nominal": key_nominal, "schluessel_min": key_min,
+                                  "items": klassen}
+
+
+def _locked_event_xml(name: str, container: str, werte: Dict[str, Any]) -> str:
+    """Wörtlich StaticContainerLocked (Sakhal), ein Container je Event."""
+    return "\n".join([
+        f'<event name="{_tool_esc_xml(name)}">', '    <nominal>1</nominal>', '    <min>1</min>', '    <max>0</max>',
+        '    <lifetime>2400</lifetime>', '    <restock>0</restock>', '    <saferadius>500</saferadius>',
+        '    <distanceradius>500</distanceradius>', '    <cleanupradius>250</cleanupradius>',
+        '    <flags deletable="1" init_random="0" remove_damaged="0"/>', '    <position>fixed</position>',
+        '    <limit>child</limit>', '    <active>1</active>', '    <children>',
+        f'        <child lootmax="{werte["loot_max"]}" lootmin="{werte["loot_min"]}" max="1" min="1" type="{container}"/>',
+        '    </children>', '</event>'])
+
+
+def _locked_proto_xml(container: str, items: List[str]) -> str:
+    """Proto-Block wie Sakhal; feste Items als <dispatch><proxy> (Format wie
+    Bohemias Fahrzeugwracks) auf den Loot-Punkten."""
+    rows = [f'<group name="{container}" lootmax="9">', '    <usage name="Special"/>', '    <usage name="Military"/>',
+            '    <container name="lootFloor" lootmax="9">', '        <category name="weapons"/>',
+            '        <tag name="floor"/>', '        <tag name="shelves"/>', '        <tag name="ground"/>']
+    for pos, rng, hoehe in _LOCKED_PROTO_PUNKTE:
+        rows.append(f'        <point pos="{pos}" range="{rng}" height="{hoehe}"/>')
+    rows.append('    </container>')
+    if items:
+        rows.append('    <dispatch>')
+        for i, item in enumerate(items):
+            pos = _LOCKED_PROTO_PUNKTE[i % len(_LOCKED_PROTO_PUNKTE)][0]
+            rows.append(f'        <proxy type="{_tool_esc_xml(item)}" pos="{pos}" rpy="0.0 0.0 0.0"/>')
+        rows.append('    </dispatch>')
+    rows.append('</group>')
+    return "\n".join(rows)
+
+
+def _locked_container_type_xml(container: str) -> str:
+    return "\n".join([f'<type name="{container}">', '    <nominal>0</nominal>', '    <lifetime>0</lifetime>',
+                      '    <restock>0</restock>', '    <min>0</min>', '    <quantmin>-1</quantmin>',
+                      '    <quantmax>-1</quantmax>', '    <cost>100</cost>',
+                      '    <flags count_in_cargo="0" count_in_hoarder="0" count_in_map="0" count_in_player="0" crafted="0" deloot="0"/>',
+                      '</type>'])
+
+
+def _locked_key_type_xml(key: str, nominal: int, minimum: int) -> str:
+    """Schlüssel-Typ wie ShippingContainerKeys_Red (Sakhal), nominal/min frei."""
+    return "\n".join([f'<type name="{key}">', f'    <nominal>{nominal}</nominal>', '    <lifetime>3600</lifetime>',
+                      '    <restock>1800</restock>', f'    <min>{minimum}</min>', '    <quantmin>-1</quantmin>',
+                      '    <quantmax>-1</quantmax>', '    <cost>100</cost>',
+                      '    <flags count_in_cargo="0" count_in_hoarder="0" count_in_map="1" count_in_player="0" crafted="0" deloot="0"/>',
+                      '    <category name="tools"/>', '    <usage name="Military"/>', '    <value name="Tier4"/>', '</type>'])
+
+
+def _locked_key_block_anpassen(block: str, nominal: int, minimum: int) -> str:
+    """nominal/min im vorhandenen Vanilla-Block des Schlüssels ersetzen – nur
+    diese beiden Werte, Rest byteidentisch."""
+    neu, n1 = re.subn(r"<nominal>\s*\d+\s*</nominal>", f"<nominal>{nominal}</nominal>", block, count=1)
+    neu, n2 = re.subn(r"<min>\s*\d+\s*</min>", f"<min>{minimum}</min>", neu, count=1)
+    if n1 != 1 or n2 != 1:
+        raise ValueError("Der types.xml-Eintrag des Schlüssels hat kein nominal/min.")
+    return neu
+
+
+async def _locked_files(conn: ServerConnection, loop):
+    files = []
+    for path, root in _LOCKED_DATEIEN:
+        raw, status = await _tools_datei_lesen(conn, path, loop)
+        if status != "ok":
+            raise ValueError(f"{path} ist auf dem Server nicht lesbar.")
+        try:
+            if ET.fromstring(raw).tag != root:
+                raise ValueError("Falsches XML-Wurzelelement.")
+            _dayzcode_segmente(raw)
+        except (ET.ParseError, ValueError) as exc:
+            raise ValueError(f"{path} enthält ungültiges XML oder beschädigte Marker.") from exc
+        files.append((path, root, raw))
+    return files
+
+
+async def api_tools_lockedcontainer_get(request: web.Request) -> web.Response:
+    conn, error = await _brlc_prepare(request, "tools.lockedcontainer", "view")
+    if error is not None:
+        return error
+    _map, size = _tool_world_size(conn)
+    return ok({"container": [{"farbe": farbe, "klasse": values[0], "schluessel": values[1]}
+                             for farbe, values in _LOCKED_FARBEN.items()],
+               "eintraege": _brlc_entries(conn, "lockedcontainers"), "world_size": size,
+               "max_items": len(_LOCKED_PROTO_PUNKTE), "hinweis": _LOCKED_HINWEIS,
+               "kein_mission_ordner": not bool(_mission_dir_of(conn))})
+
+
+async def api_tools_lockedcontainer_post(request: web.Request) -> web.Response:
+    conn, error = await _brlc_prepare(request, "tools.lockedcontainer", "edit")
+    if error is not None:
+        return error
+    data = await body(request)
+    try:
+        suffix, farbe, point, werte = _locked_container_input(data, conn)
+    except ValueError as exc:
+        return err(str(exc), 400)
+    preview = data["vorschau"]
+    if not preview and not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    if not preview:
+        error = _dash_rate_limited(request, "tools.lockedcontainer", 5)
+        if error is not None:
+            return error
+    container, key = _LOCKED_FARBEN[farbe]
+    event_name, dep_id = "StaticLocked_" + suffix, "lockedcontainer_" + suffix
+    async with _schaden_lock(conn.service_id):
+        loop = asyncio.get_running_loop()
+        try:
+            files = await _locked_files(conn, loop)
+        except ValueError as exc:
+            return err(str(exc), 502)
+        raw = {path: text for path, _root, text in files}
+        entries = _brlc_entries(conn, "lockedcontainers")
+        if (any(item.get("suffix") == suffix for item in entries)
+                or _tool_finde_benannten_block(raw["db/events.xml"], "event", event_name)
+                or _tool_finde_benannten_block(raw["cfgeventspawns.xml"], "event", event_name)):
+            return err("Dieser Locked-Container-Suffix ist bereits vorhanden.", 409)
+        proto_vorhanden = _tool_finde_benannten_block(raw["mapgroupproto.xml"], "group", container) is not None
+        if werte["items"] and proto_vorhanden:
+            return err(f"{container} hat auf diesem Server schon einen Vanilla-Proto-Block – feste Items sind "
+                       "nur möglich, wenn das Tool den Block selbst anlegt (Chernarus/Livonia).", 400)
+        fehlende_items = [k for k in werte["items"] if not _tool_finde_benannten_block(raw["db/types.xml"], "type", k)]
+        if fehlende_items:
+            return err("Unbekannte Klassen (nicht in der types.xml dieses Servers): " + ", ".join(fehlende_items), 400)
+        blocks = {"db/events.xml": _locked_event_xml(event_name, container, werte),
+                  "cfgeventspawns.xml": _dayzcode_spawn_xml(event_name, [point])}
+        if not proto_vorhanden:
+            blocks["mapgroupproto.xml"] = _locked_proto_xml(container, werte["items"])
+        typ_bloecke = []
+        if not _tool_finde_benannten_block(raw["db/types.xml"], "type", container):
+            typ_bloecke.append(_locked_container_type_xml(container))
+        key_block = _tool_finde_benannten_block(raw["db/types.xml"], "type", key)
+        schluessel_original = None
+        types_neu = raw["db/types.xml"]
+        if key_block is None:
+            typ_bloecke.append(_locked_key_type_xml(key, werte["schluessel_nominal"], werte["schluessel_min"]))
+        elif werte["schluessel_nominal"] > 0:
+            try:
+                angepasst = _locked_key_block_anpassen(key_block["block"], werte["schluessel_nominal"], werte["schluessel_min"])
+            except ValueError as exc:
+                return err(str(exc), 400)
+            schluessel_original = key_block["block"]
+            types_neu = types_neu[:key_block["start"]] + angepasst + types_neu[key_block["end"]:]
+        if typ_bloecke:
+            blocks["db/types.xml"] = "\n".join(typ_bloecke)
+        try:
+            changes = []
+            for path, root, text in files:
+                neu = types_neu if path == "db/types.xml" else text
+                if path in blocks:
+                    neu = _dayzcode_einfuegen(neu, root, dep_id, blocks[path])
+                if neu != text:
+                    ET.fromstring(neu)
+                    changes.append((path, text, neu))
+        except (ET.ParseError, ValueError) as exc:
+            return err(str(exc), 400)
+        generated = [{"filename": path, "content": blocks[path]} for path, _root in _LOCKED_DATEIEN if path in blocks]
+        if schluessel_original is not None:
+            generated.append({"filename": "db/types.xml (Schlüssel angepasst)",
+                              "content": _locked_key_block_anpassen(schluessel_original, werte["schluessel_nominal"], werte["schluessel_min"]).strip()})
+        antwort = {"generated": generated, "schluessel": key, "proto_angelegt": not proto_vorhanden,
+                   "schluessel_geaendert": schluessel_original is not None}
+        if preview:
+            return ok(antwort)
+        entry = {"id": dep_id, "suffix": suffix, "event": event_name, "farbe": farbe, "klasse": container,
+                 "schluessel": key, "position": point, "werte": werte, "proto_angelegt": not proto_vorhanden,
+                 "schluessel_original": schluessel_original, "created": time.time()}
+        error = await _brlc_transaction(conn, "lockedcontainers", changes, entries + [entry], loop)
+        if error is not None:
+            return error
+        antwort.update({"id": dep_id, "meldung": "Wirkt nach dem nächsten Server-Neustart."})
+        return ok(antwort)
+
+
+async def api_tools_lockedcontainer_remove(request: web.Request) -> web.Response:
+    conn, error = await _brlc_prepare(request, "tools.lockedcontainer", "edit")
+    if error is not None:
+        return error
+    data = await body(request)
+    try:
+        suffix = _brlc_suffix(data.get("suffix") if isinstance(data, dict) else None)
+    except ValueError as exc:
+        return err(str(exc), 400)
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    error = _dash_rate_limited(request, "tools.lockedcontainer", 5)
+    if error is not None:
+        return error
+    async with _schaden_lock(conn.service_id):
+        entries = _brlc_entries(conn, "lockedcontainers")
+        entry = next((item for item in entries if item.get("suffix") == suffix), None)
+        if entry is None:
+            return err("Diesen Locked Container gibt es nicht.", 404)
+        loop = asyncio.get_running_loop()
+        try:
+            files = await _locked_files(conn, loop)
+            changes = []
+            for path, _root, text in files:
+                neu, found = _dayzcode_entfernen(text, entry["id"])
+                original = entry.get("schluessel_original")
+                if path == "db/types.xml" and original and entry.get("schluessel"):
+                    # Vanilla-Schlüsselblock zurücksetzen, falls noch von uns geändert
+                    aktuell = _tool_finde_benannten_block(neu, "type", entry["schluessel"])
+                    if aktuell and aktuell["block"] != original:
+                        neu = neu[:aktuell["start"]] + original + neu[aktuell["end"]:]
+                        found = True
+                if found:
+                    ET.fromstring(neu)
+                    changes.append((path, text, neu))
+        except (ET.ParseError, ValueError) as exc:
+            return err(str(exc), 502)
+        error = await _brlc_transaction(conn, "lockedcontainers", changes,
+                                        [item for item in entries if item is not entry], loop)
+        return error or ok({"entfernt": suffix})
 
 
 # PRA schema: BohemiaInteractive/DayZ-Script-Diff,
@@ -28853,6 +29405,10 @@ _AUDIT_LABELS = {
     ("POST", "/api/tools/airdrop"): "Airdrop Configurator gespeichert",
     ("POST", "/api/tools/airdrop/remove"): "Airdrop entfernt",
     ("POST", "/api/tools/underground"): "Underground Area gespeichert",
+    ("POST", "/api/tools/battleroyale"): "Battle-Royale-Runde gespeichert",
+    ("POST", "/api/tools/battleroyale/remove"): "Battle-Royale-Runde entfernt",
+    ("POST", "/api/tools/lockedcontainer"): "Locked Container gespeichert",
+    ("POST", "/api/tools/lockedcontainer/remove"): "Locked Container entfernt",
     ("POST", "/api/bans"): "Spieler gebannt",
     ("POST", "/api/whitelist"): "Whitelist-Eintrag hinzugefügt",
     ("POST", "/api/announcements"): "Ankündigung angelegt",
@@ -37791,6 +38347,12 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/airdrop/remove", api_tools_airdrop_remove)
     r.add_get("/api/tools/underground", api_tools_underground_get)
     r.add_post("/api/tools/underground", api_tools_underground_post)
+    r.add_get("/api/tools/battleroyale", api_tools_battleroyale_get)
+    r.add_post("/api/tools/battleroyale", api_tools_battleroyale_post)
+    r.add_post("/api/tools/battleroyale/remove", api_tools_battleroyale_remove)
+    r.add_get("/api/tools/lockedcontainer", api_tools_lockedcontainer_get)
+    r.add_post("/api/tools/lockedcontainer", api_tools_lockedcontainer_post)
+    r.add_post("/api/tools/lockedcontainer/remove", api_tools_lockedcontainer_remove)
     r.add_get("/api/tools/weather", api_tools_weather_get)
     r.add_post("/api/tools/weather", api_tools_weather_post)
     r.add_get("/api/tools/globals", api_tools_globals_get)
@@ -38531,6 +39093,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "7940e9064a30763a0e36a96acb1e46c4d6c456c4f1e837b830cbf07fc99cd380",
+        "8061e139fd901e077cd5c7b7e519bf5cd90af8074b1e1680b6d5853ebae3c9ab",
         "d68abb8f966f9297f38ac73c6d0218fc9fe499847fcc63a8ce7687593718a911",
         "16be51d3a3621e4dae8d824867e9de4b820040dcf8e0b386fadb03b2b223d12c",
         "a61fc96c21dddb92c93105af4c08ae2969dffa924bc23492ab641a18f551ffd7",
