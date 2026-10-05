@@ -19231,8 +19231,18 @@ async def api_tools_ignorelist_post(request: web.Request) -> web.Response:
         return err("Höchstens 2000 Einträge.")
     if any(not _IGNORELIST_KLASSE_RE.fullmatch(n) for n in namen):
         return err("Klassennamen dürfen nur Buchstaben, Ziffern und _ enthalten (max. 64 Zeichen).")
-    if len({n.lower() for n in namen}) != len(namen):
-        return err("Doppelte Klassennamen sind nicht erlaubt.")
+    # Doppelte (DayZ unterscheidet keine Groß-/Kleinschreibung) auf das erste
+    # Vorkommen reduzieren – solche Zeilen stehen auch in echten Server-Dateien
+    # und dürfen die Vorschau nicht blockieren.
+    gesehen: Dict[str, str] = {}
+    doppelt: List[str] = []
+    for n in namen:
+        erster = gesehen.get(n.lower())
+        if erster is None:
+            gesehen[n.lower()] = n
+        else:
+            doppelt.append(f"{n} (= {erster})" if n != erster else n)
+    namen = list(gesehen.values())
     if not _mission_dir_of(conn):
         return err(_TOOL_KEIN_MISSION_ORDNER, 409)
     loop = asyncio.get_running_loop()
@@ -19254,6 +19264,9 @@ async def api_tools_ignorelist_post(request: web.Request) -> web.Response:
     types_text, _ts = await _tools_datei_lesen(conn, "db/types.xml", loop)
     bekannt = _types_namen(types_text)
     warnungen = []
+    if doppelt:
+        warnungen.append("Doppelte Einträge entfernt (nur das erste Vorkommen bleibt): "
+                         + ", ".join(doppelt[:10]) + (" …" if len(doppelt) > 10 else ""))
     if bekannt is not None:
         unbekannt = [n for n in namen if n not in bekannt and n not in _IGNORELIST_VANILLA]
         if unbekannt:
@@ -39585,6 +39598,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "88469e8676cbd89957ab39dfcd321191f18b924cd8491c756660d357503282b4",
         "27172ffa87e3db9763afb5cd839f6d38a5056cdc689f6352f61a4148a6eaa747",
         "b271994e632e82bf8705d36f6cddd1ff6336bda1e62475f76d13210367e96681",
         "295465571cec655662628f1da92a2f79c1c380235f9f367551004001f5fc67bb",

@@ -80,10 +80,9 @@ def test_ignorelist_missing_file_add_warn_commit_backup(monkeypatch, servers):
                           {"entries": ["Bandage", "GibtEsNicht"], "source_hash": None, "commit": False})
     assert status == 200, result
     assert result["data"]["warnungen"] and "GibtEsNicht" in result["data"]["warnungen"][0]
-    # Duplikat / falsches Format → 400
-    for entries in (["Bandage", "bandage"], ["böse name"]):
-        status, _ = call(monkeypatch, a, bot.api_tools_ignorelist_post, {"entries": entries, "source_hash": None, "commit": False})
-        assert status == 400, entries
+    # falsches Format → 400
+    status, _ = call(monkeypatch, a, bot.api_tools_ignorelist_post, {"entries": ["böse name"], "source_hash": None, "commit": False})
+    assert status == 400
     # Anlegen ohne Original: keine .bak, Datei neu
     status, result = call(monkeypatch, a, bot.api_tools_ignorelist_post,
                           {"entries": ["Bandage"], "source_hash": None, "commit": True})
@@ -99,6 +98,27 @@ def test_ignorelist_missing_file_add_warn_commit_backup(monkeypatch, servers):
     assert status == 200
     assert a.ftp.writes == ["/mission/cfgignorelist.xml.bak", "/mission/cfgignorelist.xml"]
     assert a.ftp.files["/mission/cfgignorelist.xml.bak"] == neu
+
+
+def test_ignorelist_duplicates_from_server_file_are_warning_not_error(monkeypatch, servers):
+    """Echte Server-Datei mit `Flaregun` und `flaregun`: unveränderte Liste darf
+    die Vorschau nicht blockieren; Doppelte werden auf das erste Vorkommen reduziert."""
+    a, _ = servers
+    raw = bot._ignorelist_xml(["Bandage", "Flaregun", "flaregun", "Bandage"])
+    a.ftp.files["/mission/cfgignorelist.xml"] = raw
+    a.ftp.files["/mission/db/types.xml"] = TYPES
+    status, result = call(monkeypatch, a, bot.api_tools_ignorelist_get)
+    assert status == 200 and result["data"]["entries"] == ["Bandage", "Flaregun", "flaregun", "Bandage"]
+    status, result = call(monkeypatch, a, bot.api_tools_ignorelist_post,
+                          {"entries": result["data"]["entries"], "source_hash": result["data"]["hash"], "commit": False})
+    assert status == 200, result
+    warn = [w for w in result["data"]["warnungen"] if w.startswith("Doppelte")]
+    assert len(warn) == 1 and "flaregun (= Flaregun)" in warn[0] and "Bandage" in warn[0]
+    assert bot._ignorelist_read(result["data"]["generated"][0]["content"]) == ["Bandage", "Flaregun"]
+    status, result = call(monkeypatch, a, bot.api_tools_ignorelist_post,
+                          {"entries": ["Bandage", "Flaregun", "flaregun", "Bandage"], "source_hash": _sha(raw), "commit": True})
+    assert status == 200, result
+    assert bot._ignorelist_read(a.ftp.files["/mission/cfgignorelist.xml"]) == ["Bandage", "Flaregun"]
 
 
 def test_ignorelist_defect_file_never_overwritten(monkeypatch, servers):
