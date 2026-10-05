@@ -1019,6 +1019,8 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.underground":                  {"label": "Underground Area Generator", "gruppe": "Tools"},
     "tools.battleroyale":                 {"label": "Battle Royale Builder", "gruppe": "Tools"},
     "tools.lockedcontainer":              {"label": "Locked Container Builder", "gruppe": "Tools"},
+    "tools.ignorelist":                   {"label": "Ignore List Generator", "gruppe": "Tools"},
+    "tools.weaponblueprint":              {"label": "Weapon Blueprint Generator", "gruppe": "Tools"},
     "tools.weather":                      {"label": "Weather Manager", "gruppe": "Tools"},
     "tools.globals":                      {"label": "Globals Configurator", "gruppe": "Tools"},
     "tools.economy":                      {"label": "Economy Editor", "gruppe": "Tools"},
@@ -14400,6 +14402,8 @@ _TOOL_LISTE = (
     ("underground", "🕳️", "Underground Area Generator"),
     ("battleroyale", "🎯", "Battle Royale Builder"),
     ("lockedcontainer", "🔒", "Locked Container Builder"),
+    ("ignorelist", "🚫", "Ignore List Generator"),
+    ("weaponblueprint", "🔫", "Weapon Blueprint Generator"),
     ("weather", "🌦️", "Weather Manager"),
     ("globals", "⚙️", "Globals Configurator"),
     ("economy", "🧮", "Economy Editor"),
@@ -19107,6 +19111,386 @@ async def api_tools_bag_post(request: web.Request) -> web.Response:
     block = _tool_finde_benannten_block(neu, "type", bag)
     generated = [{"filename": "cfgspawnabletypes.xml", "content": block["block"] if block else neu}]
     return ok({"bag": bag, "items": len(items), "generated": generated})
+
+
+# ── Ignore List / Weapon Blueprint – missionsspezifische CE-Dateien ───────
+# cfgignorelist.xml (Chernarus: cfgIgnoreList.xml – _mission_datei_pfad findet
+# den Namen case-insensitiv): identischer Vanilla-Inhalt auf allen drei Karten
+# (DayZ-Central-Economy, 19 Einträge). 5 davon haben KEINEN types.xml-Eintrag
+# (TransitBus, HescoBox, Wreck_Mi8, Spear, Mag_STANAGCoupled_30Rnd) – eine
+# types-Prüfung darf deshalb nur warnen, nie blockieren.
+_IGNORELIST_DATEI = "cfgignorelist.xml"
+_IGNORELIST_VANILLA = ["Bandage", "BandanaMask_BlackPattern", "BandanaMask_CamoPattern",
+                       "BandanaMask_GreenPattern", "BandanaMask_PolkaPattern", "BandanaMask_RedPattern",
+                       "CattleProd", "DallasMask", "Defibrillator", "EngineOil", "HescoBox", "EasterEgg",
+                       "HoxtonMask", "StunBaton", "TransitBus", "WolfMask", "Spear",
+                       "Mag_STANAGCoupled_30Rnd", "Wreck_Mi8"]
+_IGNORELIST_KLASSE_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
+
+
+def _ignorelist_xml(namen: List[str]) -> str:
+    """Vanilla-Format: Tab-Einrückung, leere <type>-Elemente, Reihenfolge wie übergeben."""
+    rows = ['<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>', "<ignore>"]
+    rows += [f'\t<type name="{_tool_esc_xml(n)}"></type>' for n in namen]
+    rows.append("</ignore>")
+    return "\n".join(rows) + "\n"
+
+
+def _ignorelist_read(text: str) -> List[str]:
+    root = ET.fromstring(text)
+    if root.tag != "ignore":
+        raise ValueError("cfgignorelist.xml hat nicht das Wurzelelement <ignore>.")
+    return [n.get("name") for n in root.findall("type") if n.get("name")]
+
+
+def _types_kategorie_namen(text: Optional[str], kategorie: str) -> Optional[set]:
+    """Klassennamen mit <category name="…"/> in db/types.xml – None ohne Datei."""
+    if not text:
+        return None
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return None
+    return {t.get("name") for t in root.findall("type")
+            if t.get("name") and any(c.get("name") == kategorie for c in t.findall("category"))}
+
+
+def _types_namen(text: Optional[str]) -> Optional[set]:
+    """Klassennamen aus db/types.xml – None, wenn die Datei fehlt/kaputt ist."""
+    if not text:
+        return None
+    try:
+        return {n.get("name") for n in ET.fromstring(text).findall("type") if n.get("name")}
+    except ET.ParseError:
+        return None
+
+
+async def _tool_ce_backup_commit(conn: ServerConnection, path: str, before: Optional[str], after: str,
+                                 state_key: Optional[str], state_value: Any, loop) -> bool:
+    """`.bak` (nur wenn es ein Original gab) → Datei → Manifest; schlägt das
+    Manifest fehl, wird die Datei zurückgeschrieben."""
+    if before is not None and not await _tools_datei_schreiben(conn, path + ".bak", before, loop):
+        return False
+    if not await _tools_datei_schreiben(conn, path, after, loop):
+        return False
+    if not state_key:
+        return True
+    old, existed = copy.deepcopy(conn.data.get(state_key)), state_key in conn.data
+    try:
+        _conn_store(conn, state_key, state_value, strict=True)
+        return True
+    except Exception:  # noqa: BLE001
+        if before is not None:
+            await _tools_datei_schreiben(conn, path, before, loop)
+        try:
+            if existed:
+                _conn_store(conn, state_key, old, strict=True)
+            else:
+                conn.data.pop(state_key, None)
+                connections.save(strict=True)
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+
+async def api_tools_ignorelist_get(request: web.Request) -> web.Response:
+    conn, failure = await _brlc_prepare(request, "tools.ignorelist", "view")
+    if failure is not None:
+        return failure
+    out: Dict[str, Any] = {"entries": [], "classnames": [], "vanilla": _IGNORELIST_VANILLA,
+                           "hash": None, "vorhanden": False,
+                           "kein_mission_ordner": not bool(_mission_dir_of(conn))}
+    if out["kein_mission_ordner"]:
+        return ok(out)
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, _IGNORELIST_DATEI, loop)
+    if status == "error":
+        return err("cfgignorelist.xml per FTP nicht lesbar.", 502)
+    if status == "ok":
+        try:
+            out["entries"] = _ignorelist_read(text)
+        except (ET.ParseError, ValueError) as exc:
+            return err(f"cfgignorelist.xml ist ungültig: {exc}", 502)
+        out["hash"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        out["vorhanden"] = True
+    types_text, _ts = await _tools_datei_lesen(conn, "db/types.xml", loop)
+    out["classnames"] = sorted(_types_namen(types_text) or [])
+    return ok(out)
+
+
+async def api_tools_ignorelist_post(request: web.Request) -> web.Response:
+    conn, failure = await _brlc_prepare(request, "tools.ignorelist", "edit")
+    if failure is not None:
+        return failure
+    data = await body(request)
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+        return err("Die Ignore-Liste ist ungültig.")
+    commit = bool(data.get("commit"))
+    namen = [str(n).strip() for n in data["entries"] if str(n).strip()]
+    if len(namen) > 2000:
+        return err("Höchstens 2000 Einträge.")
+    if any(not _IGNORELIST_KLASSE_RE.fullmatch(n) for n in namen):
+        return err("Klassennamen dürfen nur Buchstaben, Ziffern und _ enthalten (max. 64 Zeichen).")
+    if len({n.lower() for n in namen}) != len(namen):
+        return err("Doppelte Klassennamen sind nicht erlaubt.")
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    loop = asyncio.get_running_loop()
+    before, status = await _tools_datei_lesen(conn, _IGNORELIST_DATEI, loop)
+    if status == "error":
+        return err("cfgignorelist.xml per FTP nicht lesbar – es wird nichts geschrieben.", 502)
+    if status == "ok":
+        try:
+            _ignorelist_read(before)
+        except (ET.ParseError, ValueError) as exc:
+            return err(f"cfgignorelist.xml ist ungültig und wird nicht überschrieben: {exc}", 409)
+    else:
+        before = None
+    # Prüfsumme wie vom GET geliefert (None bei fehlender Datei)
+    quell_hash = data.get("source_hash") or None
+    ist_hash = hashlib.sha256(before.encode("utf-8")).hexdigest() if before is not None else None
+    if quell_hash != ist_hash:
+        return err("cfgignorelist.xml wurde inzwischen geändert – bitte neu laden.", 409)
+    types_text, _ts = await _tools_datei_lesen(conn, "db/types.xml", loop)
+    bekannt = _types_namen(types_text)
+    warnungen = []
+    if bekannt is not None:
+        unbekannt = [n for n in namen if n not in bekannt and n not in _IGNORELIST_VANILLA]
+        if unbekannt:
+            warnungen.append("Nicht in db/types.xml (Tippfehler oder statisches Objekt?): "
+                             + ", ".join(unbekannt[:10]) + (" …" if len(unbekannt) > 10 else ""))
+    after = _ignorelist_xml(namen)
+    generated = [{"filename": _IGNORELIST_DATEI, "content": after}]
+    if not commit:
+        return ok({"generated": generated, "warnungen": warnungen,
+                   "hinweis": "Wirkt nach dem nächsten Server-Neustart; vorhandene Gegenstände werden nicht entfernt."})
+    failure = _dash_rate_limited(request, "tools.ignorelist", 5)
+    if failure is not None:
+        return failure
+    if not await _tool_ce_backup_commit(conn, _IGNORELIST_DATEI, before, after, None, None, loop):
+        return err("Sichern oder Speichern fehlgeschlagen.", 502)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Ignore List gespeichert",
+              f"{len(namen)} Klassen · {conn.name}")
+    return ok({"generated": generated, "warnungen": warnungen,
+               "hash": hashlib.sha256(after.encode("utf-8")).hexdigest()})
+
+
+# Weapon Blueprint: Attachments einer Waffe in cfgspawnabletypes.xml. Die
+# belegte Quelle für passende Attachments ist der Vanilla-Block der Waffe
+# selbst (eine <attachments chance>-Gruppe je Slot, <item chance> als
+# Alternativen). <damage>/<cargo> des Originals bleiben unverändert.
+_BLUEPRINT_ITEM_RE = re.compile(r"[A-Za-z0-9_]{1,64}")
+
+
+def _blueprint_slots_aus_block(block: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """(Slots aus den <attachments>-Gruppen, übrige Kind-Elemente als Rohtext)."""
+    try:
+        el = ET.fromstring(block.strip())
+    except ET.ParseError:
+        return [], []
+    slots, rest = [], []
+    for kind in list(el):
+        if kind.tag == "attachments":
+            try:
+                chance = float(kind.get("chance", "1"))
+            except ValueError:
+                chance = 1.0
+            items = []
+            for it in kind.findall("item"):
+                try:
+                    items.append({"item": it.get("name", ""), "chance": float(it.get("chance", "1"))})
+                except ValueError:
+                    items.append({"item": it.get("name", ""), "chance": 1.0})
+            slots.append({"chance": chance, "items": [i for i in items if i["item"]]})
+        else:
+            rest.append(ET.tostring(kind, encoding="unicode").strip())
+    return slots, rest
+
+
+def _blueprint_katalog(text: str) -> Dict[str, Dict[str, Any]]:
+    """Alle <type> mit <attachments> (ohne Zombies) → {name: {slots, rest}}."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for m in re.finditer(r'<type name="([^"]+)">([\s\S]*?)</type>', text):
+        name = m.group(1)
+        if name.startswith("Zmb") or "<attachments" not in m.group(2):
+            continue
+        slots, rest = _blueprint_slots_aus_block(m.group(0))
+        if slots:
+            out[name] = {"slots": slots, "rest": rest}
+    return out
+
+
+def _blueprint_block(weapon: str, slots: List[Dict[str, Any]], rest: List[str]) -> str:
+    rows = [f'<type name="{_tool_esc_xml(weapon)}">']
+    rows += [f"    {r}" for r in rest]
+    for slot in slots:
+        rows.append(f'    <attachments chance="{slot["chance"]:.2f}">')
+        for it in slot["items"]:
+            rows.append(f'        <item name="{_tool_esc_xml(it["item"])}" chance="{it["chance"]:.2f}"/>')
+        rows.append("    </attachments>")
+    rows.append("</type>")
+    return "\n".join(rows)
+
+
+def _blueprint_payload(data: Any) -> Tuple[str, List[Dict[str, Any]], bool]:
+    if not isinstance(data, dict):
+        raise ValueError("Ungültige Anfrage.")
+    weapon = str(data.get("weapon") or "").strip()
+    if not _BLUEPRINT_ITEM_RE.fullmatch(weapon):
+        raise ValueError("Ungültiger Waffen-Klassenname.")
+    roh = data.get("slots")
+    if not isinstance(roh, list) or not roh or len(roh) > 12:
+        raise ValueError("Bitte 1–12 Attachment-Slots angeben.")
+    slots = []
+    for s in roh:
+        if not isinstance(s, dict):
+            raise ValueError("Ungültiger Attachment-Slot.")
+        try:
+            chance = float(s.get("chance"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Slot-Chance muss zwischen 0 und 1 liegen.") from exc
+        if not 0 <= chance <= 1:
+            raise ValueError("Slot-Chance muss zwischen 0 und 1 liegen.")
+        items = []
+        for c in s.get("items") or []:
+            name = str(c.get("item") or "").strip() if isinstance(c, dict) else ""
+            if not _BLUEPRINT_ITEM_RE.fullmatch(name):
+                raise ValueError("Ungültiger Attachment-Klassenname.")
+            try:
+                w = float(c.get("chance"))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Chance von {name} muss zwischen 0 und 1 liegen.") from exc
+            if not 0 < w <= 1:
+                raise ValueError(f"Chance von {name} muss zwischen 0 und 1 liegen.")
+            items.append({"item": name, "chance": w})
+        if not items or len({i["item"] for i in items}) != len(items) or len(items) > 10:
+            raise ValueError("Jeder Slot braucht 1–10 verschiedene Attachments.")
+        slots.append({"chance": chance, "items": items})
+    return weapon, slots, bool(data.get("commit"))
+
+
+async def api_tools_weaponblueprint_get(request: web.Request) -> web.Response:
+    conn, failure = await _brlc_prepare(request, "tools.weaponblueprint", "view")
+    if failure is not None:
+        return failure
+    gesichert = conn.data.get("weapon_blueprints")
+    out: Dict[str, Any] = {"weapons": {}, "blueprints": sorted(gesichert) if isinstance(gesichert, dict) else [],
+                           "hash": None, "kein_mission_ordner": not bool(_mission_dir_of(conn))}
+    if out["kein_mission_ordner"]:
+        return ok(out)
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
+    if status == "error":
+        return err("cfgspawnabletypes.xml per FTP nicht lesbar.", 502)
+    if status == "ok":
+        katalog = _blueprint_katalog(text)
+        out["hash"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        # Echte Waffen = Attachments in cfgspawnabletypes UND Kategorie "weapons"
+        # in db/types.xml (Chernarus: 47). Westen/Helme/Fahrzeuge landen in "sonstige".
+        types_text, _ts = await _tools_datei_lesen(conn, "db/types.xml", loop)
+        waffen = _types_kategorie_namen(types_text, "weapons")
+        if waffen is None:
+            out["weapons"], out["sonstige"], out["gefiltert"] = katalog, {}, False
+        else:
+            out["weapons"] = {k: v for k, v in katalog.items() if k in waffen}
+            out["sonstige"] = {k: v for k, v in katalog.items() if k not in waffen}
+            out["gefiltert"] = True
+    return ok(out)
+
+
+async def api_tools_weaponblueprint_post(request: web.Request) -> web.Response:
+    conn, failure = await _brlc_prepare(request, "tools.weaponblueprint", "edit")
+    if failure is not None:
+        return failure
+    data = await body(request)
+    try:
+        weapon, slots, commit = _blueprint_payload(data)
+    except ValueError as exc:
+        return err(str(exc), 400)
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    loop = asyncio.get_running_loop()
+    before, status = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
+    if status != "ok":
+        return err("cfgspawnabletypes.xml per FTP nicht lesbar – es wird nichts geschrieben.", 502)
+    try:
+        if ET.fromstring(before).tag != "spawnabletypes":
+            raise ValueError("Falsches XML-Wurzelelement.")
+    except (ET.ParseError, ValueError):
+        return err("cfgspawnabletypes.xml ist ungültig und wird nicht überschrieben.", 409)
+    if (data.get("source_hash") or None) != hashlib.sha256(before.encode("utf-8")).hexdigest():
+        return err("cfgspawnabletypes.xml wurde inzwischen geändert – bitte neu laden.", 409)
+    original = _tool_finde_benannten_block(before, "type", weapon)
+    if original is None:
+        return err(f"{weapon} hat keinen Eintrag in der cfgspawnabletypes.xml dieses Servers.", 400)
+    vanilla_slots, rest = _blueprint_slots_aus_block(original["block"])
+    types_text, _ts = await _tools_datei_lesen(conn, "db/types.xml", loop)
+    bekannt = _types_namen(types_text)
+    vanilla_items = {i["item"] for s in vanilla_slots for i in s["items"]}
+    fremd = sorted({i["item"] for s in slots for i in s["items"]} - vanilla_items)
+    if bekannt is not None:
+        unbekannt = [n for n in fremd if n not in bekannt]
+        if unbekannt:
+            return err("Unbekannte Klassen (nicht in der types.xml dieses Servers): " + ", ".join(unbekannt), 400)
+    warnungen = []
+    if fremd:
+        warnungen.append("Nicht aus dem Vanilla-Block dieser Waffe – Kompatibilität nicht geprüft: " + ", ".join(fremd))
+    try:
+        neuer_block = _blueprint_block(weapon, slots, rest)
+        after = _tool_benannten_block_ersetzen(before, "spawnabletypes", "type", weapon, neuer_block)
+        ET.fromstring(after)
+    except (ET.ParseError, ValueError) as exc:
+        return err(str(exc), 400)
+    generated = [{"filename": "cfgspawnabletypes.xml", "content": neuer_block}]
+    if not commit:
+        return ok({"generated": generated, "warnungen": warnungen})
+    failure = _dash_rate_limited(request, "tools.weaponblueprint", 5)
+    if failure is not None:
+        return failure
+    gesichert = conn.data.get("weapon_blueprints")
+    gesichert = copy.deepcopy(gesichert) if isinstance(gesichert, dict) else {}
+    gesichert.setdefault(weapon, original["block"])   # erstes Original behalten, nicht eigene Fassung
+    if not await _tool_ce_backup_commit(conn, "cfgspawnabletypes.xml", before, after, "weapon_blueprints", gesichert, loop):
+        return err("Sichern oder Speichern fehlgeschlagen.", 502)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Waffen-Bauplan gespeichert",
+              f"{weapon} · {conn.name}")
+    return ok({"generated": generated, "warnungen": warnungen,
+               "hash": hashlib.sha256(after.encode("utf-8")).hexdigest(),
+               "meldung": "Wirkt nach dem nächsten Server-Neustart."})
+
+
+async def api_tools_weaponblueprint_reset(request: web.Request) -> web.Response:
+    conn, failure = await _brlc_prepare(request, "tools.weaponblueprint", "edit")
+    if failure is not None:
+        return failure
+    data = await body(request)
+    weapon = str(data.get("weapon") or "") if isinstance(data, dict) else ""
+    gesichert = conn.data.get("weapon_blueprints")
+    if not isinstance(gesichert, dict) or weapon not in gesichert:
+        return err("Für diese Waffe ist kein Originalblock gespeichert.", 404)
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    failure = _dash_rate_limited(request, "tools.weaponblueprint", 5)
+    if failure is not None:
+        return failure
+    loop = asyncio.get_running_loop()
+    before, status = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
+    if status != "ok":
+        return err("cfgspawnabletypes.xml per FTP nicht lesbar.", 502)
+    try:
+        # gesicherter Block enthält seine Einrückung – die setzt der Ersetzer selbst
+        after = _tool_benannten_block_ersetzen(before, "spawnabletypes", "type", weapon,
+                                               str(gesichert[weapon]).lstrip(" \t"))
+        ET.fromstring(after)
+    except (ET.ParseError, ValueError) as exc:
+        return err(str(exc), 400)
+    rest = copy.deepcopy(gesichert)
+    rest.pop(weapon, None)
+    if not await _tool_ce_backup_commit(conn, "cfgspawnabletypes.xml", before, after, "weapon_blueprints", rest, loop):
+        return err("Sichern oder Zurücksetzen fehlgeschlagen.", 502)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Waffen-Bauplan zurückgesetzt",
+              f"{weapon} · {conn.name}")
+    return ok({"weapon": weapon, "hash": hashlib.sha256(after.encode("utf-8")).hexdigest()})
 
 
 # ── 7. Event-Vorlagen ──────────────────────────────────────────────────────
@@ -29485,6 +29869,9 @@ _AUDIT_LABELS = {
     ("POST", "/api/tools/battleroyale/remove"): "Battle-Royale-Runde entfernt",
     ("POST", "/api/tools/lockedcontainer"): "Locked Container gespeichert",
     ("POST", "/api/tools/lockedcontainer/remove"): "Locked Container entfernt",
+    ("POST", "/api/tools/ignorelist"): "Ignore List gespeichert",
+    ("POST", "/api/tools/weaponblueprint"): "Waffen-Bauplan gespeichert",
+    ("POST", "/api/tools/weaponblueprint/reset"): "Waffen-Bauplan zurückgesetzt",
     ("POST", "/api/bans"): "Spieler gebannt",
     ("POST", "/api/whitelist"): "Whitelist-Eintrag hinzugefügt",
     ("POST", "/api/announcements"): "Ankündigung angelegt",
@@ -38453,6 +38840,11 @@ def build_app() -> web.Application:
     r.add_get("/api/tools/lockedcontainer", api_tools_lockedcontainer_get)
     r.add_post("/api/tools/lockedcontainer", api_tools_lockedcontainer_post)
     r.add_post("/api/tools/lockedcontainer/remove", api_tools_lockedcontainer_remove)
+    r.add_get("/api/tools/ignorelist", api_tools_ignorelist_get)
+    r.add_post("/api/tools/ignorelist", api_tools_ignorelist_post)
+    r.add_get("/api/tools/weaponblueprint", api_tools_weaponblueprint_get)
+    r.add_post("/api/tools/weaponblueprint", api_tools_weaponblueprint_post)
+    r.add_post("/api/tools/weaponblueprint/reset", api_tools_weaponblueprint_reset)
     r.add_get("/api/tools/weather", api_tools_weather_get)
     r.add_post("/api/tools/weather", api_tools_weather_post)
     r.add_get("/api/tools/globals", api_tools_globals_get)
@@ -39193,6 +39585,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "27172ffa87e3db9763afb5cd839f6d38a5056cdc689f6352f61a4148a6eaa747",
         "b271994e632e82bf8705d36f6cddd1ff6336bda1e62475f76d13210367e96681",
         "295465571cec655662628f1da92a2f79c1c380235f9f367551004001f5fc67bb",
         "52d7e767c2a64d4ad36ad0d8d666af2f72c7c563f05b5ef0d7ec80c6b22a3997",
