@@ -1021,6 +1021,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.lockedcontainer":              {"label": "Locked Container Builder", "gruppe": "Tools"},
     "tools.ignorelist":                   {"label": "Ignore List Generator", "gruppe": "Tools"},
     "tools.weaponblueprint":              {"label": "Weapon Blueprint Generator", "gruppe": "Tools"},
+    "tools.lootlifetime":                 {"label": "Loot Lifetime Reducer", "gruppe": "Tools"},
     "tools.weather":                      {"label": "Weather Manager", "gruppe": "Tools"},
     "tools.globals":                      {"label": "Globals Configurator", "gruppe": "Tools"},
     "tools.economy":                      {"label": "Economy Editor", "gruppe": "Tools"},
@@ -14404,6 +14405,7 @@ _TOOL_LISTE = (
     ("lockedcontainer", "🔒", "Locked Container Builder"),
     ("ignorelist", "🚫", "Ignore List Generator"),
     ("weaponblueprint", "🔫", "Weapon Blueprint Generator"),
+    ("lootlifetime", "⏳", "Loot Lifetime Reducer"),
     ("weather", "🌦️", "Weather Manager"),
     ("globals", "⚙️", "Globals Configurator"),
     ("economy", "🧮", "Economy Editor"),
@@ -19504,6 +19506,219 @@ async def api_tools_weaponblueprint_reset(request: web.Request) -> web.Response:
     _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Waffen-Bauplan zurückgesetzt",
               f"{weapon} · {conn.name}")
     return ok({"weapon": weapon, "hash": hashlib.sha256(after.encode("utf-8")).hexdigest()})
+
+
+# ── Loot Lifetime Reducer ──────────────────────────────────────────────────
+_LOOT_LIFETIME_PATH = "db/types.xml"
+
+
+def _loot_lifetime_lesen(text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, int]]]:
+    """Liest die echten CE-Metadaten; keine Klassennamen-Heuristik."""
+    root = ET.fromstring(text)
+    if root.tag != "types":
+        raise ValueError("db/types.xml hat nicht das Wurzelelement <types>.")
+    rows, stats = [], {"categories": {}, "usages": {}, "tags": {}, "values": {}}
+    for node in root.findall("type"):
+        name = node.get("name")
+        if not name:
+            continue
+        life = node.findtext("lifetime")
+        values = {kind: [e.get("name") for e in node.findall(kind) if e.get("name")]
+                  for kind in ("category", "usage", "tag", "value")}
+        for out_key, source in (("categories", "category"), ("usages", "usage"),
+                                ("tags", "tag"), ("values", "value")):
+            for value in values[source]:
+                stats[out_key][value] = stats[out_key].get(value, 0) + 1
+        try:
+            lifetime = int(life) if life is not None else None
+        except ValueError:
+            lifetime = None
+        rows.append({"name": name, "lifetime": lifetime, "category": values["category"],
+                     "usage": values["usage"], "tag": values["tag"], "value": values["value"]})
+    return rows, stats
+
+
+def _loot_lifetime_eingabe(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("Ungültige Anfrage.")
+    try:
+        reduction, floor = int(data.get("reduction")), int(data.get("floor"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Kürzung und Mindest-Lifetime müssen ganze Zahlen sein.") from exc
+    if not 1 <= reduction <= 95:
+        raise ValueError("Kürzung muss zwischen 1 und 95 Prozent liegen.")
+    if not 60 <= floor <= 7200 or floor % 60:
+        raise ValueError("Mindest-Lifetime muss 60–7200 Sekunden in 60er-Schritten sein.")
+    filt = data.get("filter") or {}
+    if not isinstance(filt, dict):
+        raise ValueError("Filter ist ungültig.")
+    mode = filt.get("mode", "all")
+    if mode not in ("all", "include", "exclude"):
+        raise ValueError("Unbekannter Filtermodus.")
+    selected = filt.get("selected") or []
+    patterns = filt.get("patterns") or []
+    if not all(isinstance(x, str) and x for x in selected + patterns):
+        raise ValueError("Filterwerte sind ungültig.")
+    if mode == "include" and not selected and not patterns:
+        raise ValueError("Bei „Nur diese“ mindestens einen Filter wählen.")
+    return {"reduction": reduction, "floor": floor, "mode": mode,
+            "selected": selected[:100], "patterns": patterns[:50],
+            "standard_exclude": bool(data.get("standard_exclude", True)),
+            "commit": bool(data.get("commit"))}
+
+
+def _loot_lifetime_trifft(row: Dict[str, Any], params: Dict[str, Any]) -> bool:
+    chosen = set(params["selected"])
+    labels = set(row["category"] + row["usage"] + row["tag"])
+    patterns = params["patterns"]
+    found = bool(labels & chosen) or any(pattern.lower() in row["name"].lower() for pattern in patterns)
+    return params["mode"] == "all" or (found if params["mode"] == "include" else not found)
+
+
+_LOOT_TYPE_BLOCK_RE = re.compile(
+    r'<type(?=[\s/>])[^>]*\bname=(["\'])(?P<name>[^"\']*)\1[^>]*(?:/>|>[\s\S]*?</type\s*>)')
+_LOOT_LIFETIME_RE = re.compile(r'(<lifetime\s*>)[^<]*(</lifetime\s*>)')
+
+
+def _loot_lifetime_ersetzen(text: str, werte: Dict[str, int]) -> str:
+    """Ein Durchlauf über alle <type>-Blöcke: nur der Text des <lifetime>-Elements
+    der genannten Typen wird ersetzt, alles andere bleibt byteidentisch (ein
+    Block je Name, 20 s → < 1 s bei 1 MB types.xml)."""
+    if not werte:
+        return text
+
+    def block(m: "re.Match[str]") -> str:
+        neu = werte.get(m.group("name"))
+        if neu is None:
+            return m.group(0)
+        return _LOOT_LIFETIME_RE.sub(lambda l: l.group(1) + str(neu) + l.group(2), m.group(0), count=1)
+    return _LOOT_TYPE_BLOCK_RE.sub(block, text)
+
+
+def _loot_lifetime_werte(text: str, originals: Dict[str, int]) -> str:
+    """Setzt nur bekannte Originalwerte zurück, ohne fremde Textteile umzubauen."""
+    return _loot_lifetime_ersetzen(text, {k: int(v) for k, v in originals.items()})
+
+
+def _loot_lifetime_anwenden(text: str, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any], Dict[str, int]]:
+    rows, _stats = _loot_lifetime_lesen(text)
+    updates, originals, total = [], {}, 0
+    skipped = minimum = 0
+    for row in rows:
+        old = row["lifetime"]
+        if old is None or not _loot_lifetime_trifft(row, params):
+            skipped += 1; continue
+        total += 1
+        if params["standard_exclude"] and (old <= 0 or old >= 3888000):
+            skipped += 1; continue
+        target_raw = round(old * (1 - params["reduction"] / 100))
+        target = max(target_raw, params["floor"])
+        if target >= old:
+            skipped += 1; continue
+        originals[row["name"]] = old
+        updates.append({"name": row["name"], "old": old, "new": target})
+        if target == params["floor"] and target_raw < params["floor"]:
+            minimum += 1
+    after = _loot_lifetime_ersetzen(text, {c["name"]: c["new"] for c in updates})
+    average = round((sum(c["old"] for c in updates) - sum(c["new"] for c in updates)) /
+                    sum(c["old"] for c in updates) * 100) if updates else 0
+    return after, {"total": total, "reduced": len(updates), "average": average,
+                   "minimum": minimum, "skipped": skipped, "changes": updates[:50]}, originals
+
+
+async def api_tools_lootlifetime_get(request: web.Request) -> web.Response:
+    conn, failure = await _brlc_prepare(request, "tools.lootlifetime", "view")
+    if failure is not None:
+        return failure
+    out: Dict[str, Any] = {"hash": None, "anzahl": 0, "categories": {},
+                           "usages": {}, "tags": {}, "values": {},
+                           "manifest": copy.deepcopy(conn.data.get("loot_lifetime")),
+                           "kein_mission_ordner": not bool(_mission_dir_of(conn))}
+    if out["kein_mission_ordner"]:
+        return ok(out)
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, _LOOT_LIFETIME_PATH, loop)
+    if status != "ok":
+        return err("db/types.xml per FTP nicht lesbar.", 502)
+    try:
+        rows, stats = await loop.run_in_executor(None, _loot_lifetime_lesen, text)
+    except (ET.ParseError, ValueError) as exc:
+        return err(f"db/types.xml ist ungültig: {exc}", 409)
+    # Die Einzelzeilen (2000 Typen) braucht die Oberfläche nicht – nur Häufigkeiten.
+    out.update({"hash": hashlib.sha256(text.encode()).hexdigest(), "anzahl": len(rows),
+                "categories": stats["categories"], "usages": stats["usages"], "tags": stats["tags"], "values": stats["values"]})
+    return ok(out)
+
+
+async def api_tools_lootlifetime_post(request: web.Request) -> web.Response:
+    conn, failure = await _brlc_prepare(request, "tools.lootlifetime", "edit")
+    if failure is not None:
+        return failure
+    data = await body(request)
+    try:
+        params = _loot_lifetime_eingabe(data)
+    except ValueError as exc:
+        return err(str(exc), 400)
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    loop = asyncio.get_running_loop()
+    before, status = await _tools_datei_lesen(conn, _LOOT_LIFETIME_PATH, loop)
+    if status != "ok":
+        return err("db/types.xml per FTP nicht lesbar – es wird nichts geschrieben.", 502)
+    if (data.get("source_hash") or None) != hashlib.sha256(before.encode()).hexdigest():
+        return err("db/types.xml wurde inzwischen geändert – bitte neu laden.", 409)
+    try:
+        _loot_lifetime_lesen(before)
+    except (ET.ParseError, ValueError) as exc:
+        return err(f"db/types.xml ist ungültig und wird nicht überschrieben: {exc}", 409)
+    old_manifest = conn.data.get("loot_lifetime")
+    base = _loot_lifetime_werte(before, old_manifest.get("originals", {})) if isinstance(old_manifest, dict) else before
+    after, statistic, originals = await loop.run_in_executor(None, _loot_lifetime_anwenden, base, params)
+    warnings = [f"{statistic['minimum']} Einträge liegen am Mindestwert – Mindestwert eventuell zu hoch."] if statistic["minimum"] else []
+    # Die Vorschau zeigt die fertige db/types.xml – so kann sie auch heruntergeladen werden.
+    result = {"statistic": statistic, "warnings": warnings,
+              "generated": [{"filename": _LOOT_LIFETIME_PATH, "content": after}]}
+    if not params["commit"]:
+        return ok(result)
+    failure = _dash_rate_limited(request, "tools.lootlifetime", 5)
+    if failure is not None:
+        return failure
+    manifest_originals = copy.deepcopy(old_manifest.get("originals", {})) if isinstance(old_manifest, dict) else {}
+    manifest_originals.update(originals)
+    manifest = {"originals": manifest_originals, "params": {k: v for k, v in params.items() if k != "commit"},
+                "changed": len(manifest_originals), "created": time.time()}
+    if not await _tool_ce_backup_commit(conn, _LOOT_LIFETIME_PATH, before, after, "loot_lifetime", manifest, loop):
+        return err("Sichern oder Speichern fehlgeschlagen.", 502)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Loot-Lifetime gekürzt",
+              f"{params['reduction']} % · Floor {params['floor']} s · {statistic['reduced']} Einträge · {conn.name}")
+    result["hash"] = hashlib.sha256(after.encode()).hexdigest()
+    return ok(result)
+
+
+async def api_tools_lootlifetime_reset(request: web.Request) -> web.Response:
+    conn, failure = await _brlc_prepare(request, "tools.lootlifetime", "edit")
+    if failure is not None:
+        return failure
+    manifest = conn.data.get("loot_lifetime")
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("originals"), dict):
+        return err("Keine aktive Loot-Lifetime-Kürzung gespeichert.", 404)
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    failure = _dash_rate_limited(request, "tools.lootlifetime.reset", 5)
+    if failure is not None:
+        return failure
+    loop = asyncio.get_running_loop(); before, status = await _tools_datei_lesen(conn, _LOOT_LIFETIME_PATH, loop)
+    if status != "ok":
+        return err("db/types.xml per FTP nicht lesbar.", 502)
+    existing = set(_types_namen(before) or [])
+    missing = sorted(set(manifest["originals"]) - existing)
+    after = _loot_lifetime_werte(before, manifest["originals"])
+    if not await _tool_ce_backup_commit(conn, _LOOT_LIFETIME_PATH, before, after, "loot_lifetime", {}, loop):
+        return err("Sichern oder Zurücksetzen fehlgeschlagen.", 502)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Loot-Lifetime zurückgesetzt",
+              f"{len(manifest['originals']) - len(missing)} wiederhergestellt · {conn.name}")
+    return ok({"restored": len(manifest["originals"]) - len(missing), "missing": missing[:50],
+               "hash": hashlib.sha256(after.encode()).hexdigest()})
 
 
 # ── 7. Event-Vorlagen ──────────────────────────────────────────────────────
@@ -29885,6 +30100,8 @@ _AUDIT_LABELS = {
     ("POST", "/api/tools/ignorelist"): "Ignore List gespeichert",
     ("POST", "/api/tools/weaponblueprint"): "Waffen-Bauplan gespeichert",
     ("POST", "/api/tools/weaponblueprint/reset"): "Waffen-Bauplan zurückgesetzt",
+    ("POST", "/api/tools/lootlifetime"): "Loot-Lifetime gekürzt",
+    ("POST", "/api/tools/lootlifetime/reset"): "Loot-Lifetime zurückgesetzt",
     ("POST", "/api/bans"): "Spieler gebannt",
     ("POST", "/api/whitelist"): "Whitelist-Eintrag hinzugefügt",
     ("POST", "/api/announcements"): "Ankündigung angelegt",
@@ -38858,6 +39075,9 @@ def build_app() -> web.Application:
     r.add_get("/api/tools/weaponblueprint", api_tools_weaponblueprint_get)
     r.add_post("/api/tools/weaponblueprint", api_tools_weaponblueprint_post)
     r.add_post("/api/tools/weaponblueprint/reset", api_tools_weaponblueprint_reset)
+    r.add_get("/api/tools/lootlifetime", api_tools_lootlifetime_get)
+    r.add_post("/api/tools/lootlifetime", api_tools_lootlifetime_post)
+    r.add_post("/api/tools/lootlifetime/reset", api_tools_lootlifetime_reset)
     r.add_get("/api/tools/weather", api_tools_weather_get)
     r.add_post("/api/tools/weather", api_tools_weather_post)
     r.add_get("/api/tools/globals", api_tools_globals_get)
@@ -39598,6 +39818,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "53b81efd3268dfb73f5623e75142f10673d4bcf9fc055fe4c4a6d7a5d496f76d",
         "88469e8676cbd89957ab39dfcd321191f18b924cd8491c756660d357503282b4",
         "27172ffa87e3db9763afb5cd839f6d38a5056cdc689f6352f61a4148a6eaa747",
         "b271994e632e82bf8705d36f6cddd1ff6336bda1e62475f76d13210367e96681",
