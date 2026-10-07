@@ -36725,14 +36725,94 @@ def _honeypot_log_embed(member: Any, kanal: Any, action: str, dm_ok: bool, sprac
     return embed
 
 
-def _honeypot_ausgenommen(member: Any, guild: Any, e: Dict[str, Any]) -> bool:
+_HONEYPOT_AUSNAHME_TEXTE = {
+    # Schlüssel → (DM de, Log de, DM en, Log en); {rolle} wird eingesetzt
+    "owner": ("du bist der Server-Eigentümer", "der Nutzer Server-Eigentümer ist",
+              "you are the server owner", "the user is the server owner"),
+    "admin": ("du hast das Recht „Administrator“", "der Nutzer das Recht „Administrator“ hat",
+              "you have the Administrator permission", "the user has the Administrator permission"),
+    "manage": ("du hast das Recht „Server verwalten“", "der Nutzer das Recht „Server verwalten“ hat",
+               "you have the Manage Server permission", "the user has the Manage Server permission"),
+    "role": ("deine Rolle „{rolle}“ ist ausgenommen", "die Rolle „{rolle}“ ausgenommen ist",
+             "your role „{rolle}“ is exempt", "the role „{rolle}“ is exempt"),
+}
+
+
+def _honeypot_ausnahme(member: Any, guild: Any, e: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """(Schlüssel aus _HONEYPOT_AUSNAHME_TEXTE, Rollenname) wenn der Nutzer nicht bestraft wird – sonst None."""
     if getattr(guild, "owner_id", None) == getattr(member, "id", None):
-        return True
+        return "owner", ""
     perms = getattr(member, "guild_permissions", None)
-    if perms is not None and (getattr(perms, "administrator", False) or getattr(perms, "manage_guild", False)):
-        return True
-    rollen = {str(r.id) for r in (getattr(member, "roles", None) or [])}
-    return bool(rollen & set(e["exempt_roles"]))
+    if perms is not None and getattr(perms, "administrator", False):
+        return "admin", ""
+    if perms is not None and getattr(perms, "manage_guild", False):
+        return "manage", ""
+    ausgenommen = set(e["exempt_roles"])
+    for r in (getattr(member, "roles", None) or []):
+        if str(r.id) in ausgenommen:
+            return "role", str(getattr(r, "name", None) or r.id)
+    return None
+
+
+def _honeypot_ausnahme_grund(ausnahme: Tuple[str, str], sprache: str, fuer_log: bool) -> str:
+    """Lesbarer Nebensatz („weil …“) für DM (du-Form) oder Log (dritte Person)."""
+    texte = _HONEYPOT_AUSNAHME_TEXTE[ausnahme[0]]
+    return texte[(2 if sprache == "en" else 0) + (1 if fuer_log else 0)].format(rolle=ausnahme[1])
+
+
+def _honeypot_ausgenommen(member: Any, guild: Any, e: Dict[str, Any]) -> bool:
+    return _honeypot_ausnahme(member, guild, e) is not None
+
+
+def _honeypot_hinweis_dm_embed(guild_name: str, sprache: str, action: str, grund: str) -> discord.Embed:
+    """Private Nachricht an einen ausgenommenen Nutzer, der im Honeypot geschrieben hat."""
+    aktion = ("ban" if action == "ban" else "kick") if sprache == "en" else ("Bann" if action == "ban" else "Kick")
+    if sprache == "en":
+        titel = f"🍯 Honeypot on {guild_name}: no action taken"
+        text = (f"You wrote in the honeypot channel. Normally that leads to an automatic {aktion} – "
+                f"it was **not** applied because {grund}.\n"
+                "Please do not write there anyway: the channel is a bot trap, and every message can "
+                "confuse real members. Only you can see this message.")
+    else:
+        titel = f"🍯 Honeypot auf {guild_name}: keine Aktion"
+        text = (f"Du hast im Honeypot-Channel geschrieben. Normalerweise führt das zu einem automatischen {aktion} – "
+                f"er wurde **nicht** ausgeführt, weil {grund}.\n"
+                "Bitte schreibe dort trotzdem nicht: Der Channel ist eine Bot-Falle, und jede Nachricht kann "
+                "echte Mitglieder verwirren. Diese Nachricht sieht nur du.")
+    return discord.Embed(title=titel, description=text, colour=0xF1C40F)
+
+
+def _honeypot_log_uebersprungen_embed(member: Any, kanal: Any, action: str, grund: str, dm_ok: bool,
+                                      sprache: str) -> discord.Embed:
+    """Log-Eintrag: Honeypot ausgelöst, Aktion aber nicht ausgeführt (Ausnahme oder Fehler)."""
+    name = getattr(member, "display_name", None) or str(member)
+    erwaehnung = getattr(member, "mention", None) or f"@{name}"
+    kanal_text = getattr(kanal, "mention", None) or f"#{getattr(kanal, 'name', '?')}"
+    if sprache == "en":
+        titel = f"🍯 Honeypot triggered – {'ban' if action == 'ban' else 'kick'} not applied"
+        felder = (("User", f"{erwaehnung} (`{getattr(member, 'id', '?')}`)"), ("Channel", kanal_text),
+                  ("Reason", f"Not possible because {grund}."),
+                  ("Notice delivered", "yes" if dm_ok else "no (DMs closed)"))
+    else:
+        titel = f"🍯 Honeypot ausgelöst – {'Bann' if action == 'ban' else 'Kick'} nicht ausgeführt"
+        felder = (("Nutzer", f"{erwaehnung} (`{getattr(member, 'id', '?')}`)"), ("Channel", kanal_text),
+                  ("Grund", f"Nicht möglich, weil {grund}."),
+                  ("Hinweis zugestellt", "ja" if dm_ok else "nein (DMs geschlossen)"))
+    embed = discord.Embed(title=titel, colour=0xF1C40F, timestamp=discord.utils.utcnow())
+    for n, v in felder:
+        embed.add_field(name=n, value=v, inline=(n not in ("Grund", "Reason")))
+    return embed
+
+
+async def _honeypot_log_senden(e: Dict[str, Any], embed: discord.Embed) -> None:
+    if not e["log_channel_id"]:
+        return
+    try:
+        log_kanal = bot.get_channel(int(e["log_channel_id"])) if bot else None
+        if log_kanal is not None:
+            await log_kanal.send(embed=embed)
+    except Exception as exc:  # noqa: BLE001
+        log.debug(f"[HONEYPOT] Log posten fehlgeschlagen: {exc}")
 
 
 async def _honeypot_nachricht_verarbeiten(message: Any) -> bool:
@@ -36751,9 +36831,20 @@ async def _honeypot_nachricht_verarbeiten(message: Any) -> bool:
             break
     if conn is None or e is None:
         return False
-    if _honeypot_ausgenommen(autor, guild, e):
-        return False
     aktion = e["action"]
+    ausnahme = _honeypot_ausnahme(autor, guild, e)
+    if ausnahme is not None:
+        # Ausgenommen: Nachricht bleibt, aber privater Hinweis an den Nutzer und Eintrag im Log.
+        dm_ok = False
+        try:
+            await autor.send(embed=_honeypot_hinweis_dm_embed(getattr(guild, "name", "Discord"), e["language"], aktion,
+                                                             _honeypot_ausnahme_grund(ausnahme, e["language"], False)))
+            dm_ok = True
+        except Exception as exc:  # noqa: BLE001
+            log.debug(f"[HONEYPOT] Hinweis-DM an {getattr(autor, 'id', '?')} fehlgeschlagen: {exc}")
+        await _honeypot_log_senden(e, _honeypot_log_uebersprungen_embed(
+            autor, kanal, aktion, _honeypot_ausnahme_grund(ausnahme, e["language"], True), dm_ok, e["language"]))
+        return False
     try:
         await message.delete()
     except Exception as exc:  # noqa: BLE001
@@ -36776,6 +36867,11 @@ async def _honeypot_nachricht_verarbeiten(message: Any) -> bool:
             await autor.kick(reason=grund)
     except Exception as exc:  # noqa: BLE001 – fehlende Rechte/Hierarchie
         log.warning(f"[HONEYPOT] {aktion} von {getattr(autor, 'id', '?')} fehlgeschlagen ({conn.service_id}): {exc}")
+        if e["language"] == "en":
+            fehler = f"the bot lacks the permission or its role is below the user's ({exc})"
+        else:
+            fehler = f"dem Bot das Recht fehlt oder seine Rolle unter der des Nutzers steht ({exc})"
+        await _honeypot_log_senden(e, _honeypot_log_uebersprungen_embed(autor, kanal, aktion, fehler, dm_ok, e["language"]))
         return True
     log.info(f"[HONEYPOT] {getattr(autor, 'id', '?')} ({autor}) {aktion} in {getattr(guild, 'name', '?')} ({conn.service_id})")
     try:
@@ -36783,13 +36879,7 @@ async def _honeypot_nachricht_verarbeiten(message: Any) -> bool:
                   f"{conn.name} · Channel {getattr(kanal, 'id', '?')}")
     except Exception:  # noqa: BLE001
         pass
-    if e["log_channel_id"]:
-        try:
-            log_kanal = bot.get_channel(int(e["log_channel_id"])) if bot else None
-            if log_kanal is not None:
-                await log_kanal.send(embed=_honeypot_log_embed(autor, kanal, aktion, dm_ok, e["language"]))
-        except Exception as exc:  # noqa: BLE001
-            log.debug(f"[HONEYPOT] Log posten fehlgeschlagen: {exc}")
+    await _honeypot_log_senden(e, _honeypot_log_embed(autor, kanal, aktion, dm_ok, e["language"]))
     return True
 
 

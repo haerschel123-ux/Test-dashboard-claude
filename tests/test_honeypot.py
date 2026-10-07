@@ -136,11 +136,29 @@ def test_treffer_bann_mit_dm_log_und_loeschen(honeypot_setup):
     assert _run(bot._honeypot_nachricht_verarbeiten(_Message(bot_user, guild, honig))) is False
     assert _run(bot._honeypot_nachricht_verarbeiten(_Message(_Member(3), None, honig))) is False
     assert _run(bot._honeypot_nachricht_verarbeiten(_Message(_Member(3), guild, normal))) is False
-    # Ausnahmen: Admin, Server verwalten, Eigentümer, ausgenommene Rolle
-    for ausgenommen in (_Member(4, perms=_Perms(administrator=True)), _Member(5, perms=_Perms(manage_guild=True)),
-                        _Member(1), _Member(6, roles=[_Role(502, "VIP")])):
-        assert _run(bot._honeypot_nachricht_verarbeiten(_Message(ausgenommen, guild, honig))) is False
-    assert guild.bans == [] and honig.sent == []
+    # Ausnahmen: Admin, Server verwalten, Eigentümer, ausgenommene Rolle → keine Strafe,
+    # Nachricht bleibt, aber private Hinweis-DM mit Grund und Log-Eintrag „nicht ausgeführt“
+    faelle = ((_Member(4, perms=_Perms(administrator=True)), "du hast das Recht „Administrator“", "der Nutzer das Recht „Administrator“ hat"),
+              (_Member(5, perms=_Perms(manage_guild=True)), "du hast das Recht „Server verwalten“", "der Nutzer das Recht „Server verwalten“ hat"),
+              (_Member(1), "du bist der Server-Eigentümer", "der Nutzer Server-Eigentümer ist"),
+              (_Member(6, roles=[_Role(502, "VIP")]), "deine Rolle „VIP“ ist ausgenommen", "die Rolle „VIP“ ausgenommen ist"))
+    for ausgenommen, grund_dm, grund_log in faelle:
+        n = _Message(ausgenommen, guild, honig)
+        assert _run(bot._honeypot_nachricht_verarbeiten(n)) is False
+        assert not n.deleted and ausgenommen.kicked is False
+        assert len(ausgenommen.dms) == 1 and "keine Aktion" in ausgenommen.dms[0].title
+        assert f"weil {grund_dm}." in ausgenommen.dms[0].description and "nicht** ausgeführt" in ausgenommen.dms[0].description
+        eintrag = log_kanal.sent[-1]["embed"]
+        assert "Bann nicht ausgeführt" in eintrag.title
+        felder = {f.name: f.value for f in eintrag.fields}
+        assert felder["Grund"] == f"Nicht möglich, weil {grund_log}." and felder["Hinweis zugestellt"] == "ja"
+    assert guild.bans == [] and honig.sent == [] and len(log_kanal.sent) == 4
+    log_kanal.sent.clear()
+    # Ausnahme mit geschlossenen DMs → Log meldet „nein“
+    stiller = _Member(7, perms=_Perms(administrator=True), dm_ok=False)
+    assert _run(bot._honeypot_nachricht_verarbeiten(_Message(stiller, guild, honig))) is False
+    assert {f.name: f.value for f in log_kanal.sent[-1]["embed"].fields}["Hinweis zugestellt"].startswith("nein")
+    log_kanal.sent.clear()
     # Treffer
     spam = _Member(42, name="SpamBot")
     nachricht = _Message(spam, guild, honig)
@@ -159,6 +177,21 @@ def test_treffer_kick_englisch_ohne_loeschen_und_dm_geschlossen(honeypot_setup):
     spam = _Member(43, name="Spam2", dm_ok=False)
     assert _run(bot._honeypot_nachricht_verarbeiten(_Message(spam, guild, honig))) is True
     assert spam.kicked and guild.bans == [] and spam.dms == [] and log_kanal.sent == []
+    # Englische Ausnahme-DM
+    chef = _Member(8, perms=_Perms(administrator=True))
+    assert _run(bot._honeypot_nachricht_verarbeiten(_Message(chef, guild, honig))) is False
+    assert "no action taken" in chef.dms[0].title and "because you have the Administrator permission." in chef.dms[0].description
+    # Kick scheitert (Rechte) → Log „nicht ausgeführt“ mit Fehlergrund
+    a.data["honeypot"]["log_channel_id"] = "200"
+
+    class _Unkickbar(_Member):
+        async def kick(self, reason=None):
+            raise RuntimeError("Missing Permissions")
+    assert _run(bot._honeypot_nachricht_verarbeiten(_Message(_Unkickbar(9), guild, honig))) is True
+    eintrag = log_kanal.sent[-1]["embed"]
+    assert "kick not applied" in eintrag.title
+    assert "Missing Permissions" in {f.name: f.value for f in eintrag.fields}["Reason"]
+    a.data["honeypot"]["log_channel_id"] = None
     # Bann ohne Löschen → 0 Sekunden
     a.data["honeypot"].update({"action": "ban"})
     spam = _Member(44)
