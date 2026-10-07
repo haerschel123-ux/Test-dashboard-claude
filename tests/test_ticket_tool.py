@@ -324,6 +324,7 @@ class _StubInteraction2:
     def __init__(self, user, guild, channel):
         self.user = user
         self.guild = guild
+        self.guild_id = 111   # wie echte Interaktionen: Guild-ID immer gesetzt
         self.channel = channel
         self.locale = None
         self.response = _StubResponse2()

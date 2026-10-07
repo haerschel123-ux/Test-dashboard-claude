@@ -3900,7 +3900,8 @@ class ServerConnection:
         # Neustarts ausloesen.
         "map_name", "auto_restart_schedule", "auto_restart_after_purchase",
         "welcome_message", "leave_message", "reaction_roles",
-        "ticket_categories", "ticket_open", "ticket_language",
+        "ticket_categories", "ticket_open", "ticket_language", "ticket_transcript_channel",
+        "level_system", "honeypot", "guild_daten",
         # Gewinnspiele (inkl. Teilnehmerlisten) und ihre Server-Einstellungen
         # sind strikt serverspezifisch - ein Rueckfall auf cfg.config wuerde
         # (wie bei den Tickets oben) fremde Teilnehmerdaten oder eine falsche
@@ -4393,6 +4394,172 @@ class ConnectionRegistry:
         if entfernt:
             self.save()
         return entfernt
+
+
+# ── Discord Management je Guild ──────────────────────────────────────────
+# Ein Nitrado-Server kann mehreren Discord-Servern zugeordnet sein. Alles,
+# was Channel-, Rollen- oder Nachrichten-IDs EINER Guild enthaelt, darf deshalb
+# nicht am Nitrado-Server haengen, sonst postet z. B. der Willkommenstext der
+# einen Guild in den Channel der anderen. Ab der ZWEITEN Guild liegen diese
+# Schluessel je Guild unter conn.data["guild_daten"][<guild_id>]; mit nur einer
+# Guild bleiben sie wie bisher direkt am Server (connections.json unveraendert,
+# ein Zuruecksetzen auf eine aeltere Fassung bleibt gefahrlos). Zugriff nur ueber
+# GuildSicht.
+_GUILD_SCHLUESSEL_GRUPPEN: Tuple[Tuple[str, ...], ...] = (
+    ("welcome_message",), ("leave_message",), ("reaction_roles",),
+    ("ticket_categories", "ticket_open", "ticket_language", "ticket_transcript_channel"),
+    ("level_system",), ("honeypot",),
+)
+_GUILD_SCHLUESSEL = frozenset(k for gruppe in _GUILD_SCHLUESSEL_GRUPPEN for k in gruppe)
+
+
+def _snowflakes(wert: Any) -> List[int]:
+    """Alle Discord-IDs (17-20 Ziffern) in einem verschachtelten Wert."""
+    out: List[int] = []
+    if isinstance(wert, dict):
+        for v in wert.values():
+            out.extend(_snowflakes(v))
+    elif isinstance(wert, (list, tuple)):
+        for v in wert:
+            out.extend(_snowflakes(v))
+    elif isinstance(wert, (int, str)) and not isinstance(wert, bool):
+        text = str(wert).strip()
+        if text.isdigit() and 17 <= len(text) <= 20:
+            out.append(int(text))
+    return out
+
+
+def _guild_altdaten_ziel(werte: List[Any], ids: List[int]) -> int:
+    """Die Guild, zu der die Channels/Rollen alter gemeinsamer Einstellungen
+    gehoeren (Mehrheit); ohne Treffer die erste zugeordnete Guild."""
+    stimmen: Dict[int, int] = {}
+    for sf in _snowflakes(werte):
+        kanal = bot.get_channel(sf) if bot is not None else None
+        kg = getattr(getattr(kanal, "guild", None), "id", None)
+        if kg in ids:
+            stimmen[kg] = stimmen.get(kg, 0) + 1
+            continue
+        for gid in ids:
+            g = bot.get_guild(gid) if bot is not None else None
+            if g is not None and g.get_role(sf) is not None:
+                stimmen[gid] = stimmen.get(gid, 0) + 1
+                break
+    if not stimmen:
+        return ids[0]
+    return max(ids, key=lambda g: stimmen.get(g, 0))
+
+
+def _guild_altdaten_verteilen(conn: "ServerConnection") -> None:
+    """Alte, am Nitrado-Server gespeicherte Discord-Management-Einstellungen
+    einmalig der passenden Guild zuordnen – sobald der Server mehr als eine
+    Guild hat und der Bot bereit ist (sonst sind die Channels nicht aufloesbar)."""
+    if not any(k in conn.data for k in _GUILD_SCHLUESSEL):
+        return
+    ids = conn.guild_ids
+    if len(ids) < 2:
+        return
+    try:
+        bereit = bot is not None and bot.is_ready()
+    except Exception:  # noqa: BLE001
+        bereit = False
+    if not bereit:
+        return
+    alle = conn.data.setdefault("guild_daten", {})
+    for gruppe in _GUILD_SCHLUESSEL_GRUPPEN:
+        vorhanden = [k for k in gruppe if k in conn.data]
+        if not vorhanden:
+            continue
+        ziel = _guild_altdaten_ziel([conn.data[k] for k in vorhanden], ids)
+        daten = alle.setdefault(str(ziel), {})
+        for k in vorhanden:
+            daten.setdefault(k, conn.data[k])
+            conn.data.pop(k, None)
+        log.info(f"[GUILD] {conn.service_id}: {', '.join(vorhanden)} → Guild {ziel}")
+    connections.save()
+
+
+class GuildSicht:
+    """Ein Nitrado-Server aus Sicht EINER Discord-Guild.
+
+    Verhaelt sich wie die ServerConnection, legt aber die Discord-Management-
+    Schluessel (_GUILD_SCHLUESSEL) je Guild ab. guild_id/guild_ids liefern nur
+    diese eine Guild."""
+
+    def __init__(self, conn: "ServerConnection", guild_id: int):
+        object.__setattr__(self, "_conn", conn)
+        object.__setattr__(self, "_gid", int(guild_id))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    @property
+    def basis(self) -> "ServerConnection":
+        return self._conn
+
+    @property
+    def guild_id(self) -> int:
+        return self._gid
+
+    @property
+    def guild_ids(self) -> List[int]:
+        return [self._gid]
+
+    def _guild_daten(self, anlegen: bool) -> Optional[Dict[str, Any]]:
+        _guild_altdaten_verteilen(self._conn)
+        alle = self._conn.data.get("guild_daten")
+        if not isinstance(alle, dict):
+            if not anlegen:
+                return None
+            alle = {}
+            self._conn.data["guild_daten"] = alle
+        daten = alle.get(str(self._gid))
+        if not isinstance(daten, dict):
+            if not anlegen:
+                return None
+            daten = {}
+            alle[str(self._gid)] = daten
+        return daten
+
+    def _alt_gilt(self) -> bool:
+        """Gelten die alten Schluessel direkt am Server fuer diese Guild? Ja bei
+        nur einer Guild, und – solange noch nicht verteilt – fuer die erste."""
+        ids = self._conn.guild_ids
+        return bool(ids) and ids[0] == self._gid
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key not in _GUILD_SCHLUESSEL:
+            return self._conn.get(key, default)
+        daten = self._guild_daten(anlegen=False)
+        if daten is not None and key in daten:
+            return daten[key]
+        if key in self._conn.data and self._alt_gilt():
+            return self._conn.data[key]
+        return default
+
+    def set(self, key: str, value: Any) -> None:
+        if key not in _GUILD_SCHLUESSEL:
+            self._conn.set(key, value)
+            return
+        daten = self._guild_daten(anlegen=False)
+        if (daten is None or key not in daten) and len(self._conn.guild_ids) < 2:
+            self._conn.data[key] = value
+            return
+        self._guild_daten(anlegen=True)[key] = value
+
+
+def guild_sicht(conn: Optional["ServerConnection"], guild_id: Any) -> Optional[Any]:
+    """GuildSicht fuer (conn, guild_id); None, wenn die Guild dem Server nicht
+    zugeordnet ist. Eine bestehende GuildSicht wird auf ihre Basis bezogen."""
+    if conn is None:
+        return None
+    basis = conn.basis if isinstance(conn, GuildSicht) else conn
+    try:
+        gid = int(guild_id)
+    except (TypeError, ValueError):
+        return None
+    if gid not in basis.guild_ids:
+        return None
+    return GuildSicht(basis, gid)
 
 
 connections = ConnectionRegistry()
@@ -5056,16 +5223,22 @@ class DayZBot(discord.Client):
         # offenem/uebernommenem Ticket sowie Oeffnen/Loeschen-Views je
         # archiviertem Ticket wiederherstellen.
         try:
+            # Je Guild eigene Kategorien/Tickets (GuildSicht). Gleiche custom_ids
+            # in zwei Guilds sind unschaedlich: der Klick loest ueber die Guild
+            # der Interaktion auf.
             for _c in connections.all():
-                if _c.service_id:
-                    self.add_view(TicketPanelView(_c.service_id))
-                    for _t_eintrag in _ticket_open(_c):
+                if not _c.service_id:
+                    continue
+                for _gid in (_c.guild_ids or [None]):
+                    _s = _ticket_sicht(_c.service_id, _gid) or _c
+                    self.add_view(TicketPanelView(_c.service_id, _gid))
+                    for _t_eintrag in _ticket_open(_s):
                         if not _t_eintrag.get("id"):
                             continue
                         if _t_eintrag.get("status") in ("open", "claimed"):
-                            self.add_view(TicketChannelView(_c.service_id, int(_t_eintrag["id"])))
+                            self.add_view(TicketChannelView(_c.service_id, int(_t_eintrag["id"]), _gid))
                         elif _t_eintrag.get("status") == "archived":
-                            self.add_view(TicketArchivedView(_c.service_id, int(_t_eintrag["id"])))
+                            self.add_view(TicketArchivedView(_c.service_id, int(_t_eintrag["id"]), _gid))
         except Exception as e:
             log.error(f"[BOT] Persistente Ticket-Views konnten nicht registriert werden: {e}")
 
@@ -8268,6 +8441,19 @@ def _conns_of(interaction: discord.Interaction) -> List[ServerConnection]:
     return connections.all_for_guild(interaction.guild_id)
 
 
+def _conns_sicht(interaction: discord.Interaction) -> List[Any]:
+    """Wie _conns_of, aber als GuildSicht auf die Guild der Interaktion – fuer
+    Discord-Management-Daten (Tickets, Reaction Roles …). In DMs leer."""
+    if interaction.guild_id is None:
+        return []
+    out = []
+    for conn in _conns_of(interaction):
+        sicht = guild_sicht(conn, interaction.guild_id)
+        if sicht is not None:
+            out.append(sicht)
+    return out
+
+
 def _conn_waehlen(interaction: discord.Interaction, server: Optional[str] = None
                   ) -> Tuple[Optional[ServerConnection], Optional[str]]:
     """Den gemeinten Nitrado-Server bestimmen: ``(Verbindung, Fehlermeldung)``.
@@ -8554,7 +8740,8 @@ def _panel_view_registrieren(conn: "ServerConnection") -> None:
         log.debug(f"[WL] Panel-View {conn.service_id}: {e}")
     try:
         if conn.service_id and bot is not None and getattr(bot, "user", None):
-            bot.add_view(TicketPanelView(conn.service_id))
+            for _gid in (conn.guild_ids or [None]):
+                bot.add_view(TicketPanelView(conn.service_id, _gid))
     except Exception as e:  # noqa: BLE001 – doppelte Anmeldung ist harmlos
         log.debug(f"[TICKET_TOOL] Panel-View {conn.service_id}: {e}")
 
@@ -11632,6 +11819,17 @@ def _whitelist_conn(req: Dict[str, Any],
 _TICKET_CATEGORY_MAX = 20  # Discord erlaubt max. 25 Buttons je View - Puffer lassen
 
 
+def _ticket_sicht(service_id: Optional[str], guild_id: Any) -> Optional[Any]:
+    """Ticket-Daten eines Servers aus Sicht einer Guild. Ohne guild_id (z. B.
+    beim Aufbau einer View vor dem ersten Klick) die erste zugeordnete Guild."""
+    conn = connections.for_service(service_id) if service_id else None
+    if conn is None:
+        return None
+    if guild_id is None:
+        return GuildSicht(conn, conn.guild_ids[0]) if conn.guild_ids else conn
+    return guild_sicht(conn, guild_id)
+
+
 class TicketPanelView(discord.ui.View):
     """Persistentes Panel: EIN Knopf je Ticket-Kategorie (z. B. „Allgemeines
     Ticket“, „Ban-Einspruch“) - Klick startet direkt die Ticket-Erstellung
@@ -11641,10 +11839,10 @@ class TicketPanelView(discord.ui.View):
     Aendert sich die Kategorienliste, muss das Panel neu gesendet werden
     (`/send ticket panel`), damit die Knopf-Reihe aktualisiert wird."""
 
-    def __init__(self, service_id: Optional[str] = None):
+    def __init__(self, service_id: Optional[str] = None, guild_id: Optional[int] = None):
         super().__init__(timeout=None)
         self.service_id = str(service_id or "")
-        conn = connections.for_service(self.service_id) if self.service_id else None
+        conn = _ticket_sicht(self.service_id, guild_id) if self.service_id else None
         kategorien = _ticket_categories(conn) if conn is not None else []
         for kategorie in kategorien[:_TICKET_CATEGORY_MAX]:
             if not isinstance(kategorie, dict) or not kategorie.get("id"):
@@ -11658,9 +11856,9 @@ class TicketPanelView(discord.ui.View):
 
     def _erstellen_callback(self, kategorie_id: int):
         async def _callback(interaction: discord.Interaction):
-            conn = connections.for_service(self.service_id) if self.service_id else None
-            if conn is None or not conn.guild_ids or interaction.guild_id is None \
-                    or int(interaction.guild_id) not in conn.guild_ids:
+            conn = _ticket_sicht(self.service_id, interaction.guild_id) \
+                if self.service_id and interaction.guild_id is not None else None
+            if conn is None:
                 return await interaction.response.send_message(_t(
                     interaction, "❌ Für dieses Panel ist gerade kein Server zugeordnet.",
                     "❌ No server is currently assigned to this panel."), ephemeral=True)
@@ -11682,11 +11880,11 @@ class TicketChannelView(discord.ui.View):
     tragen die Ticket-ID, damit sie einen Neustart ueberleben (Vorbild:
     WhitelistApprovalView weiter unten)."""
 
-    def __init__(self, service_id: str, ticket_id: int):
+    def __init__(self, service_id: str, ticket_id: int, guild_id: Optional[int] = None):
         super().__init__(timeout=None)
         self.service_id = str(service_id)
         self.ticket_id = int(ticket_id)
-        sprache = _ticket_sprache(connections.for_service(self.service_id) if self.service_id else None)
+        sprache = _ticket_sprache(_ticket_sicht(self.service_id, guild_id) if self.service_id else None)
         claim = discord.ui.Button(
             label=_tt(sprache, "Übernehmen", "Claim"), emoji="🙋", style=discord.ButtonStyle.secondary,
             custom_id=f"ticket_claim:{self.service_id}:{self.ticket_id}")
@@ -11698,8 +11896,10 @@ class TicketChannelView(discord.ui.View):
         self.add_item(claim)
         self.add_item(close)
 
-    def _conn_und_ticket(self) -> Tuple[Optional[ServerConnection], Optional[Dict[str, Any]]]:
-        conn = connections.for_service(self.service_id) if self.service_id else None
+    def _conn_und_ticket(self, interaction: discord.Interaction
+                         ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+        conn = _ticket_sicht(self.service_id, interaction.guild_id) \
+            if self.service_id and interaction.guild_id is not None else None
         if conn is None:
             return None, None
         ticket = next((t for t in _ticket_open(conn)
@@ -11707,7 +11907,7 @@ class TicketChannelView(discord.ui.View):
         return conn, ticket
 
     async def _claim(self, interaction: discord.Interaction):
-        conn, ticket = self._conn_und_ticket()
+        conn, ticket = self._conn_und_ticket(interaction)
         if conn is None or ticket is None:
             return await interaction.response.send_message(_t(
                 interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
@@ -11730,7 +11930,7 @@ class TicketChannelView(discord.ui.View):
             f"🙋 {member.mention} has claimed this ticket."))
 
     async def _close(self, interaction: discord.Interaction):
-        conn, ticket = self._conn_und_ticket()
+        conn, ticket = self._conn_und_ticket(interaction)
         if conn is None or ticket is None:
             return await interaction.response.send_message(_t(
                 interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
@@ -11800,7 +12000,7 @@ class TicketChannelView(discord.ui.View):
                             f"Closed by {member.mention} on {jetzt}.\n{transkript_zeile}"),
             color=0x99AAB5)
         await interaction.followup.send(embed=embed,
-                                        view=TicketArchivedView(self.service_id, self.ticket_id))
+                                        view=TicketArchivedView(self.service_id, self.ticket_id, interaction.guild_id))
 
         protokoll_kanal_id = _ticket_transkript_kanal(conn)
         if protokoll_kanal_id and interaction.guild:
@@ -11832,18 +12032,19 @@ class TicketDeleteConfirmView(discord.ui.View):
     normaler Timeout reicht (Vorbild fuer nicht-persistente Views:
     _FeedTranslateView, siehe Kommentar dort)."""
 
-    def __init__(self, service_id: str, ticket_id: int):
+    def __init__(self, service_id: str, ticket_id: int, guild_id: Optional[int] = None):
         super().__init__(timeout=60)
         self.service_id = service_id
         self.ticket_id = ticket_id
-        sprache = _ticket_sprache(connections.for_service(service_id) if service_id else None)
+        sprache = _ticket_sprache(_ticket_sicht(service_id, guild_id) if service_id else None)
         knopf = discord.ui.Button(label=_tt(sprache, "Ja, endgültig löschen", "Yes, delete permanently"),
                                   emoji="✅", style=discord.ButtonStyle.danger)
         knopf.callback = self._bestaetigt
         self.add_item(knopf)
 
     async def _bestaetigt(self, interaction: discord.Interaction):
-        conn = connections.for_service(self.service_id) if self.service_id else None
+        conn = _ticket_sicht(self.service_id, interaction.guild_id) \
+            if self.service_id and interaction.guild_id is not None else None
         ticket = next((t for t in _ticket_open(conn)
                        if int(t.get("id") or 0) == self.ticket_id), None) if conn else None
         if conn is None or ticket is None:
@@ -11869,11 +12070,11 @@ class TicketArchivedView(discord.ui.View):
     Ersetzt die Übernehmen-/Schließen-Buttons von TicketChannelView, sobald
     ein Ticket geschlossen wurde."""
 
-    def __init__(self, service_id: str, ticket_id: int):
+    def __init__(self, service_id: str, ticket_id: int, guild_id: Optional[int] = None):
         super().__init__(timeout=None)
         self.service_id = str(service_id)
         self.ticket_id = int(ticket_id)
-        sprache = _ticket_sprache(connections.for_service(self.service_id) if self.service_id else None)
+        sprache = _ticket_sprache(_ticket_sicht(self.service_id, guild_id) if self.service_id else None)
         reopen = discord.ui.Button(
             label=_tt(sprache, "Öffnen", "Reopen"), emoji="↩️", style=discord.ButtonStyle.secondary,
             custom_id=f"ticket_reopen:{self.service_id}:{self.ticket_id}")
@@ -11885,8 +12086,10 @@ class TicketArchivedView(discord.ui.View):
         self.add_item(reopen)
         self.add_item(delete)
 
-    def _conn_und_ticket(self) -> Tuple[Optional[ServerConnection], Optional[Dict[str, Any]]]:
-        conn = connections.for_service(self.service_id) if self.service_id else None
+    def _conn_und_ticket(self, interaction: discord.Interaction
+                         ) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+        conn = _ticket_sicht(self.service_id, interaction.guild_id) \
+            if self.service_id and interaction.guild_id is not None else None
         if conn is None:
             return None, None
         ticket = next((t for t in _ticket_open(conn)
@@ -11902,7 +12105,7 @@ class TicketArchivedView(discord.ui.View):
             any(r.id in {sr.id for sr in support_rollen} for r in member.roles)
 
     async def _reopen(self, interaction: discord.Interaction):
-        conn, ticket = self._conn_und_ticket()
+        conn, ticket = self._conn_und_ticket(interaction)
         if conn is None or ticket is None:
             return await interaction.response.send_message(_t(
                 interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
@@ -11936,10 +12139,10 @@ class TicketArchivedView(discord.ui.View):
         _conn_store(conn, "ticket_open", _ticket_open(conn))
         await interaction.followup.send(_tt(
             sprache, "↩️ Ticket wieder geöffnet.", "↩️ Ticket reopened."),
-            view=TicketChannelView(self.service_id, self.ticket_id))
+            view=TicketChannelView(self.service_id, self.ticket_id, interaction.guild_id))
 
     async def _delete(self, interaction: discord.Interaction):
-        conn, ticket = self._conn_und_ticket()
+        conn, ticket = self._conn_und_ticket(interaction)
         if conn is None or ticket is None:
             return await interaction.response.send_message(_t(
                 interaction, "❌ Dieses Ticket ist nicht mehr bekannt.",
@@ -11952,7 +12155,7 @@ class TicketArchivedView(discord.ui.View):
         await interaction.response.send_message(_tt(
             sprache, "⚠️ Der Kanal wird dabei unwiderruflich gelöscht. Sicher?",
             "⚠️ This will permanently delete the channel. Are you sure?"),
-            view=TicketDeleteConfirmView(self.service_id, self.ticket_id), ephemeral=True)
+            view=TicketDeleteConfirmView(self.service_id, self.ticket_id, interaction.guild_id), ephemeral=True)
 
 
 async def _ticket_erstellen(interaction: discord.Interaction, conn: ServerConnection,
@@ -12035,7 +12238,7 @@ async def _ticket_erstellen(interaction: discord.Interaction, conn: ServerConnec
         color=0x5865F2)
     try:
         await kanal.send(content=erwaehnung, embed=embed,
-                         view=TicketChannelView(conn.service_id, neu["id"]))
+                         view=TicketChannelView(conn.service_id, neu["id"], conn.guild_id))
     except discord.Forbidden as e:
         log.debug(f"[TICKET_TOOL] Panel-Nachricht im neuen Ticket-Kanal fehlgeschlagen: {e}")
 
@@ -12259,6 +12462,7 @@ async def send_ticket_panel(interaction: discord.Interaction,
     if _conn is None:
         return await interaction.response.send_message(
             _fehler or _premium_missing_text(interaction), ephemeral=True)
+    _conn = guild_sicht(_conn, interaction.guild_id) or _conn
     if not _ticket_categories(_conn):
         return await interaction.response.send_message(_t(
             interaction,
@@ -12277,7 +12481,7 @@ async def send_ticket_panel(interaction: discord.Interaction,
             "automatically that only you and the responsible support team can see."),
         color=0x5865F2)
     try:
-        await panel_channel.send(embed=panel_embed, view=TicketPanelView(_conn.service_id))
+        await panel_channel.send(embed=panel_embed, view=TicketPanelView(_conn.service_id, _conn.guild_id))
     except discord.Forbidden:
         return await interaction.response.send_message(_t(
             interaction,
@@ -12299,7 +12503,7 @@ def _ticket_conn_und_eintrag(interaction: discord.Interaction, channel: discord.
     """Sucht unter allen Verbindungen DIESER Guild den Ticket-Eintrag zu
     einem Kanal (analog _reaction_role_anwenden - eine Guild kann mehrere
     Nitrado-Server verwalten, das Ticket kann zu jedem davon gehoeren)."""
-    for conn in _conns_of(interaction):
+    for conn in _conns_sicht(interaction):
         eintrag = _ticket_eintrag_von_channel(conn, channel.id)
         if eintrag is not None:
             return conn, eintrag
@@ -12389,7 +12593,7 @@ async def ticket_clear_stale(interaction: discord.Interaction):
             interaction, "❌ Das geht nur auf einem Discord-Server.",
             "❌ This only works on a Discord server."), ephemeral=True)
     geraeumt = 0
-    for conn in _conns_of(interaction):
+    for conn in _conns_sicht(interaction):
         eintraege = _ticket_open(conn)
         geaendert = False
         for t in eintraege:
@@ -36065,6 +36269,11 @@ async def _welcome_leave_posten(member: discord.Member, konn_liste: List["Server
     Event-Handler-Bloecken (wipe_money_on_leave etc.)."""
     schluessel = "welcome_message" if ist_willkommen else "leave_message"
     for conn in konn_liste:
+        # Einstellung der Guild, in der das Mitglied kam/ging – nicht die einer
+        # anderen Guild desselben Nitrado-Servers.
+        conn = guild_sicht(conn, getattr(getattr(member, "guild", None), "id", None))
+        if conn is None:
+            continue
         einstellung = conn.get(schluessel) or {}
         if not isinstance(einstellung, dict) or not einstellung.get("enabled"):
             continue
@@ -36101,6 +36310,19 @@ def _discord_mgmt_payload(conn: "ServerConnection") -> Dict[str, Any]:
             "honeypot": {"enabled": bool(_honeypot_einstellungen(conn)["enabled"])}}
 
 
+def _mgmt_sicht(request: web.Request, conn: "ServerConnection") -> Any:
+    """Discord Management im Dashboard: die Sicht auf die in der Sitzung gewaehlte
+    Guild (sonst die erste zugeordnete). Ohne Guild bleibt es der Server selbst –
+    die Endpunkte melden dann 409 bei Channel-/Rollenauswahl."""
+    if isinstance(conn, GuildSicht):
+        return conn
+    wahl = (_sess_get(request) or {}).get("guild_id")
+    sicht = guild_sicht(conn, wahl) if wahl else None
+    if sicht is None and conn.guild_ids:
+        sicht = GuildSicht(conn, conn.guild_ids[0])
+    return sicht if sicht is not None else conn
+
+
 async def get_discord_mgmt(request: web.Request) -> web.Response:
     conn, denied = _session_conn(request, "discord_mgmt")
     if denied is not None:
@@ -36111,6 +36333,7 @@ async def get_discord_mgmt(request: web.Request) -> web.Response:
     denied = await _dash_gate(request, conn, "discord_mgmt", "view")
     if denied is not None:
         return denied
+    conn = _mgmt_sicht(request, conn)
     gid = int(conn.guild_id) if conn.guild_id else 0
     payload = _discord_mgmt_payload(conn)
     payload["channels"] = _guild_payload(gid, conn.service_id)["channels"] if gid else []
@@ -36128,6 +36351,7 @@ async def _set_discord_mgmt(request: web.Request, schluessel: str) -> web.Respon
     denied = await _dash_gate(request, conn, "discord_mgmt", "edit")
     if denied is not None:
         return denied
+    conn = _mgmt_sicht(request, conn)
     denied = _dash_rate_limited(request, f"discord_mgmt.{schluessel}", 3)
     if denied is not None:
         return denied
@@ -36195,7 +36419,7 @@ _LEVEL_BALKEN_SEGMENTE = 20
 
 def _level_einstellungen(conn: "ServerConnection") -> Dict[str, Any]:
     """Einstellungen mit Vorgaben aufgefuellt und typsicher – IDs als Strings."""
-    roh = conn.data.get("level_system")
+    roh = conn.get("level_system")
     roh = roh if isinstance(roh, dict) else {}
     e: Dict[str, Any] = dict(_LEVEL_VORGABEN)
     for key in ("enabled", "announce", "stack_roles"):
@@ -36253,7 +36477,8 @@ def _level_conn_fuer_guild(guild_id: Optional[int]) -> Optional["ServerConnectio
         log.debug(f"[LEVEL] all_for_guild: {e}")
         return None
     for conn in konten:
-        if _level_einstellungen(conn)["enabled"]:
+        conn = guild_sicht(conn, guild_id)
+        if conn is not None and _level_einstellungen(conn)["enabled"]:
             return conn
     return None
 
@@ -36529,6 +36754,7 @@ async def get_discord_mgmt_level(request: web.Request) -> web.Response:
     denied = await _dash_gate(request, conn, "discord_mgmt", "view")
     if denied is not None:
         return denied
+    conn = _mgmt_sicht(request, conn)
     return ok(_level_payload(conn))
 
 
@@ -36556,6 +36782,7 @@ async def post_discord_mgmt_level(request: web.Request) -> web.Response:
     denied = await _dash_gate(request, conn, "discord_mgmt", "edit")
     if denied is not None:
         return denied
+    conn = _mgmt_sicht(request, conn)
     denied = _dash_rate_limited(request, "discord_mgmt.level_system", 3)
     if denied is not None:
         return denied
@@ -36653,7 +36880,7 @@ _HONEYPOT_AKTIONEN = ("ban", "kick")
 
 
 def _honeypot_einstellungen(conn: "ServerConnection") -> Dict[str, Any]:
-    roh = conn.data.get("honeypot")
+    roh = conn.get("honeypot")
     roh = roh if isinstance(roh, dict) else {}
     e: Dict[str, Any] = dict(_HONEYPOT_VORGABEN)
     for key in ("enabled", "delete_messages"):
@@ -36825,6 +37052,9 @@ async def _honeypot_nachricht_verarbeiten(message: Any) -> bool:
     konten = connections.all_for_guild(int(guild.id))
     conn = e = None
     for kandidat in konten:
+        kandidat = guild_sicht(kandidat, guild.id)
+        if kandidat is None:
+            continue
         einst = _honeypot_einstellungen(kandidat)
         if einst["enabled"] and einst["channel_id"] and str(getattr(kanal, "id", "")) == einst["channel_id"]:
             conn, e = kandidat, einst
@@ -36901,7 +37131,7 @@ async def _honeypot_warnung_posten(conn: "ServerConnection", e: Dict[str, Any]) 
         nachricht = await kanal.send(embed=_honeypot_warnung_embed(e["language"], e["action"], e["custom_text"]))
     except Exception as exc:  # noqa: BLE001
         return False, f"Die Warnung konnte nicht gepostet werden (Schreibrecht des Bots im Channel prüfen): {exc}"
-    daten = dict(conn.data.get("honeypot") or {})
+    daten = dict(conn.get("honeypot") or {})
     daten["warning_message_id"] = str(getattr(nachricht, "id", "") or "")
     _conn_store(conn, "honeypot", daten)
     return True, ""
@@ -36923,6 +37153,7 @@ async def _honeypot_gate(request: web.Request, recht: str):
     denied = await _dash_gate(request, conn, "discord_mgmt", recht)
     if denied is not None:
         return None, denied
+    conn = _mgmt_sicht(request, conn)
     return conn, None
 
 
@@ -37137,6 +37368,9 @@ async def _reaction_role_anwenden(client: "DayZBot", payload: "discord.RawReacti
     vergibt/entzieht die zugehoerige Rolle. Darf den Bot nie stoeren."""
     emoji_str = str(payload.emoji)
     for conn in konten:
+        conn = guild_sicht(conn, payload.guild_id)
+        if conn is None:
+            continue
         eintrag = next((e for e in _reaction_roles(conn)
                         if str(e.get("message_id")) == str(payload.message_id)
                         and str(e.get("emoji")) == emoji_str), None)
@@ -37303,6 +37537,7 @@ async def get_reaction_roles(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "discord_mgmt", "view")
     if fehler is not None:
         return fehler
+    conn = _mgmt_sicht(request, conn)
     eintraege = _reaction_roles(conn)
     return ok({
         "entries": [_reaction_role_payload(conn, e) for e in eintraege],
@@ -37320,6 +37555,7 @@ async def post_reaction_roles(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
     if fehler is not None:
         return fehler
+    conn = _mgmt_sicht(request, conn)
     fehler = _dash_rate_limited(request, "discord_mgmt.reaction_roles", 5)
     if fehler is not None:
         return fehler
@@ -37376,6 +37612,7 @@ async def delete_reaction_role(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
     if fehler is not None:
         return fehler
+    conn = _mgmt_sicht(request, conn)
     try:
         eintrag_id = int(request.match_info["id"])
     except (TypeError, ValueError):
@@ -37408,6 +37645,7 @@ async def get_ticket_categories(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "discord_mgmt", "view")
     if fehler is not None:
         return fehler
+    conn = _mgmt_sicht(request, conn)
     kategorien = _ticket_categories(conn)
     return ok({"categories": [_ticket_category_payload(conn, k) for k in kategorien],
               "language": _ticket_sprache(conn),
@@ -37424,6 +37662,7 @@ async def post_ticket_language(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
     if fehler is not None:
         return fehler
+    conn = _mgmt_sicht(request, conn)
     data = await body(request)
     sprache = str(data.get("language") or "").strip().lower()
     if sprache not in ("de", "en"):
@@ -37444,6 +37683,7 @@ async def post_ticket_transcript_channel(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
     if fehler is not None:
         return fehler
+    conn = _mgmt_sicht(request, conn)
     data = await body(request)
     roh = data.get("channel_id")
     if roh in (None, "", "0", 0):
@@ -37474,6 +37714,7 @@ async def post_ticket_categories(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
     if fehler is not None:
         return fehler
+    conn = _mgmt_sicht(request, conn)
     fehler = _dash_rate_limited(request, "discord_mgmt.ticket_categories", 5)
     if fehler is not None:
         return fehler
@@ -37525,6 +37766,7 @@ async def put_ticket_category(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
     if fehler is not None:
         return fehler
+    conn = _mgmt_sicht(request, conn)
     fehler = _dash_rate_limited(request, "discord_mgmt.ticket_categories", 5)
     if fehler is not None:
         return fehler
@@ -37576,6 +37818,7 @@ async def delete_ticket_category(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "discord_mgmt", "edit")
     if fehler is not None:
         return fehler
+    conn = _mgmt_sicht(request, conn)
     try:
         eintrag_id = int(request.match_info["id"])
     except (TypeError, ValueError):
@@ -37601,6 +37844,7 @@ async def get_ticket_open(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "discord_mgmt", "view")
     if fehler is not None:
         return fehler
+    conn = _mgmt_sicht(request, conn)
     g = bot.get_guild(int(conn.guild_id)) if bot and conn.guild_id else None
     kategorien = {k.get("id"): k.get("label") for k in _ticket_categories(conn)}
     ergebnis = []
@@ -37639,6 +37883,7 @@ async def post_ticket_close(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "discord_mgmt", "delete")
     if fehler is not None:
         return fehler
+    conn = _mgmt_sicht(request, conn)
     try:
         ticket_id = int(request.match_info["id"])
     except (TypeError, ValueError):

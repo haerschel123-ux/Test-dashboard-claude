@@ -92,6 +92,7 @@ class _StubInteraction:
     def __init__(self, user, guild):
         self.user = user
         self.guild = guild
+        self.guild_id = 111   # wie echte Interaktionen: Guild-ID immer gesetzt
         self.locale = None
         self.response = _StubResponse()
         self.followup = _StubFollowup()
@@ -153,6 +154,7 @@ def test_clear_stale_raeumt_nur_eintraege_mit_geloeschtem_kanal_auf(monkeypatch)
     monkeypatch.setattr(bot_mod, "_conns_of", lambda interaction: [conn])
     monkeypatch.setattr(bot_mod, "_is_admin", lambda interaction: True)
     interaction = _StubInteractionAdmin(guild)
+    interaction.guild_id = 222   # die Guild, der dieser Server zugeordnet ist
     asyncio.run(bot_mod.ticket_clear_stale.callback(interaction))
     eintraege = conn.data["ticket_open"]
     assert eintraege[0]["status"] == "archived"  # aufgeraeumt
