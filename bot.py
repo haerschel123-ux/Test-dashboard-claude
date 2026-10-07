@@ -1050,6 +1050,11 @@ _DISCORD_MODUL_MAP: Dict[str, str] = {
     "shop": "shop.buy",
     "buy":  "shop.buy",
     "edit": "shop.catalog_admin",
+    # Level-System (Dashboard → Discord Management): Freigabestufe des Moduls
+    "level": "discord_mgmt",
+    "levelrangliste": "discord_mgmt",
+    "levelset": "discord_mgmt",
+    "levelreset": "discord_mgmt",
 }
 
 # Die alten Sammelkategorien, die durch FEED_TYPES ersetzt wurden.
@@ -1421,6 +1426,13 @@ GEWINNSPIELE
 /gend <id>                      → Gewinnspiel vorzeitig beenden und Sieger auslosen
 /greroll <id> [anzahl]          → Neue Sieger für ein beendetes Gewinnspiel auslosen
 /gsettings set [farbe] [rolle]  → Embed-Farbe und Pflichtrolle festlegen
+
+LEVEL-SYSTEM
+────────────
+/level [nutzer]                 → Level, XP und Fortschritt anzeigen (für alle)
+/levelrangliste                 → Top 10 der Guild
+/levelset <nutzer> <xp>         → XP eines Nutzers setzen
+/levelreset <nutzer>            → Level und XP zurücksetzen
 
 EVENT VORLAGEN
 ──────────────
@@ -5253,6 +5265,16 @@ class DayZBot(discord.Client):
             return
         await _reaction_role_anwenden(self, payload, konten, vergeben=False)
 
+    async def on_message(self, message: discord.Message):
+        """Level-System (Dashboard → Discord Management): jede Nachricht in
+        einer Guild kann XP bringen. Braucht KEINEN message_content-Intent –
+        Autor, Guild und Channel reichen, der Inhalt wird nicht gelesen.
+        discord.Client hat keine Prefix-Befehle, also kein process_commands."""
+        try:
+            await _level_nachricht_verarbeiten(message)
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[LEVEL] on_message: {e}")
+
     async def on_ready(self):
         log.info(f"[BOT] ✅ Eingeloggt als {self.user} (ID: {self.user.id})")
         # Diagnose fuer die Bann/Beitritt/Austritt-Premium-Kopplung (siehe
@@ -8163,6 +8185,8 @@ _SUBCMD_DEFS: Tuple[Tuple[str, str, str, str, str], ...] = (
     ("gend", "Gewinnspiele", "Giveaways", "/gend – Beendet ein Gewinnspiel vorzeitig und lost Sieger aus (zusätzlich zu Administrator)", "/gend – Ends a giveaway early and draws winners (in addition to Administrator)"),
     ("greroll", "Gewinnspiele", "Giveaways", "/greroll – Lost neue Sieger nach (zusätzlich zu Administrator)", "/greroll – Draws new winners (in addition to Administrator)"),
     ("gsettings_set", "Gewinnspiele", "Giveaways", "/gsettings set – Setzt Farbe/Pflichtrolle für Gewinnspiele (zusätzlich zu Administrator)", "/gsettings set – Sets color/required role for giveaways (in addition to Administrator)"),
+    ("levelset", "Level-System", "Level System", "/levelset – Setzt die XP eines Nutzers (zusätzlich zu Administrator)", "/levelset – Sets a user's XP (in addition to Administrator)"),
+    ("levelreset", "Level-System", "Level System", "/levelreset – Setzt Level und XP eines Nutzers zurück (zusätzlich zu Administrator)", "/levelreset – Resets a user's level and XP (in addition to Administrator)"),
     ("events_add", "Event Vorlagen", "Event Templates", "/events add – Fügt eine Event-Vorlage an einer Position hinzu", "/events add – Adds an event template at a position"),
     ("events_list", "Event Vorlagen", "Event Templates", "/events list – Zeigt alle hinzugefügten Event-Instanzen", "/events list – Shows all added event instances"),
     ("events_remove", "Event Vorlagen", "Event Templates", "/events remove – Entfernt eine hinzugefügte Event-Instanz", "/events remove – Removes an added event instance"),
@@ -23452,6 +23476,19 @@ async def cmd_hilfe(interaction: discord.Interaction):
         "`/greroll <id> [count]` — Draw new winners for an ended giveaway\n"
         "`/gsettings set [color] [role]` — Set embed color and required role"
     ), inline=False)
+    embed.add_field(name=_t(interaction, "🏆 Level-System", "🏆 Level System"), value=_t(
+        interaction,
+        "`/level [nutzer]` — Level, XP und Fortschritt anzeigen *(für alle)*\n"
+        "`/levelrangliste` — Top 10 der Guild\n"
+        "`/levelset <nutzer> <xp>` — XP eines Nutzers setzen\n"
+        "`/levelreset <nutzer>` — Level und XP zurücksetzen\n"
+        "Tempo, Rollen und Ankündigung im Dashboard unter „Discord Management“.",
+        "`/level [user]` — Show level, XP and progress *(everyone)*\n"
+        "`/levelrangliste` — Top 10 of the guild\n"
+        "`/levelset <user> <xp>` — Set a user's XP\n"
+        "`/levelreset <user>` — Reset level and XP\n"
+        "Speed, roles and announcements in the dashboard under “Discord Management”."
+    ), inline=False)
     embed.add_field(name=_t(interaction, "🗺️ Event Vorlagen", "🗺️ Event Templates"), value=_t(
         interaction,
         "`/events add <vorlage> <x> <z> [y] [name]` — Vorlage an einer Position hinzufügen\n"
@@ -24781,6 +24818,18 @@ class EconomyDB:
                 payout     INTEGER,
                 result     TEXT,
                 created_at REAL)""")
+            # Level-System (Dashboard → Discord Management): XP durch Discord-
+            # Nachrichten, je Guild getrennt. `level` ist der zuletzt berechnete
+            # Stand (die Kurve ist einstellbar, deshalb wird er beim Lesen aus
+            # xp neu bestimmt und hier nur fuer die Rangliste gepflegt).
+            c.execute("""CREATE TABLE IF NOT EXISTS levels (
+                guild_id   INTEGER NOT NULL,
+                user_id    INTEGER NOT NULL,
+                xp         INTEGER NOT NULL DEFAULT 0,
+                level      INTEGER NOT NULL DEFAULT 1,
+                messages   INTEGER NOT NULL DEFAULT 0,
+                last_xp_at REAL    NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id))""")
             # PvP-Kills für /stats und /leaderboard – je Nitrado-Server getrennt,
             # sonst stünden die Spieler fremder Kunden in derselben Rangliste.
             c.execute("""CREATE TABLE IF NOT EXISTS kills (
@@ -25072,6 +25121,77 @@ class EconomyDB:
                 "DELETE FROM balances WHERE guild_id=? AND user_id=?",
                 (guild_id, user_id))
             self._conn.commit()
+
+    # ── Level-System ──────────────────────────────────────────
+    def level_get(self, guild_id: int, user_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT xp, level, messages, last_xp_at FROM levels WHERE guild_id=? AND user_id=?",
+                (int(guild_id), int(user_id))).fetchone()
+        if row is None:
+            return {"xp": 0, "level": 1, "messages": 0, "last_xp_at": 0.0}
+        return {"xp": int(row["xp"]), "level": int(row["level"]),
+                "messages": int(row["messages"]), "last_xp_at": float(row["last_xp_at"])}
+
+    def level_add_xp(self, guild_id: int, user_id: int, delta: int, now: float) -> int:
+        """XP gutschreiben (zaehlt die Nachricht mit, merkt sich den Zeitpunkt
+        fuer die Abklingzeit). Gibt die neue Gesamt-XP zurueck."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO levels (guild_id, user_id, xp, level, messages, last_xp_at) "
+                "VALUES (?,?,?,1,1,?) ON CONFLICT(guild_id, user_id) DO UPDATE SET "
+                "xp = xp + excluded.xp, messages = messages + 1, last_xp_at = excluded.last_xp_at",
+                (int(guild_id), int(user_id), max(0, int(delta)), float(now)))
+            self._conn.commit()
+        return self.level_get(guild_id, user_id)["xp"]
+
+    def level_set(self, guild_id: int, user_id: int, xp: int, level: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO levels (guild_id, user_id, xp, level, messages, last_xp_at) "
+                "VALUES (?,?,?,?,0,0) ON CONFLICT(guild_id, user_id) DO UPDATE SET "
+                "xp = excluded.xp, level = excluded.level",
+                (int(guild_id), int(user_id), max(0, int(xp)), max(1, int(level))))
+            self._conn.commit()
+
+    def level_set_level(self, guild_id: int, user_id: int, level: int) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE levels SET level=? WHERE guild_id=? AND user_id=?",
+                               (max(1, int(level)), int(guild_id), int(user_id)))
+            self._conn.commit()
+
+    def level_reset(self, guild_id: int, user_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM levels WHERE guild_id=? AND user_id=?",
+                               (int(guild_id), int(user_id)))
+            self._conn.commit()
+
+    def level_rank(self, guild_id: int, user_id: int) -> Tuple[int, int]:
+        """(Platz, Teilnehmer) – Platz 1 = meiste XP."""
+        with self._lock:
+            xp_row = self._conn.execute("SELECT xp FROM levels WHERE guild_id=? AND user_id=?",
+                                        (int(guild_id), int(user_id))).fetchone()
+            gesamt = int(self._conn.execute("SELECT COUNT(*) FROM levels WHERE guild_id=?",
+                                            (int(guild_id),)).fetchone()[0])
+            if xp_row is None:
+                return gesamt + 1, gesamt
+            besser = int(self._conn.execute(
+                "SELECT COUNT(*) FROM levels WHERE guild_id=? AND xp > ?",
+                (int(guild_id), int(xp_row["xp"]))).fetchone()[0])
+        return besser + 1, gesamt
+
+    def level_top(self, guild_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT user_id, xp, level, messages FROM levels WHERE guild_id=? "
+                "ORDER BY xp DESC, user_id ASC LIMIT ?", (int(guild_id), int(limit))).fetchall()
+        return [{"user_id": int(r["user_id"]), "xp": int(r["xp"]), "level": int(r["level"]),
+                 "messages": int(r["messages"])} for r in rows]
+
+    def level_count(self, guild_id: int) -> int:
+        with self._lock:
+            return int(self._conn.execute("SELECT COUNT(*) FROM levels WHERE guild_id=?",
+                                          (int(guild_id),)).fetchone()[0])
 
     def get_balance(self, guild_id: int, user_id: int) -> Tuple[int, int]:
         self.ensure_user(guild_id, user_id)
@@ -35970,7 +36090,8 @@ def _discord_mgmt_payload(conn: "ServerConnection") -> Dict[str, Any]:
             "include_avatar": bool(d.get("include_avatar", True)),
         }
     return {"welcome_message": _eintrag("welcome_message"),
-            "leave_message": _eintrag("leave_message")}
+            "leave_message": _eintrag("leave_message"),
+            "level_system": {"enabled": bool(_level_einstellungen(conn)["enabled"])}}
 
 
 async def get_discord_mgmt(request: web.Request) -> web.Response:
@@ -36043,6 +36164,469 @@ async def post_discord_mgmt_welcome(request: web.Request) -> web.Response:
 
 async def post_discord_mgmt_leave(request: web.Request) -> web.Response:
     return await _set_discord_mgmt(request, "leave_message")
+
+
+# ══════════════════════════════════════════════════════════════
+#  Discord Management: Level-System (XP durch Nachrichten, /level)
+# ══════════════════════════════════════════════════════════════
+# Einstellungen liegen je Mandant in conn.data["level_system"] (kein Rueckfall
+# auf cfg.config). XP/Level je Discord-Guild in economy.db (Tabelle levels):
+# verwaltet eine Guild mehrere Nitrado-Server, teilen sie sich die XP, die
+# Einstellungen kommen vom ersten Server, der das System aktiviert hat.
+_LEVEL_VORGABEN: Dict[str, Any] = {
+    "enabled": False, "language": "de",
+    "xp_min": 15, "xp_max": 25, "cooldown": 60,
+    "xp_basis": 100, "steigerung": 15,
+    "announce": True, "announce_channel_id": None,
+    "role_rewards": [], "stack_roles": True,
+    "ignored_channels": [], "ignored_roles": [],
+}
+_LEVEL_MAX = 500
+_LEVEL_ROLLEN_MAX = 25
+_LEVEL_BALKEN_SEGMENTE = 20
+
+
+def _level_einstellungen(conn: "ServerConnection") -> Dict[str, Any]:
+    """Einstellungen mit Vorgaben aufgefuellt und typsicher – IDs als Strings."""
+    roh = conn.data.get("level_system")
+    roh = roh if isinstance(roh, dict) else {}
+    e: Dict[str, Any] = dict(_LEVEL_VORGABEN)
+    for key in ("enabled", "announce", "stack_roles"):
+        if key in roh:
+            e[key] = bool(roh[key])
+    for key in ("xp_min", "xp_max", "cooldown", "xp_basis", "steigerung"):
+        try:
+            if key in roh:
+                e[key] = int(roh[key])
+        except (TypeError, ValueError):
+            pass
+    if roh.get("language") in _DISCORD_MGMT_SPRACHEN:
+        e["language"] = roh["language"]
+    e["announce_channel_id"] = str(roh["announce_channel_id"]) if roh.get("announce_channel_id") else None
+    e["role_rewards"] = sorted(
+        ({"level": int(r.get("level")), "role_id": str(r.get("role_id"))}
+         for r in (roh.get("role_rewards") or []) if isinstance(r, dict) and r.get("role_id")
+         and str(r.get("level", "")).lstrip("-").isdigit()),
+        key=lambda r: r["level"])
+    e["ignored_channels"] = [str(x) for x in (roh.get("ignored_channels") or []) if x]
+    e["ignored_roles"] = [str(x) for x in (roh.get("ignored_roles") or []) if x]
+    e["role_rewards"] = [dict(r) for r in e["role_rewards"]]
+    return e
+
+
+def _level_xp_noetig(level: int, basis: int, steigerung: float) -> int:
+    """XP, um VON ``level`` auf ``level + 1`` zu kommen (Kurve aus dem Dashboard)."""
+    return max(1, int(round(float(basis) * (1.0 + float(steigerung) / 100.0) ** (max(1, int(level)) - 1))))
+
+
+def _level_aus_xp(xp: int, basis: int, steigerung: float) -> Tuple[int, int, int]:
+    """(Level, XP innerhalb des Levels, XP bis zum naechsten Level)."""
+    level, rest = 1, max(0, int(xp))
+    while level < _LEVEL_MAX:
+        noetig = _level_xp_noetig(level, basis, steigerung)
+        if rest < noetig:
+            return level, rest, noetig
+        rest -= noetig
+        level += 1
+    return _LEVEL_MAX, rest, _level_xp_noetig(_LEVEL_MAX, basis, steigerung)
+
+
+def _level_gesamt_xp(level: int, basis: int, steigerung: float) -> int:
+    """Gesamt-XP, mit denen ``level`` gerade erreicht ist."""
+    return sum(_level_xp_noetig(stufe, basis, steigerung) for stufe in range(1, max(1, int(level))))
+
+
+def _level_conn_fuer_guild(guild_id: Optional[int]) -> Optional["ServerConnection"]:
+    """Erster Mandant dieser Guild mit aktiviertem Level-System, sonst None."""
+    if not guild_id:
+        return None
+    try:
+        konten = connections.all_for_guild(int(guild_id))
+    except Exception as e:  # noqa: BLE001
+        log.debug(f"[LEVEL] all_for_guild: {e}")
+        return None
+    for conn in konten:
+        if _level_einstellungen(conn)["enabled"]:
+            return conn
+    return None
+
+
+def _level_balken(xp_im_level: int, noetig: int) -> Tuple[str, int]:
+    """Fortschrittsbalken aus 20 Segmenten + Prozent (fuer das /level-Embed)."""
+    anteil = min(1.0, max(0.0, xp_im_level / noetig)) if noetig > 0 else 1.0
+    voll = int(round(anteil * _LEVEL_BALKEN_SEGMENTE))
+    return "█" * voll + "░" * (_LEVEL_BALKEN_SEGMENTE - voll), int(anteil * 100)
+
+
+def _level_farbe(level: int) -> int:
+    if level >= 50:
+        return 0xF1C40F   # Gold
+    if level >= 30:
+        return 0x9B59B6   # Lila
+    if level >= 15:
+        return 0x3498DB   # Blau
+    if level >= 5:
+        return 0x2ECC71   # Gruen
+    return 0x95A5A6       # Grau
+
+
+def _level_embed(member: Any, daten: Dict[str, Any], rang: int, teilnehmer: int,
+                 e: Dict[str, Any], sprache: str) -> discord.Embed:
+    level, im_level, noetig = _level_aus_xp(daten["xp"], e["xp_basis"], e["steigerung"])
+    balken, prozent = _level_balken(im_level, noetig)
+    name = getattr(member, "display_name", None) or str(member)
+    en = sprache == "en"
+    embed = discord.Embed(title=f"🏆 Level {level}", colour=_level_farbe(level),
+                          description=(f"{_BRIGARDE_EMOJI} **{name}**"))
+    embed.add_field(name="🥇 " + ("Rank" if en else "Rang"), value=f"#{rang} / {teilnehmer}", inline=True)
+    embed.add_field(name="✨ XP", value=f"{im_level:,} / {noetig:,}".replace(",", "."), inline=True)
+    embed.add_field(name="💬 " + ("Messages" if en else "Nachrichten"), value=f"{daten['messages']:,}".replace(",", "."), inline=True)
+    embed.add_field(name=("Progress to level" if en else "Fortschritt zu Level") + f" {min(level + 1, _LEVEL_MAX)}",
+                    value=f"`{balken}` **{prozent} %**", inline=False)
+    embed.set_footer(text=(f"Total XP: {daten['xp']:,}" if en else f"Gesamt-XP: {daten['xp']:,}").replace(",", "."))
+    avatar = getattr(member, "display_avatar", None)
+    if avatar is not None and getattr(avatar, "url", None):
+        embed.set_thumbnail(url=avatar.url)
+    return embed
+
+
+def _level_aufstieg_embed(member: Any, level: int, sprache: str,
+                          rollen_namen: List[str]) -> discord.Embed:
+    name = getattr(member, "display_name", None) or str(member)
+    erwaehnung = getattr(member, "mention", None) or f"@{name}"
+    if sprache == "en":
+        titel = f"🎉 Level up! {name} reached level {level}"
+        text = f"Congratulations {erwaehnung}, you are now **level {level}**!"
+        rollen_text = "🎁 New role: " if len(rollen_namen) == 1 else "🎁 New roles: "
+    else:
+        titel = f"🎉 Level-Aufstieg! {name} hat Level {level} erreicht"
+        text = f"Glückwunsch {erwaehnung}, du bist jetzt **Level {level}**!"
+        rollen_text = "🎁 Neue Rolle: " if len(rollen_namen) == 1 else "🎁 Neue Rollen: "
+    if rollen_namen:
+        text += "\n" + rollen_text + ", ".join(f"**{r}**" for r in rollen_namen)
+    embed = discord.Embed(title=titel, description=text, colour=_level_farbe(level))
+    avatar = getattr(member, "display_avatar", None)
+    if avatar is not None and getattr(avatar, "url", None):
+        embed.set_thumbnail(url=avatar.url)
+    return embed
+
+
+async def _level_rollen_anwenden(guild: Any, member: Any, level: int, e: Dict[str, Any]) -> List[str]:
+    """Level-Rollen gemaess role_rewards setzen. stack_roles an: alle erreichten
+    Rollen bleiben; aus: nur die hoechste erreichte, niedrigere werden entfernt.
+    Gibt die Namen der NEU vergebenen Rollen zurueck. Fehler nur loggen."""
+    if guild is None or member is None:
+        return []
+    belohnungen = [(int(r["level"]), str(r["role_id"])) for r in e["role_rewards"]]
+    erreicht = [rid for lv, rid in belohnungen if lv <= level]
+    behalten = set(erreicht) if e["stack_roles"] else ({erreicht[-1]} if erreicht else set())
+    entfernen = {rid for _lv, rid in belohnungen} - behalten
+    vorhandene = {str(r.id) for r in (getattr(member, "roles", None) or [])}
+    neu: List[str] = []
+    for rid in [r for r in erreicht if r in behalten and r not in vorhandene]:
+        rolle = guild.get_role(int(rid))
+        if rolle is None:
+            continue
+        try:
+            await member.add_roles(rolle, reason="Level-System")
+            neu.append(getattr(rolle, "name", str(rid)))
+        except Exception as exc:  # noqa: BLE001 – Hierarchie/Rechte: nie den Bot stoeren
+            log.debug(f"[LEVEL] add_roles {rid} fehlgeschlagen: {exc}")
+    for rid in entfernen & vorhandene:
+        rolle = guild.get_role(int(rid))
+        if rolle is None:
+            continue
+        try:
+            await member.remove_roles(rolle, reason="Level-System")
+        except Exception as exc:  # noqa: BLE001
+            log.debug(f"[LEVEL] remove_roles {rid} fehlgeschlagen: {exc}")
+    return neu
+
+
+async def _level_aufstieg(guild: Any, member: Any, kanal: Any, level: int, e: Dict[str, Any]) -> None:
+    rollen_namen = await _level_rollen_anwenden(guild, member, level, e)
+    if not e["announce"]:
+        return
+    ziel = None
+    if e["announce_channel_id"]:
+        try:
+            ziel = bot.get_channel(int(e["announce_channel_id"])) if bot else None
+        except Exception:  # noqa: BLE001
+            ziel = None
+    ziel = ziel or kanal
+    if ziel is None:
+        return
+    try:
+        # Erwaehnung im Nachrichtentext pingt wirklich – im Embed allein nicht.
+        await ziel.send(content=getattr(member, "mention", None),
+                        embed=_level_aufstieg_embed(member, level, e["language"], rollen_namen))
+    except Exception as exc:  # noqa: BLE001
+        log.debug(f"[LEVEL] Aufstieg posten fehlgeschlagen: {exc}")
+
+
+async def _level_nachricht_verarbeiten(message: Any) -> None:
+    """Kern von DayZBot.on_message: Abklingzeit, Ausnahmen, XP, Aufstieg."""
+    autor = getattr(message, "author", None)
+    guild = getattr(message, "guild", None)
+    if guild is None or autor is None or getattr(autor, "bot", False):
+        return
+    conn = _level_conn_fuer_guild(getattr(guild, "id", None))
+    if conn is None:
+        return
+    e = _level_einstellungen(conn)
+    kanal = getattr(message, "channel", None)
+    kanal_ids = {str(getattr(kanal, "id", "") or ""),
+                 str(getattr(getattr(kanal, "parent", None), "id", "") or "")}  # Threads: Elternkanal
+    if kanal_ids & set(e["ignored_channels"]):
+        return
+    if {str(r.id) for r in (getattr(autor, "roles", None) or [])} & set(e["ignored_roles"]):
+        return
+    jetzt = time.time()
+    vorher = db.level_get(guild.id, autor.id)
+    if vorher["last_xp_at"] and jetzt - vorher["last_xp_at"] < e["cooldown"]:
+        return
+    gewinn = random.randint(min(e["xp_min"], e["xp_max"]), max(e["xp_min"], e["xp_max"]))
+    level_vorher = _level_aus_xp(vorher["xp"], e["xp_basis"], e["steigerung"])[0]
+    xp_neu = db.level_add_xp(guild.id, autor.id, gewinn, jetzt)
+    level_neu = _level_aus_xp(xp_neu, e["xp_basis"], e["steigerung"])[0]
+    if level_neu != vorher["level"]:
+        db.level_set_level(guild.id, autor.id, level_neu)
+    if level_neu > level_vorher:
+        await _level_aufstieg(guild, autor, kanal, level_neu, e)
+
+
+# ── Befehle ───────────────────────────────────────────────────
+async def _level_befehl_vorbereiten(interaction: discord.Interaction
+                                    ) -> Tuple[Optional["ServerConnection"], Optional[Dict[str, Any]]]:
+    if not await _require_guild(interaction):
+        return None, None
+    conn = _level_conn_fuer_guild(interaction.guild_id)
+    if conn is None:
+        await interaction.response.send_message(_t(
+            interaction, "❌ Das Level-System ist auf diesem Server nicht aktiviert "
+                         "(Dashboard → Discord Management → Level-System).",
+            "❌ The level system is not enabled on this server "
+            "(Dashboard → Discord Management → Level System)."), ephemeral=True)
+        return None, None
+    return conn, _level_einstellungen(conn)
+
+
+@bot.tree.command(name="level", description=app_commands.locale_str("🏆 Zeigt dein Level, deine XP und den Fortschritt"))
+@app_commands.describe(user="Anderes Mitglied (optional – leer = du selbst)")
+async def cmd_level(interaction: discord.Interaction, user: Optional[discord.Member] = None):
+    conn, e = await _level_befehl_vorbereiten(interaction)
+    if conn is None:
+        return
+    ziel = user or interaction.user
+    daten = db.level_get(interaction.guild_id, ziel.id)
+    rang, teilnehmer = db.level_rank(interaction.guild_id, ziel.id)
+    embed = _level_embed(ziel, daten, rang, max(teilnehmer, 1), e, _sprache(interaction))
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="levelrangliste", description=app_commands.locale_str("🏆 Zeigt die Top 10 des Level-Systems"))
+async def cmd_levelrangliste(interaction: discord.Interaction):
+    conn, e = await _level_befehl_vorbereiten(interaction)
+    if conn is None:
+        return
+    top = db.level_top(interaction.guild_id, 10)
+    if not top:
+        return await interaction.response.send_message(_t(
+            interaction, "Noch niemand hat XP gesammelt.", "Nobody has earned XP yet."), ephemeral=True)
+    medaillen = ("🥇", "🥈", "🥉")
+    zeilen = []
+    for platz, row in enumerate(top, start=1):
+        member = interaction.guild.get_member(row["user_id"]) if interaction.guild else None
+        name = member.mention if member is not None else f"<@{row['user_id']}>"
+        level = _level_aus_xp(row["xp"], e["xp_basis"], e["steigerung"])[0]
+        xp = f"{row['xp']:,}".replace(",", ".")
+        kennung = medaillen[platz - 1] if platz <= 3 else f"**{platz}.**"
+        zeilen.append(f"{kennung} {name} — Level **{level}** · {xp} XP")
+    embed = discord.Embed(
+        title=_t(interaction, "🏆 Level-Rangliste", "🏆 Level Leaderboard"),
+        description="\n".join(zeilen), colour=0xF1C40F)
+    embed.set_footer(text=_t(interaction, f"{db.level_count(interaction.guild_id)} Teilnehmer",
+                             f"{db.level_count(interaction.guild_id)} participants"))
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="levelset", description=app_commands.locale_str("🛠️ Setzt die XP eines Nutzers (Admin)"))
+@app_commands.describe(user="Mitglied", xp="Neue Gesamt-XP (0 oder mehr)")
+async def cmd_levelset(interaction: discord.Interaction, user: discord.Member, xp: int):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "levelset")):
+        return await _deny_subcmd(interaction)
+    conn, e = await _level_befehl_vorbereiten(interaction)
+    if conn is None:
+        return
+    if xp < 0 or xp > 10_000_000:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ XP müssen zwischen 0 und 10.000.000 liegen.",
+            "❌ XP must be between 0 and 10,000,000."), ephemeral=True)
+    level = _level_aus_xp(xp, e["xp_basis"], e["steigerung"])[0]
+    db.level_set(interaction.guild_id, user.id, xp, level)
+    await _level_rollen_anwenden(interaction.guild, user, level, e)
+    name = getattr(user, "display_name", None) or str(user)
+    await interaction.response.send_message(_t(
+        interaction, f"✅ {name} hat jetzt **{xp:,} XP** (Level {level}).".replace(",", "."),
+        f"✅ {name} now has **{xp:,} XP** (level {level})."), ephemeral=True)
+
+
+@bot.tree.command(name="levelreset", description=app_commands.locale_str("🛠️ Setzt Level und XP eines Nutzers zurück (Admin)"))
+@app_commands.describe(user="Mitglied")
+async def cmd_levelreset(interaction: discord.Interaction, user: discord.Member):
+    if not (_is_admin(interaction) or _subcmd_allowed(interaction, "levelreset")):
+        return await _deny_subcmd(interaction)
+    conn, e = await _level_befehl_vorbereiten(interaction)
+    if conn is None:
+        return
+    db.level_reset(interaction.guild_id, user.id)
+    await _level_rollen_anwenden(interaction.guild, user, 1, e)
+    name = getattr(user, "display_name", None) or str(user)
+    await interaction.response.send_message(_t(
+        interaction, f"✅ Level und XP von {name} wurden zurückgesetzt.",
+        f"✅ Level and XP of {name} have been reset."), ephemeral=True)
+
+
+# ── Dashboard-API ─────────────────────────────────────────────
+def _rolle_gehoert_guild(gid: int, rollen_id: int, feld: str = "Rolle") -> Optional[web.Response]:
+    """Wie _kanal_gehoert_guild, nur fuer Rollen."""
+    g = bot.get_guild(int(gid)) if bot else None
+    if g is None:
+        if bot is None or not getattr(bot, "is_ready", lambda: False)():
+            return err(f"Der Bot ist gerade nicht bei Discord angemeldet – die "
+                       f"{feld}-ID lässt sich erst prüfen, wenn er wieder verbunden ist.", 409)
+        return err(f"Der Bot erreicht diesen Discord-Server nicht – die {feld}-ID "
+                   f"kann deshalb nicht geprüft werden. Ist der Bot dort eingeladen?", 409)
+    if g.get_role(int(rollen_id)) is None:
+        return err(f"Diese {feld}-ID gibt es in dem gewählten Discord-Server nicht.")
+    return None
+
+
+def _level_payload(conn: "ServerConnection") -> Dict[str, Any]:
+    e = _level_einstellungen(conn)
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    try:
+        e["teilnehmer"] = db.level_count(gid) if gid else 0
+    except Exception:  # noqa: BLE001
+        e["teilnehmer"] = 0
+    return e
+
+
+async def get_discord_mgmt_level(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request, "discord_mgmt")
+    if denied is not None:
+        return denied
+    denied = await _modul_pruefen("discord_mgmt", request, conn)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "discord_mgmt", "view")
+    if denied is not None:
+        return denied
+    return ok(_level_payload(conn))
+
+
+def _level_ganzzahl(data: Dict[str, Any], key: str, lo: int, hi: int) -> int:
+    wert = data.get(key, _LEVEL_VORGABEN[key])
+    if isinstance(wert, bool) or not isinstance(wert, (int, float, str)):
+        raise ValueError(f"{key} muss eine ganze Zahl sein.")
+    try:
+        zahl = int(float(wert))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{key} muss eine ganze Zahl sein.") from exc
+    if not lo <= zahl <= hi:
+        # Wortlaut passt zum Übersetzungsmuster „…: Wert muss zwischen … und … liegen.“ in app.js
+        raise ValueError(f"{key}: Wert muss zwischen {lo} und {hi} liegen.")
+    return zahl
+
+
+async def post_discord_mgmt_level(request: web.Request) -> web.Response:
+    conn, denied = _session_conn(request, "discord_mgmt")
+    if denied is not None:
+        return denied
+    denied = await _modul_pruefen("discord_mgmt", request, conn)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, conn, "discord_mgmt", "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.level_system", 3)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    if not isinstance(data, dict):
+        return err("Ungültige Anfrage.")
+    try:
+        xp_min = _level_ganzzahl(data, "xp_min", 1, 1000)
+        xp_max = _level_ganzzahl(data, "xp_max", 1, 1000)
+        cooldown = _level_ganzzahl(data, "cooldown", 0, 3600)
+        xp_basis = _level_ganzzahl(data, "xp_basis", 10, 100000)
+        steigerung = _level_ganzzahl(data, "steigerung", 0, 100)
+    except ValueError as exc:
+        return err(str(exc))
+    if xp_max < xp_min:
+        return err("XP je Nachricht: Maximum darf nicht kleiner als Minimum sein.")
+    sprache = str(data.get("language") or "de").strip().lower()
+    if sprache not in _DISCORD_MGMT_SPRACHEN:
+        return err("Unbekannte Sprache.")
+    enabled = bool(data.get("enabled", False))
+    gid = int(conn.guild_id) if conn.guild_id else 0
+
+    def _id(wert: Any) -> Optional[int]:
+        if wert in (None, "", "0"):
+            return None
+        try:
+            return int(wert)
+        except (TypeError, ValueError):
+            return -1
+    kanal_id = _id(data.get("announce_channel_id"))
+    if kanal_id == -1:
+        return err("Ungültige Channel-ID.")
+    rollen_roh = data.get("role_rewards") or []
+    ignorierte_kanaele = [_id(x) for x in (data.get("ignored_channels") or [])]
+    ignorierte_rollen = [_id(x) for x in (data.get("ignored_roles") or [])]
+    if not isinstance(rollen_roh, list) or any(x in (None, -1) for x in ignorierte_kanaele + ignorierte_rollen):
+        return err("Ungültige Channel- oder Rollen-ID.")
+    if len(rollen_roh) > _LEVEL_ROLLEN_MAX:
+        return err(f"Höchstens {_LEVEL_ROLLEN_MAX} Rollen-Belohnungen.")
+    rollen: List[Dict[str, Any]] = []
+    for eintrag in rollen_roh:
+        if not isinstance(eintrag, dict):
+            return err("Ungültige Rollen-Belohnung.")
+        try:
+            level = int(eintrag.get("level"))
+        except (TypeError, ValueError):
+            return err("Level einer Rollen-Belohnung muss eine ganze Zahl sein.")
+        rid = _id(eintrag.get("role_id"))
+        if not 1 <= level <= _LEVEL_MAX or rid in (None, -1):
+            return err(f"Rollen-Belohnung: Level 1–{_LEVEL_MAX} und eine Rolle wählen.")
+        if any(r["level"] == level for r in rollen):
+            return err(f"Für Level {level} ist schon eine Rolle hinterlegt.")
+        rollen.append({"level": level, "role_id": str(rid)})
+    braucht_guild = enabled or kanal_id or rollen or ignorierte_kanaele or ignorierte_rollen
+    if braucht_guild and not gid:
+        return err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
+    for kid in ([kanal_id] if kanal_id else []) + ignorierte_kanaele:
+        fehler = _kanal_gehoert_guild(gid, kid)
+        if fehler is not None:
+            return fehler
+    for rid in [int(r["role_id"]) for r in rollen] + ignorierte_rollen:
+        fehler = _rolle_gehoert_guild(gid, rid)
+        if fehler is not None:
+            return fehler
+    _conn_store(conn, "level_system", {
+        "enabled": enabled, "language": sprache,
+        "xp_min": xp_min, "xp_max": xp_max, "cooldown": cooldown,
+        "xp_basis": xp_basis, "steigerung": steigerung,
+        "announce": bool(data.get("announce", True)),
+        "announce_channel_id": str(kanal_id) if kanal_id else None,
+        "role_rewards": sorted(rollen, key=lambda r: r["level"]),
+        "stack_roles": bool(data.get("stack_roles", True)),
+        "ignored_channels": [str(x) for x in ignorierte_kanaele],
+        "ignored_roles": [str(x) for x in ignorierte_rollen],
+    })
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+              "Discord-Management aktualisiert", f"level_system · {conn.name}")
+    return ok(_level_payload(conn))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -40498,6 +41082,8 @@ def build_app() -> web.Application:
     # ── Discord Management ──
     r.add_get("/api/discord-management", get_discord_mgmt)
     r.add_post("/api/discord-management/welcome", post_discord_mgmt_welcome)
+    r.add_get("/api/discord-management/level", get_discord_mgmt_level)
+    r.add_post("/api/discord-management/level", post_discord_mgmt_level)
     r.add_post("/api/discord-management/leave", post_discord_mgmt_leave)
     r.add_get("/api/discord-management/reaction-roles", get_reaction_roles)
     r.add_post("/api/discord-management/reaction-roles", post_reaction_roles)
@@ -41353,6 +41939,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "4659b64843dc4a42edc6ef15cf8455e615e73c16b664b2b885d070e14f5f3a84",
         "9b49059c7d07ff813dc2f4a608c97cb1b37eeab268fbabea1f229c0c0eb2d343",
         "53b81efd3268dfb73f5623e75142f10673d4bcf9fc055fe4c4a6d7a5d496f76d",
         "88469e8676cbd89957ab39dfcd321191f18b924cd8491c756660d357503282b4",

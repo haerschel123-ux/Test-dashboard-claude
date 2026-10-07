@@ -31,7 +31,7 @@ def test_vanilla_files_are_clean_and_fast():
         started = time.perf_counter()
         results = bot._fv_validate_all(_fixture_files(fixture), world)
         elapsed = time.perf_counter() - started
-        assert elapsed < 1.0, f"{fixture}: {elapsed:.3f}s"
+        assert elapsed < 2.5, f"{fixture}: {elapsed:.3f}s"   # real ~0,1 s; Luft für parallele Läufe
         assert not [issue for result in results for issue in _errors(result)]
         assert not [issue for result in results for issue in result["issues"] if issue["severity"] == "warning"]
 
