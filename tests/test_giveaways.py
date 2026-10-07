@@ -315,7 +315,7 @@ def test_teilnehmen_fuegt_user_hinzu_und_aktualisiert_embed():
     view = bot_mod.GiveawayEntryView(conn.service_id, 1)
     kanal = _StubChannel()
     nachricht = _StubMessage(1000)
-    interaction = _StubInteraction(_StubMember(42), kanal)
+    interaction = _StubInteraction(_StubMember(42), kanal, guild_id=conn.guild_id)
     interaction.message = nachricht
     _run(view._teilnehmen(interaction))
     assert eintrag["entrants"] == [42]
@@ -330,7 +330,7 @@ def test_teilnehmen_doppelt_wird_ignoriert():
               "required_role_id": None, "entrants": [42], "winners": [], "status": "running"}
     conn.data["giveaways"] = [eintrag]
     view = bot_mod.GiveawayEntryView(conn.service_id, 1)
-    interaction = _StubInteraction(_StubMember(42), _StubChannel())
+    interaction = _StubInteraction(_StubMember(42), _StubChannel(), guild_id=conn.guild_id)
     interaction.message = _StubMessage(1000)
     _run(view._teilnehmen(interaction))
     assert eintrag["entrants"] == [42]
@@ -344,7 +344,7 @@ def test_teilnehmen_ohne_pflichtrolle_lehnt_ab():
               "required_role_id": 999, "entrants": [], "winners": [], "status": "running"}
     conn.data["giveaways"] = [eintrag]
     view = bot_mod.GiveawayEntryView(conn.service_id, 1)
-    interaction = _StubInteraction(_StubMember(42, roles=[]), _StubChannel())
+    interaction = _StubInteraction(_StubMember(42, roles=[]), _StubChannel(), guild_id=conn.guild_id)
     interaction.message = _StubMessage(1000)
     _run(view._teilnehmen(interaction))
     assert eintrag["entrants"] == []
@@ -360,7 +360,7 @@ def test_teilnehmen_mit_pflichtrolle_erlaubt(monkeypatch):
     view = bot_mod.GiveawayEntryView(conn.service_id, 1)
     rolle = type("R", (), {"id": 999})()
     monkeypatch.setattr(discord, "Member", _StubMember)  # isinstance-Pruefung im Callback
-    interaction = _StubInteraction(_StubMember(42, roles=[rolle]), _StubChannel())
+    interaction = _StubInteraction(_StubMember(42, roles=[rolle]), _StubChannel(), guild_id=conn.guild_id)
     interaction.message = _StubMessage(1000)
     _run(view._teilnehmen(interaction))
     assert eintrag["entrants"] == [42]

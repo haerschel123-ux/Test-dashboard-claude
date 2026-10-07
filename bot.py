@@ -4409,6 +4409,9 @@ _GUILD_SCHLUESSEL_GRUPPEN: Tuple[Tuple[str, ...], ...] = (
     ("welcome_message",), ("leave_message",), ("reaction_roles",),
     ("ticket_categories", "ticket_open", "ticket_language", "ticket_transcript_channel"),
     ("level_system",), ("honeypot",),
+    ("giveaways", "giveaway_farbe", "giveaway_required_role_id"),
+    ("ban_immune_role_ids",), ("link_add_role_ids", "link_remove_role_ids"),
+    ("log_ban_temp_channel_id", "log_ban_perm_channel_id", "log_unban_channel_id"),
 )
 _GUILD_SCHLUESSEL = frozenset(k for gruppe in _GUILD_SCHLUESSEL_GRUPPEN for k in gruppe)
 
@@ -5249,9 +5252,11 @@ class DayZBot(discord.Client):
             for _c in connections.all():
                 if not _c.service_id:
                     continue
-                for _g in _giveaways(_c):
-                    if isinstance(_g, dict) and _g.get("status") == "running" and _g.get("id"):
-                        self.add_view(GiveawayEntryView(_c.service_id, int(_g["id"])))
+                for _gid in (_c.guild_ids or [None]):
+                    _s = guild_sicht(_c, _gid) if _gid else _c
+                    for _g in _giveaways(_s or _c):
+                        if isinstance(_g, dict) and _g.get("status") == "running" and _g.get("id"):
+                            self.add_view(GiveawayEntryView(_c.service_id, int(_g["id"])))
         except Exception as e:
             log.error(f"[BOT] Persistente Gewinnspiel-Views konnten nicht registriert werden: {e}")
 
@@ -7245,11 +7250,13 @@ class DayZBot(discord.Client):
             _audit_add("system", conn.name, "Temp-Ban aufgehoben", ", ".join(faellig))
 
     async def _giveaways_once(self):
-        for conn in connections.all():
-            try:
-                await self._giveaways_conn(conn)
-            except Exception as e:  # noqa: BLE001 – ein Server darf die anderen nicht stoppen
-                log.error(f"[GEWINNSPIELE] {conn.name}: {e}")
+        for basis in connections.all():
+            # Je Guild eigene Gewinnspiele (GuildSicht); ohne Guild der Server selbst.
+            for conn in ([GuildSicht(basis, g) for g in basis.guild_ids] or [basis]):
+                try:
+                    await self._giveaways_conn(conn)
+                except Exception as e:  # noqa: BLE001 – ein Server darf die anderen nicht stoppen
+                    log.error(f"[GEWINNSPIELE] {conn.name}: {e}")
 
     async def _giveaways_conn(self, conn: ServerConnection):
         jetzt = time.time()
@@ -8452,6 +8459,16 @@ def _conns_sicht(interaction: discord.Interaction) -> List[Any]:
         if sicht is not None:
             out.append(sicht)
     return out
+
+
+def _conn_waehlen_guild(interaction: discord.Interaction, server: Optional[str] = None
+                        ) -> Tuple[Optional[Any], Optional[str]]:
+    """Wie _conn_waehlen, aber als GuildSicht auf die Guild der Interaktion –
+    fuer Gewinnspiele und andere je Guild gespeicherte Daten."""
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is not None and interaction.guild_id is not None:
+        conn = guild_sicht(conn, interaction.guild_id) or conn
+    return conn, fehler
 
 
 def _conn_waehlen(interaction: discord.Interaction, server: Optional[str] = None
@@ -10100,11 +10117,12 @@ def _zone_ereignis_erlaubt(zone: Dict, key: str, pname: str, ev: Optional[Dict])
 async def _spieler_ban_immun(conn: ServerConnection, pname: str) -> bool:
     """Ban-Immunitaet: der Spieler ist in einer Guild dieses Servers mit einem
     Discord-Konto verknuepft, das eine der ``ban_immune_role_ids`` traegt."""
-    daten = getattr(conn, "data", None)
-    rollen = daten.get("ban_immune_role_ids") if isinstance(daten, dict) else None
-    if not isinstance(rollen, list) or not rollen:
-        return False
-    for gid in conn.guild_ids:
+    basis = conn.basis if isinstance(conn, GuildSicht) else conn
+    for gid in basis.guild_ids:
+        # Rollen-IDs gelten nur in ihrer Guild – je Guild deren eigene Liste.
+        rollen = GuildSicht(basis, gid).get("ban_immune_role_ids")
+        if not isinstance(rollen, list) or not rollen:
+            continue
         try:
             rows = db.links_for_name(pname, int(gid))
         except Exception:  # noqa: BLE001
@@ -10135,8 +10153,11 @@ async def _ban_log_senden(conn: ServerConnection, art: str, namen: List[str], gr
     Versandfehler darf den Ban selbst nie scheitern lassen."""
     try:
         key = _BAN_LOG_KANAL[art]
-        kanal = conn.data.get(key) if hasattr(conn, "data") else None
-        if not kanal or not namen:
+        basis = conn.basis if isinstance(conn, GuildSicht) else conn
+        # Je Guild deren eigener Log-Channel (Channel-IDs gelten nur dort).
+        ziele = [(gid, GuildSicht(basis, gid).get(key)) for gid in getattr(basis, "guild_ids", [])]
+        ziele = [(gid, k) for gid, k in ziele if k]
+        if not ziele or not namen:
             return False
         if art == "temp":
             titel, farbe = "🔨 Zeitlicher Ban", 0xE67E22
@@ -10157,12 +10178,12 @@ async def _ban_log_senden(conn: ServerConnection, art: str, namen: List[str], gr
             e.add_field(name="Endet", value=f"<t:{int(expires_at)}:R>", inline=True)
         e.set_footer(text=f"{conn.name} · Änderung greift ggf. erst nach einem Server-Neustart.")
         e.timestamp = datetime.now(timezone.utc)
-        gid = int(conn.guild_id) if getattr(conn, "guild_ids", None) else None
-        if gid is None:
-            return False
-        geschickt, _grund = await _post_feed(gid, "adminlog", e, channel_id=int(kanal),
-                                             service_id=conn.service_id)
-        return bool(geschickt)
+        irgendwo = False
+        for gid, kanal in ziele:
+            geschickt, _grund = await _post_feed(int(gid), "adminlog", e, channel_id=int(kanal),
+                                                 service_id=conn.service_id)
+            irgendwo = irgendwo or bool(geschickt)
+        return irgendwo
     except Exception as exc:  # noqa: BLE001 – Logging darf den Ban nie blockieren
         log.warning(f"[BAN-LOG] {getattr(conn, 'name', '?')}: {exc}")
         return False
@@ -24621,7 +24642,7 @@ class GiveawayCreateModal(discord.ui.Modal):
             return await interaction.response.send_message(_t(
                 interaction, "❌ Die Anzahl der Sieger muss mindestens 1 sein.",
                 "❌ The number of winners must be at least 1."), ephemeral=True)
-        conn = connections.for_service(self.service_id)
+        conn = guild_sicht(connections.for_service(self.service_id), interaction.guild_id)
         if conn is None:
             return await interaction.response.send_message(_t(
                 interaction, "❌ Dieser Server ist nicht mehr verfügbar.",
@@ -24706,7 +24727,8 @@ class GiveawayEntryView(discord.ui.View):
         self.add_item(knopf)
 
     async def _teilnehmen(self, interaction: discord.Interaction):
-        conn = connections.for_service(self.service_id) if self.service_id else None
+        conn = guild_sicht(connections.for_service(self.service_id), interaction.guild_id) \
+            if self.service_id else None
         eintrag = _giveaway_finden(conn, self.giveaway_id) if conn is not None else None
         if conn is None or eintrag is None:
             return await interaction.response.send_message(_t(
@@ -24752,7 +24774,7 @@ async def gsettings_set(interaction: discord.Interaction, color: Optional[str] =
                         server: Optional[str] = None):
     if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gsettings_set")):
         return await _deny_subcmd(interaction)
-    conn, fehler = _conn_waehlen(interaction, server)
+    conn, fehler = _conn_waehlen_guild(interaction, server)
     if conn is None:
         return await interaction.response.send_message(fehler, ephemeral=True)
     if color:
@@ -24782,7 +24804,7 @@ async def gsettings_set(interaction: discord.Interaction, color: Optional[str] =
 async def cmd_gcreate(interaction: discord.Interaction, server: Optional[str] = None):
     if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gcreate")):
         return await _deny_subcmd(interaction)
-    conn, fehler = _conn_waehlen(interaction, server)
+    conn, fehler = _conn_waehlen_guild(interaction, server)
     if conn is None:
         return await interaction.response.send_message(fehler, ephemeral=True)
     await interaction.response.send_modal(GiveawayCreateModal(conn.service_id, _sprache(interaction)))
@@ -24801,7 +24823,7 @@ async def cmd_gstart(interaction: discord.Interaction, duration: str,
                      description: Optional[str] = None, server: Optional[str] = None):
     if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gstart")):
         return await _deny_subcmd(interaction)
-    conn, fehler = _conn_waehlen(interaction, server)
+    conn, fehler = _conn_waehlen_guild(interaction, server)
     if conn is None:
         return await interaction.response.send_message(fehler, ephemeral=True)
     dauer_s = _dauer_parsen(duration)
@@ -24819,7 +24841,7 @@ async def cmd_gstart(interaction: discord.Interaction, duration: str,
 async def cmd_glist(interaction: discord.Interaction, server: Optional[str] = None):
     if not (_is_admin(interaction) or _subcmd_allowed(interaction, "glist")):
         return await _deny_subcmd(interaction)
-    conn, fehler = _conn_waehlen(interaction, server)
+    conn, fehler = _conn_waehlen_guild(interaction, server)
     if conn is None:
         return await interaction.response.send_message(fehler, ephemeral=True)
     laufend = [g for g in _giveaways(conn) if isinstance(g, dict) and g.get("status") == "running"]
@@ -24847,7 +24869,7 @@ async def cmd_glist(interaction: discord.Interaction, server: Optional[str] = No
 async def cmd_gdelete(interaction: discord.Interaction, giveaway_id: int, server: Optional[str] = None):
     if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gdelete")):
         return await _deny_subcmd(interaction)
-    conn, fehler = _conn_waehlen(interaction, server)
+    conn, fehler = _conn_waehlen_guild(interaction, server)
     if conn is None:
         return await interaction.response.send_message(fehler, ephemeral=True)
     eintraege = _giveaways(conn)
@@ -24879,7 +24901,7 @@ async def cmd_greroll(interaction: discord.Interaction, giveaway_id: int,
                       count: app_commands.Range[int, 1] = 1, server: Optional[str] = None):
     if not (_is_admin(interaction) or _subcmd_allowed(interaction, "greroll")):
         return await _deny_subcmd(interaction)
-    conn, fehler = _conn_waehlen(interaction, server)
+    conn, fehler = _conn_waehlen_guild(interaction, server)
     if conn is None:
         return await interaction.response.send_message(fehler, ephemeral=True)
     eintrag = _giveaway_finden(conn, giveaway_id)
@@ -24913,7 +24935,7 @@ async def cmd_greroll(interaction: discord.Interaction, giveaway_id: int,
 async def cmd_gend(interaction: discord.Interaction, giveaway_id: int, server: Optional[str] = None):
     if not (_is_admin(interaction) or _subcmd_allowed(interaction, "gend")):
         return await _deny_subcmd(interaction)
-    conn, fehler = _conn_waehlen(interaction, server)
+    conn, fehler = _conn_waehlen_guild(interaction, server)
     if conn is None:
         return await interaction.response.send_message(fehler, ephemeral=True)
     eintrag = _giveaway_finden(conn, giveaway_id)
@@ -26701,8 +26723,9 @@ async def _link_hooks_anwenden(conn: Optional[ServerConnection], guild_id: int, 
     daten = getattr(conn, "data", None)
     if not isinstance(daten, dict):
         return ""
-    add_ids = [str(r) for r in (daten.get("link_add_role_ids") or [])]
-    remove_ids = [str(r) for r in (daten.get("link_remove_role_ids") or [])]
+    conn = guild_sicht(conn, guild_id) or conn   # Rollen-IDs dieser Guild
+    add_ids = [str(r) for r in (conn.get("link_add_role_ids") or [])]
+    remove_ids = [str(r) for r in (conn.get("link_remove_role_ids") or [])]
     set_nick = bool(conn.get("link_set_nickname", False))
     if not (add_ids or remove_ids or set_nick):
         return ""
@@ -39957,7 +39980,7 @@ def _general_payload(conn: ServerConnection) -> Dict[str, Any]:
     for schluessel in _GENERAL_KARTEN_SCHLUESSEL.values():
         for key in schluessel:
             if key in _GENERAL_ROLLENLISTEN or key == "location_privacy_names":
-                wert = conn.data.get(key)
+                wert = conn.get(key)
                 out[key] = [str(v) for v in wert] if isinstance(wert, list) else []
             else:
                 out[key] = conn.get(key)
@@ -40067,6 +40090,7 @@ async def api_server_general_get(request: web.Request) -> web.Response:
     denied = await _dash_gate(request, conn, "server", "view")
     if denied is not None:
         return denied
+    conn = _mgmt_sicht(request, conn)   # Rollen/Log-Channels je gewaehlter Guild
     return ok({"general": _general_payload(conn),
                "andere_server": _general_andere_server(conn),
                "heatmap_typen": [{"key": k, "label_de": de, "label_en": en, "emoji": em}
@@ -40084,6 +40108,7 @@ async def api_server_general_set(request: web.Request) -> web.Response:
     denied = _dash_rate_limited(request, "server.general", 5)
     if denied is not None:
         return denied
+    conn = _mgmt_sicht(request, conn)   # Rollen/Log-Channels je gewaehlter Guild
     data = await body(request)
     erlaubt = {k for schluessel in _GENERAL_KARTEN_SCHLUESSEL.values() for k in schluessel}
     neu: Dict[str, Any] = {}
@@ -40118,6 +40143,7 @@ async def api_server_general_copy(request: web.Request) -> web.Response:
     denied = _dash_rate_limited(request, "server.general.copy", 10)
     if denied is not None:
         return denied
+    conn = _mgmt_sicht(request, conn)
     data = await body(request)
     karte = str(data.get("karte") or "")
     schluessel = _GENERAL_KARTEN_SCHLUESSEL.get(karte)
@@ -40137,8 +40163,10 @@ async def api_server_general_copy(request: web.Request) -> web.Response:
             ergebnis.append({"service_id": zc.service_id, "name": zc.name, "kopiert": False,
                              "grund": "andere Discord-Guild – Rollen-IDs gelten dort nicht"})
             continue
+        # Guild-gebundene Werte landen im Ziel bei derselben Guild.
+        ziel_sicht = (guild_sicht(zc, conn.guild_id) if conn.guild_id else None) or zc
         for key in schluessel:
-            _conn_store(zc, key, copy.deepcopy(quelle.get(key)))
+            _conn_store(ziel_sicht, key, copy.deepcopy(quelle.get(key)))
         ergebnis.append({"service_id": zc.service_id, "name": zc.name, "kopiert": True})
     _audit_add("dashboard", _audit_actor(_sess_get(request)), "General-Einstellungen kopiert",
               f"{karte} von {conn.name} auf {len([e for e in ergebnis if e['kopiert']])} Server")
