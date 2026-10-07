@@ -5271,6 +5271,12 @@ class DayZBot(discord.Client):
         Autor, Guild und Channel reichen, der Inhalt wird nicht gelesen.
         discord.Client hat keine Prefix-Befehle, also kein process_commands."""
         try:
+            # Honeypot zuerst: ein Treffer wird gekickt/gebannt und bekommt keine XP.
+            if await _honeypot_nachricht_verarbeiten(message):
+                return
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[HONEYPOT] on_message: {e}")
+        try:
             await _level_nachricht_verarbeiten(message)
         except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
             log.debug(f"[LEVEL] on_message: {e}")
@@ -36091,7 +36097,8 @@ def _discord_mgmt_payload(conn: "ServerConnection") -> Dict[str, Any]:
         }
     return {"welcome_message": _eintrag("welcome_message"),
             "leave_message": _eintrag("leave_message"),
-            "level_system": {"enabled": bool(_level_einstellungen(conn)["enabled"])}}
+            "level_system": {"enabled": bool(_level_einstellungen(conn)["enabled"])},
+            "honeypot": {"enabled": bool(_honeypot_einstellungen(conn)["enabled"])}}
 
 
 async def get_discord_mgmt(request: web.Request) -> web.Response:
@@ -36627,6 +36634,302 @@ async def post_discord_mgmt_level(request: web.Request) -> web.Response:
     _audit_add("dashboard", _audit_actor(_sess_get(request)),
               "Discord-Management aktualisiert", f"level_system · {conn.name}")
     return ok(_level_payload(conn))
+
+
+# ══════════════════════════════════════════════════════════════
+#  Discord Management: Honeypot (Bot-Erkennung über einen Köder-Channel)
+# ══════════════════════════════════════════════════════════════
+# Der Bot postet in einem Channel eine Warnung. Spam-Bots posten in jeden
+# Channel – wer hier schreibt, bekommt eine DM mit dem Grund und wird gekickt
+# oder gebannt. Admins/Moderatoren (Administrator, Server verwalten, Owner)
+# und ausgenommene Rollen sind nie betroffen. Einstellungen je Mandant in
+# conn.data["honeypot"], kein Rueckfall auf cfg.config.
+_HONEYPOT_VORGABEN: Dict[str, Any] = {
+    "enabled": False, "channel_id": None, "language": "de", "action": "ban",
+    "delete_messages": True, "exempt_roles": [], "log_channel_id": None,
+    "warning_message_id": None, "custom_text": "",
+}
+_HONEYPOT_AKTIONEN = ("ban", "kick")
+
+
+def _honeypot_einstellungen(conn: "ServerConnection") -> Dict[str, Any]:
+    roh = conn.data.get("honeypot")
+    roh = roh if isinstance(roh, dict) else {}
+    e: Dict[str, Any] = dict(_HONEYPOT_VORGABEN)
+    for key in ("enabled", "delete_messages"):
+        if key in roh:
+            e[key] = bool(roh[key])
+    if roh.get("language") in _DISCORD_MGMT_SPRACHEN:
+        e["language"] = roh["language"]
+    if roh.get("action") in _HONEYPOT_AKTIONEN:
+        e["action"] = roh["action"]
+    for key in ("channel_id", "log_channel_id", "warning_message_id"):
+        e[key] = str(roh[key]) if roh.get(key) else None
+    e["exempt_roles"] = [str(x) for x in (roh.get("exempt_roles") or []) if x]
+    e["custom_text"] = str(roh.get("custom_text") or "")[:300]
+    return e
+
+
+def _honeypot_warnung_embed(sprache: str, action: str, custom_text: str) -> discord.Embed:
+    aktion_en = "banned" if action == "ban" else "kicked"
+    aktion_de = "gebannt" if action == "ban" else "gekickt"
+    if sprache == "en":
+        titel = "⚠️ Do NOT write in this channel"
+        text = ("This channel is a **bot trap**: it only exists to detect spam bots.\n"
+                f"**Anyone who posts here is automatically {aktion_en}** – no exceptions, no warning.\n"
+                "Real members: simply ignore this channel.")
+    else:
+        titel = "⚠️ Hier NICHT schreiben"
+        text = ("Dieser Channel ist eine **Bot-Falle**: Er dient nur der Erkennung von Spam-Bots.\n"
+                f"**Wer hier schreibt, wird automatisch {aktion_de}** – ohne Ausnahme, ohne Vorwarnung.\n"
+                "Echte Mitglieder: diesen Channel einfach ignorieren.")
+    if custom_text:
+        text += "\n\n" + custom_text
+    embed = discord.Embed(title=titel, description=text, colour=0xE74C3C)
+    embed.set_footer(text="Brigarde Killfeed · Honeypot")
+    return embed
+
+
+def _honeypot_dm_embed(guild_name: str, sprache: str, action: str, custom_text: str) -> discord.Embed:
+    if sprache == "en":
+        titel = f"🚫 You have been {'banned from' if action == 'ban' else 'kicked from'} {guild_name}"
+        text = ("You wrote in the honeypot channel. That channel is a bot trap and clearly says that "
+                f"every message there leads to an automatic {'ban' if action == 'ban' else 'kick'}.\n"
+                "If you are not a bot and this was a mistake, contact the server team.")
+    else:
+        titel = f"🚫 Du wurdest von {guild_name} {'gebannt' if action == 'ban' else 'gekickt'}"
+        text = ("Du hast im Honeypot-Channel geschrieben. Dieser Channel ist eine Bot-Falle und weist "
+                f"deutlich darauf hin, dass jede Nachricht dort zu einem automatischen "
+                f"{'Bann' if action == 'ban' else 'Kick'} führt.\n"
+                "Falls du kein Bot bist und das ein Versehen war, wende dich an das Server-Team.")
+    if custom_text:
+        text += "\n\n" + custom_text
+    return discord.Embed(title=titel, description=text, colour=0xE74C3C)
+
+
+def _honeypot_log_embed(member: Any, kanal: Any, action: str, dm_ok: bool, sprache: str) -> discord.Embed:
+    name = getattr(member, "display_name", None) or str(member)
+    erwaehnung = getattr(member, "mention", None) or f"@{name}"
+    kanal_text = getattr(kanal, "mention", None) or f"#{getattr(kanal, 'name', '?')}"
+    if sprache == "en":
+        titel = f"🍯 Honeypot hit – {'banned' if action == 'ban' else 'kicked'}"
+        felder = (("User", f"{erwaehnung} (`{getattr(member, 'id', '?')}`)"), ("Channel", kanal_text),
+                  ("DM delivered", "yes" if dm_ok else "no (DMs closed)"))
+    else:
+        titel = f"🍯 Honeypot-Treffer – {'gebannt' if action == 'ban' else 'gekickt'}"
+        felder = (("Nutzer", f"{erwaehnung} (`{getattr(member, 'id', '?')}`)"), ("Channel", kanal_text),
+                  ("DM zugestellt", "ja" if dm_ok else "nein (DMs geschlossen)"))
+    embed = discord.Embed(title=titel, colour=0xE67E22, timestamp=discord.utils.utcnow())
+    for n, v in felder:
+        embed.add_field(name=n, value=v, inline=True)
+    return embed
+
+
+def _honeypot_ausgenommen(member: Any, guild: Any, e: Dict[str, Any]) -> bool:
+    if getattr(guild, "owner_id", None) == getattr(member, "id", None):
+        return True
+    perms = getattr(member, "guild_permissions", None)
+    if perms is not None and (getattr(perms, "administrator", False) or getattr(perms, "manage_guild", False)):
+        return True
+    rollen = {str(r.id) for r in (getattr(member, "roles", None) or [])}
+    return bool(rollen & set(e["exempt_roles"]))
+
+
+async def _honeypot_nachricht_verarbeiten(message: Any) -> bool:
+    """True, wenn die Nachricht ein Honeypot-Treffer war (Autor gekickt/gebannt)."""
+    autor = getattr(message, "author", None)
+    guild = getattr(message, "guild", None)
+    kanal = getattr(message, "channel", None)
+    if guild is None or autor is None or kanal is None or getattr(autor, "bot", False):
+        return False
+    konten = connections.all_for_guild(int(guild.id))
+    conn = e = None
+    for kandidat in konten:
+        einst = _honeypot_einstellungen(kandidat)
+        if einst["enabled"] and einst["channel_id"] and str(getattr(kanal, "id", "")) == einst["channel_id"]:
+            conn, e = kandidat, einst
+            break
+    if conn is None or e is None:
+        return False
+    if _honeypot_ausgenommen(autor, guild, e):
+        return False
+    aktion = e["action"]
+    try:
+        await message.delete()
+    except Exception as exc:  # noqa: BLE001
+        log.debug(f"[HONEYPOT] Nachricht löschen fehlgeschlagen: {exc}")
+    dm_ok = False
+    try:
+        await autor.send(embed=_honeypot_dm_embed(getattr(guild, "name", "Discord"), e["language"], aktion, e["custom_text"]))
+        dm_ok = True
+    except Exception as exc:  # noqa: BLE001 – DMs geschlossen o. ä.
+        log.debug(f"[HONEYPOT] DM an {getattr(autor, 'id', '?')} fehlgeschlagen: {exc}")
+    grund = "Honeypot: Nachricht im Köder-Channel (Bot-Erkennung)"
+    try:
+        if aktion == "ban":
+            sekunden = 86400 if e["delete_messages"] else 0
+            try:
+                await guild.ban(autor, reason=grund, delete_message_seconds=sekunden)
+            except TypeError:  # ältere discord.py: delete_message_days
+                await guild.ban(autor, reason=grund, delete_message_days=1 if sekunden else 0)
+        else:
+            await autor.kick(reason=grund)
+    except Exception as exc:  # noqa: BLE001 – fehlende Rechte/Hierarchie
+        log.warning(f"[HONEYPOT] {aktion} von {getattr(autor, 'id', '?')} fehlgeschlagen ({conn.service_id}): {exc}")
+        return True
+    log.info(f"[HONEYPOT] {getattr(autor, 'id', '?')} ({autor}) {aktion} in {getattr(guild, 'name', '?')} ({conn.service_id})")
+    try:
+        _audit_add("discord", str(autor), f"Honeypot: {'Bann' if aktion == 'ban' else 'Kick'}",
+                  f"{conn.name} · Channel {getattr(kanal, 'id', '?')}")
+    except Exception:  # noqa: BLE001
+        pass
+    if e["log_channel_id"]:
+        try:
+            log_kanal = bot.get_channel(int(e["log_channel_id"])) if bot else None
+            if log_kanal is not None:
+                await log_kanal.send(embed=_honeypot_log_embed(autor, kanal, aktion, dm_ok, e["language"]))
+        except Exception as exc:  # noqa: BLE001
+            log.debug(f"[HONEYPOT] Log posten fehlgeschlagen: {exc}")
+    return True
+
+
+async def _honeypot_warnung_posten(conn: "ServerConnection", e: Dict[str, Any]) -> Tuple[bool, str]:
+    """Postet die Warnung neu (alte Warnung vorher löschen). (ok, fehlertext)."""
+    try:
+        kanal = bot.get_channel(int(e["channel_id"])) if (bot and e["channel_id"]) else None
+    except Exception:  # noqa: BLE001
+        kanal = None
+    if kanal is None:
+        return False, "Der Honeypot-Channel ist gerade nicht erreichbar."
+    if e.get("warning_message_id"):
+        try:
+            alt = await kanal.fetch_message(int(e["warning_message_id"]))
+            await alt.delete()
+        except Exception:  # noqa: BLE001 – schon weg oder keine Rechte
+            pass
+    try:
+        nachricht = await kanal.send(embed=_honeypot_warnung_embed(e["language"], e["action"], e["custom_text"]))
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Die Warnung konnte nicht gepostet werden (Schreibrecht des Bots im Channel prüfen): {exc}"
+    daten = dict(conn.data.get("honeypot") or {})
+    daten["warning_message_id"] = str(getattr(nachricht, "id", "") or "")
+    _conn_store(conn, "honeypot", daten)
+    return True, ""
+
+
+def _honeypot_payload(conn: "ServerConnection") -> Dict[str, Any]:
+    e = _honeypot_einstellungen(conn)
+    e["warning_posted"] = bool(e["warning_message_id"])
+    return e
+
+
+async def _honeypot_gate(request: web.Request, recht: str):
+    conn, denied = _session_conn(request, "discord_mgmt")
+    if denied is not None:
+        return None, denied
+    denied = await _modul_pruefen("discord_mgmt", request, conn)
+    if denied is not None:
+        return None, denied
+    denied = await _dash_gate(request, conn, "discord_mgmt", recht)
+    if denied is not None:
+        return None, denied
+    return conn, None
+
+
+async def get_discord_mgmt_honeypot(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "view")
+    if denied is not None:
+        return denied
+    return ok(_honeypot_payload(conn))
+
+
+async def post_discord_mgmt_honeypot(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.honeypot", 3)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    if not isinstance(data, dict):
+        return err("Ungültige Anfrage.")
+    enabled = bool(data.get("enabled", False))
+    sprache = str(data.get("language") or "de").strip().lower()
+    if sprache not in _DISCORD_MGMT_SPRACHEN:
+        return err("Unbekannte Sprache.")
+    aktion = str(data.get("action") or "ban").strip().lower()
+    if aktion not in _HONEYPOT_AKTIONEN:
+        return err("Aktion muss „ban“ oder „kick“ sein.")
+    custom_text = str(data.get("custom_text") or "").strip()
+    if len(custom_text) > 300:
+        return err("Der Zusatztext darf höchstens 300 Zeichen lang sein.")
+
+    def _id(wert: Any) -> Optional[int]:
+        if wert in (None, "", "0"):
+            return None
+        try:
+            return int(wert)
+        except (TypeError, ValueError):
+            return -1
+    kanal_id = _id(data.get("channel_id"))
+    log_id = _id(data.get("log_channel_id"))
+    rollen = [_id(x) for x in (data.get("exempt_roles") or [])]
+    if -1 in (kanal_id, log_id) or any(x in (None, -1) for x in rollen):
+        return err("Ungültige Channel- oder Rollen-ID.")
+    if enabled and not kanal_id:
+        return err("Bitte zuerst einen Honeypot-Channel wählen.")
+    if kanal_id and log_id and kanal_id == log_id:
+        return err("Log-Channel und Honeypot-Channel dürfen nicht derselbe sein.")
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    if (kanal_id or log_id or rollen) and not gid:
+        return err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
+    for kid, feld in ((kanal_id, "Channel"), (log_id, "Log-Channel")):
+        if kid:
+            fehler = _kanal_gehoert_guild(gid, kid, feld)
+            if fehler is not None:
+                return fehler
+    for rid in rollen:
+        fehler = _rolle_gehoert_guild(gid, rid)
+        if fehler is not None:
+            return fehler
+    alt = _honeypot_einstellungen(conn)
+    neu = {
+        "enabled": enabled, "channel_id": str(kanal_id) if kanal_id else None, "language": sprache,
+        "action": aktion, "delete_messages": bool(data.get("delete_messages", True)),
+        "exempt_roles": [str(x) for x in rollen], "log_channel_id": str(log_id) if log_id else None,
+        "warning_message_id": alt["warning_message_id"], "custom_text": custom_text,
+    }
+    # Warnung neu posten, wenn Channel/Sprache/Aktion/Text sich geändert haben oder sie noch fehlt
+    geaendert = any(alt[k] != neu[k] for k in ("channel_id", "language", "action", "custom_text"))
+    if geaendert and alt["channel_id"] != neu["channel_id"]:
+        neu["warning_message_id"] = None   # alte Warnung liegt in einem anderen Channel – dort nicht anfassen
+    _conn_store(conn, "honeypot", neu)
+    hinweis = None
+    if enabled and (geaendert or not neu["warning_message_id"]):
+        ok_, fehler_text = await _honeypot_warnung_posten(conn, _honeypot_einstellungen(conn))
+        if not ok_:
+            hinweis = fehler_text
+    _audit_add("dashboard", _audit_actor(_sess_get(request)),
+              "Discord-Management aktualisiert", f"honeypot · {conn.name}")
+    payload = _honeypot_payload(conn)
+    payload["hinweis"] = hinweis
+    return ok(payload)
+
+
+async def post_discord_mgmt_honeypot_repost(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.honeypot.repost", 5)
+    if denied is not None:
+        return denied
+    e = _honeypot_einstellungen(conn)
+    if not e["channel_id"]:
+        return err("Bitte zuerst einen Honeypot-Channel wählen und speichern.")
+    ok_, fehler_text = await _honeypot_warnung_posten(conn, e)
+    if not ok_:
+        return err(fehler_text, 502)
+    return ok(_honeypot_payload(conn))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -41084,6 +41387,9 @@ def build_app() -> web.Application:
     r.add_post("/api/discord-management/welcome", post_discord_mgmt_welcome)
     r.add_get("/api/discord-management/level", get_discord_mgmt_level)
     r.add_post("/api/discord-management/level", post_discord_mgmt_level)
+    r.add_get("/api/discord-management/honeypot", get_discord_mgmt_honeypot)
+    r.add_post("/api/discord-management/honeypot", post_discord_mgmt_honeypot)
+    r.add_post("/api/discord-management/honeypot/repost", post_discord_mgmt_honeypot_repost)
     r.add_post("/api/discord-management/leave", post_discord_mgmt_leave)
     r.add_get("/api/discord-management/reaction-roles", get_reaction_roles)
     r.add_post("/api/discord-management/reaction-roles", post_reaction_roles)
@@ -41939,6 +42245,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "2caece378d7fd03a324a1380e118ba3de9506505946ac69eba11c1156af21374",
         "4659b64843dc4a42edc6ef15cf8455e615e73c16b664b2b885d070e14f5f3a84",
         "9b49059c7d07ff813dc2f4a608c97cb1b37eeab268fbabea1f229c0c0eb2d343",
         "53b81efd3268dfb73f5623e75142f10673d4bcf9fc055fe4c4a6d7a5d496f76d",
