@@ -41866,8 +41866,14 @@ async def api_server_status(request: web.Request) -> web.Response:
         except Exception:
             nit_info = None
     gestoppt = conn.data.get("server_absichtlich_gestoppt")
+    # Online heisst: Spielabfrage (A2S) antwortet ODER Nitrado meldet „gestartet“. Ohne
+    # den zweiten Weg zeigte das Dashboard „Offline“, sobald der Query-Port nicht
+    # erreichbar ist (falscher Port, Konsole, Firewall), obwohl der Server laeuft –
+    # der Discord-Befehl /status nutzt denselben Ersatz schon.
+    laeuft_laut_nitrado = str((nit_info or {}).get("state") or "").lower() == "started"
     return ok({
-        "online": bool(live),
+        "online": bool(live) or laeuft_laut_nitrado,
+        "a2s_erreichbar": bool(live),
         "a2s": live,
         "nitrado": nit_info,
         "map_name": conn.get("map_name"),
@@ -43478,6 +43484,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "2d7c460099f2c20e50d9b4b075f4a4f4c075237bc77ead8adce3ddc324f9e231",
         "c4da26626e1adddb6ad1bd6f641dba6da3750e91c7f3724c767564453fa4ce25",
         "bc65fa1acb74aa6f9222564542583125944b77a7fec02787b374f774b1333a1e",
         "2caece378d7fd03a324a1380e118ba3de9506505946ac69eba11c1156af21374",
