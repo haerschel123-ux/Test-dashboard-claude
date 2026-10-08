@@ -1,0 +1,115 @@
+<spawnabletypes>
+<type name="MorsecodeLeaflet_blood">
+		<damage min="0.0" max="0.0" />
+	</type>
+<type name="MorsecodeLeaflet_coffee">
+		<damage min="0.0" max="0.0" />
+	</type>
+<type name="MorsecodeLeaflet_fire">
+		<damage min="0.0" max="0.0" />
+	</type>
+<type name="PlateCarrierVest_Desert">
+		<damage min="0.1" max="0.6" />
+		<attachments chance="0.25">
+			<item name="PlateCarrierHolster_Desert" chance="1.00" />
+		</attachments>
+		<attachments chance="0.15">
+			<item name="PlateCarrierPouches_Desert" chance="1.00" />
+		</attachments>
+	</type>
+<type name="PlateCarrierPouches_Desert">
+	</type>
+<type name="TortillaBag_Desert">
+		<cargo preset="foodArmy" />
+		<cargo preset="mixArmy" />
+		<cargo chance="0.2">
+			<item name="Mag_SCARH_20Rnd" chance="1.0" />
+		</cargo>
+	</type>
+<type name="AirborneMask">
+		<damage min="0.0" max="0.35" />
+		<attachments chance="0.2">
+			<item name="GasMask_Filter" />
+		</attachments>
+	</type>
+<type name="AK74">
+		<attachments chance="1.00">
+			<item name="AK_FoldingBttstck" chance="40.00" />
+			<item name="AKS74U_Bttstck" chance="30.00" />
+			<item name="AK_PlasticBttstck" chance="20.00" />
+			<item name="AK74_WoodBttstck" chance="5.00" />
+			<item name="AK_WoodBttstck" chance="5.00" />
+		</attachments>
+		<attachments chance="1.00">
+			<item name="AK_RailHndgrd" chance="50.00" />
+			<item name="AK_PlasticHndgrd" chance="30.00" />
+			<item name="AK74_Hndgrd" chance="10.00" />
+			<item name="AK_WoodHndgrd" chance="10.00" />
+		</attachments>
+		<attachments chance="0.30">
+			<item name="KashtanOptic" chance="0.50" />
+			<item name="PSO11Optic" chance="0.30" />
+		</attachments>
+		<attachments chance="0.30">
+			<item name="Mag_AK74_45Rnd" chance="0.15" />
+			<item name="Mag_AK74_30Rnd" chance="1.00" />
+		</attachments>
+	</type>
+<type name="AK101">
+		<damage min="0.3" max="0.7" />
+		<attachments chance="1.00">
+			<item name="AK_FoldingBttstck" chance="40.00" />
+			<item name="AKS74U_Bttstck" chance="30.00" />
+			<item name="AK_PlasticBttstck" chance="20.00" />
+			<item name="AK74_WoodBttstck" chance="5.00" />
+			<item name="AK_WoodBttstck" chance="5.00" />
+		</attachments>
+		<attachments chance="1.00">
+			<item name="AK_RailHndgrd" chance="50.00" />
+			<item name="AK_PlasticHndgrd" chance="30.00" />
+			<item name="AK74_Hndgrd" chance="10.00" />
+			<item name="AK_WoodHndgrd" chance="10.00" />
+		</attachments>
+		<attachments chance="0.30">
+			<item name="KashtanOptic" chance="0.50" />
+			<item name="PSO11Optic" chance="0.30" />
+		</attachments>
+		<attachments chance="0.30">
+			<item name="Mag_AK101_30Rnd" chance="1.00" />
+		</attachments>
+	</type>
+<type name="SCARH">
+		<damage min="0.15" max="0.35" />
+		<attachments chance="1.00">
+			<item name="SCAR_PrecisionBttstck" chance="0.50" />
+			<item name="SCAR_StockBttstck" chance="0.50" />
+		</attachments>
+		<attachments chance="0.33">
+			<item name="M68Optic" chance="0.30" />
+			<item name="HoloOptic" chance="0.20" />
+			<item name="M4_T3NRDSOptic" chance="0.20" />
+			<item name="ReflexOptic" chance="0.20" />
+			<item name="ACOGOptic" chance="0.10" />
+		</attachments>
+		<attachments chance="1.00">
+			<item name="Mag_SCARH_20Rnd" chance="1.00" />
+		</attachments>
+	</type>
+<type name="SCARH_Black">
+		<damage min="0.15" max="0.35" />
+		<attachments chance="1.00">
+			<item name="SCAR_PrecisionBttstck_Black" chance="0.50" />
+			<item name="SCAR_StockBttstck_Black" chance="0.50" />
+		</attachments>
+		<attachments chance="0.33">
+			<item name="M68Optic" chance="0.30" />
+			<item name="HoloOptic" chance="0.20" />
+			<item name="M4_T3NRDSOptic" chance="0.20" />
+			<item name="ReflexOptic" chance="0.20" />
+			<item name="ACOGOptic" chance="0.10" />
+		</attachments>
+		<attachments chance="1.00">
+			<item name="Mag_SCARH_20Rnd_Black" chance="1.00" />
+		</attachments>
+	</type>
+</spawnabletypes>

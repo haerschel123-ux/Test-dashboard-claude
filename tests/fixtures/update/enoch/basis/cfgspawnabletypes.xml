@@ -1,0 +1,40 @@
+<spawnabletypes>
+<type name="AirborneMask">
+		<damage min="0.0" max="0.35" />
+		<attachments chance="0.2">
+			<item name="GasMask_Filter" />
+		</attachments>
+	</type>
+<type name="AK74">
+		<attachments chance="0.25">
+			<item name="AK74_WoodBttstck" chance="1.00" />
+		</attachments>
+		<attachments chance="1.00">
+			<item name="AK74_Hndgrd" chance="1.00" />
+		</attachments>
+		<attachments chance="0.30">
+			<item name="KashtanOptic" chance="0.50" />
+			<item name="PSO11Optic" chance="0.30" />
+		</attachments>
+		<attachments chance="0.1">
+			<item name="Mag_AK74_30Rnd" chance="0.75" />
+			<item name="Mag_AK74_45Rnd" chance="0.25" />
+		</attachments>
+	</type>
+<type name="AK101">
+		<damage min="0.3" max="0.7" />
+		<attachments chance="0.25">
+			<item name="AK_PlasticBttstck" chance="1.00" />
+		</attachments>
+		<attachments chance="1.00">
+			<item name="AK_PlasticHndgrd" chance="1.00" />
+		</attachments>
+		<attachments chance="0.30">
+			<item name="KashtanOptic" chance="0.50" />
+			<item name="PSO11Optic" chance="0.30" />
+		</attachments>
+		<attachments chance="0.1">
+			<item name="Mag_AK101_30Rnd" chance="1.00" />
+		</attachments>
+	</type>
+</spawnabletypes>

@@ -1027,6 +1027,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.lootlifetime":                 {"label": "Loot Lifetime Reducer", "gruppe": "Tools"},
     "tools.qrcode":                       {"label": "QR-Code Generator", "gruppe": "Tools"},
     "tools.filevalidator":                {"label": "Datei-Validator", "gruppe": "Tools"},
+    "tools.updateassistant":              {"label": "Update Assistant", "gruppe": "Tools"},
     "tools.weather":                      {"label": "Weather Manager", "gruppe": "Tools"},
     "tools.globals":                      {"label": "Globals Configurator", "gruppe": "Tools"},
     "tools.economy":                      {"label": "Economy Editor", "gruppe": "Tools"},
@@ -14667,6 +14668,7 @@ _TOOL_LISTE = (
     ("weaponblueprint", "🔫", "Weapon Blueprint Generator"),
     ("lootlifetime", "⏳", "Loot Lifetime Reducer"),
     ("filevalidator", "🧪", "Datei-Validator"),
+    ("updateassistant", "🔄", "Update Assistant"),
     ("weather", "🌦️", "Weather Manager"),
     ("globals", "⚙️", "Globals Configurator"),
     ("economy", "🧮", "Economy Editor"),
@@ -21499,6 +21501,688 @@ async def _fv_vorlagen_laden(ordner: str) -> List[Dict[str, str]]:
     if len(generated) == len(_FV_VORLAGEN_DATEIEN):
         _FV_VORLAGEN_CACHE[ordner] = generated
     return generated
+
+
+# ── Update Assistant: three-way CE merge, exact source spans, tenant history ─
+_UPDATE_DATEIEN = {
+    "types.xml": ("db/types.xml", "types", ("type",)),
+    "events.xml": ("db/events.xml", "events", ("event",)),
+    "cfgspawnabletypes.xml": ("cfgspawnabletypes.xml", "spawnabletypes", ("type",)),
+    "cfgrandompresets.xml": ("cfgrandompresets.xml", "randompresets", ("cargo", "attachments")),
+    "mapgroupproto.xml": ("mapgroupproto.xml", "prototype", ("group",)),
+    "globals.xml": ("db/globals.xml", "variables", ("var",)),
+    "cfgeventspawns.xml": ("cfgeventspawns.xml", "eventposdef", ("event",)),
+    "messages.xml": ("db/messages.xml", "messages", ("message",)),
+    "cfgeventgroups.xml": ("cfgeventgroups.xml", "eventgroupdef", ("group",)),
+}
+_UPDATE_STAENDE: Dict[str, List[Dict[str, str]]] = {
+    "ChernarusPlus": [
+        {
+            "key": "latest",
+            "label": "Neuester Stand",
+            "ref": "master",
+            "datum": ""
+        },
+        {
+            "key": "b86c1b71cbad",
+            "label": "2026-08-13 · b86c1b71",
+            "ref": "b86c1b71cbad4b62c4ca004f6ec7c8d4bbaccead",
+            "datum": "2026-08-13"
+        },
+        {
+            "key": "083cd041b88e",
+            "label": "2026-07-15 · 083cd041",
+            "ref": "083cd041b88e196b6e1c312dfc272ae8120d9752",
+            "datum": "2026-07-15"
+        },
+        {
+            "key": "9f01d3f3af52",
+            "label": "2026-04-08 · 9f01d3f3",
+            "ref": "9f01d3f3af5283610f225a5f8c8387d7d569aec3",
+            "datum": "2026-04-08"
+        },
+        {
+            "key": "5d5a41a1f058",
+            "label": "2025-06-03 · 5d5a41a1",
+            "ref": "5d5a41a1f058db87772ea796b217d44221182c28",
+            "datum": "2025-06-03"
+        },
+        {
+            "key": "099b1e8f325f",
+            "label": "2025-03-18 · 099b1e8f",
+            "ref": "099b1e8f325fa73bc2661cf3b7cdcf0021f0d288",
+            "datum": "2025-03-18"
+        },
+        {
+            "key": "014ffc82fc51",
+            "label": "2025-02-26 · 014ffc82",
+            "ref": "014ffc82fc512ba7798581b80aba5e27bd22c1ab",
+            "datum": "2025-02-26"
+        },
+        {
+            "key": "a12380688fb1",
+            "label": "2024-11-20 · a1238068",
+            "ref": "a12380688fb1ba8d48876ef4212b0aa9c5f59127",
+            "datum": "2024-11-20"
+        },
+        {
+            "key": "b534fd7ce766",
+            "label": "2024-10-15 · b534fd7c",
+            "ref": "b534fd7ce76683661920f466926b27916777931d",
+            "datum": "2024-10-15"
+        }
+    ],
+    "Livonia": [
+        {
+            "key": "latest",
+            "label": "Neuester Stand",
+            "ref": "master",
+            "datum": ""
+        },
+        {
+            "key": "9a21bb9f5fb9",
+            "label": "2026-08-13 · 9a21bb9f",
+            "ref": "9a21bb9f5fb9c62a7ce2761402196091588133e6",
+            "datum": "2026-08-13"
+        },
+        {
+            "key": "527bbb55adfe",
+            "label": "2026-07-15 · 527bbb55",
+            "ref": "527bbb55adfe13b24465ef4080b0931dd836a397",
+            "datum": "2026-07-15"
+        },
+        {
+            "key": "09f0af21af7a",
+            "label": "2026-04-08 · 09f0af21",
+            "ref": "09f0af21af7a53831fb8a719449f9ec6e3e901ac",
+            "datum": "2026-04-08"
+        },
+        {
+            "key": "32bf10ccb137",
+            "label": "2025-06-03 · 32bf10cc",
+            "ref": "32bf10ccb137b000109c200d937bfb35550824f3",
+            "datum": "2025-06-03"
+        },
+        {
+            "key": "c2d451f8dd48",
+            "label": "2025-03-18 · c2d451f8",
+            "ref": "c2d451f8dd48ecd8ce99db7c938e497f2d2f6720",
+            "datum": "2025-03-18"
+        },
+        {
+            "key": "7c6f750bcc31",
+            "label": "2025-02-26 · 7c6f750b",
+            "ref": "7c6f750bcc312bb7ce303b882d6ab1dd197918b8",
+            "datum": "2025-02-26"
+        },
+        {
+            "key": "8970bc46947e",
+            "label": "2024-11-20 · 8970bc46",
+            "ref": "8970bc46947e747d3ce2820b0b9d163fcda79f0a",
+            "datum": "2024-11-20"
+        },
+        {
+            "key": "0f932a202fb9",
+            "label": "2024-10-15 · 0f932a20",
+            "ref": "0f932a202fb983d500a9aef55b26f5b92b5252d2",
+            "datum": "2024-10-15"
+        }
+    ],
+    "Sakhal": [
+        {
+            "key": "latest",
+            "label": "Neuester Stand",
+            "ref": "master",
+            "datum": ""
+        },
+        {
+            "key": "9a21bb9f5fb9",
+            "label": "2026-08-13 · 9a21bb9f",
+            "ref": "9a21bb9f5fb9c62a7ce2761402196091588133e6",
+            "datum": "2026-08-13"
+        },
+        {
+            "key": "8e769861441f",
+            "label": "2026-07-15 · 8e769861",
+            "ref": "8e769861441f19c32d30ba0d9a074e15b740d917",
+            "datum": "2026-07-15"
+        },
+        {
+            "key": "4696b4b0ed09",
+            "label": "2026-04-08 · 4696b4b0",
+            "ref": "4696b4b0ed09e9ed8076c3f397649f71a871abf1",
+            "datum": "2026-04-08"
+        },
+        {
+            "key": "ba33cf15e8a1",
+            "label": "2025-06-03 · ba33cf15",
+            "ref": "ba33cf15e8a14416383c90f22c8bc1680dbca4cb",
+            "datum": "2025-06-03"
+        },
+        {
+            "key": "130379b8ad9b",
+            "label": "2025-03-18 · 130379b8",
+            "ref": "130379b8ad9bd88b10f723a0cc2e5bfcab66fdb5",
+            "datum": "2025-03-18"
+        },
+        {
+            "key": "9dc1e76da326",
+            "label": "2025-02-26 · 9dc1e76d",
+            "ref": "9dc1e76da32617748006933d09f3ec519427ea53",
+            "datum": "2025-02-26"
+        },
+        {
+            "key": "2075828cf5e8",
+            "label": "2024-11-20 · 2075828c",
+            "ref": "2075828cf5e8b8fc710ebbf070c12f995e38b4f4",
+            "datum": "2024-11-20"
+        },
+        {
+            "key": "508a2b3ec128",
+            "label": "2024-10-15 · 508a2b3e",
+            "ref": "508a2b3ec1285aa51f96d9baf8f6c9c3af2e1a10",
+            "datum": "2024-10-15"
+        }
+    ]
+}
+_UPDATE_CACHE: Dict[Tuple[str, str, str], Tuple[float, str]] = {}
+_UPDATE_MAX_BYTES = 20 * 1024 * 1024
+_UPDATE_TOKEN_RE = re.compile(r'<!--.*?-->|<!\[CDATA\[.*?\]\]>|<\?.*?\?>|</?[\w:.-]+\b(?:[^<>"\x27]|"[^"]*"|\x27[^\x27]*\x27)*>', re.S)
+_UPDATE_LAGEN = ("neu", "update", "konflikt", "entfernt", "eigen", "aktuell", "unveraendert")
+_UPDATE_GRUENDE = {
+    "neu": "Neuer offizieller Eintrag fehlt auf dem Server.",
+    "update": "Server entspricht der Basis; offizieller Eintrag wurde geändert.",
+    "konflikt": "Server und offizieller Stand unterscheiden sich; eigene Werte bleiben erhalten.",
+    "entfernt": "Offiziell entfernt; der Servereintrag bleibt standardmäßig erhalten.",
+    "eigen": "Eigener Servereintrag ohne offizielle Basis.",
+    "aktuell": "Servereintrag entspricht bereits dem Zielstand.",
+    "unveraendert": "Offizielle Basis und Ziel sind identisch; Server bleibt unverändert.",
+}
+
+
+def _update_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _update_form(node: ET.Element):
+    """Ignore layout whitespace, retain XML structure, values and child order."""
+    return (node.tag, tuple(sorted((key, value.casefold() if key == "name" else value)
+                                  for key, value in node.attrib.items())),
+            " ".join((node.text or "").split()),
+            tuple((_update_form(child), " ".join((child.tail or "").split())) for child in node))
+
+
+def _update_index(text: str, name: str):
+    """Validate once, tokenize once; indices point into the untouched original string.
+    Only direct root children count. Comments/CDATA cannot masquerade as entries.
+    Anonymous messages use their normalized content hash, never guessed positions.
+    """
+    if len(text.encode("utf-8")) > _UPDATE_MAX_BYTES or "<!DOCTYPE" in text.upper():
+        raise ValueError("Update-Datei ist zu groß oder enthält eine nicht unterstützte DTD.")
+    _path, expected_root, tags = _UPDATE_DATEIEN[name]
+    root = ET.fromstring(text)
+    if root.tag != expected_root:
+        raise ET.ParseError("Update-Datei hat ein falsches Wurzelelement.")
+    nodes = iter(root)
+    entries, ordered, stack, start, current = {}, [], [], None, None
+    close = None
+    for token in _UPDATE_TOKEN_RE.finditer(text):
+        raw = token.group()
+        if raw.startswith(("<!", "<?")):
+            continue
+        ending = raw.startswith("</")
+        tag = re.match(r'</?([\w:.-]+)', raw).group(1)
+        if ending:
+            if len(stack) == 1:
+                close = token.start()
+            if len(stack) == 2 and start is not None:
+                block = text[start:token.end()]
+                row = {"start": start, "end": token.end(), "raw": block, "node": current,
+                       "form": _update_form(current)}
+                row["name"] = current.get("name") or "message@" + _update_hash(repr(row["form"]))[:20]
+                row["key"] = (tag + ":" if len(tags) > 1 else "") + row["name"].casefold()
+                ordered.append(row); entries.setdefault(row["key"], row)
+                start, current = None, None
+            stack.pop()
+        else:
+            if len(stack) == 1:
+                node = next(nodes)
+                if tag in tags:
+                    if not node.get("name") and tag != "message":
+                        raise ET.ParseError("Update-Eintrag hat keinen Namen.")
+                    if raw.rstrip().endswith("/>"):
+                        form = _update_form(node)
+                        label = node.get("name") or "message@" + _update_hash(repr(form))[:20]
+                        key = (tag + ":" if len(tags) > 1 else "") + label.casefold()
+                        row = {"start": token.start(), "end": token.end(), "raw": raw,
+                               "node": node, "form": form, "name": label, "key": key}
+                        ordered.append(row); entries.setdefault(key, row)
+                    else:
+                        start, current = token.start(), node
+            if not raw.rstrip().endswith("/>"):
+                stack.append(tag)
+    # Empty self-closing roots are valid for comparison, but insertion needs expansion.
+    return {"entries": entries, "ordered": ordered, "close": close, "root": root}
+
+
+def _update_diff(old, new) -> List[Dict[str, str]]:
+    def fields(row):
+        if row is None:
+            return {}
+        node = row["node"]
+        result = {"@" + key: value for key, value in node.attrib.items() if key != "name"}
+        for child in node:
+            # Scalar fields read as nominal: 1 → 2, not entire XML tags.
+            if not len(child) and not child.attrib:
+                value = " ".join((child.text or "").split())
+            else:
+                # Lesbar als XML (z. B. <category name="weapons" />), nicht als Python-Tupel.
+                kopie = copy.copy(child); kopie.tail = None
+                value = " ".join(ET.tostring(kopie, encoding="unicode").split())
+            result.setdefault(child.tag, []).append(value)
+        return {key: " | ".join(value) if isinstance(value, list) else value for key, value in result.items()}
+    before, after = fields(old), fields(new)
+    return [{"feld": key, "alt": before.get(key, "—")[:500], "neu": after.get(key, "—")[:500]}
+            for key in sorted(before.keys() | after.keys()) if before.get(key) != after.get(key)]
+
+
+def _update_vergleichen(name: str, basis: str, neu: str, meine: str):
+    indexes = [_update_index(text, name) for text in (basis, neu, meine)]
+    base, target, own = [index["entries"] for index in indexes]
+    rows, counts = [], {key: 0 for key in _UPDATE_LAGEN}
+    for key in sorted(base.keys() | target.keys() | own.keys()):
+        b, n, m = base.get(key), target.get(key), own.get(key)
+        bf, nf, mf = [row["form"] if row else None for row in (b, n, m)]
+        if n is None:
+            if m is None:
+                continue
+            state = "entfernt" if b else "eigen"
+        elif bf == nf:
+            state = "unveraendert"
+        elif mf == nf:
+            state = "aktuell"
+        elif b is None and m is None:
+            state = "neu"
+        elif b is not None and mf == bf:
+            state = "update"
+        else:
+            state = "konflikt"  # includes user-deleted entry and independently added name
+        action = "uebernehmen" if state in ("neu", "update") else "behalten"
+        row = n or m or b
+        # „unveraendert“ (offiziell Basis = Ziel): nichts zu entscheiden – weder Blöcke noch
+        # Diff übertragen, sonst wird die Antwort bei ~2000 Einträgen mehrere MB groß.
+        stumm = state == "unveraendert"
+        cut = lambda r: "" if stumm or not r else r["raw"].encode("utf-8")[:4096].decode("utf-8", "ignore")  # noqa: E731
+        rows.append({"key": key, "name": row["name"], "lage": state, "aktion": action,
+                     "grund": _UPDATE_GRUENDE[state], "kurzdiff": [] if stumm else _update_diff(m or b, n),
+                     "basis": cut(b), "alt": cut(m), "neu": cut(n)})
+        counts[state] += 1
+    seen, duplicates = set(), []
+    for row in indexes[2]["ordered"]:
+        if row["key"] in seen:
+            duplicates.append(row["name"])
+        seen.add(row["key"])
+    return {"name": name, "source_hash": _update_hash(meine), "eintraege": rows,
+            "zaehler": counts, "doppelte": duplicates}, indexes
+
+
+def _update_block_format(raw: str, indent: str, nl: str) -> str:
+    lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    # Translate the official indentation to the server's surrounding indentation.
+    tail = [len(line) - len(line.lstrip(" \t")) for line in lines[1:] if line.strip()]
+    offset = min(tail, default=0)
+    return lines[0] + "".join(nl + indent + line[offset:] for line in lines[1:])
+
+
+def _update_merge(name: str, basis: str, neu: str, meine: str, label: str, options=None):
+    options = options or {}
+    decisions = options.get("entscheidungen", {})
+    if not isinstance(decisions, dict) or any(not isinstance(key, str) or value not in
+            ("uebernehmen", "behalten", "entfernen") for key, value in decisions.items()):
+        raise ValueError("Ungültige Update-Entscheidung.")
+    for switch in ("doppelte_entfernen", "kommentar"):
+        if switch in options and type(options[switch]) is not bool:
+            raise ValueError("Update-Schalter muss ein Wahrheitswert sein.")
+    result, indexes = _update_vergleichen(name, basis, neu, meine)
+    _base, target, own = [index["entries"] for index in indexes]
+    allowed = {row["key"] for row in result["eintraege"]}
+    if decisions.keys() - allowed:
+        raise ValueError("Unbekannter Update-Eintrag.")
+    edits, append, actions = {}, [], {"hinzugefuegt": 0, "uebernommen": 0, "behalten": 0, "entfernt": 0}
+    nl = _tool_eol(meine)  # once, not one full-file newline scan per entry
+    for row in result["eintraege"]:
+        key = row["key"]; action = decisions.get(key, row["aktion"])
+        old, new = own.get(key), target.get(key)
+        row["aktion"] = action
+        if action == "entfernen":
+            if row["lage"] != "entfernt":
+                raise ValueError("Nur offiziell entfernte Einträge dürfen entfernt werden.")
+            if old:
+                for item in indexes[2]["ordered"]:
+                    if item["key"] == key:
+                        edits[item["start"]] = (item["end"], "")
+                actions["entfernt"] += 1
+        elif action == "uebernehmen":
+            if new is None:
+                raise ValueError("Kein offizieller Zielblock für diesen Eintrag.")
+            if old:
+                if old["form"] != new["form"]:
+                    line_start = meine.rfind("\n", 0, old["start"]) + 1
+                    prefix = meine[line_start:old["start"]]
+                    indent = prefix if not prefix.strip() else ""
+                    edits[old["start"]] = (old["end"], _update_block_format(new["raw"], indent, nl))
+                    actions["uebernommen"] += 1
+            else:
+                append.append(new["raw"]); actions["hinzugefuegt"] += 1
+        else:
+            actions["behalten"] += int(old is not None)
+    seen = set()
+    if options.get("doppelte_entfernen", False):
+        for item in indexes[2]["ordered"]:
+            if item["key"] in seen:
+                edits[item["start"]] = (item["end"], "")
+            seen.add(item["key"])
+    if append:
+        first = indexes[2]["ordered"][:1]
+        prefix = meine[meine.rfind("\n", 0, first[0]["start"]) + 1:first[0]["start"]] if first else "    "
+        indent = prefix if not prefix.strip() else "    "
+        safe_label = label.replace("--", "—").replace("<", "").replace(">", "")
+        marker = "Brigarde Killfeed Update " + safe_label
+        inserted = nl + (indent + "<!-- " + marker + " -->" + nl if options.get("kommentar", True) else "")
+        inserted += nl.join(indent + _update_block_format(block, indent, nl) for block in append) + nl
+        if options.get("kommentar", True):
+            inserted += indent + "<!-- End " + marker + " -->" + nl
+        close = indexes[2]["close"]
+        if close is None:
+            root_match = next(t for t in _UPDATE_TOKEN_RE.finditer(meine) if t.group().startswith("<" + _UPDATE_DATEIEN[name][1]))
+            root_raw = root_match.group()
+            edits[root_match.start()] = (root_match.end(), root_raw[:-2] + ">" + inserted + "</" + _UPDATE_DATEIEN[name][1] + ">")
+        else:
+            edits[close] = (close, inserted)
+    chunks, cursor = [], 0
+    for start, (end, replacement) in sorted(edits.items()):
+        chunks.extend((meine[cursor:start], replacement)); cursor = end
+    chunks.append(meine[cursor:]); after = "".join(chunks)
+    _update_index(after, name)  # final well-formedness and schema-root gate
+    result.update(actions); result["hash_nachher"] = _update_hash(after)
+    return after, result
+
+
+def _update_karte(conn):
+    canonical = _canonical_map_name(str(conn.data.get("map_name") or ""))
+    if canonical not in _UPDATE_STAENDE:
+        raise ValueError("Karte für den Update Assistant nicht unterstützt.")
+    return canonical
+
+
+def _update_stand(karte: str, key: Any):
+    if not isinstance(key, str):
+        raise ValueError("Unbekannter Update-Stand.")
+    row = next((item for item in _UPDATE_STAENDE[karte] if item["key"] == key), None)
+    if row is None:
+        raise ValueError("Unbekannter Update-Stand.")
+    return row
+
+
+async def _update_laden(karte: str, key: str, name: str) -> str:
+    stand = _update_stand(karte, key)
+    cache_key = (karte, key, name); cached = _UPDATE_CACHE.get(cache_key)
+    if cached and (stand["ref"] != "master" or time.monotonic() - cached[0] < 300):
+        return cached[1]
+    path, root, _tags = _UPDATE_DATEIEN[name]
+    url = ("https://raw.githubusercontent.com/BohemiaInteractive/DayZ-Central-Economy/"
+           + stand["ref"] + "/dayzOffline." + _FV_VORLAGEN_ORDNER[karte] + "/" + path)
+    try:
+        async with aiohttp.ClientSession(trust_env=True, timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.get(url, allow_redirects=False) as response:
+                if response.status == 404:
+                    text = "<" + root + "></" + root + ">"
+                else:
+                    if response.status != 200:
+                        raise OSError("HTTP " + str(response.status))
+                    data = bytearray()
+                    async for chunk in response.content.iter_chunked(65536):
+                        data.extend(chunk)
+                        if len(data) > _UPDATE_MAX_BYTES:
+                            raise OSError("size limit")
+                    text = data.decode("utf-8")
+        _update_index(text, name)
+    except Exception as exc:  # noqa: BLE001 - transport/XML failures are actionable API errors
+        log.warning("Update Assistant: Bohemia-Quelle (%s): %s", name, exc)
+        raise OSError("Bohemia-Quelle nicht erreichbar oder ungültig.") from exc
+    if len(_UPDATE_CACHE) >= 144:
+        _UPDATE_CACHE.pop(next(iter(_UPDATE_CACHE)))
+    _UPDATE_CACHE[cache_key] = (time.monotonic(), text)
+    return text
+
+
+async def _update_serverdateien(conn):
+    loop = asyncio.get_running_loop(); files = {}
+    paths = [row[0] for row in _UPDATE_DATEIEN.values()] + ["cfglimitsdefinition.xml", "cfglimitsdefinitionuser.xml", "cfgeconomycore.xml"]
+    for path in paths:
+        raw, status = await _tools_datei_lesen(conn, path, loop)
+        if status == "ok" and raw is not None:
+            files[path] = raw
+        elif status != "missing":
+            raise OSError("Server-Dateien konnten nicht vollständig gelesen werden.")
+    # Include custom CE dependencies; same bounded catalog as the validator.
+    if hasattr(conn.ftp, "walk"):
+        listing, status = await loop.run_in_executor(None, lambda: conn.ftp.walk(_mission_dir_of(conn), max_dateien=500, max_bytes=_UPDATE_MAX_BYTES))
+        if status != "ok":
+            raise OSError("Server-Dateien konnten nicht vollständig gelesen werden.")
+        for path, _size in listing:
+            if path not in files and _fv_base(path) in _FV_ROOTS:
+                if path.startswith("/") or ".." in path.split("/"):
+                    continue
+                raw, state = await _tools_datei_lesen(conn, path, loop)
+                if state != "ok":
+                    raise OSError("Server-Dateien konnten nicht vollständig gelesen werden.")
+                files[path] = raw
+    if sum(len(value.encode()) for value in files.values()) > _UPDATE_MAX_BYTES:
+        raise ValueError("Update-Dateien überschreiten zusammen 20 MB.")
+    return files
+
+
+def _update_neue_probleme(before, after, karte):
+    def issues(files):
+        return {(row["name"], issue["severity"], issue["message"]): issue
+                for row in _fv_validate_all(files, karte) for issue in row["issues"]
+                if issue["severity"] in ("error", "warning")}
+    old, new = issues(before), issues(after)
+    return [{"name": key[0], **issue} for key, issue in new.items() if key not in old]
+
+
+def _update_laeufe(conn):
+    return _brlc_entries(conn, "update_laeufe")
+
+
+async def api_tools_updateassistant_get(request: web.Request) -> web.Response:
+    conn, failure = await _brlc_prepare(request, "tools.updateassistant", "view")
+    if failure is not None:
+        return failure
+    try:
+        karte = _update_karte(conn)
+        files = await _update_serverdateien(conn) if _mission_dir_of(conn) else {}
+    except ValueError as exc:
+        return err(str(exc), 400)
+    except OSError as exc:
+        return err(str(exc), 502)
+    rows = [{"name": name, "path": spec[0], "vorhanden": spec[0] in files,
+             "size": str(len(files.get(spec[0], "").encode())),
+             "hash": _update_hash(files[spec[0]]) if spec[0] in files else None,
+             "hinweis": "Loot-Positionen können persistenzabhängig sein; kein automatischer Wipe." if name == "mapgroupproto.xml" else None}
+            for name, spec in _UPDATE_DATEIEN.items()]
+    return ok({"karte": karte, "staende": _UPDATE_STAENDE[karte], "dateien": rows,
+               "laeufe": _update_laeufe(conn)[-20:], "kein_mission_ordner": not bool(_mission_dir_of(conn))})
+
+
+async def api_tools_updateassistant_erkennen(request: web.Request) -> web.Response:
+    conn, failure = await _brlc_prepare(request, "tools.updateassistant", "view")
+    if failure is not None:
+        return failure
+    data = await body(request)
+    name = data.get("datei") if isinstance(data, dict) else None
+    if not isinstance(name, str) or name not in _UPDATE_DATEIEN:
+        return err("Unbekannte Update-Datei.", 400)
+    try:
+        karte = _update_karte(conn)
+        raw, status = await _tools_datei_lesen(conn, _UPDATE_DATEIEN[name][0], asyncio.get_running_loop())
+        if status != "ok":
+            return err("Update-Datei ist nicht vorhanden oder nicht lesbar.", 404)
+        own = _update_index(raw, name)["entries"]
+        scores = []
+        for stand in _UPDATE_STAENDE[karte][1:9]:
+            official = _update_index(await _update_laden(karte, stand["key"], name), name)["entries"]
+            denominator = len(own.keys() | official.keys())
+            matches = sum(key in own and own[key]["form"] == value["form"] for key, value in official.items())
+            scores.append({"key": stand["key"], "label": stand["label"], "identisch": matches,
+                           "prozent": round(matches * 100 / denominator, 1) if denominator else 0})
+        winner = max(scores, key=lambda row: (row["identisch"], row["prozent"]))
+        return ok({"vorschlag": winner, "kandidaten": scores,
+                   "hinweis": "Nur ein Vorschlag: angepasste Dateien erreichen oft keine 100 Prozent; gleiche Treffer sind mehrdeutig."})
+    except (ValueError, ET.ParseError) as exc:
+        return err(str(exc), 409)
+    except OSError as exc:
+        return err(str(exc), 502)
+
+
+async def _update_plan(conn, data, apply=False):
+    if not isinstance(data, dict):
+        raise ValueError("Ungültige Update-Anfrage.")
+    karte = _update_karte(conn)
+    _update_stand(karte, data.get("von")); target = _update_stand(karte, data.get("auf"))
+    selected = data.get("dateien")
+    if not isinstance(selected, list) or not 1 <= len(selected) <= 9:
+        raise ValueError("Bitte 1–9 Update-Dateien auswählen.")
+    options, seen = [], set()
+    extra_options = data.get("optionen", {})
+    if not isinstance(extra_options, dict):
+        raise ValueError("Ungültige Update-Anfrage.")
+    for item in selected:
+        row = item if apply else None
+        if not apply and isinstance(item, str) and isinstance(extra_options.get(item, {}), dict):
+            row = {**extra_options.get(item, {}), "name": item}
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str) or row["name"] not in _UPDATE_DATEIEN or row["name"] in seen:
+            raise ValueError("Unbekannte oder doppelte Update-Datei.")
+        seen.add(row["name"]); options.append(row)
+    files = await _update_serverdateien(conn); after = dict(files); results = []
+    for row in options:
+        name = row["name"]; path = _UPDATE_DATEIEN[name][0]
+        if path not in files:
+            raise FileNotFoundError("Update-Datei ist nicht vorhanden oder nicht lesbar.")
+        if apply and row.get("source_hash") != _update_hash(files[path]):
+            raise FileExistsError("Update-Datei wurde inzwischen geändert. Bitte erneut vergleichen.")
+        base = await _update_laden(karte, data["von"], name)
+        new = await _update_laden(karte, data["auf"], name)
+        after[path], result = await asyncio.get_running_loop().run_in_executor(None, _update_merge, name, base, new, files[path], target["label"], row)
+        results.append(result)
+    problems = await asyncio.get_running_loop().run_in_executor(None, _update_neue_probleme, files, after, karte)
+    return files, after, results, problems
+
+
+async def api_tools_updateassistant_vergleich(request: web.Request) -> web.Response:
+    conn, failure = await _brlc_prepare(request, "tools.updateassistant", "view")
+    if failure is not None:
+        return failure
+    try:
+        _before, _after, results, problems = await _update_plan(conn, await body(request))
+        return ok({"dateien": results, "probleme": problems})
+    except FileNotFoundError as exc:
+        return err(str(exc), 404)
+    except FileExistsError as exc:
+        return err(str(exc), 409)
+    except ET.ParseError as exc:
+        return err("Update-XML ungültig oder inzwischen geändert: " + str(exc), 409)
+    except ValueError as exc:
+        return err(str(exc), 400)
+    except OSError as exc:
+        return err(str(exc), 502)
+
+
+async def api_tools_updateassistant_anwenden(request: web.Request) -> web.Response:
+    conn, failure = await _brlc_prepare(request, "tools.updateassistant", "edit")
+    if failure is not None:
+        return failure
+    failure = _dash_rate_limited(request, "tools.updateassistant.anwenden", 10)
+    if failure is not None:
+        return failure
+    data = await body(request)
+    async with _schaden_lock(conn.service_id):
+        try:
+            before, after, results, problems = await _update_plan(conn, data, True)
+            if any(issue["severity"] == "error" for issue in problems) and data.get("bestaetigt_fehler") is not True:
+                return err("Neue Update-Fehler müssen ausdrücklich bestätigt werden.", 409, probleme=problems)
+            run_id = uuid.uuid4().hex; changes, manifest_rows = [], []
+            loop = asyncio.get_running_loop()
+            for result in results:
+                path = _UPDATE_DATEIEN[result["name"]][0]
+                if before[path] == after[path]:
+                    continue
+                # Run-specific .bak avoids corrupting older undo records on later updates.
+                backup = path + "." + run_id + ".bak"
+                backup_old, state = await _tools_datei_lesen(conn, backup, loop)
+                if state != "missing":
+                    raise OSError("Update-Sicherung konnte nicht angelegt werden.")
+                changes.extend(((backup, backup_old, before[path]), (path, before[path], after[path])))
+                manifest_rows.append({"name": result["name"], "bak": backup,
+                    "hash_vorher": _update_hash(before[path]), "hash_nachher": _update_hash(after[path]),
+                    **{key: result[key] for key in ("hinzugefuegt", "uebernommen", "behalten", "entfernt")}})
+            if not changes:
+                return ok({"geaendert": False, "probleme": problems})
+            # Cold official downloads may take time: check every source again
+            # immediately before the first backup/write, without partial writes.
+            for result in results:
+                path = _UPDATE_DATEIEN[result["name"]][0]
+                current, state = await _tools_datei_lesen(conn, path, loop)
+                if state != "ok" or _update_hash(current) != result["source_hash"]:
+                    raise FileExistsError("Update-Datei wurde inzwischen geändert. Bitte erneut vergleichen.")
+            entry = {"id": run_id, "zeit": time.time(), "von": data["von"], "auf": data["auf"], "dateien": manifest_rows}
+            failure = await _brlc_transaction(conn, "update_laeufe", changes, (_update_laeufe(conn) + [entry])[-20:], loop)
+            if failure is not None:
+                return failure
+            _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Update Assistant angewendet", run_id + " · " + conn.name)
+            return ok({"geaendert": True, "lauf": entry, "probleme": problems})
+        except FileNotFoundError as exc:
+            return err(str(exc), 404)
+        except FileExistsError as exc:
+            return err(str(exc), 409)
+        except ET.ParseError as exc:
+            return err("Update-XML ungültig oder inzwischen geändert: " + str(exc), 409)
+        except ValueError as exc:
+            return err(str(exc), 400)
+        except OSError as exc:
+            return err(str(exc), 502)
+
+
+async def api_tools_updateassistant_zurueck(request: web.Request) -> web.Response:
+    conn, failure = await _brlc_prepare(request, "tools.updateassistant", "edit")
+    if failure is not None:
+        return failure
+    failure = _dash_rate_limited(request, "tools.updateassistant.zurueck", 10)
+    if failure is not None:
+        return failure
+    data = await body(request)
+    async with _schaden_lock(conn.service_id):
+        history = _update_laeufe(conn)
+        entry = next((row for row in history if isinstance(data, dict) and row["id"] == data.get("id") and not row.get("zurueck")), None)
+        if entry is None:
+            return err("Update-Lauf nicht gefunden.", 404)
+        loop = asyncio.get_running_loop(); changes = []
+        for row in entry["dateien"]:
+            path = _UPDATE_DATEIEN[row["name"]][0]
+            current, state = await _tools_datei_lesen(conn, path, loop)
+            if state != "ok" or _update_hash(current) != row["hash_nachher"]:
+                return err("Update-Datei wurde inzwischen geändert. Zurückspielen nicht möglich.", 409)
+            original, state = await _tools_datei_lesen(conn, row["bak"], loop)
+            if state != "ok" or _update_hash(original) != row["hash_vorher"]:
+                return err("Update-Sicherung fehlt oder wurde verändert.", 409)
+            changes.append((path, current, original))
+        entry["zurueck"] = time.time()
+        failure = await _brlc_transaction(conn, "update_laeufe", changes, history, loop)
+        if failure is not None:
+            return failure
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Update Assistant zurückgespielt", entry["id"] + " · " + conn.name)
+        return ok({"zurueck": entry["id"]})
 
 
 # ── 7. Event-Vorlagen ──────────────────────────────────────────────────────
@@ -31983,6 +32667,8 @@ _AUDIT_LABELS = {
     ("POST", "/api/tools/qrcode"): "QR-Code eingesetzt",
     ("POST", "/api/tools/qrcode/remove"): "QR-Code entfernt",
     ("POST", "/api/tools/filevalidator/fix"): "Datei-Validator Fix angewendet",
+    ("POST", "/api/tools/updateassistant/anwenden"): "Tool: Update Assistant angewendet",
+    ("POST", "/api/tools/updateassistant/zurueck"): "Tool: Update Assistant zurückgespielt",
     ("POST", "/api/bans"): "Spieler gebannt",
     ("POST", "/api/whitelist"): "Whitelist-Eintrag hinzugefügt",
     ("POST", "/api/announcements"): "Ankündigung angelegt",
@@ -41865,6 +42551,11 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/filevalidator/check", api_tools_filevalidator_check)
     r.add_post("/api/tools/filevalidator/fix", api_tools_filevalidator_fix)
     r.add_get("/api/tools/filevalidator/templates", api_tools_filevalidator_templates)
+    r.add_get("/api/tools/updateassistant", api_tools_updateassistant_get)
+    r.add_post("/api/tools/updateassistant/erkennen", api_tools_updateassistant_erkennen)
+    r.add_post("/api/tools/updateassistant/vergleich", api_tools_updateassistant_vergleich)
+    r.add_post("/api/tools/updateassistant/anwenden", api_tools_updateassistant_anwenden)
+    r.add_post("/api/tools/updateassistant/zurueck", api_tools_updateassistant_zurueck)
     r.add_get("/api/tools/weather", api_tools_weather_get)
     r.add_post("/api/tools/weather", api_tools_weather_post)
     r.add_get("/api/tools/globals", api_tools_globals_get)
@@ -42608,6 +43299,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "bc65fa1acb74aa6f9222564542583125944b77a7fec02787b374f774b1333a1e",
         "2caece378d7fd03a324a1380e118ba3de9506505946ac69eba11c1156af21374",
         "4659b64843dc4a42edc6ef15cf8455e615e73c16b664b2b885d070e14f5f3a84",
         "9b49059c7d07ff813dc2f4a608c97cb1b37eeab268fbabea1f229c0c0eb2d343",

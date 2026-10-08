@@ -1,0 +1,5 @@
+<variables>
+<var name="AnimalMaxCount" type="0" value="200"/>
+<var name="CleanupAvoidance" type="0" value="100"/>
+<var name="CleanupLifetimeDeadAnimal" type="0" value="1200"/>
+</variables>

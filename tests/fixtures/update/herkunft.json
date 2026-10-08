@@ -1,0 +1,488 @@
+[
+  {
+    "karte": "ChernarusPlus",
+    "file": "types.xml",
+    "basis": {
+      "key": "083cd041b88e",
+      "label": "2026-07-15 · 083cd041",
+      "ref": "083cd041b88e196b6e1c312dfc272ae8120d9752",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "b86c1b71cbad",
+      "label": "2026-08-13 · b86c1b71",
+      "ref": "b86c1b71cbad4b62c4ca004f6ec7c8d4bbaccead",
+      "datum": "2026-08-13"
+    },
+    "entries": 13,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "ChernarusPlus",
+    "file": "events.xml",
+    "basis": {
+      "key": "083cd041b88e",
+      "label": "2026-07-15 · 083cd041",
+      "ref": "083cd041b88e196b6e1c312dfc272ae8120d9752",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "b86c1b71cbad",
+      "label": "2026-08-13 · b86c1b71",
+      "ref": "b86c1b71cbad4b62c4ca004f6ec7c8d4bbaccead",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "ChernarusPlus",
+    "file": "cfgspawnabletypes.xml",
+    "basis": {
+      "key": "083cd041b88e",
+      "label": "2026-07-15 · 083cd041",
+      "ref": "083cd041b88e196b6e1c312dfc272ae8120d9752",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "b86c1b71cbad",
+      "label": "2026-08-13 · b86c1b71",
+      "ref": "b86c1b71cbad4b62c4ca004f6ec7c8d4bbaccead",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "ChernarusPlus",
+    "file": "cfgrandompresets.xml",
+    "basis": {
+      "key": "083cd041b88e",
+      "label": "2026-07-15 · 083cd041",
+      "ref": "083cd041b88e196b6e1c312dfc272ae8120d9752",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "b86c1b71cbad",
+      "label": "2026-08-13 · b86c1b71",
+      "ref": "b86c1b71cbad4b62c4ca004f6ec7c8d4bbaccead",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "ChernarusPlus",
+    "file": "mapgroupproto.xml",
+    "basis": {
+      "key": "083cd041b88e",
+      "label": "2026-07-15 · 083cd041",
+      "ref": "083cd041b88e196b6e1c312dfc272ae8120d9752",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "b86c1b71cbad",
+      "label": "2026-08-13 · b86c1b71",
+      "ref": "b86c1b71cbad4b62c4ca004f6ec7c8d4bbaccead",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "ChernarusPlus",
+    "file": "globals.xml",
+    "basis": {
+      "key": "083cd041b88e",
+      "label": "2026-07-15 · 083cd041",
+      "ref": "083cd041b88e196b6e1c312dfc272ae8120d9752",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "b86c1b71cbad",
+      "label": "2026-08-13 · b86c1b71",
+      "ref": "b86c1b71cbad4b62c4ca004f6ec7c8d4bbaccead",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "ChernarusPlus",
+    "file": "cfgeventspawns.xml",
+    "basis": {
+      "key": "083cd041b88e",
+      "label": "2026-07-15 · 083cd041",
+      "ref": "083cd041b88e196b6e1c312dfc272ae8120d9752",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "b86c1b71cbad",
+      "label": "2026-08-13 · b86c1b71",
+      "ref": "b86c1b71cbad4b62c4ca004f6ec7c8d4bbaccead",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "ChernarusPlus",
+    "file": "messages.xml",
+    "basis": {
+      "key": "083cd041b88e",
+      "label": "2026-07-15 · 083cd041",
+      "ref": "083cd041b88e196b6e1c312dfc272ae8120d9752",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "b86c1b71cbad",
+      "label": "2026-08-13 · b86c1b71",
+      "ref": "b86c1b71cbad4b62c4ca004f6ec7c8d4bbaccead",
+      "datum": "2026-08-13"
+    },
+    "entries": 0,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "ChernarusPlus",
+    "file": "cfgeventgroups.xml",
+    "basis": {
+      "key": "083cd041b88e",
+      "label": "2026-07-15 · 083cd041",
+      "ref": "083cd041b88e196b6e1c312dfc272ae8120d9752",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "b86c1b71cbad",
+      "label": "2026-08-13 · b86c1b71",
+      "ref": "b86c1b71cbad4b62c4ca004f6ec7c8d4bbaccead",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Livonia",
+    "file": "types.xml",
+    "basis": {
+      "key": "527bbb55adfe",
+      "label": "2026-07-15 · 527bbb55",
+      "ref": "527bbb55adfe13b24465ef4080b0931dd836a397",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "9a21bb9f5fb9",
+      "label": "2026-08-13 · 9a21bb9f",
+      "ref": "9a21bb9f5fb9c62a7ce2761402196091588133e6",
+      "datum": "2026-08-13"
+    },
+    "entries": 4,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Livonia",
+    "file": "events.xml",
+    "basis": {
+      "key": "527bbb55adfe",
+      "label": "2026-07-15 · 527bbb55",
+      "ref": "527bbb55adfe13b24465ef4080b0931dd836a397",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "9a21bb9f5fb9",
+      "label": "2026-08-13 · 9a21bb9f",
+      "ref": "9a21bb9f5fb9c62a7ce2761402196091588133e6",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Livonia",
+    "file": "cfgspawnabletypes.xml",
+    "basis": {
+      "key": "527bbb55adfe",
+      "label": "2026-07-15 · 527bbb55",
+      "ref": "527bbb55adfe13b24465ef4080b0931dd836a397",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "9a21bb9f5fb9",
+      "label": "2026-08-13 · 9a21bb9f",
+      "ref": "9a21bb9f5fb9c62a7ce2761402196091588133e6",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Livonia",
+    "file": "cfgrandompresets.xml",
+    "basis": {
+      "key": "527bbb55adfe",
+      "label": "2026-07-15 · 527bbb55",
+      "ref": "527bbb55adfe13b24465ef4080b0931dd836a397",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "9a21bb9f5fb9",
+      "label": "2026-08-13 · 9a21bb9f",
+      "ref": "9a21bb9f5fb9c62a7ce2761402196091588133e6",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Livonia",
+    "file": "mapgroupproto.xml",
+    "basis": {
+      "key": "527bbb55adfe",
+      "label": "2026-07-15 · 527bbb55",
+      "ref": "527bbb55adfe13b24465ef4080b0931dd836a397",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "9a21bb9f5fb9",
+      "label": "2026-08-13 · 9a21bb9f",
+      "ref": "9a21bb9f5fb9c62a7ce2761402196091588133e6",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Livonia",
+    "file": "globals.xml",
+    "basis": {
+      "key": "527bbb55adfe",
+      "label": "2026-07-15 · 527bbb55",
+      "ref": "527bbb55adfe13b24465ef4080b0931dd836a397",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "9a21bb9f5fb9",
+      "label": "2026-08-13 · 9a21bb9f",
+      "ref": "9a21bb9f5fb9c62a7ce2761402196091588133e6",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Livonia",
+    "file": "cfgeventspawns.xml",
+    "basis": {
+      "key": "527bbb55adfe",
+      "label": "2026-07-15 · 527bbb55",
+      "ref": "527bbb55adfe13b24465ef4080b0931dd836a397",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "9a21bb9f5fb9",
+      "label": "2026-08-13 · 9a21bb9f",
+      "ref": "9a21bb9f5fb9c62a7ce2761402196091588133e6",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Livonia",
+    "file": "messages.xml",
+    "basis": {
+      "key": "527bbb55adfe",
+      "label": "2026-07-15 · 527bbb55",
+      "ref": "527bbb55adfe13b24465ef4080b0931dd836a397",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "9a21bb9f5fb9",
+      "label": "2026-08-13 · 9a21bb9f",
+      "ref": "9a21bb9f5fb9c62a7ce2761402196091588133e6",
+      "datum": "2026-08-13"
+    },
+    "entries": 0,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Livonia",
+    "file": "cfgeventgroups.xml",
+    "basis": {
+      "key": "527bbb55adfe",
+      "label": "2026-07-15 · 527bbb55",
+      "ref": "527bbb55adfe13b24465ef4080b0931dd836a397",
+      "datum": "2026-07-15"
+    },
+    "neu": {
+      "key": "9a21bb9f5fb9",
+      "label": "2026-08-13 · 9a21bb9f",
+      "ref": "9a21bb9f5fb9c62a7ce2761402196091588133e6",
+      "datum": "2026-08-13"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Sakhal",
+    "file": "types.xml",
+    "basis": {
+      "key": "4696b4b0ed09",
+      "label": "2026-04-08 · 4696b4b0",
+      "ref": "4696b4b0ed09e9ed8076c3f397649f71a871abf1",
+      "datum": "2026-04-08"
+    },
+    "neu": {
+      "key": "8e769861441f",
+      "label": "2026-07-15 · 8e769861",
+      "ref": "8e769861441f19c32d30ba0d9a074e15b740d917",
+      "datum": "2026-07-15"
+    },
+    "entries": 34,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Sakhal",
+    "file": "events.xml",
+    "basis": {
+      "key": "4696b4b0ed09",
+      "label": "2026-04-08 · 4696b4b0",
+      "ref": "4696b4b0ed09e9ed8076c3f397649f71a871abf1",
+      "datum": "2026-04-08"
+    },
+    "neu": {
+      "key": "8e769861441f",
+      "label": "2026-07-15 · 8e769861",
+      "ref": "8e769861441f19c32d30ba0d9a074e15b740d917",
+      "datum": "2026-07-15"
+    },
+    "entries": 4,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Sakhal",
+    "file": "cfgspawnabletypes.xml",
+    "basis": {
+      "key": "4696b4b0ed09",
+      "label": "2026-04-08 · 4696b4b0",
+      "ref": "4696b4b0ed09e9ed8076c3f397649f71a871abf1",
+      "datum": "2026-04-08"
+    },
+    "neu": {
+      "key": "8e769861441f",
+      "label": "2026-07-15 · 8e769861",
+      "ref": "8e769861441f19c32d30ba0d9a074e15b740d917",
+      "datum": "2026-07-15"
+    },
+    "entries": 11,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Sakhal",
+    "file": "cfgrandompresets.xml",
+    "basis": {
+      "key": "4696b4b0ed09",
+      "label": "2026-04-08 · 4696b4b0",
+      "ref": "4696b4b0ed09e9ed8076c3f397649f71a871abf1",
+      "datum": "2026-04-08"
+    },
+    "neu": {
+      "key": "8e769861441f",
+      "label": "2026-07-15 · 8e769861",
+      "ref": "8e769861441f19c32d30ba0d9a074e15b740d917",
+      "datum": "2026-07-15"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Sakhal",
+    "file": "mapgroupproto.xml",
+    "basis": {
+      "key": "4696b4b0ed09",
+      "label": "2026-04-08 · 4696b4b0",
+      "ref": "4696b4b0ed09e9ed8076c3f397649f71a871abf1",
+      "datum": "2026-04-08"
+    },
+    "neu": {
+      "key": "8e769861441f",
+      "label": "2026-07-15 · 8e769861",
+      "ref": "8e769861441f19c32d30ba0d9a074e15b740d917",
+      "datum": "2026-07-15"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Sakhal",
+    "file": "globals.xml",
+    "basis": {
+      "key": "4696b4b0ed09",
+      "label": "2026-04-08 · 4696b4b0",
+      "ref": "4696b4b0ed09e9ed8076c3f397649f71a871abf1",
+      "datum": "2026-04-08"
+    },
+    "neu": {
+      "key": "8e769861441f",
+      "label": "2026-07-15 · 8e769861",
+      "ref": "8e769861441f19c32d30ba0d9a074e15b740d917",
+      "datum": "2026-07-15"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Sakhal",
+    "file": "cfgeventspawns.xml",
+    "basis": {
+      "key": "4696b4b0ed09",
+      "label": "2026-04-08 · 4696b4b0",
+      "ref": "4696b4b0ed09e9ed8076c3f397649f71a871abf1",
+      "datum": "2026-04-08"
+    },
+    "neu": {
+      "key": "8e769861441f",
+      "label": "2026-07-15 · 8e769861",
+      "ref": "8e769861441f19c32d30ba0d9a074e15b740d917",
+      "datum": "2026-07-15"
+    },
+    "entries": 3,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Sakhal",
+    "file": "messages.xml",
+    "basis": {
+      "key": "4696b4b0ed09",
+      "label": "2026-04-08 · 4696b4b0",
+      "ref": "4696b4b0ed09e9ed8076c3f397649f71a871abf1",
+      "datum": "2026-04-08"
+    },
+    "neu": {
+      "key": "8e769861441f",
+      "label": "2026-07-15 · 8e769861",
+      "ref": "8e769861441f19c32d30ba0d9a074e15b740d917",
+      "datum": "2026-07-15"
+    },
+    "entries": 0,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  },
+  {
+    "karte": "Sakhal",
+    "file": "cfgeventgroups.xml",
+    "basis": {
+      "key": "4696b4b0ed09",
+      "label": "2026-04-08 · 4696b4b0",
+      "ref": "4696b4b0ed09e9ed8076c3f397649f71a871abf1",
+      "datum": "2026-04-08"
+    },
+    "neu": {
+      "key": "8e769861441f",
+      "label": "2026-07-15 · 8e769861",
+      "ref": "8e769861441f19c32d30ba0d9a074e15b740d917",
+      "datum": "2026-07-15"
+    },
+    "entries": 1,
+    "source": "https://github.com/BohemiaInteractive/DayZ-Central-Economy"
+  }
+]

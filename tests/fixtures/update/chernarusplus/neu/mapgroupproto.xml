@@ -1,0 +1,80 @@
+<prototype>
+<group name="Land_Airfield_Hangar_Green">
+				<usage name="Industrial" />
+				<container name="lootFloor" lootmax="6">
+						<category name="tools" />
+						<category name="containers" />
+						<category name="clothes" />
+						<category name="food" />
+						<tag name="ground" />
+						<tag name="floor" />
+						<tag name="shelves" />
+						<point pos="-0.556982 -5.873707 -2.182739" range="1.199951" height="2.000000" />
+						<point pos="4.940017 -5.873707 -2.799033" range="1.199951" height="2.000000" />
+						<point pos="10.024015 -5.873707 -2.916298" range="1.199951" height="2.000000" />
+						<point pos="14.799690 -5.873707 -2.430686" range="1.199951" height="2.000000" />
+						<point pos="20.616117 -5.873707 -1.506009" range="1.199951" height="2.000000" />
+						<point pos="20.995377 -5.873707 -12.041319" range="1.199951" height="2.000000" />
+						<point pos="10.430390 -5.873707 -13.651895" range="1.199951" height="2.000000" />
+						<point pos="0.639014 -5.873707 -12.519395" range="1.199951" height="2.000000" />
+						<point pos="-6.294950 -5.873707 -11.893210" range="1.199951" height="2.000000" />
+						<point pos="-12.280378 -5.873707 -8.493432" range="1.199951" height="2.000000" />
+						<point pos="-18.450100 -5.873707 -11.072787" range="1.199951" height="2.000000" />
+						<point pos="-15.869028 -5.873707 4.180776" range="1.199951" height="2.000000" />
+						<point pos="-14.316822 -5.873707 -2.075099" range="1.199951" height="2.000000" />
+						<point pos="-17.528742 -5.873707 10.485650" range="1.199951" height="2.000000" />
+						<point pos="-11.437869 -5.873707 11.812913" range="1.199951" height="2.000000" />
+						<point pos="-1.604898 -5.873707 13.376926" range="1.199951" height="2.000000" />
+						<point pos="6.769409 -5.873707 12.968884" range="1.199951" height="2.000000" />
+						<point pos="14.665885 -5.873707 12.970013" range="1.199951" height="2.000000" />
+						<point pos="21.123547 -5.873707 13.321635" range="1.199951" height="2.000000" />
+						<point pos="20.579266 -5.873707 6.633991" range="1.199951" height="2.000000" />
+						<point pos="17.379486 -5.873707 3.011131" range="1.199951" height="2.000000" />
+						<point pos="-7.040497 -5.873707 -2.209310" range="1.199951" height="2.000000" />
+						<point pos="-5.674132 -5.873707 6.909420" range="1.199951" height="2.000000" />
+						<point pos="4.749569 -5.873707 4.586981" range="1.199951" height="2.000000" />
+						<point pos="11.311040 -5.873707 5.060560" range="1.199951" height="2.000000" />
+						<point pos="18.322161 -5.873707 9.603466" range="1.199951" height="2.000000" />
+						<point pos="17.133739 -5.873707 -7.997792" range="1.199951" height="2.000000" />
+				</container>
+		</group>
+<group name="Bonfire" lootmax="8">
+				<usage name="SeasonalEvent" />
+				<usage name="Firefighter" />
+				<container name="lootFloor" lootmax="8">
+						<point pos="2.876667 0.5 3.211807" range="1.65" height="1.5" flags="32" />
+						<point pos="2.496737 0.5 -3.174454" range="1.65" height="1.5" flags="32" />
+						<point pos="-3.760472 0.5 3.067368" range="1.65" height="1.5" flags="32" />
+						<point pos="-2.757211 0.5 -2.885785" range="1.65" height="1.5" flags="32" />
+						<point pos="-3.068999 0.5 0.274213" range="1.65" height="1.5" flags="32" />
+						<point pos="3.068931 0.5 0.468461" range="1.65" height="1.5" flags="32" />
+						<point pos="0.829929 0.5 3.131861" range="1.65" height="1.5" flags="32" />
+						<point pos="0.975612 0.5 -3.178558" range="1.65" height="1.5" flags="32" />
+				</container>
+		</group>
+<group name="ChristmasTree" lootmax="10">
+				<usage name="SeasonalEvent" />
+				<container name="lootFloor" lootmax="10">
+						<category name="containers" />
+						<point pos="2.621 1 -3.694" range="0.30" height="1" />
+						<point pos="-2.043 1 -3.967" range="0.30" height="1" />
+						<point pos="-2.616 1 -3.121" range="0.30" height="1" />
+						<point pos="-3.926 1 -2.848" range="0.30" height="1" />
+						<point pos="-4.417 1 -1.566" range="0.30" height="1" />
+						<point pos="-1.880 1 3.781" range="0.30" height="1" />
+						<point pos="-0.243 1 3.917" range="0.30" height="1" />
+						<point pos="0.957 1 4.190" range="0.30" height="1" />
+						<point pos="2.621 1 3.644" range="0.30" height="1" />
+						<point pos="3.494 1 2.662" range="0.30" height="1" />
+						<point pos="4.313 1 1.817" range="0.30" height="1" />
+						<point pos="4.667 1 0.753" range="0.30" height="1" />
+						<point pos="4.777 1 -0.366" range="0.30" height="1" />
+						<point pos="4.449 1 -1.593" range="0.30" height="1" />
+						<point pos="4.013 1 -3.367" range="0.30" height="1" />
+						<point pos="1.066 1 -3.585" range="0.30" height="1" />
+						<point pos="-0.543 1 -3.912" range="0.30" height="1" />
+						<point pos="-4.771 1 0.725" range="0.30" height="1" />
+						<point pos="-4.144 1 3.808" range="0.30" height="1" />
+				</container>
+		</group>
+</prototype>

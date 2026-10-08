@@ -1,0 +1,39 @@
+<eventgroupdef>
+<group name="Abandoned_Arsenovo">
+        <child type="StaticObj_Wreck_MTVR_Cargo_DE" deloot="1" lootmax="3" lootmin="2" x="0" z="0" a="42.800"/>
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="-0.349" z="-1.252" a="45.575"/>
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="-1.577" z="-10.871" a="0"/>
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="-6.421" z="-15.165" a="174.362"/>
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="-21.742" z="-19.327" a="330.736"/>
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="-17.860" z="-28.331" a="163.723"/>
+        <child type="Land_Wreck_Offroad02_Aban1_TK_DE" deloot="1" lootmax="3" lootmin="2" x="-21.371" z="-19.243" a="339.889"/>
+        <child type="StaticObj_Wreck_Stryker_DE" deloot="1" lootmax="3" lootmin="2" x="-6.068" z="-17.091" a="358.195"/>
+        <child type="Land_Wreck_Offroad02_Medic_TK_DE" deloot="1" lootmax="3" lootmin="2" x="-2.029" z="-13.583" a="6.961"/>
+        <child type="Land_Wreck_Offroad02_Aban2_TK_DE" deloot="1" lootmax="3" lootmin="2" x="-17.305" z="-29.343" a="0"/>
+    </group>
+<group name="Abandoned_Balota">
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="0" z="0" a="266.407"/>
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="5.242" z="21.793" a="5.286"/>
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="3.392" z="10.454" a="25.912"/>
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="-31.581" z="7.590" a="281.233"/>
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="-7.314" z="6.913" a="286.647"/>
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="-0.110" z="7.367" a="247.328"/>
+        <child type="Land_Wreck_Offroad02_Aban1_TK_DE" deloot="1" lootmax="3" lootmin="2" x="-29.744" z="6.677" a="281.104"/>
+        <child type="StaticObj_Wreck_Ural_DE" deloot="1" lootmax="3" lootmin="2" x="1.379" z="9.086" a="223.736"/>
+        <child type="StaticObj_Wreck_MTVR_Cargo_DE" deloot="1" lootmax="3" lootmin="2" x="-8.375" z="7.284" a="284.842"/>
+        <child type="StaticObj_Wreck_Uaz_DE" deloot="1" lootmax="3" lootmin="2" x="0.562" z="-0.015" a="287.678"/>
+        <child type="StaticObj_Wreck_MTVR_Cargo_DE" deloot="1" lootmax="3" lootmin="2" x="4.784" z="21.874" a="194.859"/>
+    </group>
+<group name="Abandoned_Cherno">
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="0" z="0" a="142.967"/>
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="-5.323" z="10.334" a="153.667"/>
+        <child type="StaticObj_Wreck_Decal_Small2_DE" spawnsecondary="false" x="9.347" z="-10.342" a="134.330"/>
+        <child type="StaticObj_Wreck_Uaz_DE" deloot="1" lootmax="3" lootmin="2" x="-9.127" z="17.177" a="145.675"/>
+        <child type="StaticObj_Wreck_Stryker_DE" deloot="1" lootmax="3" lootmin="2" x="0.775" z="-0.222" a="145.546"/>
+        <child type="Land_Wreck_Offroad02_Medic_TK_DE" deloot="1" lootmax="3" lootmin="2" x="-4.731" z="10.653" a="156.761"/>
+        <child type="Land_Wreck_Offroad02_Aban1_TK_DE" deloot="1" lootmax="2" lootmin="2" x="-8.959" z="20.259" a="66.649"/>
+        <child type="Land_Wreck_Offroad02_Aban2_TK_DE" deloot="1" lootmax="3" lootmin="2" x="9.812" z="-10.736" a="131.623"/>
+        <child type="StaticObj_Wreck_Decal_Small1_DE" spawnsecondary="false" x="-9.434" z="20.466" a="73.224"/>
+        <child type="StaticObj_Wreck_Decal_Small1_DE" spawnsecondary="false" x="-9.245" z="16.426" a="336.924"/>
+    </group>
+</eventgroupdef>

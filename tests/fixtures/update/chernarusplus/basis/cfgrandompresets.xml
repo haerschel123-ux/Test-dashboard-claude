@@ -1,0 +1,33 @@
+<randompresets>
+<attachments chance="0.1" name="bagsCity">
+			<item name="CanvasBag_Olive" chance="0.30" />
+			<item name="TaloonBag_Orange" chance="0.10" />
+			<item name="TaloonBag_Blue" chance="0.10" />
+			<item name="TaloonBag_Violet" chance="0.10" />
+			<item name="TaloonBag_Green" chance="0.10" />
+		</attachments>
+<attachments chance="0.08" name="bagsArmy">
+			<item name="DuffelBagSmall_Camo" chance="0.10" />
+			<item name="DuffelBagSmall_Green" chance="0.10" />
+			<item name="DuffelBagSmall_Medical" chance="0.10" />
+			<item name="ArmyPouch_Black" chance="0.10" />
+			<item name="ArmyPouch_Camo" chance="0.10" />
+			<item name="AssaultBag_Green" chance="0.10" />
+			<item name="AssaultBag_Ttsko" chance="0.10" />
+			<item name="AssaultBag_Black" chance="0.10" />
+			<item name="TortillaBag" chance="0.10" />
+		</attachments>
+<attachments chance="0.1" name="backpacks_T1">
+			<item name="Slingbag_Black" chance="0.1" />
+			<item name="Slingbag_Brown" chance="0.1" />
+			<item name="Slingbag_Gray" chance="0.1" />
+			<item name="CourierBag" chance="0.1" />
+			<item name="FurCourierBag" chance="0.1" />
+			<item name="CanvasBag_Olive" chance="0.1" />
+			<item name="DuffelBagSmall_Green" chance="0.08" />
+			<item name="TaloonBag_Blue" chance="0.08" />
+			<item name="TaloonBag_Green" chance="0.08" />
+			<item name="TaloonBag_Orange" chance="0.08" />
+			<item name="TaloonBag_Violet" chance="0.08" />
+		</attachments>
+</randompresets>
