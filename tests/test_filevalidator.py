@@ -156,3 +156,15 @@ def test_api_fix_refuses_result_that_does_not_parse(monkeypatch, servers):
     a.ftp.files["/mission/db/types.xml"] = text
     status, _ = call(monkeypatch, a, bot.api_tools_filevalidator_fix, {"name": "db/types.xml", "source_hash": _sha(text), "commit": True})
     assert status == 409 and a.ftp.writes == []
+
+
+def test_zeilennummer_gleich_alter_zaehlung_und_schnell_bei_riesiger_einzeile():
+    import random
+    random.seed(7)
+    text = "".join(random.choice("ab\n") for _ in range(20000))
+    assert all(bot._fv_line(text, pos) == text.count("\n", 0, pos) + 1 for pos in random.sample(range(len(text)), 400))
+    assert bot._fv_line("a\r\nb", 3) == 2 and bot._fv_line("abc", -4) == 1
+    riesig = "<types>" + '<type name="A"><nominal>1</nominal></type>' * 60000 + "</types>"   # eine einzige Zeile
+    start = time.perf_counter()
+    bot._fv_validate_all({"db/types.xml": riesig}, "ChernarusPlus")
+    assert time.perf_counter() - start < 10     # frueher: quadratisch (Minuten)

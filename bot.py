@@ -23,6 +23,7 @@ import sys
 import json
 import re
 import asyncio
+import bisect
 import ftplib
 import io
 import math
@@ -1835,6 +1836,22 @@ cfg = ConfigManager()
 # ══════════════════════════════════════════════════════════════
 #  Nitrado API-Client
 # ══════════════════════════════════════════════════════════════
+# ── Sanfte Drosselung der Log-Abfragen ────────────────────────────────────
+# Antwortet Nitrado mit HTTP 429 (zu viele Anfragen) oder 5xx, wartet die
+# naechste Log-Abfrage KURZ, statt sofort nachzuhaemmern (ein Poll-Zyklus
+# fragt denselben Ordner mehrfach direkt hintereinander ab). Es wird nichts
+# uebersprungen: nach der Pause laeuft die Anfrage normal. Die Pause gilt je
+# Token (das Limit liegt am Nitrado-Konto, nicht am einzelnen Server) und endet
+# bei der ersten erfolgreichen Antwort. Neustart/Stopp/Einstellungen sind nie
+# gedrosselt.
+_NITRADO_PAUSE_BIS: Dict[str, float] = {}   # Token -> time.monotonic() bis wann
+_NITRADO_FEHLSERIE: Dict[str, Tuple[int, float]] = {}   # Token -> (Anzahl, Zeit letzter Fehler)
+_NITRADO_PAUSE_5XX = (1.0, 2.0)    # 1. Fehler, weitere Fehler in Folge
+_NITRADO_PAUSE_429 = 3.0           # ohne Retry-After
+_NITRADO_PAUSE_MAX = 5.0           # harte Obergrenze je Wartezeit
+_NITRADO_SERIE_FENSTER = 30.0      # laenger zurueckliegende Fehler zaehlen nicht mehr
+
+
 class NitradoAPI:
     def __init__(self, token: str, service_id: str, base: str = "https://api.nitrado.net"):
         self.token      = token
@@ -1853,6 +1870,44 @@ class NitradoAPI:
 
     def _headers(self) -> Dict:
         return {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+
+    async def _gate(self) -> None:
+        """Wartet (hoechstens _NITRADO_PAUSE_MAX) bis eine laufende Pause nach
+        HTTP 429/5xx abgelaufen ist."""
+        rest = _NITRADO_PAUSE_BIS.get(self.token, 0.0) - time.monotonic()
+        if rest > 0:
+            await asyncio.sleep(min(rest, _NITRADO_PAUSE_MAX))
+
+    def _drosseln(self, antwort: Any) -> None:
+        """Merkt sich nach HTTP 429/5xx eine kurze Pause. Andere Status: nichts.
+        Darf die Fehlerbehandlung des Aufrufers nie selbst stoeren."""
+        status = int(getattr(antwort, "status", 0) or 0)
+        if status != 429 and status < 500:
+            return
+        try:
+            retry_after = (getattr(antwort, "headers", None) or {}).get("Retry-After")
+        except Exception:  # noqa: BLE001
+            retry_after = None
+        jetzt = time.monotonic()
+        anzahl, zuletzt = _NITRADO_FEHLSERIE.get(self.token, (0, 0.0))
+        anzahl = anzahl + 1 if jetzt - zuletzt <= _NITRADO_SERIE_FENSTER else 1
+        _NITRADO_FEHLSERIE[self.token] = (anzahl, jetzt)
+        if status == 429:
+            try:
+                pause = float(retry_after)
+            except (TypeError, ValueError):
+                pause = _NITRADO_PAUSE_429
+            pause = min(max(pause, 1.0), _NITRADO_PAUSE_MAX)
+        else:
+            pause = _NITRADO_PAUSE_5XX[0] if anzahl <= 1 else _NITRADO_PAUSE_5XX[1]
+        _NITRADO_PAUSE_BIS[self.token] = max(_NITRADO_PAUSE_BIS.get(self.token, 0.0), jetzt + pause)
+        if anzahl == 3:
+            log.info(f"[NITRADO] HTTP {status} {anzahl}x in Folge – Log-Abfragen warten jeweils kurz ({pause:g}s).")
+
+    def _drosseln_ende(self) -> None:
+        """Erfolgreiche Antwort: Pause und Fehlerserie dieses Tokens aufheben."""
+        _NITRADO_PAUSE_BIS.pop(self.token, None)
+        _NITRADO_FEHLSERIE.pop(self.token, None)
 
     async def _s(self) -> aiohttp.ClientSession:
         if not self._session or self._session.closed:
@@ -1941,6 +1996,7 @@ class NitradoAPI:
         (nicht dasselbe wie eine leere Liste – siehe read_from_offset-Konvention
         beim FTP-Pendant)."""
         try:
+            await self._gate()
             s = await self._s()
             url = f"{self.base}/services/{self.service_id}/gameservers/file_server/list"
             async with s.get(url, params={"dir": directory}) as r:
@@ -1950,7 +2006,9 @@ class NitradoAPI:
                     if isinstance(entries, list):
                         self.consecutive_failures = 0
                         self.last_error = ""
+                        self._drosseln_ende()
                         return entries
+                self._drosseln(r)
                 log.warning(f"[NITRADO] list_files({directory}): HTTP {r.status}")
                 self.consecutive_failures += 1
                 self.last_error = f"HTTP {r.status} bei list_files({directory})"
@@ -1982,12 +2040,14 @@ class NitradoAPI:
         """
         length = min(length, self._SEEK_MAX_LENGTH)
         try:
+            await self._gate()
             s = await self._s()
             url = f"{self.base}/services/{self.service_id}/gameservers/file_server/seek"
             params: Dict[str, Any] = {"file": path, "offset": offset,
                                       "mode": "raw", "length": length}
             async with s.get(url, params=params) as r:
                 if r.status != 200:
+                    self._drosseln(r)
                     log.warning(f"[NITRADO] seek_file({path}): HTTP {r.status}")
                     self.consecutive_failures += 1
                     self.last_error = f"HTTP {r.status} bei seek_file({path})"
@@ -2002,6 +2062,7 @@ class NitradoAPI:
                     if sr.status == 200:
                         self.consecutive_failures = 0
                         self.last_error = ""
+                        self._drosseln_ende()
                         return await sr.read()
                     log.warning(f"[NITRADO] seek_file({path}): Abruf-URL HTTP {sr.status}")
                     self.consecutive_failures += 1
@@ -21170,8 +21231,19 @@ def _fv_issue(severity: str, message: str, line: Optional[int] = None,
     return result
 
 
+_FV_ZEILEN_CACHE: Tuple[Any, List[int]] = (None, [])   # (Text, Positionen der Zeilenumbrueche)
+
+
 def _fv_line(text: str, pos: int) -> int:
-    return text.count("\n", 0, max(pos, 0)) + 1
+    """Zeilennummer (ab 1) der Position ``pos``. Die Umbruch-Positionen werden je Text
+    einmal berechnet; frueher zaehlte jeder Aufruf ab Dateianfang neu und die Pruefung
+    wuchs dadurch quadratisch mit der Zahl der Eintraege."""
+    global _FV_ZEILEN_CACHE
+    cache = _FV_ZEILEN_CACHE          # ein Tupel: auch bei mehreren Threads nie halb aktualisiert
+    if cache[0] is not text:
+        cache = (text, [m.start() for m in re.finditer("\n", text)])
+        _FV_ZEILEN_CACHE = cache
+    return bisect.bisect_left(cache[1], max(pos, 0)) + 1
 
 
 def _fv_base(name: str) -> str:
@@ -21956,31 +22028,78 @@ async def _update_laden(karte: str, key: str, name: str) -> str:
     return text
 
 
+# Persistenz-Ordner der Mission: viele MB Binaerdaten, fuer den Abgleich ohne Belang
+# (und sie sprengen sonst die Mengengrenze des Verzeichnis-Durchlaufs).
+_UPDATE_SPEICHER_ORDNER = frozenset(("storage_1", "storage_2", "storage_3", "storage_-1", "storage_0"))
+
+
 async def _update_serverdateien(conn):
+    """Liest die neun CE-Dateien plus Bezugsdateien des Servers.
+
+    Nicht lesbare oder fehlende Dateien fehlen einfach im Ergebnis; der Aufrufer
+    meldet fehlende AUSGEWAEHLTE Dateien (``_update_plan``). Zusatzdateien und der
+    Verzeichnis-Durchlauf duerfen das Tool nie blockieren – wie beim Datei-Validator."""
     loop = asyncio.get_running_loop(); files = {}
     paths = [row[0] for row in _UPDATE_DATEIEN.values()] + ["cfglimitsdefinition.xml", "cfglimitsdefinitionuser.xml", "cfgeconomycore.xml"]
     for path in paths:
-        raw, status = await _tools_datei_lesen(conn, path, loop)
+        try:
+            raw, status = await _tools_datei_lesen(conn, path, loop)
+        except Exception as exc:  # noqa: BLE001 - eine Datei darf nicht alles stoppen
+            log.warning("Update Assistant: %s nicht lesbar: %s", path, exc)
+            continue
         if status == "ok" and raw is not None:
             files[path] = raw
-        elif status != "missing":
-            raise OSError("Server-Dateien konnten nicht vollständig gelesen werden.")
-    # Include custom CE dependencies; same bounded catalog as the validator.
+    # Eigene CE-Dateien als Bezug fuer die Querpruefung; dieselbe begrenzte Liste wie der Validator.
     if hasattr(conn.ftp, "walk"):
-        listing, status = await loop.run_in_executor(None, lambda: conn.ftp.walk(_mission_dir_of(conn), max_dateien=500, max_bytes=_UPDATE_MAX_BYTES))
-        if status != "ok":
-            raise OSError("Server-Dateien konnten nicht vollständig gelesen werden.")
-        for path, _size in listing:
-            if path not in files and _fv_base(path) in _FV_ROOTS:
-                if path.startswith("/") or ".." in path.split("/"):
-                    continue
-                raw, state = await _tools_datei_lesen(conn, path, loop)
-                if state != "ok":
-                    raise OSError("Server-Dateien konnten nicht vollständig gelesen werden.")
-                files[path] = raw
+        try:
+            listing, status = await loop.run_in_executor(None, lambda: conn.ftp.walk(
+                _mission_dir_of(conn), max_dateien=500, max_bytes=_UPDATE_MAX_BYTES,
+                ueberspringen=set(_UPDATE_SPEICHER_ORDNER)))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Update Assistant: Verzeichnis-Durchlauf fehlgeschlagen: %s", exc)
+            listing, status = [], "fehler"
+        if status == "ok":
+            for path, _size in listing:
+                if path not in files and _fv_base(path) in _FV_ROOTS:
+                    if path.startswith("/") or ".." in path.split("/"):
+                        continue
+                    try:
+                        raw, state = await _tools_datei_lesen(conn, path, loop)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("Update Assistant: %s nicht lesbar: %s", path, exc)
+                        continue
+                    if state == "ok" and raw is not None:
+                        files[path] = raw
     if sum(len(value.encode()) for value in files.values()) > _UPDATE_MAX_BYTES:
         raise ValueError("Update-Dateien überschreiten zusammen 20 MB.")
     return files
+
+
+_UPDATE_IMPORT_MAX = 6 * 1024 * 1024   # insgesamt; die Anfrage darf höchstens 8 MB groß sein
+
+
+def _update_importe(data) -> Dict[str, str]:
+    """Manuell importierte Serverdateien ``{Dateiname: Text}`` aus der Anfrage
+    pruefen. Sie werden nur verglichen – nie auf den Server geschrieben."""
+    roh = data.get("importiert") if isinstance(data, dict) else None
+    if roh in (None, {}):
+        return {}
+    if not isinstance(roh, dict) or len(roh) > len(_UPDATE_DATEIEN):
+        raise ValueError("Ungültige Update-Anfrage.")
+    out: Dict[str, str] = {}
+    gesamt = 0
+    for name, text in roh.items():
+        if name not in _UPDATE_DATEIEN or not isinstance(text, str) or not text.strip():
+            raise ValueError("Unbekannte Update-Datei.")
+        gesamt += len(text.encode("utf-8"))
+        if gesamt > _UPDATE_IMPORT_MAX:
+            raise ValueError("Importierte Dateien sind zu groß (höchstens 6 MB insgesamt).")
+        try:
+            _update_index(text, name)
+        except (ET.ParseError, ValueError) as exc:
+            raise ValueError("Importierte Datei ist keine gültige Update-XML: " + name + " – " + str(exc)) from exc
+        out[name] = text
+    return out
 
 
 def _update_neue_probleme(before, after, karte):
@@ -21996,24 +22115,43 @@ def _update_laeufe(conn):
     return _brlc_entries(conn, "update_laeufe")
 
 
+def _update_dateiinfo(conn) -> Dict[str, Optional[int]]:
+    """Groesse je der neun Dateien (None = nicht vorhanden/lesbar), ohne sie zu
+    laden – das Oeffnen des Tools muss schnell sein und nie an einer Datei scheitern."""
+    out: Dict[str, Optional[int]] = {}
+    for name, spec in _UPDATE_DATEIEN.items():
+        groesse = None
+        try:
+            pfad = _mission_datei_pfad(conn, spec[0])
+            if pfad:
+                messen = getattr(conn.ftp, "file_size_or_none", None)
+                groesse = messen(pfad) if messen else None
+                if groesse is None:   # SIZE nicht beantwortet: kurz lesen, um Vorhandensein zu klaeren
+                    raw, status = conn.ftp.read_file_ex(pfad)
+                    groesse = len(raw.encode("utf-8")) if status == "ok" and raw is not None else None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Update Assistant: %s nicht pruefbar: %s", spec[0], exc)
+            groesse = None
+        out[name] = groesse
+    return out
+
+
 async def api_tools_updateassistant_get(request: web.Request) -> web.Response:
     conn, failure = await _brlc_prepare(request, "tools.updateassistant", "view")
     if failure is not None:
         return failure
     try:
         karte = _update_karte(conn)
-        files = await _update_serverdateien(conn) if _mission_dir_of(conn) else {}
     except ValueError as exc:
         return err(str(exc), 400)
-    except OSError as exc:
-        return err(str(exc), 502)
-    rows = [{"name": name, "path": spec[0], "vorhanden": spec[0] in files,
-             "size": str(len(files.get(spec[0], "").encode())),
-             "hash": _update_hash(files[spec[0]]) if spec[0] in files else None,
+    kein_ordner = not _mission_dir_of(conn) or conn.ftp is None
+    groessen = {} if kein_ordner else await asyncio.get_running_loop().run_in_executor(None, _update_dateiinfo, conn)
+    rows = [{"name": name, "path": spec[0], "vorhanden": groessen.get(name) is not None,
+             "size": str(groessen.get(name) or 0),
              "hinweis": "Loot-Positionen können persistenzabhängig sein; kein automatischer Wipe." if name == "mapgroupproto.xml" else None}
             for name, spec in _UPDATE_DATEIEN.items()]
     return ok({"karte": karte, "staende": _UPDATE_STAENDE[karte], "dateien": rows,
-               "laeufe": _update_laeufe(conn)[-20:], "kein_mission_ordner": not bool(_mission_dir_of(conn))})
+               "laeufe": _update_laeufe(conn)[-20:], "kein_mission_ordner": kein_ordner})
 
 
 async def api_tools_updateassistant_erkennen(request: web.Request) -> web.Response:
@@ -22026,7 +22164,11 @@ async def api_tools_updateassistant_erkennen(request: web.Request) -> web.Respon
         return err("Unbekannte Update-Datei.", 400)
     try:
         karte = _update_karte(conn)
-        raw, status = await _tools_datei_lesen(conn, _UPDATE_DATEIEN[name][0], asyncio.get_running_loop())
+        importe = _update_importe({"importiert": {name: data["text"]}}) if isinstance(data.get("text"), str) else {}
+        if name in importe:
+            raw, status = importe[name], "ok"
+        else:
+            raw, status = await _tools_datei_lesen(conn, _UPDATE_DATEIEN[name][0], asyncio.get_running_loop())
         if status != "ok":
             return err("Update-Datei ist nicht vorhanden oder nicht lesbar.", 404)
         own = _update_index(raw, name)["entries"]
@@ -22040,7 +22182,9 @@ async def api_tools_updateassistant_erkennen(request: web.Request) -> web.Respon
         winner = max(scores, key=lambda row: (row["identisch"], row["prozent"]))
         return ok({"vorschlag": winner, "kandidaten": scores,
                    "hinweis": "Nur ein Vorschlag: angepasste Dateien erreichen oft keine 100 Prozent; gleiche Treffer sind mehrdeutig."})
-    except (ValueError, ET.ParseError) as exc:
+    except ValueError as exc:
+        return err(str(exc), 400)
+    except ET.ParseError as exc:
         return err(str(exc), 409)
     except OSError as exc:
         return err(str(exc), 502)
@@ -22065,7 +22209,16 @@ async def _update_plan(conn, data, apply=False):
         if not isinstance(row, dict) or not isinstance(row.get("name"), str) or row["name"] not in _UPDATE_DATEIEN or row["name"] in seen:
             raise ValueError("Unbekannte oder doppelte Update-Datei.")
         seen.add(row["name"]); options.append(row)
-    files = await _update_serverdateien(conn); after = dict(files); results = []
+    importe = _update_importe(data)
+    if apply and importe:
+        raise ValueError("Importierte Dateien werden nicht auf den Server geschrieben. Bitte das Ergebnis herunterladen.")
+    server_noetig = any(row["name"] not in importe for row in options)
+    if server_noetig and (not _mission_dir_of(conn) or conn.ftp is None):
+        raise FileNotFoundError("Für diesen Server ist kein Mission-Ordner oder FTP-Zugang eingerichtet.")
+    files = await _update_serverdateien(conn) if server_noetig else {}
+    for name, text in importe.items():
+        files[_UPDATE_DATEIEN[name][0]] = text      # importierte Datei ersetzt die Serverdatei im Vergleich
+    after = dict(files); results = []
     for row in options:
         name = row["name"]; path = _UPDATE_DATEIEN[name][0]
         if path not in files:
@@ -22074,7 +22227,8 @@ async def _update_plan(conn, data, apply=False):
             raise FileExistsError("Update-Datei wurde inzwischen geändert. Bitte erneut vergleichen.")
         base = await _update_laden(karte, data["von"], name)
         new = await _update_laden(karte, data["auf"], name)
-        after[path], result = await asyncio.get_running_loop().run_in_executor(None, _update_merge, name, base, new, files[path], target["label"], row)
+        after[path], result = await asyncio.get_running_loop().run_in_executor(None, _update_merge, name, base, new, files[path], ("latest" if target["key"] == "latest" else target["label"]), row)
+        result["quelle"] = "import" if name in importe else "server"
         results.append(result)
     problems = await asyncio.get_running_loop().run_in_executor(None, _update_neue_probleme, files, after, karte)
     return files, after, results, problems
@@ -22087,6 +22241,30 @@ async def api_tools_updateassistant_vergleich(request: web.Request) -> web.Respo
     try:
         _before, _after, results, problems = await _update_plan(conn, await body(request))
         return ok({"dateien": results, "probleme": problems})
+    except FileNotFoundError as exc:
+        return err(str(exc), 404)
+    except FileExistsError as exc:
+        return err(str(exc), 409)
+    except ET.ParseError as exc:
+        return err("Update-XML ungültig oder inzwischen geändert: " + str(exc), 409)
+    except ValueError as exc:
+        return err(str(exc), 400)
+    except OSError as exc:
+        return err(str(exc), 502)
+
+
+async def api_tools_updateassistant_ergebnis(request: web.Request) -> web.Response:
+    """Fertige, zusammengefuehrte Dateien zum Herunterladen/Kopieren. Schreibt
+    NICHTS auf den Server – der Weg fuer importierte Dateien und fuer Server ohne
+    FTP-Zugang."""
+    conn, failure = await _brlc_prepare(request, "tools.updateassistant", "view")
+    if failure is not None:
+        return failure
+    try:
+        _before, after, results, problems = await _update_plan(conn, await body(request))
+        generated = [{"filename": row["name"], "content": after[_UPDATE_DATEIEN[row["name"]][0]]} for row in results]
+        return ok({"generated": generated, "dateien": [{k: v for k, v in row.items() if k != "eintraege"} for row in results],
+                   "probleme": problems})
     except FileNotFoundError as exc:
         return err(str(exc), 404)
     except FileExistsError as exc:
@@ -42554,6 +42732,7 @@ def build_app() -> web.Application:
     r.add_get("/api/tools/updateassistant", api_tools_updateassistant_get)
     r.add_post("/api/tools/updateassistant/erkennen", api_tools_updateassistant_erkennen)
     r.add_post("/api/tools/updateassistant/vergleich", api_tools_updateassistant_vergleich)
+    r.add_post("/api/tools/updateassistant/ergebnis", api_tools_updateassistant_ergebnis)
     r.add_post("/api/tools/updateassistant/anwenden", api_tools_updateassistant_anwenden)
     r.add_post("/api/tools/updateassistant/zurueck", api_tools_updateassistant_zurueck)
     r.add_get("/api/tools/weather", api_tools_weather_get)
@@ -43299,6 +43478,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "c4da26626e1adddb6ad1bd6f641dba6da3750e91c7f3724c767564453fa4ce25",
         "bc65fa1acb74aa6f9222564542583125944b77a7fec02787b374f774b1333a1e",
         "2caece378d7fd03a324a1380e118ba3de9506505946ac69eba11c1156af21374",
         "4659b64843dc4a42edc6ef15cf8455e615e73c16b664b2b885d070e14f5f3a84",

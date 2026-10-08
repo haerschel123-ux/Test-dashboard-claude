@@ -325,3 +325,127 @@ def test_readable_diff_and_silent_identical_rows():
     assert rows["A"]["alt"] and rows["A"]["neu"]
     assert rows["B"]["lage"] == "unveraendert" and rows["B"]["kurzdiff"] == []
     assert not (rows["B"]["alt"] or rows["B"]["neu"] or rows["B"]["basis"])
+
+
+def test_get_ist_leicht_und_blockiert_nie(monkeypatch, servers, official):
+    """Oeffnen des Tools: kein Laden der Dateien, kein Abbruch bei Zusatzordnern/Lesefehlern."""
+    a, b = servers; seed(a, official)
+    # Ohne Mission-Ordner / FTP: 200 mit Hinweis statt Fehler
+    b.data["ftp_mission_dir"] = ""
+    status, result = call(monkeypatch, b, bot.api_tools_updateassistant_get)
+    assert status == 200 and result["data"]["kein_mission_ordner"] is True
+    assert not any(row["vorhanden"] for row in result["data"]["dateien"])
+    # Lesefehler einer Datei, kaputter Verzeichnis-Durchlauf: Tool oeffnet trotzdem
+    read = a.ftp.read_file_ex
+    a.ftp.read_file_ex = lambda path: (_ for _ in ()).throw(RuntimeError("FTP weg")) if path.endswith("events.xml") else read(path)
+    a.ftp.walk = lambda *args, **kw: ([], "zu_gross")
+    status, result = call(monkeypatch, a, bot.api_tools_updateassistant_get)
+    assert status == 200
+    rows = {row["name"]: row for row in result["data"]["dateien"]}
+    assert rows["types.xml"]["vorhanden"] and not rows["events.xml"]["vorhanden"]
+    assert "hash" not in rows["types.xml"] and a.ftp.writes == []
+
+
+def test_vergleich_toleriert_kaputten_durchlauf_und_meldet_fehlende_auswahl(monkeypatch, servers, official):
+    a, _ = servers; seed(a, official)
+    seen = {}
+    def walk(root, max_dateien=0, max_bytes=0, ueberspringen=None):
+        seen["skip"] = ueberspringen
+        return [], "zu_gross"     # z. B. Persistenz-Ordner sprengt die Mengengrenze
+    a.ftp.walk = walk
+    status, result = call(monkeypatch, a, bot.api_tools_updateassistant_vergleich, payload(a))
+    assert status == 200, result
+    assert "storage_1" in seen["skip"]                      # Persistenz wird gar nicht erst durchlaufen
+    del a.ftp.files["/mission/db/types.xml"]
+    status, result = call(monkeypatch, a, bot.api_tools_updateassistant_vergleich, payload(a))
+    assert status == 404 and "nicht vorhanden" in result["error"]
+    a.data["ftp_mission_dir"] = ""
+    status, result = call(monkeypatch, a, bot.api_tools_updateassistant_vergleich, payload(a))
+    assert status == 404 and "Mission-Ordner" in result["error"]
+
+
+def test_import_vergleicht_ohne_server_und_schreibt_nie(monkeypatch, servers, official):
+    """Manuell importierte Datei: Vergleich + Ergebnis auch ohne FTP/Mission-Ordner, nichts wird geschrieben."""
+    a, b = servers; base, new, _calls = official
+    b.data["ftp_mission_dir"] = ""                       # Server ohne Dateizugriff (z. B. Konsole)
+    p = payload(a)
+    p["dateien"] = ["types.xml"]; p["importiert"] = {"types.xml": base["types.xml"]}
+    status, result = call(monkeypatch, b, bot.api_tools_updateassistant_vergleich, p)
+    assert status == 200, result
+    row = result["data"]["dateien"][0]
+    assert row["quelle"] == "import" and row["zaehler"]["update"] == 1
+    status, result = call(monkeypatch, b, bot.api_tools_updateassistant_ergebnis, p)
+    assert status == 200, result
+    gen = result["data"]["generated"][0]
+    assert gen["filename"] == "types.xml" and gen["content"] != base["types.xml"]
+    assert gen["content"] == bot._update_merge("types.xml", base["types.xml"], new["types.xml"], base["types.xml"], "x")[0]   # genau die Server-Logik
+    assert b.ftp.writes == [] and "update_laeufe" not in b.data
+    # Ohne Import fehlt der Zugang weiterhin mit klarer Meldung
+    p2 = payload(a); p2["dateien"] = ["types.xml"]
+    status, result = call(monkeypatch, b, bot.api_tools_updateassistant_vergleich, p2)
+    assert status == 404 and "Mission-Ordner" in result["error"]
+
+
+def test_import_ersetzt_serverdatei_und_gemischte_auswahl(monkeypatch, servers, official):
+    a, _ = servers; base, new, _calls = official; seed(a, official)
+    a.ftp.files["/mission/db/types.xml"] = new["types.xml"]            # Server ist schon aktuell …
+    p = payload(a); p["dateien"] = ["types.xml", "events.xml"]
+    p["importiert"] = {"types.xml": base["types.xml"]}                  # … importiert wird aber der alte Stand
+    status, result = call(monkeypatch, a, bot.api_tools_updateassistant_vergleich, p)
+    assert status == 200, result
+    rows = {row["name"]: row for row in result["data"]["dateien"]}
+    assert rows["types.xml"]["quelle"] == "import" and rows["types.xml"]["zaehler"]["update"] == 1
+    assert rows["events.xml"]["quelle"] == "server"
+    assert a.ftp.writes == []
+
+
+def test_import_fehler_und_anwenden_verweigert(monkeypatch, servers, official):
+    a, _ = servers; base, _new, _calls = official; seed(a, official)
+    p = payload(a); p["dateien"] = ["types.xml"]
+    for bad, teil in (({"types.xml": "<types><type name='A'>"}, "keine gültige Update-XML"),
+                      ({"types.xml": "<events/>"}, "keine gültige Update-XML"),
+                      ({"types.xml": "<!DOCTYPE x><types/>"}, "keine gültige Update-XML"),
+                      ({"passwd": "x"}, "Unbekannte"), ({"types.xml": 5}, "Unbekannte"), ({"types.xml": "  "}, "Unbekannte"),
+                      ({"types.xml": "<types>" + "<type name='A'><nominal>1</nominal></type>" * 180000 + "</types>"}, "zu groß"),
+                      (["types.xml"], "Ungültige")):
+        status, result = call(monkeypatch, a, bot.api_tools_updateassistant_vergleich, {**p, "importiert": bad})
+        assert status == 400 and teil in result["error"], (bad if len(str(bad)) < 80 else "gross", result)
+    # Anwenden mit Import: nie auf den Server schreiben
+    q = payload(a, apply=True); q["importiert"] = {"types.xml": base["types.xml"]}
+    status, result = call(monkeypatch, a, bot.api_tools_updateassistant_anwenden, q)
+    assert status == 400 and "nicht auf den Server geschrieben" in result["error"] and a.ftp.writes == []
+
+
+def test_erkennen_mit_importiertem_text_und_mandanten(monkeypatch, servers, official):
+    a, b = servers; base, _new, _calls = official; b.data["ftp_mission_dir"] = ""
+    status, result = call(monkeypatch, b, bot.api_tools_updateassistant_erkennen, {"datei": "types.xml", "text": base["types.xml"]})
+    assert status == 200, result
+    assert result["data"]["vorschlag"]["prozent"] >= 0 and result["data"]["kandidaten"]
+    status, result = call(monkeypatch, b, bot.api_tools_updateassistant_erkennen, {"datei": "types.xml", "text": "<types><kaputt"})
+    assert status == 400 and "keine gültige Update-XML" in result["error"]
+
+
+def test_import_findet_fehlende_eintraege_und_haengt_sie_an(monkeypatch, servers, official):
+    """Kernfall des Imports: Eintraege fehlen in der eigenen Datei → werden gemeldet und im Ergebnis ergaenzt."""
+    a, b = servers; base, new, _calls = official
+    b.data["ftp_mission_dir"] = ""
+    new_types = '<types><type name="A"><nominal>1</nominal></type><type name="Fehlt1"><nominal>3</nominal></type><type name="Fehlt2"><nominal>4</nominal></type></types>'
+    official_new = dict(new); official_new["types.xml"] = new_types
+    async def load(karte, key, name):
+        return base[name] if key == bot._UPDATE_STAENDE[karte][2]["key"] else official_new[name]
+    monkeypatch.setattr(bot, "_update_laden", load)
+    p = payload(a); p["dateien"] = ["types.xml"]
+    p["importiert"] = {"types.xml": '<types><type name="A"><nominal>1</nominal></type></types>'}   # eigene Datei: Fehlt1/Fehlt2 fehlen
+    status, result = call(monkeypatch, b, bot.api_tools_updateassistant_vergleich, p)
+    assert status == 200, result
+    row = result["data"]["dateien"][0]
+    assert row["zaehler"]["neu"] == 2 and {e["name"] for e in row["eintraege"] if e["lage"] == "neu"} == {"Fehlt1", "Fehlt2"}
+    status, result = call(monkeypatch, b, bot.api_tools_updateassistant_ergebnis, p)
+    assert status == 200, result
+    content = result["data"]["generated"][0]["content"]
+    assert 'name="Fehlt1"' in content and 'name="Fehlt2"' in content and "Brigarde Killfeed Update" in content
+    assert content.rstrip().endswith("</types>") and b.ftp.writes == []
+    # Abgewaehlter Eintrag bleibt draussen
+    p["optionen"] = {"types.xml": {"entscheidungen": {"fehlt2": "behalten"}}}
+    status, result = call(monkeypatch, b, bot.api_tools_updateassistant_ergebnis, p)
+    assert 'name="Fehlt1"' in result["data"]["generated"][0]["content"] and 'name="Fehlt2"' not in result["data"]["generated"][0]["content"]
