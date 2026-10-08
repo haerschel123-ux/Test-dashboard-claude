@@ -37,3 +37,9 @@ __pycache__/
 
 # Test-/Debug-Artefakte
 _smoke_*.png
+
+# Schluessel & lokale Arbeitsdateien – nie committen
+.env
+*.env
+*.zip
+scratchpad/
