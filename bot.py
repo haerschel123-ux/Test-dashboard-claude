@@ -1020,6 +1020,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.deployment":                   {"label": "NPC + Vehicle Deployment", "gruppe": "Tools"},
     "tools.airstrike":                    {"label": "Airstrike Generator", "gruppe": "Tools"},
     "tools.airdrop":                      {"label": "Airdrop Configurator", "gruppe": "Tools"},
+    "tools.airdropjson":                  {"label": "Airdrops JSON", "gruppe": "Tools"},
     "tools.underground":                  {"label": "Underground Area Generator", "gruppe": "Tools"},
     "tools.battleroyale":                 {"label": "Battle Royale Builder", "gruppe": "Tools"},
     "tools.lockedcontainer":              {"label": "Locked Container Builder", "gruppe": "Tools"},
@@ -1059,6 +1060,8 @@ _DISCORD_MODUL_MAP: Dict[str, str] = {
     "levelreset": "discord_mgmt",
     # KI-Helfer (/ki): gleiche Freigabestufe wie das übrige Discord Management
     "ki": "discord_mgmt",
+    # Airdrops JSON (/airdrop add|list|remove): Freigabestufe des Tools
+    "airdrop": "tools.airdropjson",
 }
 
 # Die alten Sammelkategorien, die durch FEED_TYPES ersetzt wurden.
@@ -1441,6 +1444,12 @@ LEVEL-SYSTEM
 KI-HELFER
 ─────────
 /ki <prompt>                    → Der KI eine Frage stellen (wenn im Dashboard aktiviert)
+
+AIRDROPS (Dashboard → Tools → „Airdrops JSON“)
+──────────────────────────────────────────────
+/airdrop add <name> <x> <y> <z> <restarts> → Airdrop platzieren (aktiv ab dem nächsten Neustart)
+/airdrop list [art]             → Platzierte bzw. vom Scheduler gesetzte Airdrops anzeigen
+/airdrop remove <name>          → Platzierten Airdrop vorzeitig entfernen
 
 EVENT VORLAGEN
 ──────────────
@@ -3974,6 +3983,8 @@ class ServerConnection:
         # Betreiber-Schluessel liegt nur in der Umgebung bzw. config.json und
         # darf auf keinem Weg als "Vorgabe" bei einem Kunden ankommen.
         "ki_helfer", "openrouter_api_key",
+        # Airdrops JSON: platzierte Airdrops und Scheduler gehoeren genau einem Server.
+        "airdrop_json",
         # Gewinnspiele (inkl. Teilnehmerlisten) und ihre Server-Einstellungen
         # sind strikt serverspezifisch - ein Rueckfall auf cfg.config wuerde
         # (wie bei den Tickets oben) fremde Teilnehmerdaten oder eine falsche
@@ -5063,6 +5074,13 @@ _BEFEHL_NAMEN_EN = {
 _BEFEHL_BESCHREIBUNG_EN = {
     "🏓 Zeigt die Verbindung zum Bot in ms": "🏓 Shows the connection to the bot in ms",
     "🤖 Stelle der KI eine Frage": "🤖 Ask the AI a question",
+    "🪂 Airdrop-Dateien auf dem Server platzieren": "🪂 Place airdrop files on the server",
+    "🪂 Platziert einen Airdrop an einer Position (aktiv ab dem nächsten Neustart)":
+        "🪂 Places an airdrop at a position (active from the next restart)",
+    "🪂 Zeigt aktive Airdrops (per /airdrop add platziert oder vom Scheduler)":
+        "🪂 Shows active airdrops (placed via /airdrop add or by the scheduler)",
+    "🪂 Entfernt einen per /airdrop add platzierten Airdrop vorzeitig":
+        "🪂 Removes an airdrop placed via /airdrop add early",
     "📡 Zeigt alle Feed-Channels und ihren Status": "📡 Shows all feed channels and their status",
     "🧱 Schaltet Base- oder Container-Schaden an/aus (cfggameplay.json)":
         "🧱 Turns base or container damage on/off (cfggameplay.json)",
@@ -6082,6 +6100,10 @@ class DayZBot(discord.Client):
                 # gleiches Task-Muster wie beim Shop-Cleanup direkt darueber.
                 conn.rentals.spawn_cleanup(delayed=restart_detected)
 
+            # Airdrops JSON: offene Verarbeitung (Wiederholung nach Fehler) anstossen; der erkannte
+            # Neustart selbst wird erst nach dem Speichern des Log-Cursors verbucht (siehe unten).
+            _adj_poll(conn, False)
+
             if restart_detected:
                 # Server-Neustart wirft alle Spieler → offene Spielzeit-Sitzungen
                 # DIESES Servers beenden (nicht die der anderen Kunden)
@@ -6140,6 +6162,7 @@ class DayZBot(discord.Client):
                     conn.log_state["current"] = state
                     conn.log_state["last_poll_ts"] = now
                     connections.save()
+                    _adj_poll(conn, restart_detected)      # Cursor ist gespeichert: Neustart jetzt verbuchen
                     await loop.run_in_executor(None, db.close_all_sessions, conn.service_id)
                     mins = int(gap // 60) if gap >= 0 else 0
                     log.info(f"[POLL] Bot war {mins} Min offline – überspringe Alt-Events, Offset={state['offset']} ({latest})")
@@ -6207,6 +6230,7 @@ class DayZBot(discord.Client):
             conn.log_state["current"] = state
             conn.log_state["last_poll_ts"] = now
             connections.save()
+            _adj_poll(conn, restart_detected)      # Cursor ist gespeichert: Neustart jetzt verbuchen (nie doppelt)
 
             if events:
                 log.info(f"[POLL] {len(events)} neue Events aus {latest}")
@@ -8462,6 +8486,9 @@ _SUBCMD_DEFS: Tuple[Tuple[str, str, str, str, str], ...] = (
     ("gsettings_set", "Gewinnspiele", "Giveaways", "/gsettings set – Setzt Farbe/Pflichtrolle für Gewinnspiele (zusätzlich zu Administrator)", "/gsettings set – Sets color/required role for giveaways (in addition to Administrator)"),
     ("levelset", "Level-System", "Level System", "/levelset – Setzt die XP eines Nutzers (zusätzlich zu Administrator)", "/levelset – Sets a user's XP (in addition to Administrator)"),
     ("levelreset", "Level-System", "Level System", "/levelreset – Setzt Level und XP eines Nutzers zurück (zusätzlich zu Administrator)", "/levelreset – Resets a user's level and XP (in addition to Administrator)"),
+    ("airdrop_add", "Airdrops", "Airdrops", "/airdrop add – Platziert einen Airdrop", "/airdrop add – Places an airdrop"),
+    ("airdrop_list", "Airdrops", "Airdrops", "/airdrop list – Zeigt aktive Airdrops", "/airdrop list – Shows active airdrops"),
+    ("airdrop_remove", "Airdrops", "Airdrops", "/airdrop remove – Entfernt einen Airdrop vorzeitig", "/airdrop remove – Removes an airdrop early"),
     ("events_add", "Event Vorlagen", "Event Templates", "/events add – Fügt eine Event-Vorlage an einer Position hinzu", "/events add – Adds an event template at a position"),
     ("events_list", "Event Vorlagen", "Event Templates", "/events list – Zeigt alle hinzugefügten Event-Instanzen", "/events list – Shows all added event instances"),
     ("events_remove", "Event Vorlagen", "Event Templates", "/events remove – Entfernt eine hinzugefügte Event-Instanz", "/events remove – Removes an added event instance"),
@@ -8667,7 +8694,7 @@ def _conn_store(conn: ServerConnection, key: str, value: Any, *, strict: bool = 
         connections.save()
     # New tenant-only data has no legacy config consumers to mirror to.
     # ki_helfer enthaelt den API-Schluessel des Kunden - nie nach config.json spiegeln.
-    if key in ("eigene_npcs", "airstrikes", "ki_helfer"):
+    if key in ("eigene_npcs", "airstrikes", "ki_helfer", "airdrop_json"):
         return
     if connections.primary() is conn:
         cfg.config[key] = value
@@ -14763,6 +14790,7 @@ _TOOL_LISTE = (
     ("deployment", "🚚", "NPC + Vehicle Deployment"),
     ("airstrike", "💥", "Airstrike Generator"),
     ("airdrop", "🪂", "Airdrop Configurator"),
+    ("airdropjson", "📦", "Airdrops JSON"),
     ("underground", "🕳️", "Underground Area Generator"),
     ("battleroyale", "🎯", "Battle Royale Builder"),
     ("lockedcontainer", "🔒", "Locked Container Builder"),
@@ -24625,12 +24653,17 @@ async def cmd_hilfe(interaction: discord.Interaction):
     ), inline=False)
     embed.add_field(name=_t(interaction, "🤖 KI-Helfer", "🤖 AI Helper"), value=_t(
         interaction,
-        "`/ki <prompt>` — Stelle der KI eine Frage *(wenn aktiviert)*\n"
-        "In Tickets antwortet die KI zuerst und ruft bei Bedarf den Support.\n"
-        "Einrichtung im Dashboard unter „Discord Management“ → „KI-Helfer“.",
-        "`/ki <prompt>` — Ask the AI a question *(if enabled)*\n"
-        "In tickets the AI answers first and calls support when needed.\n"
-        "Set up in the dashboard under “Discord Management” → “AI Helper”."
+        "`/ki <prompt>` — Frage an die KI *(wenn aktiviert, Dashboard → „KI-Helfer“)*",
+        "`/ki <prompt>` — Ask the AI *(if enabled, dashboard → “AI Helper”)*"
+    ), inline=False)
+    embed.add_field(name=_t(interaction, "🪂 Airdrops", "🪂 Airdrops"), value=_t(
+        interaction,
+        "`/airdrop add <name> <x> <y> <z> <restarts>`\n"
+        "`/airdrop list [art]` · `/airdrop remove <name>`\n"
+        "Tool: Dashboard → „Airdrops JSON“.",
+        "`/airdrop add <name> <x> <y> <z> <restarts>`\n"
+        "`/airdrop list [type]` · `/airdrop remove <name>`\n"
+        "Tool: dashboard → “Airdrops JSON”."
     ), inline=False)
     embed.add_field(name=_t(interaction, "🗺️ Event Vorlagen", "🗺️ Event Templates"), value=_t(
         interaction,
@@ -31048,6 +31081,1098 @@ bot.tree.add_command(events_group)
 
 
 # ══════════════════════════════════════════════════════════════
+#  Tool „Airdrops JSON“ + /airdrop + Airdrop-Scheduler
+# ══════════════════════════════════════════════════════════════
+# Object-Spawner-JSON-Dateien ({"Objects":[{name,pos,ypr,scale,…}]}) mit absoluten
+# Weltkoordinaten. Der Bot versetzt ALLE Objekte so, dass die Mitte der Anlage (x/z) und
+# ihr tiefster Punkt (y) auf der gewuenschten Koordinate liegen, schreibt sie als
+# custom/adj_<id>.json auf den Server und traegt sie in cfggameplay.json →
+# WorldsData.objectSpawnersArr ein. Der Server liest das nur beim Start: ein Airdrop ist
+# deshalb ab dem NAECHSTEN Neustart sichtbar. „restarts“ zaehlt die Server-Laeufe, in denen
+# er sichtbar bleibt; danach wird er ausgetragen.
+# Speicher: Premade (Betreiber, global) und Eigene (je Server) als Dateien unter airdrop_json/,
+# Zustand je Server (platzierte Airdrops, Scheduler) in conn.data["airdrop_json"].
+_ADJ_ORDNER = "airdrop_json"
+_ADJ_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,40}\Z")
+_ADJ_DATEI_RE = re.compile(r"^custom/adj_([0-9a-f]{6})\.json$")
+_ADJ_MAX_BYTES = 5_000_000
+_ADJ_INDEX = ".index.json"                      # beginnt mit Punkt: kann nie ein gueltiger Dateiname sein
+_ADJ_QUOTA_EIGENE = 50_000_000                  # Gesamtgroesse aller eigenen Dateien je Server
+_ADJ_QUOTA_PREMADE = 200_000_000
+_ADJ_CUSTOMSTRING_MAX = 1000
+_ADJ_IO_LOCK = threading.Lock()
+_ADJ_MAX_OBJEKTE = 5000
+_ADJ_WARN_OBJEKTE = 200
+_ADJ_MAX_PREMADE = 100
+_ADJ_MAX_EIGENE = 20
+_ADJ_MAX_INSTANZEN = 20
+_ADJ_MAX_RESTARTS = 100
+_ADJ_MAX_SCHEDULER_ANZAHL = 10
+_ADJ_MAX_POSITIONEN = 50
+_ADJ_STANDARD_KARTE = 20480
+_ADJ_FEHLER_FTP = "Für diesen Server fehlt der FTP-Zugang."
+
+
+def _adj_zahl(wert: Any) -> Optional[float]:
+    """Endliche Zahl (kein bool) oder None."""
+    if isinstance(wert, bool) or not isinstance(wert, (int, float)):
+        return None
+    try:
+        wert = float(wert)
+    except (OverflowError, ValueError):
+        return None
+    return wert if math.isfinite(wert) and abs(wert) < 1e7 else None
+
+
+def _adj_pruefen(inhalt: str) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """Object-Spawner-JSON pruefen und normalisieren: (Objekte, Fehlertext).
+    Jedes Objekt wird auf name/pos/ypr/scale/enableCEPersistency/customString
+    reduziert; Pfade als Name (/ oder \\) und andere Formate werden abgelehnt."""
+    if len(inhalt.encode("utf-8", errors="ignore")) > _ADJ_MAX_BYTES:
+        return None, "Die Datei ist zu groß (höchstens 5 MB)."
+    try:
+        geparst = json.loads(inhalt)
+    except (TypeError, ValueError, RecursionError):
+        return None, "Das ist kein gültiges JSON."
+    if isinstance(geparst, dict) and "Objects" not in geparst and ("Containers" in geparst or "Loot" in geparst):
+        return None, ("Das sieht nach einer Expansion-Airdrop-Einstellung aus – hier werden "
+                      "Object-Spawner-Dateien mit „Objects“ erwartet.")
+    if not isinstance(geparst, dict) or not isinstance(geparst.get("Objects"), list):
+        return None, "Die Datei braucht ein Feld „Objects“ (Liste) im Object-Spawner-Format."
+    roh = geparst["Objects"]
+    if not roh:
+        return None, "Die Datei enthält keine Objekte."
+    if len(roh) > _ADJ_MAX_OBJEKTE:
+        return None, "Die Datei hat zu viele Objekte (höchstens 5000)."
+    objekte: List[Dict[str, Any]] = []
+    for o in roh:
+        if not isinstance(o, dict):
+            return None, "Ein Eintrag in „Objects“ ist kein Objekt."
+        name = o.get("name")
+        if not isinstance(name, str) or not 1 <= len(name) <= 200 or "/" in name or "\\" in name \
+                or any(ord(c) < 32 for c in name):
+            return None, "Ein Objekt hat keinen gültigen Namen (Text ohne / und \\)."
+        pos = o.get("pos")
+        if not isinstance(pos, list) or len(pos) != 3 or any(_adj_zahl(p) is None for p in pos):
+            return None, "Ein Objekt hat keine gültige Position „pos“ (genau 3 Zahlen)."
+        ypr = o.get("ypr", [0, 0, 0])
+        if not isinstance(ypr, list) or len(ypr) != 3 or any(_adj_zahl(p) is None for p in ypr):
+            return None, "Ein Objekt hat kein gültiges „ypr“ (3 Zahlen)."
+        scale = o.get("scale", 1.0)
+        if _adj_zahl(scale) is None or not 0 < float(scale) <= 1000:
+            return None, "Ein Objekt hat einen ungültigen „scale“-Wert."
+        persist = o.get("enableCEPersistency", 0)
+        custom = o.get("customString", "")
+        objekte.append({"name": name, "pos": [float(p) for p in pos], "ypr": [float(p) for p in ypr],
+                        "scale": float(scale), "enableCEPersistency": 1 if persist in (1, True) else 0,
+                        "customString": custom if isinstance(custom, str) and len(custom) <= _ADJ_CUSTOMSTRING_MAX else ""})
+    return objekte, None
+
+
+def _adj_meta(name: str, objekte: List[Dict[str, Any]], bytes_: int, user: str) -> Dict[str, Any]:
+    xs = [o["pos"][0] for o in objekte]
+    ys = [o["pos"][1] for o in objekte]
+    zs = [o["pos"][2] for o in objekte]
+    return {"name": name, "objekte": len(objekte), "bytes": int(bytes_),
+            "breite_x": round(max(xs) - min(xs), 1), "breite_z": round(max(zs) - min(zs), 1),
+            "hoehe": round(max(ys) - min(ys), 1), "warnung": len(objekte) >= _ADJ_WARN_OBJEKTE,
+            "hochgeladen": datetime.now(timezone.utc).isoformat(), "von": str(user)[:60]}
+
+
+def _adj_verschieben(objekte: List[Dict[str, Any]], x: float, y: float, z: float
+                     ) -> List[Dict[str, Any]]:
+    """Alle Objekte so versetzen, dass die Mitte des umschliessenden Rahmens (x/z) auf (x, z)
+    und der tiefste Punkt auf y liegt. Abstaende, Hoehenunterschiede, ypr, scale bleiben."""
+    xs = [o["pos"][0] for o in objekte]
+    ys = [o["pos"][1] for o in objekte]
+    zs = [o["pos"][2] for o in objekte]
+    dx = x - (min(xs) + max(xs)) / 2.0
+    dz = z - (min(zs) + max(zs)) / 2.0
+    dy = y - min(ys)
+    aus: List[Dict[str, Any]] = []
+    for o in objekte:
+        neu = dict(o)
+        neu["pos"] = [round(o["pos"][0] + dx, 4), round(o["pos"][1] + dy, 4), round(o["pos"][2] + dz, 4)]
+        neu["ypr"] = list(o["ypr"])
+        aus.append(neu)
+    return aus
+
+
+def _adj_kartengroesse(conn: ServerConnection) -> int:
+    return DEFAULT_MAP_SIZES.get(_canonical_map_name(str(conn.data.get("map_name") or "")) or "",
+                                 _ADJ_STANDARD_KARTE)
+
+
+def _adj_bauen(conn: ServerConnection, objekte: List[Dict[str, Any]], x: Any, y: Any, z: Any
+               ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """Verschobene Objekte + Fehlertext. Prueft Ziel und dass nichts ausserhalb der Karte landet."""
+    xf, yf, zf = _adj_zahl(x), _adj_zahl(y), _adj_zahl(z)
+    if xf is None or yf is None or zf is None:
+        return None, "Die Koordinaten müssen Zahlen sein."
+    groesse = _adj_kartengroesse(conn)
+    if not (0 <= xf <= groesse and 0 <= zf <= groesse):
+        return None, "Die Koordinate liegt außerhalb der Karte."
+    if not -1000 <= yf <= 10000:
+        return None, "Die Höhe y muss zwischen -1000 und 10000 liegen."
+    neu = _adj_verschieben(objekte, xf, yf, zf)
+    if any(not (0 <= o["pos"][0] <= groesse and 0 <= o["pos"][2] <= groesse) for o in neu):
+        return None, "Der Airdrop würde mit Teilen außerhalb der Karte liegen – bitte weiter in die Mitte setzen."
+    return neu, None
+
+
+# ── Dateispeicher (Premade global, Eigene je Server) ──────────────────────
+def _adj_verz(quelle: str, service_id: str = "") -> str:
+    if quelle == "premade":
+        return os.path.join(_ADJ_ORDNER, "premade")
+    sid = re.sub(r"[^A-Za-z0-9_-]", "_", str(service_id))[:40] or "x"
+    return os.path.join(_ADJ_ORDNER, "eigene", sid)
+
+
+def _adj_atomar_schreiben(pfad: str, text: str) -> None:
+    os.makedirs(os.path.dirname(pfad), exist_ok=True)
+    tmp = f"{pfad}.{secrets.token_hex(4)}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, pfad)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _adj_index_lesen(verz: str) -> Dict[str, Dict[str, Any]]:
+    try:
+        with open(os.path.join(verz, _ADJ_INDEX), "r", encoding="utf-8") as f:
+            roh = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in roh.items() if isinstance(v, dict) and _ADJ_NAME_RE.match(str(k))} \
+        if isinstance(roh, dict) else {}
+
+
+def _adj_liste(quelle: str, service_id: str = "") -> List[Dict[str, Any]]:
+    """Metadaten aller Dateien dieser Quelle (nur die, deren Datei wirklich existiert)."""
+    verz = _adj_verz(quelle, service_id)
+    index = _adj_index_lesen(verz)
+    return sorted((m for n, m in index.items() if os.path.exists(os.path.join(verz, n + ".json"))),
+                  key=lambda m: str(m.get("name", "")).lower())
+
+
+def _adj_speichern(quelle: str, service_id: str, name: str, objekte: List[Dict[str, Any]],
+                   user: str) -> Dict[str, Any]:
+    if not _ADJ_NAME_RE.match(name):
+        raise ValueError("Ungültiger Name.")
+    verz = _adj_verz(quelle, service_id)
+    text = json.dumps({"Objects": objekte}, indent=1, ensure_ascii=False) + "\n"
+    if len(text.encode("utf-8")) > _ADJ_MAX_BYTES:
+        raise ValueError("Die Datei ist zu groß (höchstens 5 MB).")
+    with _ADJ_IO_LOCK:                           # Datei + Index gemeinsam (Threads des Executors)
+        _adj_atomar_schreiben(os.path.join(verz, name + ".json"), text)
+        index = _adj_index_lesen(verz)
+        meta = _adj_meta(name, objekte, len(text.encode("utf-8")), user)
+        index[name] = meta
+        _adj_atomar_schreiben(os.path.join(verz, _ADJ_INDEX), json.dumps(index, indent=1, ensure_ascii=False))
+    return meta
+
+
+def _adj_laden(quelle: str, service_id: str, name: str) -> Optional[List[Dict[str, Any]]]:
+    if not _ADJ_NAME_RE.match(str(name or "")) or quelle not in ("premade", "eigen"):
+        return None
+    try:
+        with open(os.path.join(_adj_verz(quelle, service_id), name + ".json"), "r", encoding="utf-8") as f:
+            objekte, fehler = _adj_pruefen(f.read())
+    except OSError:
+        return None
+    return None if fehler else objekte
+
+
+def _adj_loeschen(quelle: str, service_id: str, name: str) -> bool:
+    if not _ADJ_NAME_RE.match(str(name or "")) or quelle not in ("premade", "eigen"):
+        return False
+    verz = _adj_verz(quelle, service_id)
+    with _ADJ_IO_LOCK:
+        index = _adj_index_lesen(verz)
+        vorhanden = os.path.exists(os.path.join(verz, name + ".json"))
+        if vorhanden:
+            os.remove(os.path.join(verz, name + ".json"))
+        if name in index:
+            del index[name]
+            _adj_atomar_schreiben(os.path.join(verz, _ADJ_INDEX), json.dumps(index, indent=1, ensure_ascii=False))
+    return vorhanden
+
+
+# ── Zustand je Server ─────────────────────────────────────────────────────
+def _adj_zustand(conn: ServerConnection) -> Dict[str, Any]:
+    """Zustand dieses Servers (direkt aus conn.data - NIE ueber conn.get(): kein Rueckfall auf die globale Config)."""
+    roh = conn.data.get("airdrop_json")
+    z = roh if isinstance(roh, dict) else {}
+    if not isinstance(z.get("instanzen"), list):
+        z["instanzen"] = []
+    sch = z.get("scheduler")
+    if not isinstance(sch, dict):
+        sch = {}
+    sch.setdefault("aktiv", False)
+    sch.setdefault("anzahl", 1)
+    sch.setdefault("alle_neustarts", 1)
+    sch.setdefault("zaehler", 0)
+    for k in ("airdrops", "positionen"):
+        if not isinstance(sch.get(k), list):
+            sch[k] = []
+    for obj, felder in ((sch, ("anzahl", "alle_neustarts", "zaehler")),
+                        (z, ("neustarts_offen", "laeufe", "laeufe_verarbeitet"))):
+        for feld in felder:               # kaputte Werte (handgeaenderte connections.json) duerfen den Poll nie stoppen
+            try:
+                obj[feld] = max(0, int(obj.get(feld) or 0))
+            except (TypeError, ValueError, OverflowError):
+                obj[feld] = 0
+    sch["anzahl"] = max(1, sch["anzahl"])
+    sch["alle_neustarts"] = max(1, sch["alle_neustarts"])
+    z["scheduler"] = sch
+    conn.data["airdrop_json"] = z
+    return z
+
+
+def _adj_zustand_speichern(conn: ServerConnection) -> None:
+    # Direkt ueber conn.data + connections.save(): _conn_store wuerde beim Hauptserver nach config.json spiegeln.
+    connections.save()
+
+
+def _adj_instanz_von(z: Dict[str, Any], inst_id: str) -> Optional[Dict[str, Any]]:
+    return next((i for i in z["instanzen"] if i.get("id") == inst_id), None)
+
+
+def _adj_neue_id(z: Dict[str, Any]) -> str:
+    while True:
+        i = secrets.token_hex(3)
+        if _adj_instanz_von(z, i) is None:
+            return i
+
+
+# ── Server schreiben (cfggameplay.json objectSpawnersArr) ─────────────────
+# Sperrreihenfolge (nie umdrehen): erst _adj_lock (logische Operation), darin _schaden_lock
+# (Dateizugriff auf cfggameplay.json, geteilt mit den anderen Tools).
+_ADJ_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def _adj_lock(service_id: str) -> asyncio.Lock:
+    return _ADJ_LOCKS.setdefault(service_id, asyncio.Lock())
+
+
+async def _adj_gameplay_lesen(conn: ServerConnection, loop) -> Tuple[Optional[Dict[str, Any]], str]:
+    """cfggameplay.json im Executor lesen (Pfadaufloesung per list_dir darf den Event-Loop nicht blockieren)."""
+    inhalt, status = await loop.run_in_executor(None, _tool_datei_lesen_sync, conn, "cfggameplay.json")
+    if status != "ok":
+        return None, status
+    try:
+        geparst = json.loads(inhalt)
+    except (TypeError, ValueError):
+        return None, "kaputt"
+    return (geparst, "ok") if isinstance(geparst, dict) else (None, "kaputt")
+
+
+async def _adj_transaktion(conn: ServerConnection, neue: List[Tuple[str, List[Dict[str, Any]]]],
+                           entfernen: List[str], bleibende_ids: Optional[Set[str]] = None,
+                           uebernehmen: Any = None) -> Optional[str]:
+    """Schreibt die Dateien custom/adj_<id>.json der ``neue`` (id, Objekte), aendert
+    objectSpawnersArr EINMAL (neue rein, ``entfernen`` raus, dazu verwaiste adj_-Eintraege, die
+    nicht zum Zustand gehoeren) und loescht danach die Dateien der entfernten. ``uebernehmen``
+    (Zustand aktualisieren) laeuft noch UNTER der Sperre, damit ein paralleler Aufruf nie einen
+    halb aktualisierten Zustand sieht. ``bleibende_ids`` wird ignoriert (frueher vor der Sperre
+    berechnet - veraltet bei parallelen Aufrufen); sie entstehen jetzt innerhalb der Sperre aus
+    dem aktuellen Zustand. Fehlertext oder None."""
+    if conn.ftp is None or not _mission_dir_of(conn):
+        return _ADJ_FEHLER_FTP
+    loop = asyncio.get_running_loop()
+    async with _schaden_lock(conn.service_id):
+        geschrieben: List[str] = []
+        try:
+            if neue and not await loop.run_in_executor(
+                    None, conn.ftp.mkdir, f"{_mission_dir_of(conn).rstrip('/')}/custom"):
+                return "Der Ordner custom konnte auf dem Server nicht angelegt werden."
+            for inst_id, objekte in neue:
+                ziel = f"custom/adj_{inst_id}.json"
+                text = json.dumps({"Objects": objekte}, indent=1, ensure_ascii=False) + "\n"
+                if not await _tools_datei_schreiben(conn, ziel, text, loop):
+                    raise OSError(ziel)
+                geschrieben.append(ziel)
+            gameplay, status = await _adj_gameplay_lesen(conn, loop)
+            if gameplay is None:
+                raise OSError("cfggameplay.json")
+            liste = _json_wert_finden(gameplay, "objectSpawnersArr")
+            if not isinstance(liste, list):
+                welten = gameplay.setdefault("WorldsData", {})
+                if not isinstance(welten, dict):
+                    raise OSError("WorldsData")
+                liste = []
+                welten["objectSpawnersArr"] = liste
+            weg = {_custom_spawner_pfad_normalisieren(f"custom/adj_{i}.json") for i in entfernen}
+            behalten = ({f"custom/adj_{i}.json" for i in _adj_inst_ids(_adj_zustand(conn))}
+                        | {f"custom/adj_{i}.json" for i, _ in neue}) - weg
+
+            def _verwaist(eintrag: Any) -> bool:
+                p = _custom_spawner_pfad_normalisieren(eintrag) if isinstance(eintrag, str) else ""
+                return bool(_ADJ_DATEI_RE.match(p)) and p not in behalten
+            neue_liste = [e for e in liste if not (isinstance(e, str) and (
+                _custom_spawner_pfad_normalisieren(e) in weg or _verwaist(e)))]
+            vorhanden = {_custom_spawner_pfad_normalisieren(e) for e in neue_liste if isinstance(e, str)}
+            for inst_id, _ in neue:
+                eintrag = f"custom/adj_{inst_id}.json"
+                if eintrag not in vorhanden:
+                    neue_liste.append(eintrag)
+            if neue_liste != liste:
+                liste[:] = neue_liste
+                text = json.dumps(gameplay, indent=4, ensure_ascii=False) + "\n"
+                if not await loop.run_in_executor(None, _tool_datei_schreiben_sync, conn, "cfggameplay.json", text):
+                    raise OSError("cfggameplay.json")
+        except Exception as ex:  # noqa: BLE001 – Rollback der neuen Dateien
+            for ziel in reversed(geschrieben):
+                try:
+                    await _tools_datei_loeschen(conn, ziel, loop)
+                except Exception:  # noqa: BLE001
+                    pass
+            log.warning(f"[AIRDROPJSON] {conn.service_id}: Schreiben fehlgeschlagen ({type(ex).__name__})")
+            return "Speichern auf dem Server fehlgeschlagen – nichts wurde geändert."
+        if uebernehmen is not None:
+            uebernehmen()
+        for inst_id in entfernen:               # Dateien erst NACH dem Austragen loeschen (best effort)
+            try:
+                await _tools_datei_loeschen(conn, f"custom/adj_{inst_id}.json", loop)
+            except Exception:  # noqa: BLE001
+                pass
+    return None
+
+
+def _adj_inst_ids(z: Dict[str, Any]) -> Set[str]:
+    return {str(i.get("id")) for i in z["instanzen"]}
+
+
+def _adj_ab_lauf(zustand: Dict[str, Any]) -> int:
+    """Ab welchem erkannten Server-Lauf ein JETZT geschriebener Airdrop sichtbar ist: der naechste.
+    Ein schon erkannter, aber noch nicht verbuchter Neustart hat die Config bereits gelesen."""
+    return int(zustand["laeufe"]) + 1
+
+
+async def _adj_platzieren(conn: ServerConnection, quelle: str, name: str, x: Any, y: Any, z_: Any,
+                          restarts: int, von: str, user: str
+                          ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Einen Airdrop platzieren (Befehl). (Instanz, Fehlertext)."""
+    async with _adj_lock(conn.service_id):
+        return await _adj_platzieren_roh(conn, quelle, name, x, y, z_, restarts, von, user)
+
+
+async def _adj_platzieren_roh(conn: ServerConnection, quelle: str, name: str, x: Any, y: Any, z_: Any,
+                              restarts: int, von: str, user: str
+                              ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    zustand = _adj_zustand(conn)
+    if len(zustand["instanzen"]) >= _ADJ_MAX_INSTANZEN:
+        return None, "Es sind schon zu viele Airdrops aktiv (höchstens 20) – bitte erst welche entfernen."
+    if not 1 <= int(restarts) <= _ADJ_MAX_RESTARTS:
+        return None, "Die Zahl der Neustarts muss zwischen 1 und 100 liegen."
+    loop = asyncio.get_running_loop()
+    objekte = await loop.run_in_executor(None, _adj_laden, quelle, conn.service_id, name)
+    if objekte is None:
+        return None, "Diesen Airdrop gibt es nicht (mehr)."
+    neu, fehler = _adj_bauen(conn, objekte, x, y, z_)
+    if fehler:
+        return None, fehler
+    inst_id = _adj_neue_id(zustand)
+    inst = {"id": inst_id, "name": name, "quelle": quelle, "datei": f"custom/adj_{inst_id}.json",
+            "x": round(float(x), 2), "y": round(float(y), 2), "z": round(float(z_), 2),
+            "restarts": int(restarts), "gesehen": 0, "ab_lauf": _adj_ab_lauf(zustand), "von": von,
+            "user": str(user)[:60], "erstellt": datetime.now(timezone.utc).isoformat(), "objekte": len(neu)}
+
+    def uebernehmen() -> None:
+        zustand["instanzen"].append(inst)
+        _adj_zustand_speichern(conn)
+    fehler = await _adj_transaktion(conn, [(inst_id, neu)], [], None, uebernehmen)
+    if fehler:
+        return None, fehler
+    return inst, None
+
+
+async def _adj_entfernen(conn: ServerConnection, inst_ids: List[str]) -> Optional[str]:
+    """Instanzen austragen + Dateien loeschen + Zustand aktualisieren. Fehlertext oder None."""
+    async with _adj_lock(conn.service_id):
+        return await _adj_entfernen_roh(conn, inst_ids)
+
+
+async def _adj_entfernen_roh(conn: ServerConnection, inst_ids: List[str]) -> Optional[str]:
+    zustand = _adj_zustand(conn)
+    ids = [i for i in inst_ids if _adj_instanz_von(zustand, i) is not None]
+    if not ids:
+        return None
+
+    def uebernehmen() -> None:
+        zustand["instanzen"] = [i for i in zustand["instanzen"] if i.get("id") not in ids]
+        _adj_zustand_speichern(conn)
+    return await _adj_transaktion(conn, [], ids, None, uebernehmen)
+
+
+# ── Scheduler: Rotation alle X Neustarts ──────────────────────────────────
+def _adj_scheduler_validieren(daten: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Scheduler-Einstellungen aus der API pruefen: (bereinigt, Fehlertext)."""
+    try:
+        anzahl = int(daten.get("anzahl"))
+        alle = int(daten.get("alle_neustarts"))
+    except (TypeError, ValueError, OverflowError):
+        return None, "Anzahl und Neustarts müssen ganze Zahlen sein."
+    if not 1 <= anzahl <= _ADJ_MAX_SCHEDULER_ANZAHL:
+        return None, "Die Zahl gleichzeitiger Airdrops muss zwischen 1 und 10 liegen."
+    if not 1 <= alle <= _ADJ_MAX_RESTARTS:
+        return None, "Der Wechsel „alle X Neustarts“ muss zwischen 1 und 100 liegen."
+    airdrops: List[Dict[str, str]] = []
+    roh_a = daten.get("airdrops") or []
+    if not isinstance(roh_a, list) or len(roh_a) > 100:
+        return None, "Ungültige Airdrop-Auswahl."
+    for a in roh_a:
+        if not isinstance(a, dict) or a.get("quelle") not in ("premade", "eigen") \
+                or not _ADJ_NAME_RE.match(str(a.get("name") or "")):
+            return None, "Ungültige Airdrop-Auswahl."
+        eintrag = {"quelle": a["quelle"], "name": str(a["name"])}
+        if eintrag not in airdrops:
+            airdrops.append(eintrag)
+    positionen: List[Dict[str, float]] = []
+    roh_p = daten.get("positionen") or []
+    if not isinstance(roh_p, list) or len(roh_p) > _ADJ_MAX_POSITIONEN:
+        return None, "Ungültige Positionen (höchstens 50)."
+    for p in roh_p:
+        if not isinstance(p, dict):
+            return None, "Ungültige Positionen (höchstens 50)."
+        px, py, pz = _adj_zahl(p.get("x")), _adj_zahl(p.get("y")), _adj_zahl(p.get("z"))
+        if px is None or py is None or pz is None:
+            return None, "Jede Position braucht x, y und z als Zahlen."
+        pos = {"x": round(px, 2), "y": round(py, 2), "z": round(pz, 2)}
+        if pos not in positionen:
+            positionen.append(pos)
+    aktiv = bool(daten.get("aktiv"))
+    if aktiv and not airdrops:
+        return None, "Bitte mindestens einen Airdrop auswählen."
+    if aktiv and len(positionen) < anzahl:
+        return None, "Es braucht mindestens so viele Positionen wie gleichzeitige Airdrops."
+    return {"aktiv": aktiv, "anzahl": anzahl, "alle_neustarts": alle,
+            "airdrops": airdrops, "positionen": positionen}, None
+
+
+def _adj_rotation_waehlen(conn: ServerConnection, zustand: Dict[str, Any], vorher: List[Dict[str, Any]]
+                          ) -> List[Tuple[str, str, Dict[str, float]]]:
+    """Zufaellige Belegung: [(quelle, name, position)]. Airdrops moeglichst ohne Wiederholung,
+    Positionen nie doppelt, nicht auf einer per Befehl gesetzten Position und moeglichst nicht
+    dieselben wie zuvor."""
+    sch = zustand["scheduler"]
+    verfuegbar = [a for a in sch["airdrops"]
+                  if os.path.exists(os.path.join(_adj_verz(a["quelle"], conn.service_id), a["name"] + ".json"))]
+    if not verfuegbar or not sch["positionen"]:
+        return []
+    belegt = [(i["x"], i["z"]) for i in zustand["instanzen"] if i.get("von") == "befehl"]
+    frei = [p for p in sch["positionen"] if all(abs(p["x"] - bx) > 1 or abs(p["z"] - bz) > 1 for bx, bz in belegt)]
+    n = min(int(sch["anzahl"]), len(frei))
+    if n <= 0:
+        return []
+    zuvor = [(i["x"], i["z"]) for i in vorher]
+    neu_pos = [p for p in frei if all(abs(p["x"] - ax) > 1 or abs(p["z"] - az) > 1 for ax, az in zuvor)]
+    pool = neu_pos if len(neu_pos) >= n else frei
+    positionen = random.sample(pool, n)
+    if len(verfuegbar) >= n:
+        auswahl = random.sample(verfuegbar, n)
+    else:
+        auswahl = [random.choice(verfuegbar) for _ in range(n)]
+    return [(a["quelle"], a["name"], p) for a, p in zip(auswahl, positionen)]
+
+
+async def _adj_scheduler_anwenden(conn: ServerConnection) -> Optional[str]:
+    """Scheduler-Belegung neu setzen: alte Scheduler-Airdrops raus, neue rein (aktiv) bzw. nur raus
+    (aus). Setzt den Zaehler zurueck. Fehlertext oder None."""
+    async with _adj_lock(conn.service_id):
+        return await _adj_scheduler_anwenden_roh(conn)
+
+
+async def _adj_scheduler_speichern(conn: ServerConnection, sauber: Dict[str, Any]) -> Optional[str]:
+    """Scheduler-Einstellungen uebernehmen UND anwenden - alles unter der Sperre; bei einem Fehler
+    bleiben die alten Einstellungen stehen."""
+    async with _adj_lock(conn.service_id):
+        zustand = _adj_zustand(conn)
+        alt = copy.deepcopy(zustand["scheduler"])
+        zustand["scheduler"].update(sauber)
+        fehler = await _adj_scheduler_anwenden_roh(conn)
+        if fehler:
+            zustand["scheduler"] = alt
+        return fehler
+
+
+async def _adj_scheduler_anwenden_roh(conn: ServerConnection) -> Optional[str]:
+    zustand = _adj_zustand(conn)
+    sch = zustand["scheduler"]
+    alte = [i for i in zustand["instanzen"] if i.get("von") == "scheduler"]
+    neue_plan = _adj_rotation_waehlen(conn, zustand, alte) if sch["aktiv"] else []
+    loop = asyncio.get_running_loop()
+    neue: List[Tuple[str, List[Dict[str, Any]]]] = []
+    neue_inst: List[Dict[str, Any]] = []
+    for quelle, name, pos in neue_plan:
+        objekte = await loop.run_in_executor(None, _adj_laden, quelle, conn.service_id, name)
+        if objekte is None:
+            continue
+        verschoben, fehler = _adj_bauen(conn, objekte, pos["x"], pos["y"], pos["z"])
+        if fehler:
+            log.warning(f"[AIRDROPJSON] {conn.service_id}: Scheduler-Position übersprungen ({fehler})")
+            continue
+        inst_id = _adj_neue_id({"instanzen": zustand["instanzen"] + neue_inst})
+        neue.append((inst_id, verschoben))
+        neue_inst.append({"id": inst_id, "name": name, "quelle": quelle, "datei": f"custom/adj_{inst_id}.json",
+                          "x": pos["x"], "y": pos["y"], "z": pos["z"], "restarts": int(sch["alle_neustarts"]),
+                          "gesehen": 0, "ab_lauf": _adj_ab_lauf(zustand), "von": "scheduler", "user": "scheduler",
+                          "erstellt": datetime.now(timezone.utc).isoformat(), "objekte": len(verschoben)})
+    alte_ids = [str(i["id"]) for i in alte]
+    if not neue and not alte_ids:
+        sch["zaehler"] = 0
+        _adj_zustand_speichern(conn)
+        return None
+
+    def uebernehmen() -> None:
+        zustand["instanzen"] = [i for i in zustand["instanzen"] if i.get("von") != "scheduler"] + neue_inst
+        sch["zaehler"] = 0
+        _adj_zustand_speichern(conn)
+    return await _adj_transaktion(conn, neue, alte_ids, None, uebernehmen)
+
+
+# ── Neustart-Zaehler (Poll-Hook) ──────────────────────────────────────────
+_ADJ_TASKS: Dict[str, "asyncio.Task[None]"] = {}
+_ADJ_RETRY_AB: Dict[str, float] = {}
+_ADJ_RETRY_SEKUNDEN = 90
+
+
+def _adj_hat_arbeit(conn: ServerConnection) -> bool:
+    z = conn.data.get("airdrop_json")
+    return isinstance(z, dict) and bool(z.get("instanzen") or (z.get("scheduler") or {}).get("aktiv"))
+
+
+def _adj_poll(conn: ServerConnection, restart_erkannt: bool) -> None:
+    """Vom Log-Poll aufgerufen (billig): merkt einen erkannten Neustart persistent vor und stoesst
+    die Verarbeitung an (auch als Wiederholung nach einem Fehler). ``restart_erkannt=True`` erst
+    aufrufen, NACHDEM der Log-Cursor gespeichert ist - sonst erkennt der naechste Poll dieselbe
+    Rotation noch einmal und zaehlt doppelt."""
+    try:
+        if not isinstance(conn.data.get("airdrop_json"), dict):
+            return
+        zustand = _adj_zustand(conn)
+        if restart_erkannt and _adj_hat_arbeit(conn):
+            zustand["neustarts_offen"] += 1
+            zustand["laeufe"] += 1
+            _adj_zustand_speichern(conn)
+        if zustand["neustarts_offen"] <= 0:
+            return
+        laufend = _ADJ_TASKS.get(conn.service_id)
+        if laufend is not None and not laufend.done():
+            return
+        if time.time() < _ADJ_RETRY_AB.get(conn.service_id, 0.0):
+            return
+        _ADJ_TASKS[conn.service_id] = asyncio.get_running_loop().create_task(_adj_neustarts_verarbeiten(conn))
+    except Exception as ex:  # noqa: BLE001 – darf den Log-Poll nie stoppen
+        log.error(f"[AIRDROPJSON] {getattr(conn, 'service_id', '?')}: Poll-Hook {type(ex).__name__}")
+
+
+async def _adj_warten_bis_online(conn: ServerConnection) -> None:
+    """Wie RentalManager._wait_for_server_online: die cfggameplay.json wird beim Start gelesen -
+    ein zu fruehes Schreiben wuerde schon im laufenden Start wirken (Zaehlung um einen verschoben)."""
+    ip = str(conn.get("server_ip") or "").split(":")[0].strip()
+    qport = int(conn.get("query_port", 0) or 0)
+    if not ip or not qport:
+        return
+    ende = time.time() + max(60, int(conn.get("delivery_online_wait_max_seconds", 2700) or 2700))
+    loop = asyncio.get_running_loop()
+    while time.time() < ende:
+        if await loop.run_in_executor(None, a2s_query, ip, qport):
+            return
+        await asyncio.sleep(20)
+
+
+async def _adj_neustarts_verarbeiten(conn: ServerConnection) -> None:
+    try:
+        await _adj_warten_bis_online(conn)
+        while True:
+            zustand = _adj_zustand(conn)
+            if zustand["neustarts_offen"] <= 0:
+                return
+            fehler = await _adj_einen_neustart(conn)
+            if fehler:
+                log.warning(f"[AIRDROPJSON] {conn.service_id}: Neustart-Verarbeitung wird wiederholt ({fehler})")
+                _ADJ_RETRY_AB[conn.service_id] = time.time() + _ADJ_RETRY_SEKUNDEN
+                return
+    except Exception as ex:  # noqa: BLE001 – darf den Poll nie stoeren
+        log.error(f"[AIRDROPJSON] {conn.service_id}: {type(ex).__name__}")
+        _ADJ_RETRY_AB[conn.service_id] = time.time() + _ADJ_RETRY_SEKUNDEN
+
+
+async def _adj_einen_neustart(conn: ServerConnection) -> Optional[str]:
+    """EINEN erkannten Neustart verbuchen: gesehen+1, Ablaufende austragen, ggf. Scheduler rotieren.
+    Der Zaehler sinkt erst nach erfolgreichem Schreiben (Wiederholung ist ungefaehrlich)."""
+    async with _adj_lock(conn.service_id):
+        return await _adj_einen_neustart_roh(conn)
+
+
+async def _adj_einen_neustart_roh(conn: ServerConnection) -> Optional[str]:
+    zustand = _adj_zustand(conn)
+    sch = zustand["scheduler"]
+    lauf = zustand["laeufe_verarbeitet"] + 1
+    # Nur Airdrops, die in diesem Lauf schon in der Config standen (ab_lauf <= lauf), werden gezaehlt;
+    # ein nach dem Serverstart gesetzter war in diesem Lauf noch nicht sichtbar.
+    sichtbar = [i for i in zustand["instanzen"] if int(i.get("ab_lauf", 1)) <= lauf]
+    abgelaufen = [str(i["id"]) for i in sichtbar if int(i.get("gesehen", 0)) + 1 >= int(i.get("restarts", 1))]
+    rotieren = bool(sch["aktiv"]) and int(sch["zaehler"]) + 1 >= int(sch["alle_neustarts"])
+    if sch["aktiv"]:
+        # Scheduler-Airdrops folgen der Rotation (alle X Neustarts), nicht ihrem eigenen Ablauf
+        abgelaufen = [i for i in abgelaufen if (_adj_instanz_von(zustand, i) or {}).get("von") != "scheduler"]
+    if abgelaufen:
+        def entfernt() -> None:
+            zustand["instanzen"] = [i for i in zustand["instanzen"] if i.get("id") not in abgelaufen]
+            _adj_zustand_speichern(conn)
+        fehler = await _adj_transaktion(conn, [], abgelaufen, None, entfernt)
+        if fehler:
+            return fehler
+    for i in zustand["instanzen"]:
+        if int(i.get("ab_lauf", 1)) <= lauf:
+            i["gesehen"] = int(i.get("gesehen", 0)) + 1
+    if rotieren:
+        fehler = await _adj_scheduler_anwenden_roh(conn)
+        if fehler:
+            for i in zustand["instanzen"]:          # Zaehlung zuruecknehmen, damit die Wiederholung stimmt
+                if int(i.get("ab_lauf", 1)) <= lauf:
+                    i["gesehen"] = max(0, int(i.get("gesehen", 0)) - 1)
+            return fehler
+    elif sch["aktiv"]:
+        sch["zaehler"] = int(sch["zaehler"]) + 1
+    zustand["neustarts_offen"] = max(0, zustand["neustarts_offen"] - 1)
+    zustand["laeufe_verarbeitet"] = lauf
+    _adj_zustand_speichern(conn)
+    return None
+
+
+# ── Slash-Befehle: /airdrop add | list | remove ───────────────────────────
+# Discord erlaubt keinen Befehl mit eigenen Optionen UND Unterbefehlen -
+# deshalb die Gruppe „airdrop“ (wie /events add|list|remove).
+airdrop_group = app_commands.Group(name="airdrop", description=app_commands.locale_str(
+    "🪂 Airdrop-Dateien auf dem Server platzieren"))
+
+_ADJ_EN: Dict[str, str] = {
+    _ADJ_FEHLER_FTP: "This server is missing FTP access.",
+    "Es sind schon zu viele Airdrops aktiv (höchstens 20) – bitte erst welche entfernen.":
+        "Too many airdrops are already active (maximum 20) – please remove some first.",
+    "Die Zahl der Neustarts muss zwischen 1 und 100 liegen.": "The number of restarts must be between 1 and 100.",
+    "Diesen Airdrop gibt es nicht (mehr).": "This airdrop does not exist (anymore).",
+    "Die Koordinaten müssen Zahlen sein.": "The coordinates must be numbers.",
+    "Die Koordinate liegt außerhalb der Karte.": "The coordinate is outside the map.",
+    "Die Höhe y muss zwischen -1000 und 10000 liegen.": "The height y must be between -1000 and 10000.",
+    "Der Airdrop würde mit Teilen außerhalb der Karte liegen – bitte weiter in die Mitte setzen.":
+        "Parts of the airdrop would lie outside the map – please place it further towards the middle.",
+    "Der Ordner custom konnte auf dem Server nicht angelegt werden.": "The custom folder could not be created on the server.",
+    "Speichern auf dem Server fehlgeschlagen – nichts wurde geändert.": "Saving on the server failed – nothing was changed.",
+}
+
+
+def _adj_t(interaction: discord.Interaction, de: str) -> str:
+    return _t(interaction, de, _ADJ_EN.get(de, de))
+
+
+def _adj_quelle_name(wert: str, conn: Optional[ServerConnection] = None) -> Tuple[str, str]:
+    """„premade:name“ / „eigen:name“ (aus dem Autocomplete) oder ein blosser Name (dann eigene vor Premade)."""
+    quelle, _, name = str(wert or "").partition(":")
+    if quelle in ("premade", "eigen") and name:
+        return quelle, name.strip()
+    name = str(wert or "").strip()
+    if conn is not None and _ADJ_NAME_RE.match(name):
+        if os.path.exists(os.path.join(_adj_verz("eigen", conn.service_id), name + ".json")):
+            return "eigen", name
+        if os.path.exists(os.path.join(_adj_verz("premade"), name + ".json")):
+            return "premade", name
+    return "", name
+
+
+async def _adj_name_autocomplete(interaction: discord.Interaction,
+                                 current: str) -> List[app_commands.Choice[str]]:
+    if not _subcmd_allowed(interaction, "airdrop_add"):
+        return []                       # Namen/Dateien nur denen zeigen, die den Befehl nutzen duerfen
+    cur = (current or "").strip().lower()
+    out: List[app_commands.Choice[str]] = []
+    quellen: List[Tuple[str, str]] = [("premade", "")] + [("eigen", c.service_id) for c in _ac_conns(interaction)]
+    gesehen: Set[str] = set()
+    for quelle, sid in quellen:
+        for meta in _adj_liste(quelle, sid):
+            n = str(meta.get("name"))
+            wert = f"{quelle}:{n}"
+            if (cur and cur not in n.lower()) or wert in gesehen:
+                continue
+            gesehen.add(wert)
+            label = f"[{'Premade' if quelle == 'premade' else 'Eigen'}] {n} · {meta.get('objekte')} obj."
+            out.append(app_commands.Choice(name=label[:100], value=wert[:100]))
+            if len(out) >= 25:
+                return out
+    return out
+
+
+async def _adj_instanz_autocomplete(interaction: discord.Interaction,
+                                    current: str) -> List[app_commands.Choice[str]]:
+    if not _subcmd_allowed(interaction, "airdrop_remove"):
+        return []                       # Positionen platzierter Airdrops sind spielentscheidend
+    cur = (current or "").strip().lower()
+    out: List[app_commands.Choice[str]] = []
+    for c in _ac_conns(interaction):
+        for i in _adj_zustand(c)["instanzen"]:
+            if i.get("von") != "befehl" or (cur and cur not in str(i.get("name", "")).lower()):
+                continue
+            rest = int(i.get("restarts", 1)) - int(i.get("gesehen", 0))
+            label = f"{i.get('name')} · {i.get('x')}, {i.get('y')}, {i.get('z')} · {rest}x"
+            out.append(app_commands.Choice(name=label[:100], value=str(i.get("id"))))
+            if len(out) >= 25:
+                return out
+    return out
+
+
+def _adj_status_text(interaction: discord.Interaction, inst: Dict[str, Any]) -> str:
+    rest = max(0, int(inst.get("restarts", 1)) - int(inst.get("gesehen", 0)))
+    if int(inst.get("gesehen", 0)) == 0:
+        return _t(interaction, f"ab dem nächsten Neustart aktiv · {rest} Neustart(s)",
+                  f"active from the next restart · {rest} restart(s)")
+    return _t(interaction, f"aktiv · noch {rest} Neustart(s)", f"active · {rest} restart(s) left")
+
+
+def _adj_zeile(interaction: discord.Interaction, conn: ServerConnection, inst: Dict[str, Any],
+               mit_server: bool) -> str:
+    quelle = "Premade" if inst.get("quelle") == "premade" else _t(interaction, "Eigen", "Own")
+    link = _izurvive_url(float(inst.get("x", 0)), float(inst.get("z", 0)), conn.data.get("map_name") or "ChernarusPlus",
+                         float(inst.get("y", 0)))
+    server = f" · {conn.name}" if mit_server else ""
+    return (f"• **{inst.get('name')}** [{quelle}] [{inst.get('x')}, {inst.get('y')}, {inst.get('z')}]({link}) · "
+            f"{inst.get('objekte', '?')} obj. · {_adj_status_text(interaction, inst)} · `{inst.get('id')}`{server}")
+
+
+@airdrop_group.command(name="add", description=app_commands.locale_str(
+    "🪂 Platziert einen Airdrop an einer Position (aktiv ab dem nächsten Neustart)"))
+@app_commands.describe(
+    name="Airdrop (Premade oder eigene Datei, per Vorschlag wählen)",
+    x="X-Koordinate (Ost)", y="Höhe (y) – der tiefste Punkt des Airdrops liegt darauf", z="Z-Koordinate (Nord)",
+    restarts="In wie vielen Server-Läufen (Neustarts) der Airdrop sichtbar bleibt (1–100)",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def airdrop_add(interaction: discord.Interaction, name: str, x: float, y: float, z: float,
+                      restarts: app_commands.Range[int, 1, 100], server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "airdrop_add"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    quelle, airdrop = _adj_quelle_name(name, conn)
+    if not quelle:
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Kein Airdrop namens „{airdrop[:60]}“ gefunden – bitte aus der Vorschlagsliste wählen.",
+            f"❌ No airdrop named \"{airdrop[:60]}\" found – please pick one from the suggestions."), ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    inst, fehler = await _adj_platzieren(conn, quelle, airdrop, x, y, z, restarts, "befehl", interaction.user.id)
+    if inst is None:
+        return await interaction.followup.send("❌ " + _adj_t(interaction, str(fehler)), ephemeral=True)
+    _audit_add("discord", f"{interaction.user} ({interaction.user.id})", "/airdrop add",
+               f"{airdrop} {inst['x']} {inst['y']} {inst['z']} x{restarts} · {conn.name}")
+    await interaction.followup.send(_t(
+        interaction,
+        f"✅ **{airdrop}** wird ab dem **nächsten Neustart** bei `{inst['x']}, {inst['y']}, {inst['z']}` aktiv "
+        f"und bleibt für **{restarts}** Neustart(s) (danach wird er ausgetragen). {inst['objekte']} Objekte · "
+        f"ID `{inst['id']}`.\nHinweis: Der Bot kennt die Geländehöhe nicht – bei Hanglage können Teile schweben.",
+        f"✅ **{airdrop}** becomes active from the **next restart** at `{inst['x']}, {inst['y']}, {inst['z']}` "
+        f"and stays for **{restarts}** restart(s) (then it is removed). {inst['objekte']} objects · "
+        f"ID `{inst['id']}`.\nNote: the bot does not know the terrain height – parts may float on slopes."),
+        ephemeral=True)
+
+
+@airdrop_group.command(name="list", description=app_commands.locale_str(
+    "🪂 Zeigt aktive Airdrops (per /airdrop add platziert oder vom Scheduler)"))
+@app_commands.describe(art="Welche Airdrops? (Standard: per /airdrop add platziert)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+@app_commands.choices(art=[app_commands.Choice(name="Platziert (/airdrop add)", value="platziert"),
+                           app_commands.Choice(name="Scheduler", value="scheduler")])
+async def airdrop_list(interaction: discord.Interaction, art: Optional[app_commands.Choice[str]] = None,
+                       server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "airdrop_list"):
+        return await _deny_subcmd(interaction)
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler, ephemeral=True)
+    zustand = _adj_zustand(conn)
+    scheduler = bool(art is not None and art.value == "scheduler")
+    von = "scheduler" if scheduler else "befehl"
+    zeilen = [_adj_zeile(interaction, conn, i, False) for i in zustand["instanzen"] if i.get("von") == von]
+    sch = zustand["scheduler"]
+    kopf = ""
+    if scheduler:
+        kopf = _t(interaction,
+                  f"**Scheduler:** {'an' if sch['aktiv'] else 'aus'} · {sch['anzahl']} gleichzeitig · "
+                  f"Wechsel alle {sch['alle_neustarts']} Neustarts · nächster Wechsel in "
+                  f"{max(0, int(sch['alle_neustarts']) - int(sch['zaehler']))} Neustart(s) · "
+                  f"{len(sch['airdrops'])} Airdrops · {len(sch['positionen'])} Positionen\n\n",
+                  f"**Scheduler:** {'on' if sch['aktiv'] else 'off'} · {sch['anzahl']} at a time · "
+                  f"rotation every {sch['alle_neustarts']} restarts · next rotation in "
+                  f"{max(0, int(sch['alle_neustarts']) - int(sch['zaehler']))} restart(s) · "
+                  f"{len(sch['airdrops'])} airdrops · {len(sch['positionen'])} positions\n\n")
+    if not zeilen:
+        text = _t(interaction, "Keine aktiven Airdrops.", "No active airdrops.")
+    else:
+        text, gekappt = "", 0
+        for zeile in zeilen:
+            if len(kopf) + len(text) + len(zeile) > 3800:
+                gekappt += 1
+                continue
+            text += zeile + "\n"
+        text = text.rstrip("\n")
+        if gekappt:
+            text += _t(interaction, f"\n… und {gekappt} weitere", f"\n… and {gekappt} more")
+    titel = _t(interaction, "🪂 Airdrops – Scheduler" if scheduler else "🪂 Airdrops – platziert",
+               "🪂 Airdrops – scheduler" if scheduler else "🪂 Airdrops – placed")
+    embed = discord.Embed(title=titel, description=(kopf + text)[:4000], color=0x3498DB)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@airdrop_group.command(name="remove", description=app_commands.locale_str(
+    "🪂 Entfernt einen per /airdrop add platzierten Airdrop vorzeitig"))
+@app_commands.describe(name="Welcher platzierte Airdrop? (per Vorschlag wählen)",
+                       server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def airdrop_remove(interaction: discord.Interaction, name: str, server: Optional[str] = None):
+    if not _subcmd_allowed(interaction, "airdrop_remove"):
+        return await _deny_subcmd(interaction)
+    if server:
+        conn, fehler = _conn_waehlen(interaction, server)
+        if conn is None:
+            return await interaction.response.send_message(fehler, ephemeral=True)
+        kandidaten = [conn]
+    else:
+        kandidaten = _conns_of(interaction)
+        if not kandidaten:
+            return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    gesucht = name.strip()
+    treffer_liste: List[Tuple[ServerConnection, Dict[str, Any]]] = []
+    for c in kandidaten:
+        for i in _adj_zustand(c)["instanzen"]:
+            if i.get("von") == "befehl" and (i.get("id") == gesucht or str(i.get("name")).lower() == gesucht.lower()):
+                treffer_liste.append((c, i))
+    nach_id = [t for t in treffer_liste if t[1].get("id") == gesucht]
+    if nach_id:
+        treffer_liste = nach_id
+    if not treffer_liste:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Keinen passenden platzierten Airdrop gefunden. `/airdrop list` zeigt alle.",
+            "❌ No matching placed airdrop found. `/airdrop list` shows all."), ephemeral=True)
+    if len(treffer_liste) > 1:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Mehrere Airdrops passen – bitte `server:` angeben oder die ID aus `/airdrop list` wählen.",
+            "❌ Several airdrops match – please specify `server:` or pick the ID from `/airdrop list`."), ephemeral=True)
+    conn, inst = treffer_liste[0]
+    await interaction.response.defer(ephemeral=True)
+    fehler_text = await _adj_entfernen(conn, [str(inst["id"])])
+    if fehler_text:
+        return await interaction.followup.send("❌ " + _adj_t(interaction, fehler_text), ephemeral=True)
+    _audit_add("discord", f"{interaction.user} ({interaction.user.id})", "/airdrop remove",
+               f"{inst.get('name')} {inst.get('id')} · {conn.name}")
+    await interaction.followup.send(_t(
+        interaction,
+        f"✅ **{inst.get('name')}** wurde ausgetragen und verschwindet mit dem **nächsten Neustart**.",
+        f"✅ **{inst.get('name')}** was removed and disappears with the **next restart**."), ephemeral=True)
+
+
+airdrop_add.autocomplete("name")(_adj_name_autocomplete)
+airdrop_add.autocomplete("server")(_server_autocomplete)
+airdrop_list.autocomplete("server")(_server_autocomplete)
+airdrop_remove.autocomplete("name")(_adj_instanz_autocomplete)
+airdrop_remove.autocomplete("server")(_server_autocomplete)
+bot.tree.add_command(airdrop_group)
+
+
+# ── Dashboard-API ─────────────────────────────────────────────────────────
+async def _adj_gate(request: web.Request, recht: str):
+    conn, fehler = _session_conn(request, "tools.airdropjson")
+    if fehler is not None:
+        return None, fehler
+    fehler = await _modul_pruefen("tools.airdropjson", request, conn)
+    if fehler is not None:
+        return None, fehler
+    fehler = await _dash_gate(request, conn, "tools", recht)
+    if fehler is not None:
+        return None, fehler
+    return conn, None
+
+
+def _adj_instanz_view(i: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: i.get(k) for k in ("id", "name", "quelle", "x", "y", "z", "restarts", "gesehen", "von", "objekte", "erstellt")}
+
+
+def _adj_scheduler_view(zustand: Dict[str, Any]) -> Dict[str, Any]:
+    s = zustand["scheduler"]
+    return {"aktiv": bool(s["aktiv"]), "anzahl": int(s["anzahl"]), "alle_neustarts": int(s["alle_neustarts"]),
+            "airdrops": list(s["airdrops"]), "positionen": list(s["positionen"]), "zaehler": int(s["zaehler"])}
+
+
+async def _adj_uebersicht(request: web.Request, conn: ServerConnection) -> Dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    zustand = _adj_zustand(conn)
+    premade = await loop.run_in_executor(None, _adj_liste, "premade", "")
+    eigene = await loop.run_in_executor(None, _adj_liste, "eigen", conn.service_id)
+    oeffentlich = ("name", "objekte", "bytes", "breite_x", "breite_z", "hoehe", "warnung")   # nie „von“ (Discord-ID)
+    premade = [{k: m.get(k) for k in oeffentlich} for m in premade]
+    eigene = [{k: m.get(k) for k in oeffentlich} for m in eigene]
+    return {"premade": premade, "eigene": eigene,
+            "kann_edit": _dash_perm_allowed(_sess_get(request), conn, "tools", "edit"),
+            "instanzen": [_adj_instanz_view(i) for i in zustand["instanzen"]],
+            "scheduler": _adj_scheduler_view(zustand),
+            "ist_betreiber": bool((_sess_get(request) or {}).get("is_admin")),
+            "karte": _adj_kartengroesse(conn), "warn_objekte": _ADJ_WARN_OBJEKTE,
+            "ftp": bool(conn.ftp is not None and _mission_dir_of(conn))}
+
+
+async def api_tools_airdropjson_get(request: web.Request) -> web.Response:
+    conn, fehler = await _adj_gate(request, "view")
+    if fehler is not None:
+        return fehler
+    return ok(await _adj_uebersicht(request, conn))
+
+
+def _adj_name_aus(daten: Dict[str, Any]) -> str:
+    roh = str(daten.get("name") or "").strip()
+    if roh.lower().endswith(".json"):
+        roh = roh[:-5]
+    return roh
+
+
+async def _adj_datei_speichern(request: web.Request, quelle: str, conn: Optional[ServerConnection],
+                               limit: int, audit_text: str, quota: Optional[int] = None) -> web.Response:
+    """Gemeinsamer Import fuer Premade und Eigene (Gates machen die Aufrufer)."""
+    data = await body(request)
+    name = _adj_name_aus(data)
+    if not _ADJ_NAME_RE.match(name):
+        return err("Der Name darf nur Buchstaben, Ziffern, _ und - enthalten (höchstens 40 Zeichen).")
+    inhalt = data.get("content")
+    if not isinstance(inhalt, str) or not inhalt.strip():
+        return err("Bitte den JSON-Inhalt der Airdrop-Datei einfügen.")
+    objekte, fehler = _adj_pruefen(inhalt)
+    if fehler:
+        return err(fehler)
+    sid = conn.service_id if conn is not None else ""
+    loop = asyncio.get_running_loop()
+    vorhanden = await loop.run_in_executor(None, _adj_liste, quelle, sid)
+    if any(m.get("name") == name for m in vorhanden):
+        if not bool(data.get("overwrite")):
+            return ok({"konflikt": True, "name": name})
+    elif len(vorhanden) >= limit:
+        return err(f"Es sind höchstens {limit} Dateien erlaubt – bitte erst welche löschen.")
+    belegt = sum(int(m.get("bytes") or 0) for m in vorhanden if m.get("name") != name)
+    if belegt + len(inhalt.encode("utf-8", errors="ignore")) > (quota or _ADJ_QUOTA_EIGENE):
+        return err("Das Speicherkontingent ist ausgeschöpft – bitte erst Dateien löschen.")
+    sess = _sess_get(request)
+    try:
+        meta = await loop.run_in_executor(None, _adj_speichern, quelle, sid, name, objekte or [], _audit_actor(sess))
+    except ValueError as ex:
+        return err(str(ex))
+    _audit_add("dashboard", _audit_actor(sess), audit_text,
+               f"{name} ({meta['objekte']} Objekte)" + (f" · {conn.name}" if conn is not None else ""))
+    return ok({"gespeichert": True, "meta": meta, "warnung": bool(meta["warnung"])})
+
+
+async def api_tools_airdropjson_premade_post(request: web.Request) -> web.Response:
+    fehler = await _require_admin(request)
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.airdropjson.premade", 2)
+    if fehler is not None:
+        return fehler
+    return await _adj_datei_speichern(request, "premade", None, _ADJ_MAX_PREMADE, "Tool: Premade-Airdrop gespeichert",
+                                     _ADJ_QUOTA_PREMADE)
+
+
+async def api_tools_airdropjson_premade_delete(request: web.Request) -> web.Response:
+    fehler = await _require_admin(request)
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.airdropjson.premade", 2)
+    if fehler is not None:
+        return fehler
+    name = str(request.match_info.get("name", "")).strip()
+    if not _ADJ_NAME_RE.match(name):
+        return err("Ungültiger Name.")
+    geloescht = await asyncio.get_running_loop().run_in_executor(None, _adj_loeschen, "premade", "", name)
+    if not geloescht:
+        return err("Diese Datei gibt es nicht.", 404)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Premade-Airdrop gelöscht", name)
+    return ok({"geloescht": True})
+
+
+async def api_tools_airdropjson_eigene_post(request: web.Request) -> web.Response:
+    conn, fehler = await _adj_gate(request, "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.airdropjson.eigene", 2)
+    if fehler is not None:
+        return fehler
+    return await _adj_datei_speichern(request, "eigen", conn, _ADJ_MAX_EIGENE, "Tool: eigener Airdrop gespeichert")
+
+
+async def api_tools_airdropjson_eigene_delete(request: web.Request) -> web.Response:
+    conn, fehler = await _adj_gate(request, "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.airdropjson.eigene", 2)
+    if fehler is not None:
+        return fehler
+    name = str(request.match_info.get("name", "")).strip()
+    if not _ADJ_NAME_RE.match(name):
+        return err("Ungültiger Name.")
+    geloescht = await asyncio.get_running_loop().run_in_executor(None, _adj_loeschen, "eigen", conn.service_id, name)
+    if not geloescht:
+        return err("Diese Datei gibt es nicht.", 404)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: eigener Airdrop gelöscht", f"{name} · {conn.name}")
+    return ok({"geloescht": True})
+
+
+async def api_tools_airdropjson_scheduler_post(request: web.Request) -> web.Response:
+    conn, fehler = await _adj_gate(request, "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.airdropjson.scheduler", 3)
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    sauber, fehler_text = _adj_scheduler_validieren(data)
+    if sauber is None:
+        return err(fehler_text or "Ungültige Anfrage.")
+    zustand = _adj_zustand(conn)
+    groesse = _adj_kartengroesse(conn)
+    if any(not (0 <= p["x"] <= groesse and 0 <= p["z"] <= groesse and -1000 <= p["y"] <= 10000)
+           for p in sauber["positionen"]):
+        return err("Eine Position liegt außerhalb der Karte.")
+    if (sauber["aktiv"] or zustand["scheduler"].get("aktiv") or any(i.get("von") == "scheduler" for i in zustand["instanzen"])) \
+            and (conn.ftp is None or not _mission_dir_of(conn)):
+        return err(_ADJ_FEHLER_FTP, 409)
+    fehler_text = await _adj_scheduler_speichern(conn, sauber)
+    if fehler_text:
+        return err(fehler_text, 502)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Airdrop-Scheduler gespeichert",
+               f"{'an' if sauber['aktiv'] else 'aus'} · {sauber['anzahl']} · alle {sauber['alle_neustarts']} · {conn.name}")
+    return ok(await _adj_uebersicht(request, conn))
+
+
+async def api_tools_airdropjson_instanz_entfernen(request: web.Request) -> web.Response:
+    conn, fehler = await _adj_gate(request, "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.airdropjson.entfernen", 2)
+    if fehler is not None:
+        return fehler
+    inst_id = str(request.match_info.get("id", "")).strip()
+    if not re.fullmatch(r"[0-9a-f]{6}", inst_id) or _adj_instanz_von(_adj_zustand(conn), inst_id) is None:
+        return err("Diesen Airdrop gibt es nicht (mehr).", 404)
+    fehler_text = await _adj_entfernen(conn, [inst_id])
+    if fehler_text:
+        return err(fehler_text, 502)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Airdrop entfernt", f"{inst_id} · {conn.name}")
+    return ok(await _adj_uebersicht(request, conn))
+
+
+# ══════════════════════════════════════════════════════════════
 #  /edit ankuendigung – Nachricht/Bild einer geplanten Ankündigung ändern
 # ══════════════════════════════════════════════════════════════
 edit_group = app_commands.Group(name="edit", description="✏️ Edit entries of the shop catalog")
@@ -33696,6 +34821,11 @@ def _voll_backup_erstellen(keep: int = 7) -> Optional[str]:
                     z.writestr(os.path.basename(pfad), text)
                 else:
                     z.write(pfad, arcname=os.path.basename(pfad))
+            # Airdrops JSON: Premade-Dateien und die eigenen Dateien aller Kunden (airdrop_json/…)
+            for wurzel, _ordner, namen in os.walk(_ADJ_ORDNER):
+                for n in namen:
+                    pfad = os.path.join(wurzel, n)
+                    z.write(pfad, arcname=pfad.replace(os.sep, "/"))
 
         alle = sorted(glob.glob(os.path.join(_BACKUP_VERZEICHNIS, "betreiber_backup-*.zip")))
         for alt in alle[:-keep] if keep > 0 else alle:
@@ -43914,6 +45044,13 @@ def build_app() -> web.Application:
     r.add_get("/api/tools/custombuildmap", api_tools_custombuildmap_get)
     r.add_post("/api/tools/custombuildmap/import", api_tools_custombuildmap_import)
     r.add_delete("/api/tools/custombuildmap/{filename}", api_tools_custombuildmap_remove)
+    r.add_get("/api/tools/airdropjson", api_tools_airdropjson_get)
+    r.add_post("/api/tools/airdropjson/premade", api_tools_airdropjson_premade_post)
+    r.add_delete("/api/tools/airdropjson/premade/{name}", api_tools_airdropjson_premade_delete)
+    r.add_post("/api/tools/airdropjson/eigene", api_tools_airdropjson_eigene_post)
+    r.add_delete("/api/tools/airdropjson/eigene/{name}", api_tools_airdropjson_eigene_delete)
+    r.add_post("/api/tools/airdropjson/scheduler", api_tools_airdropjson_scheduler_post)
+    r.add_post("/api/tools/airdropjson/platziert/{id}/entfernen", api_tools_airdropjson_instanz_entfernen)
     r.add_get("/api/tools/skymessage", api_tools_skymessage_get)
     r.add_post("/api/tools/skymessage", api_tools_skymessage_post)
     r.add_get("/api/tools/typesmanager", api_tools_typesmanager_get)
@@ -44932,6 +46069,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "391ff9f9dad38e7fa6e74efb6968d754e84251df3a41f30cebeddfd65d8c08eb",
         "bc3359369f7e0769a778677d3c380c9b5aa1a0176239e55fc847d81355c8e75a",
         "e92fe6b01df74f175b2f872b78e6aca6aab47323cf71bc7d81f8cbb1f4a9da52",
+        "d0eef5ce76711ee541fadf83fe4567f35015d884cae9ac12f45ff28ce1330741",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",

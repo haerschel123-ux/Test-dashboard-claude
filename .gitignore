@@ -43,3 +43,6 @@ _smoke_*.png
 *.env
 *.zip
 scratchpad/
+
+# Airdrops JSON: hochgeladene Dateien (Premade/Eigene)
+airdrop_json/
