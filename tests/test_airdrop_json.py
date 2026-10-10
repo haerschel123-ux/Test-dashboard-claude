@@ -1591,9 +1591,9 @@ def slash(monkeypatch, env):
     return env
 
 
-def add(name="premade:drop1", x=5000.0, y=300.0, z=6000.0, restarts=2, server=None, **kw):
+def add(name="premade:drop1", x=5000.0, y=300.0, z=6000.0, restarts=2, server=None, ankuendigen=None, **kw):
     inter = _Interaktion(**kw)
-    run(bot.airdrop_add.callback(inter, name, x, y, z, restarts, server))
+    run(bot.airdrop_add.callback(inter, name, x, y, z, restarts, ankuendigen=ankuendigen, server=server))
     return inter
 
 
@@ -1932,7 +1932,7 @@ def test_befehlsgruppe_ist_registriert():
     assert gruppe is bot.airdrop_group
     assert sorted(c.name for c in gruppe.commands) == ["add", "list", "remove"]
     add_cmd = gruppe.get_command("add")
-    assert [p.name for p in add_cmd.parameters] == ["name", "x", "y", "z", "restarts", "server"]
+    assert [p.name for p in add_cmd.parameters] == ["name", "x", "y", "z", "restarts", "ankuendigen", "server"]
     restarts = next(p for p in add_cmd.parameters if p.name == "restarts")
     assert (restarts.min_value, restarts.max_value) == (1, 100)
     assert [c.value for c in next(p for p in gruppe.get_command("list").parameters if p.name == "art").choices] == ["platziert", "scheduler"]
@@ -2022,7 +2022,7 @@ def test_api_get_liefert_alles_fuer_die_seite(monkeypatch, env):
     status, r = dash(monkeypatch, env.a, bot.api_tools_airdropjson_get)
     assert status == 200 and r["ok"] is True
     d = r["data"]
-    assert set(d) == {"premade", "eigene", "instanzen", "scheduler", "ist_betreiber", "karte", "warn_objekte", "ftp", "kann_edit"}
+    assert set(d) == {"premade", "eigene", "instanzen", "scheduler", "ist_betreiber", "karte", "warn_objekte", "ftp", "kann_edit", "ankuendigung"}
     assert [m["name"] for m in d["premade"]] == ["drop1"] and d["premade"][0]["objekte"] == 12
     assert [(m["name"], m["objekte"]) for m in d["eigene"]] == [("mein1", 3)]            # nichts von Server 2000
     assert d["ist_betreiber"] is True and d["karte"] == 15360 and d["warn_objekte"] == 200 and d["ftp"] is True
@@ -2666,3 +2666,92 @@ def test_scheduler_position_ausserhalb_der_karte_wird_abgelehnt(monkeypatch, env
             "positionen": [{"x": 99999, "y": 200, "z": 5000}]}
     status, r = dash(monkeypatch, env.a, bot.api_tools_airdropjson_scheduler_post, wert)
     assert status == 400 and "außerhalb der Karte" in r["error"]
+
+
+# ── Ankündigung im Discord ───────────────────────────────────────────────
+class _Kanal:
+    def __init__(self, gid):
+        self.guild = SimpleNamespace(id=gid)
+        self.gesendet = []
+
+    async def send(self, **kw):
+        self.gesendet.append(kw)
+
+
+@pytest.fixture
+def kanal(monkeypatch, slash):
+    k = _Kanal(GID)
+    monkeypatch.setattr(bot.bot, "get_channel", lambda i: k if int(i) == 555 else None, raising=False)
+    monkeypatch.setattr(bot, "_kanal_gehoert_guild", lambda gid, kid, feld="Channel": None)
+    return k
+
+
+def _ank(conn, **w):
+    bot._adj_zustand(conn)["ankuendigung"].update({"kanal_id": 555, "scheduler": False, "befehl": False, **w})
+
+
+def test_ankuendigung_standard_ist_aus_und_kaputte_werte_werden_repariert(slash):
+    assert bot._adj_zustand(slash.a)["ankuendigung"] == {"kanal_id": 0, "scheduler": False, "befehl": False}
+    slash.a.data["airdrop_json"] = {"ankuendigung": {"kanal_id": "x", "befehl": 1}}
+    assert bot._adj_zustand(slash.a)["ankuendigung"] == {"kanal_id": 0, "scheduler": False, "befehl": True}
+
+
+def test_befehl_kuendigt_nach_dashboardstandard_und_per_option_an(slash, kanal):
+    add()
+    assert kanal.gesendet == []                                   # Standard aus
+    _ank(slash.a, befehl=True)
+    add(x=7000.0)
+    assert len(kanal.gesendet) == 1
+    text = kanal.gesendet[0]["embed"].description
+    assert "drop1" in text and "7000.0" in text and "izurvive" in text and "next restart" in text
+    add(x=8000.0, ankuendigen=False)                              # Option überschreibt den Standard
+    assert len(kanal.gesendet) == 1
+    _ank(slash.a, befehl=False)
+    add(x=9000.0, ankuendigen=True)
+    assert len(kanal.gesendet) == 2
+
+
+def test_befehl_ohne_channel_kuendigt_nichts_an_und_scheitert_nicht(slash, kanal):
+    inter = add(ankuendigen=True)
+    assert inter.followup.gesendet[0]["content"].startswith("✅") and kanal.gesendet == []
+
+
+def test_ankuendigung_fremder_channel_wird_nie_beschickt(monkeypatch, slash, kanal):
+    kanal.guild = SimpleNamespace(id=GID_B)
+    _ank(slash.a, befehl=True)
+    assert add().followup.gesendet[0]["content"].startswith("✅") and kanal.gesendet == []
+
+
+def test_ankuendigung_sendefehler_laesst_das_platzieren_gelingen(slash, kanal):
+    async def kaputt(**kw):
+        raise RuntimeError("keine Rechte")
+    kanal.send = kaputt
+    _ank(slash.a, befehl=True)
+    assert add().followup.gesendet[0]["content"].startswith("✅")
+    assert len(bot._adj_zustand(slash.a)["instanzen"]) == 1
+
+
+def test_scheduler_kuendigt_nur_mit_schalter_an(slash, kanal):
+    _ank(slash.a, scheduler=False)
+    scheduler_an(slash.a, anzahl=2)
+    assert kanal.gesendet == []
+    _ank(slash.a, scheduler=True)
+    assert run(bot._adj_scheduler_anwenden(slash.a)) is None
+    assert len(kanal.gesendet) == 1 and kanal.gesendet[0]["embed"].description.count("🪂") == 4      # 2 Airdrops × (DE + EN)
+
+
+def test_api_ankuendigung_speichern_validieren_und_mandantentrennung(monkeypatch, slash, kanal):
+    a = slash.a
+    status, r = dash(monkeypatch, a, bot.api_tools_airdropjson_ankuendigung_post,
+                     {"kanal_id": "555", "scheduler": True, "befehl": False})
+    assert status == 200 and r["data"]["ankuendigung"] == {"kanal_id": "555", "scheduler": True, "befehl": False}
+    assert bot._adj_zustand(slash.b)["ankuendigung"]["kanal_id"] == 0
+    status, _ = dash(monkeypatch, a, bot.api_tools_airdropjson_ankuendigung_post, {"kanal_id": "", "befehl": True})
+    assert status == 400                                          # Schalter an, aber kein Channel
+    status, _ = dash(monkeypatch, a, bot.api_tools_airdropjson_ankuendigung_post, {"kanal_id": "abc"})
+    assert status == 400
+    monkeypatch.setattr(bot, "_kanal_gehoert_guild", lambda gid, kid, feld="Channel": bot.err("fremd", 403))
+    status, _ = dash(monkeypatch, a, bot.api_tools_airdropjson_ankuendigung_post, {"kanal_id": "999"})
+    assert status == 403 and bot._adj_zustand(a)["ankuendigung"]["kanal_id"] == 555
+    status, _ = gast(monkeypatch, a, bot.api_tools_airdropjson_ankuendigung_post, {"kanal_id": ""})
+    assert status in (401, 403)

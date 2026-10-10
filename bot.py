@@ -31331,6 +31331,16 @@ def _adj_zustand(conn: ServerConnection) -> Dict[str, Any]:
     sch["anzahl"] = max(1, sch["anzahl"])
     sch["alle_neustarts"] = max(1, sch["alle_neustarts"])
     z["scheduler"] = sch
+    ank = z.get("ankuendigung")
+    if not isinstance(ank, dict):
+        ank = {}
+    try:
+        ank["kanal_id"] = max(0, int(ank.get("kanal_id") or 0))
+    except (TypeError, ValueError, OverflowError):
+        ank["kanal_id"] = 0
+    ank["scheduler"] = bool(ank.get("scheduler"))
+    ank["befehl"] = bool(ank.get("befehl"))
+    z["ankuendigung"] = ank
     conn.data["airdrop_json"] = z
     return z
 
@@ -31453,6 +31463,33 @@ def _adj_ab_lauf(zustand: Dict[str, Any]) -> int:
     """Ab welchem erkannten Server-Lauf ein JETZT geschriebener Airdrop sichtbar ist: der naechste.
     Ein schon erkannter, aber noch nicht verbuchter Neustart hat die Config bereits gelesen."""
     return int(zustand["laeufe"]) + 1
+
+
+async def _adj_ankuendigen(conn: ServerConnection, instanzen: List[Dict[str, Any]]) -> None:
+    """Meldet neu gesetzte Airdrops im gewaehlten Discord-Channel (zweisprachig). Fehler (Channel
+    weg, keine Rechte) werden nur protokolliert - das Setzen selbst darf daran nie scheitern."""
+    try:
+        kid = _adj_zustand(conn)["ankuendigung"]["kanal_id"]
+        gid = conn.guild_id
+        if not kid or not instanzen or not gid or bot is None:
+            return
+        kanal = bot.get_channel(int(kid))
+        if kanal is None or getattr(getattr(kanal, "guild", None), "id", None) != int(gid):
+            return                      # nur der Channel der eigenen Guild (nie ein fremder)
+        karte = str(conn.get("map_name") or "ChernarusPlus")
+        zeilen_de, zeilen_en = [], []
+        for i in instanzen[:10]:
+            link = _izurvive_url(float(i["x"]), float(i["z"]), karte)
+            rest = f"{i.get('restarts')} Neustart(s)"
+            zeilen_de.append(f"🪂 **{i.get('name')}** – [{i['x']}, {i['z']}]({link}) · {rest}")
+            zeilen_en.append(f"🪂 **{i.get('name')}** – [{i['x']}, {i['z']}]({link}) · {i.get('restarts')} restart(s)")
+        emb = discord.Embed(title="🪂 Airdrop gelandet / Airdrop incoming",
+                            description="\n".join(zeilen_de) + "\n\n*Aktiv ab dem nächsten Neustart.*\n"
+                            + "\n".join(zeilen_en) + "\n*Active from the next restart.*",
+                            colour=discord.Colour.orange())
+        await kanal.send(embed=emb)
+    except Exception as ex:  # noqa: BLE001
+        log.warning(f"[AIRDROPJSON] {getattr(conn, 'service_id', '?')}: Ankündigung {type(ex).__name__}")
 
 
 async def _adj_platzieren(conn: ServerConnection, quelle: str, name: str, x: Any, y: Any, z_: Any,
@@ -31634,7 +31671,10 @@ async def _adj_scheduler_anwenden_roh(conn: ServerConnection) -> Optional[str]:
         zustand["instanzen"] = [i for i in zustand["instanzen"] if i.get("von") != "scheduler"] + neue_inst
         sch["zaehler"] = 0
         _adj_zustand_speichern(conn)
-    return await _adj_transaktion(conn, neue, alte_ids, None, uebernehmen)
+    fehler_tx = await _adj_transaktion(conn, neue, alte_ids, None, uebernehmen)
+    if fehler_tx is None and neue_inst and zustand["ankuendigung"]["scheduler"]:
+        await _adj_ankuendigen(conn, neue_inst)
+    return fehler_tx
 
 
 # ── Neustart-Zaehler (Poll-Hook) ──────────────────────────────────────────
@@ -31853,9 +31893,11 @@ def _adj_zeile(interaction: discord.Interaction, conn: ServerConnection, inst: D
     name="Airdrop (Premade oder eigene Datei, per Vorschlag wählen)",
     x="X-Koordinate (Ost)", y="Höhe (y) – der tiefste Punkt des Airdrops liegt darauf", z="Z-Koordinate (Nord)",
     restarts="In wie vielen Server-Läufen (Neustarts) der Airdrop sichtbar bleibt (1–100)",
+    ankuendigen="Im Discord ankündigen? (Standard: Einstellung im Dashboard; Channel dort wählen)",
     server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def airdrop_add(interaction: discord.Interaction, name: str, x: float, y: float, z: float,
-                      restarts: app_commands.Range[int, 1, 100], server: Optional[str] = None):
+                      restarts: app_commands.Range[int, 1, 100], ankuendigen: Optional[bool] = None,
+                      server: Optional[str] = None):
     if not _subcmd_allowed(interaction, "airdrop_add"):
         return await _deny_subcmd(interaction)
     conn, fehler = _conn_waehlen(interaction, server)
@@ -31870,6 +31912,9 @@ async def airdrop_add(interaction: discord.Interaction, name: str, x: float, y: 
     inst, fehler = await _adj_platzieren(conn, quelle, airdrop, x, y, z, restarts, "befehl", interaction.user.id)
     if inst is None:
         return await interaction.followup.send("❌ " + _adj_t(interaction, str(fehler)), ephemeral=True)
+    ank = _adj_zustand(conn)["ankuendigung"]
+    if ank["kanal_id"] and (ank["befehl"] if ankuendigen is None else ankuendigen):
+        await _adj_ankuendigen(conn, [inst])
     _audit_add("discord", f"{interaction.user} ({interaction.user.id})", "/airdrop add",
                f"{airdrop} {inst['x']} {inst['y']} {inst['z']} x{restarts} · {conn.name}")
     await interaction.followup.send(_t(
@@ -32020,6 +32065,7 @@ async def _adj_uebersicht(request: web.Request, conn: ServerConnection) -> Dict[
             "kann_edit": _dash_perm_allowed(_sess_get(request), conn, "tools", "edit"),
             "instanzen": [_adj_instanz_view(i) for i in zustand["instanzen"]],
             "scheduler": _adj_scheduler_view(zustand),
+            "ankuendigung": dict(zustand["ankuendigung"], kanal_id=str(zustand["ankuendigung"]["kanal_id"] or "")),
             "ist_betreiber": bool((_sess_get(request) or {}).get("is_admin")),
             "karte": _adj_kartengroesse(conn), "warn_objekte": _ADJ_WARN_OBJEKTE,
             "ftp": bool(conn.ftp is not None and _mission_dir_of(conn))}
@@ -32152,6 +32198,36 @@ async def api_tools_airdropjson_scheduler_post(request: web.Request) -> web.Resp
         return err(fehler_text, 502)
     _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Airdrop-Scheduler gespeichert",
                f"{'an' if sauber['aktiv'] else 'aus'} · {sauber['anzahl']} · alle {sauber['alle_neustarts']} · {conn.name}")
+    return ok(await _adj_uebersicht(request, conn))
+
+
+async def api_tools_airdropjson_ankuendigung_post(request: web.Request) -> web.Response:
+    conn, fehler = await _adj_gate(request, "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.airdropjson.ankuendigung", 3)
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    kid = 0
+    if data.get("kanal_id") not in (None, "", "0"):
+        try:
+            kid = int(data.get("kanal_id"))
+        except (TypeError, ValueError, OverflowError):
+            return err("Ungültige Channel-ID.")
+        if not conn.guild_id:
+            return err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
+        fehler = _kanal_gehoert_guild(int(conn.guild_id), kid)
+        if fehler is not None:
+            return fehler
+    scheduler, befehl = bool(data.get("scheduler")), bool(data.get("befehl"))
+    if (scheduler or befehl) and not kid:
+        return err("Bitte zuerst einen Channel wählen.")
+    ank = _adj_zustand(conn)["ankuendigung"]
+    ank.update({"kanal_id": kid, "scheduler": scheduler, "befehl": befehl})
+    _adj_zustand_speichern(conn)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Airdrop-Ankündigung gespeichert",
+               f"{'an' if kid else 'aus'} · {conn.name}")
     return ok(await _adj_uebersicht(request, conn))
 
 
@@ -45050,6 +45126,7 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/airdropjson/eigene", api_tools_airdropjson_eigene_post)
     r.add_delete("/api/tools/airdropjson/eigene/{name}", api_tools_airdropjson_eigene_delete)
     r.add_post("/api/tools/airdropjson/scheduler", api_tools_airdropjson_scheduler_post)
+    r.add_post("/api/tools/airdropjson/ankuendigung", api_tools_airdropjson_ankuendigung_post)
     r.add_post("/api/tools/airdropjson/platziert/{id}/entfernen", api_tools_airdropjson_instanz_entfernen)
     r.add_get("/api/tools/skymessage", api_tools_skymessage_get)
     r.add_post("/api/tools/skymessage", api_tools_skymessage_post)
@@ -46070,6 +46147,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "bc3359369f7e0769a778677d3c380c9b5aa1a0176239e55fc847d81355c8e75a",
         "e92fe6b01df74f175b2f872b78e6aca6aab47323cf71bc7d81f8cbb1f4a9da52",
         "d0eef5ce76711ee541fadf83fe4567f35015d884cae9ac12f45ff28ce1330741",
+        "f169190c2d442781198586a16d175f96ab3fed801907cc259c9057d3bfcc9539",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
