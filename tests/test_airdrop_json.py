@@ -2793,3 +2793,21 @@ def test_api_ankuendigung_prueft_den_channel_gegen_die_gewaehlte_guild(monkeypat
     _ank(a, befehl=True)
     add()
     assert len(k.gesendet) == 1
+
+
+def test_warten_auf_a2s_ist_begrenzt_und_haengt_nie_45_minuten(monkeypatch, env):
+    a = env.a
+    a.data.update({"server_ip": "1.2.3.4:2302", "query_port": 27016})   # Konsolen-Server: A2S antwortet nie
+    uhr = [1000.0]
+    monkeypatch.setattr(bot.time, "time", lambda: uhr[0])
+
+    async def schlafen(sek):
+        uhr[0] += sek
+    monkeypatch.setattr(bot.asyncio, "sleep", schlafen)
+    monkeypatch.setattr(bot, "a2s_query", lambda ip, port, timeout=3.0: None)
+    run(bot._adj_warten_bis_online(a))
+    assert uhr[0] - 1000.0 <= bot._ADJ_ONLINE_WARTEN_MAX + 20          # nicht die 2700 s des Shops
+    uhr[0] = 1000.0
+    monkeypatch.setattr(bot, "a2s_query", lambda ip, port, timeout=3.0: {"name": "x"})
+    run(bot._adj_warten_bis_online(a))
+    assert uhr[0] == 1000.0                                            # antwortet er, geht es sofort weiter

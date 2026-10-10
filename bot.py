@@ -31692,6 +31692,7 @@ async def _adj_scheduler_anwenden_roh(conn: ServerConnection) -> Optional[str]:
 _ADJ_TASKS: Dict[str, "asyncio.Task[None]"] = {}
 _ADJ_RETRY_AB: Dict[str, float] = {}
 _ADJ_RETRY_SEKUNDEN = 90
+_ADJ_ONLINE_WARTEN_MAX = 300
 
 
 def _adj_hat_arbeit(conn: ServerConnection) -> bool:
@@ -31712,6 +31713,7 @@ def _adj_poll(conn: ServerConnection, restart_erkannt: bool) -> None:
             zustand["neustarts_offen"] += 1
             zustand["laeufe"] += 1
             _adj_zustand_speichern(conn)
+            log.info(f"[AIRDROPJSON] {conn.service_id}: Neustart erkannt (offen: {zustand['neustarts_offen']})")
         if zustand["neustarts_offen"] <= 0:
             return
         laufend = _ADJ_TASKS.get(conn.service_id)
@@ -31731,12 +31733,18 @@ async def _adj_warten_bis_online(conn: ServerConnection) -> None:
     qport = int(conn.get("query_port", 0) or 0)
     if not ip or not qport:
         return
-    ende = time.time() + max(60, int(conn.get("delivery_online_wait_max_seconds", 2700) or 2700))
+    # Hoechstens _ADJ_ONLINE_WARTEN_MAX Sekunden: Konsolen-Server (PS4/Xbox) antworten oft nie per A2S -
+    # mit den 45 Minuten des Shops wuerde die Rotation sonst fast eine Stunde nach dem Neustart kommen.
+    # Die Mission liest die cfggameplay.json in den ersten Minuten, danach ist Schreiben sicher.
+    ende = time.time() + min(_ADJ_ONLINE_WARTEN_MAX,
+                             max(60, int(conn.get("delivery_online_wait_max_seconds", 2700) or 2700)))
     loop = asyncio.get_running_loop()
     while time.time() < ende:
         if await loop.run_in_executor(None, a2s_query, ip, qport):
             return
         await asyncio.sleep(20)
+    log.info(f"[AIRDROPJSON] {conn.service_id}: Server antwortet nicht per A2S - mache nach "
+             f"{_ADJ_ONLINE_WARTEN_MAX // 60} Min trotzdem weiter")
 
 
 async def _adj_neustarts_verarbeiten(conn: ServerConnection) -> None:
@@ -31760,7 +31768,10 @@ async def _adj_einen_neustart(conn: ServerConnection) -> Optional[str]:
     """EINEN erkannten Neustart verbuchen: gesehen+1, Ablaufende austragen, ggf. Scheduler rotieren.
     Der Zaehler sinkt erst nach erfolgreichem Schreiben (Wiederholung ist ungefaehrlich)."""
     async with _adj_lock(conn.service_id):
-        return await _adj_einen_neustart_roh(conn)
+        fehler = await _adj_einen_neustart_roh(conn)
+    if fehler is None:
+        log.info(f"[AIRDROPJSON] {conn.service_id}: Neustart verbucht")
+    return fehler
 
 
 async def _adj_einen_neustart_roh(conn: ServerConnection) -> Optional[str]:
