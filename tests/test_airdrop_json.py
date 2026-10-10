@@ -2755,3 +2755,19 @@ def test_api_ankuendigung_speichern_validieren_und_mandantentrennung(monkeypatch
     assert status == 403 and bot._adj_zustand(a)["ankuendigung"]["kanal_id"] == 555
     status, _ = gast(monkeypatch, a, bot.api_tools_airdropjson_ankuendigung_post, {"kanal_id": ""})
     assert status in (401, 403)
+
+
+def test_api_ankuendigung_prueft_den_channel_gegen_die_gewaehlte_guild(monkeypatch, slash, kanal):
+    a = slash.a
+    bot.connections.add_guild("1000", GID_B)                      # Server hängt an zwei Guilds
+    geprueft = []
+    monkeypatch.setattr(bot, "_kanal_gehoert_guild", lambda gid, kid, feld="Channel": geprueft.append(gid))
+    status, _ = dash(monkeypatch, a, bot.api_tools_airdropjson_ankuendigung_post, {"kanal_id": "555", "guild_id": str(GID_B)})
+    assert status == 200 and geprueft == [GID_B]                  # nicht stumpf die erste Guild
+    status, _ = dash(monkeypatch, a, bot.api_tools_airdropjson_ankuendigung_post, {"kanal_id": "555", "guild_id": "999"})
+    assert status == 409 and geprueft == [GID_B]                  # fremde Guild wird abgelehnt
+    k = _Kanal(GID_B)                                             # Ankündigung geht in den Channel der zweiten Guild
+    monkeypatch.setattr(bot.bot, "get_channel", lambda i: k, raising=False)
+    _ank(a, befehl=True)
+    add()
+    assert len(k.gesendet) == 1

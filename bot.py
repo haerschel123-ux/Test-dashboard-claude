@@ -31470,12 +31470,11 @@ async def _adj_ankuendigen(conn: ServerConnection, instanzen: List[Dict[str, Any
     weg, keine Rechte) werden nur protokolliert - das Setzen selbst darf daran nie scheitern."""
     try:
         kid = _adj_zustand(conn)["ankuendigung"]["kanal_id"]
-        gid = conn.guild_id
-        if not kid or not instanzen or not gid or bot is None:
+        if not kid or not instanzen or bot is None:
             return
         kanal = bot.get_channel(int(kid))
-        if kanal is None or getattr(getattr(kanal, "guild", None), "id", None) != int(gid):
-            return                      # nur der Channel der eigenen Guild (nie ein fremder)
+        if kanal is None or getattr(getattr(kanal, "guild", None), "id", None) not in conn.guild_ids:
+            return                      # nur ein Channel einer Guild dieses Servers (nie ein fremder)
         karte = str(conn.get("map_name") or "ChernarusPlus")
         zeilen_de, zeilen_en = [], []
         for i in instanzen[:10]:
@@ -32215,9 +32214,14 @@ async def api_tools_airdropjson_ankuendigung_post(request: web.Request) -> web.R
             kid = int(data.get("kanal_id"))
         except (TypeError, ValueError, OverflowError):
             return err("Ungültige Channel-ID.")
-        if not conn.guild_id:
+        # Hängt der Server an mehreren Guilds, gilt die in der Sitzung gewählte (wie bei den Feeds).
+        try:
+            gid = int(data.get("guild_id") or (_sess_get(request) or {}).get("guild_id") or conn.guild_id or 0)
+        except (TypeError, ValueError, OverflowError):
+            return err("Ungültige Guild-ID.")
+        if not gid or gid not in conn.guild_ids:
             return err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
-        fehler = _kanal_gehoert_guild(int(conn.guild_id), kid)
+        fehler = _kanal_gehoert_guild(gid, kid)
         if fehler is not None:
             return fehler
     scheduler, befehl = bool(data.get("scheduler")), bool(data.get("befehl"))
@@ -46148,6 +46152,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "e92fe6b01df74f175b2f872b78e6aca6aab47323cf71bc7d81f8cbb1f4a9da52",
         "d0eef5ce76711ee541fadf83fe4567f35015d884cae9ac12f45ff28ce1330741",
         "f169190c2d442781198586a16d175f96ab3fed801907cc259c9057d3bfcc9539",
+        "21d81dd050e63dacb661d3d04183b759ff1a5941f56afd0abba9e6628b2ad73b",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
