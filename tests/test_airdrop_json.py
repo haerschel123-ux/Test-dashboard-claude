@@ -18,6 +18,7 @@ import copy
 import json
 import logging
 import os
+import re
 import sys
 import time
 import zipfile
@@ -61,6 +62,11 @@ _ROH = [
     ("Land_Tent_Big", [3030.0, 287.0, 12365.0], [270.0, 0.0, 0.0], 1.0),
     ("Wooden_Crate", [3040.0, 284.0, 12330.0], [0.0, 0.0, 0.0], 0.5),
 ]
+
+
+def _s0(z):
+    """Der (erste) Scheduler eines Zustands."""
+    return z["schedulers"][0]
 
 
 def _roh_objekte():
@@ -631,17 +637,17 @@ def test_premade_ist_global_und_gleicher_name_in_beiden_quellen_ist_getrennt(env
 def test_zustand_vorgaben(env):
     z = bot._adj_zustand(env.a)
     assert z["instanzen"] == [] and z["neustarts_offen"] == 0
-    assert z["scheduler"] == {"aktiv": False, "anzahl": 1, "alle_neustarts": 1, "zaehler": 0, "airdrops": [], "positionen": []}
+    assert z["schedulers"] == [] and "scheduler" not in z
     assert env.a.data["airdrop_json"] is z
 
 
 def test_zustand_repariert_kaputte_werte(env):
     env.a.data["airdrop_json"] = {"instanzen": "x", "scheduler": [1], "neustarts_offen": -3}
     z = bot._adj_zustand(env.a)
-    assert z["instanzen"] == [] and z["scheduler"]["aktiv"] is False and z["neustarts_offen"] == 0
+    assert z["instanzen"] == [] and z["schedulers"] == [] and z["neustarts_offen"] == 0
     env.a.data["airdrop_json"] = {"scheduler": {"airdrops": None, "positionen": "x", "aktiv": True}, "neustarts_offen": None}
     z = bot._adj_zustand(env.a)
-    assert z["scheduler"]["airdrops"] == [] and z["scheduler"]["positionen"] == [] and z["neustarts_offen"] == 0
+    assert _s0(z)["airdrops"] == [] and _s0(z)["positionen"] == [] and _s0(z)["aktiv"] is True and "scheduler" not in z and z["neustarts_offen"] == 0
     env.a.data["airdrop_json"] = "kaputt"
     assert bot._adj_zustand(env.a)["instanzen"] == []
 
@@ -652,7 +658,7 @@ def test_zustand_hat_keine_rueckfallebene_auf_die_globale_config(env):
     bot.cfg.config["airdrop_json"] = fremd                   # Betreiber-Config enthält etwas
     assert env.b.get("airdrop_json") is None
     z = bot._adj_zustand(env.b)
-    assert z["instanzen"] == [] and z["scheduler"]["aktiv"] is False
+    assert z["instanzen"] == [] and z["schedulers"] == []
     assert _ids(env.a) == []
 
 
@@ -957,7 +963,7 @@ def _sch(**changes):
 def test_scheduler_validieren_gueltig_und_bereinigt():
     sauber, fehler = bot._adj_scheduler_validieren(_sch())
     assert fehler is None
-    assert sauber == {"aktiv": True, "anzahl": 2, "alle_neustarts": 3,
+    assert sauber == {"name": "", "aktiv": True, "anzahl": 2, "alle_neustarts": 3, "modus": "neustarts", "sekunden": 3600,
                       "airdrops": [{"quelle": "premade", "name": "drop1"}, {"quelle": "eigen", "name": "mein1"}],
                       "positionen": [{"x": 1000.0, "y": 200.0, "z": 2000.0}, {"x": 3000.0, "y": 210.0, "z": 4000.0},
                                      {"x": 5000.0, "y": 220.0, "z": 6000.0}]}
@@ -1043,7 +1049,7 @@ def test_scheduler_validieren_aktiv_braucht_airdrop_und_genug_positionen():
     assert sauber is None
     # ausgeschaltet darf alles leer sein
     sauber, fehler = bot._adj_scheduler_validieren({"aktiv": False, "anzahl": 5, "alle_neustarts": 1})
-    assert fehler is None and sauber == {"aktiv": False, "anzahl": 5, "alle_neustarts": 1, "airdrops": [], "positionen": []}
+    assert fehler is None and sauber == {"name": "", "aktiv": False, "anzahl": 5, "alle_neustarts": 1, "modus": "neustarts", "sekunden": 3600, "airdrops": [], "positionen": []}
 
 
 def test_scheduler_validieren_aktiv_ist_ein_wahrheitswert_und_fehlend_ist_aus():
@@ -1123,7 +1129,7 @@ def test_neustart_zustand_wird_gespeichert(env):
 def test_neustart_ohne_instanzen_und_ohne_scheduler_aendert_nichts(env):
     bot._adj_zustand(env.a)
     assert neustart(env.a) is None
-    assert env.a.ftp.protokoll == [] and bot._adj_zustand(env.a)["scheduler"]["zaehler"] == 0
+    assert env.a.ftp.protokoll == [] and bot._adj_zustand(env.a)["schedulers"] == []
 
 
 def test_neustart_schreibfehler_laesst_die_zaehlung_stehen_und_wiederholung_ist_idempotent(env):
@@ -1178,10 +1184,11 @@ def scheduler_an(conn, anzahl=2, alle=3, airdrops=("drop1", "drop2", "drop3"), p
     for n in airdrops:
         if bot._adj_laden("premade", "", n) is None:
             _premade(n)
-    sch = bot._adj_zustand(conn)["scheduler"]
-    sch.update({"aktiv": True, "anzahl": anzahl, "alle_neustarts": alle, "zaehler": 0,
-                "airdrops": [{"quelle": "premade", "name": n} for n in airdrops], "positionen": copy.deepcopy(list(positionen))})
-    assert run(bot._adj_scheduler_anwenden(conn)) is None
+    z = bot._adj_zustand(conn)
+    sauber = {"name": "Scheduler 1", "aktiv": True, "anzahl": anzahl, "alle_neustarts": alle,
+              "airdrops": [{"quelle": "premade", "name": n} for n in airdrops], "positionen": copy.deepcopy(list(positionen))}
+    sid, fehler = run(bot._adj_scheduler_speichern(conn, z["schedulers"][0]["id"] if z["schedulers"] else None, sauber))
+    assert fehler is None and sid
     return bot._adj_zustand(conn)
 
 
@@ -1200,7 +1207,7 @@ def test_scheduler_anwenden_setzt_anzahl_instanzen_auf_unterschiedlichen_positio
         x0, x1, y0, _y1, z0, z1 = _rahmen(objekte)
         assert ((x0 + x1) / 2, (z0 + z1) / 2, y0) == (i["x"], i["z"], i["y"])
     assert env.a.ftp.eintraege() == ["custom/alt.json"] + [i["datei"] for i in sch_inst]
-    assert z["scheduler"]["zaehler"] == 0
+    assert _s0(z)["zaehler"] == 0
 
 
 def test_scheduler_anwenden_aus_traegt_nur_scheduler_instanzen_aus(env):
@@ -1208,8 +1215,8 @@ def test_scheduler_anwenden_aus_traegt_nur_scheduler_instanzen_aus(env):
     befehl = _platziere(env.a, x=15000, z=15000, restarts=9)
     z = scheduler_an(env.a)
     assert len([i for i in z["instanzen"] if i["von"] == "scheduler"]) == 2
-    z["scheduler"]["aktiv"] = False
-    assert run(bot._adj_scheduler_anwenden(env.a)) is None
+    _s0(z)["aktiv"] = False
+    assert run(bot._adj_scheduler_anwenden(env.a, _s0(z)["id"])) is None
     assert _ids(env.a) == [befehl["id"]] and env.a.ftp.eintraege() == ["custom/alt.json", befehl["datei"]]
     assert env.a.ftp.adj_dateien() == [f"adj_{befehl['id']}.json"]
 
@@ -1220,12 +1227,12 @@ def test_scheduler_instanzen_verfallen_nicht_einzeln_nur_per_rotation(env):
     for i in z["instanzen"]:
         i["restarts"] = 1                                           # wäre als Befehls-Airdrop sofort fällig
     neustart(env.a)
-    assert _ids(env.a, "scheduler") == ids_vorher and z["scheduler"]["zaehler"] == 1
+    assert _ids(env.a, "scheduler") == ids_vorher and _s0(z)["zaehler"] == 1
     neustart(env.a)
-    assert _ids(env.a, "scheduler") == ids_vorher and z["scheduler"]["zaehler"] == 2
+    assert _ids(env.a, "scheduler") == ids_vorher and _s0(z)["zaehler"] == 2
     neustart(env.a)                                                 # dritter Neustart: Rotation
     neu = _ids(env.a, "scheduler")
-    assert len(neu) == 2 and not set(neu) & set(ids_vorher) and z["scheduler"]["zaehler"] == 0
+    assert len(neu) == 2 and not set(neu) & set(ids_vorher) and _s0(z)["zaehler"] == 0
     assert all(i["gesehen"] == 0 for i in z["instanzen"])
     assert len(env.a.ftp.eintraege()) == 3 and len(env.a.ftp.adj_dateien()) == 2
 
@@ -1234,7 +1241,7 @@ def test_scheduler_rotation_alle_einen_neustart(env):
     z = scheduler_an(env.a, anzahl=1, alle=1)
     vorher = _ids(env.a)
     neustart(env.a)
-    assert len(_ids(env.a)) == 1 and _ids(env.a) != vorher and z["scheduler"]["zaehler"] == 0
+    assert len(_ids(env.a)) == 1 and _ids(env.a) != vorher and _s0(z)["zaehler"] == 0
 
 
 def test_scheduler_rotation_waehlt_nie_dieselben_positionen_wie_zuvor_und_nie_doppelt(env, monkeypatch):
@@ -1311,7 +1318,7 @@ def test_scheduler_ohne_vorhandene_dateien_oder_positionen_setzt_nichts(env):
     bot._adj_loeschen("premade", "", "drop2")
     bot._adj_loeschen("premade", "", "drop3")
     neustart(env.a)                                                        # alte raus, nichts Neues möglich
-    assert z["instanzen"] == [] and env.a.ftp.eintraege() == ["custom/alt.json"] and z["scheduler"]["zaehler"] == 0
+    assert z["instanzen"] == [] and env.a.ftp.eintraege() == ["custom/alt.json"] and _s0(z)["zaehler"] == 0
 
 
 def test_scheduler_rotation_laesst_befehls_airdrops_unberuehrt(env):
@@ -1373,14 +1380,14 @@ def test_scheduler_rotation_schreibfehler_nach_ablauf_zaehlt_den_neustart_nicht_
 
 def test_scheduler_ausgeschaltet_zaehlt_nicht(env):
     z = scheduler_an(env.a, anzahl=1, alle=5)
-    z["scheduler"]["aktiv"] = False
+    _s0(z)["aktiv"] = False
     neustart(env.a, 3)
-    assert z["scheduler"]["zaehler"] == 0
+    assert _s0(z)["zaehler"] == 0
 
 
 def test_scheduler_ist_je_server_getrennt(env):
     scheduler_an(env.a, anzahl=2, alle=1)
-    assert bot._adj_zustand(env.b)["instanzen"] == [] and bot._adj_zustand(env.b)["scheduler"]["aktiv"] is False
+    assert bot._adj_zustand(env.b)["instanzen"] == [] and bot._adj_zustand(env.b)["schedulers"] == []
     assert env.b.ftp.protokoll == []
 
 
@@ -1804,13 +1811,13 @@ def test_list_scheduler_und_platziert_sind_getrennte_ansichten(slash):
     assert befehl["id"] in platziert and not any(i in platziert for i in sch_ids)
     emb = liste(art="scheduler").response.gesendet[0]["embed"]
     assert "Scheduler" in emb.title and all(i in emb.description for i in sch_ids) and befehl["id"] not in emb.description
-    assert "**Scheduler:** an · 2 gleichzeitig · Wechsel alle 3 Neustarts · nächster Wechsel in 3 Neustart(s) · 3 Airdrops · 6 Positionen" in emb.description
+    assert "**Scheduler 1:** an · 2 gleichzeitig · Wechsel alle 3 Neustarts · nächster Wechsel in 3 Neustart(s) · 3 Airdrops · 6 Positionen" in emb.description
     neustart(slash.a, 2)
     assert "nächster Wechsel in 1 Neustart(s)" in liste(art="scheduler").response.gesendet[0]["embed"].description
     en = liste(art="scheduler", locale=EN).response.gesendet[0]["embed"].description
-    assert "**Scheduler:** on · 2 at a time · rotation every 3 restarts · next rotation in 1 restart(s)" in en
-    z["scheduler"]["aktiv"] = False
-    assert "**Scheduler:** aus" in liste(art="scheduler").response.gesendet[0]["embed"].description
+    assert "**Scheduler 1:** on · 2 at a time · rotation every 3 restarts · next rotation in 1 restart(s)" in en
+    _s0(z)["aktiv"] = False
+    assert "**Scheduler 1:** aus" in liste(art="scheduler").response.gesendet[0]["embed"].description
 
 
 def test_list_zeigt_nur_instanzen_des_eigenen_servers(slash):
@@ -2037,15 +2044,15 @@ def test_api_get_liefert_alles_fuer_die_seite(monkeypatch, env):
     status, r = dash(monkeypatch, env.a, bot.api_tools_airdropjson_get)
     assert status == 200 and r["ok"] is True
     d = r["data"]
-    assert set(d) == {"premade", "eigene", "instanzen", "scheduler", "ist_betreiber", "karte", "warn_objekte", "ftp", "kann_edit", "ankuendigung"}
+    assert set(d) == {"premade", "eigene", "instanzen", "schedulers", "ist_betreiber", "karte", "warn_objekte", "ftp", "kann_edit", "ankuendigung"}
     assert [m["name"] for m in d["premade"]] == ["drop1"] and d["premade"][0]["objekte"] == 12
     assert [(m["name"], m["objekte"]) for m in d["eigene"]] == [("mein1", 3)]            # nichts von Server 2000
     assert d["ist_betreiber"] is True and d["karte"] == 15360 and d["warn_objekte"] == 200 and d["ftp"] is True
-    assert d["scheduler"] == {"aktiv": False, "anzahl": 1, "alle_neustarts": 1, "airdrops": [], "positionen": [], "zaehler": 0}
+    assert d["schedulers"] == []
     assert [{k: i[k] for k in ("id", "name", "quelle", "x", "y", "z", "restarts", "gesehen", "von", "objekte")} for i in d["instanzen"]] == [
         {"id": inst["id"], "name": "drop1", "quelle": "premade", "x": 5000.0, "y": 300.0, "z": 6000.0, "restarts": 2, "gesehen": 0,
          "von": "befehl", "objekte": 12}]
-    assert set(d["instanzen"][0]) == {"id", "name", "quelle", "x", "y", "z", "restarts", "gesehen", "von", "objekte", "erstellt"}   # kein user/datei
+    assert set(d["instanzen"][0]) == {"id", "name", "quelle", "x", "y", "z", "restarts", "gesehen", "von", "scheduler_id", "objekte", "erstellt"}   # kein user/datei
 
 
 def test_api_get_kunde_sieht_premade_aber_ist_kein_betreiber(monkeypatch, env):
@@ -2320,36 +2327,41 @@ def test_api_scheduler_speichert_und_wendet_sofort_an(monkeypatch, sch):
     status, r = dash(monkeypatch, a, bot.api_tools_airdropjson_scheduler_post, sch_wert())
     assert status == 200 and r["ok"] is True
     d = r["data"]
-    assert d["scheduler"]["aktiv"] is True and d["scheduler"]["anzahl"] == 2 and d["scheduler"]["alle_neustarts"] == 3
-    assert d["scheduler"]["zaehler"] == 0 and len(d["scheduler"]["airdrops"]) == 2 and len(d["scheduler"]["positionen"]) == 4
+    s0 = d["schedulers"][0]
+    assert len(d["schedulers"]) == 1 and s0["name"] == "Scheduler 1" and re.fullmatch(r"[0-9a-f]{6}", s0["id"])
+    assert s0["aktiv"] is True and s0["anzahl"] == 2 and s0["alle_neustarts"] == 3
+    assert s0["zaehler"] == 0 and len(s0["airdrops"]) == 2 and len(s0["positionen"]) == 4
     von = collections.Counter(i["von"] for i in d["instanzen"])
     assert von == {"befehl": 1, "scheduler": 2}
     sched = [i for i in d["instanzen"] if i["von"] == "scheduler"]
     assert len({(i["x"], i["z"]) for i in sched}) == 2 and all(i["restarts"] == 3 and i["gesehen"] == 0 for i in sched)
     assert a.ftp.eintraege() == ["custom/alt.json", befehl["datei"]] + [f"custom/adj_{i['id']}.json" for i in sched]
     assert len(a.ftp.adj_dateien()) == 3
-    assert _platte("1000")["airdrop_json"]["scheduler"]["aktiv"] is True and len(_platte("1000")["airdrop_json"]["instanzen"]) == 3
+    assert _platte("1000")["airdrop_json"]["schedulers"][0]["aktiv"] is True and len(_platte("1000")["airdrop_json"]["instanzen"]) == 3
+    assert all(i["scheduler_id"] == s0["id"] for i in sched)
     assert any(a_.startswith("Tool: Airdrop-Scheduler gespeichert") for a_ in _audit_aktionen())
     assert "an · 2 · alle 3" in list(bot._audit_log)[-1]["detail"]
     assert bot._adj_zustand(sch.b)["instanzen"] == [] and sch.b.ftp.protokoll == []
 
 
 def test_api_scheduler_aenderung_ersetzt_die_belegung_und_setzt_den_zaehler_zurueck(monkeypatch, sch):
-    dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert())
+    sid = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert())[1]["data"]["schedulers"][0]["id"]
     alt = _ids(sch.a, "scheduler")
     neustart(sch.a)
-    assert bot._adj_zustand(sch.a)["scheduler"]["zaehler"] == 1
-    status, r = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert(anzahl=1, alle_neustarts=5))
-    assert status == 200 and len(r["data"]["instanzen"]) == 1 and r["data"]["scheduler"]["zaehler"] == 0
+    assert _s0(bot._adj_zustand(sch.a))["zaehler"] == 1
+    status, r = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert(id=sid, anzahl=1, alle_neustarts=5))
+    assert status == 200 and len(r["data"]["instanzen"]) == 1 and r["data"]["schedulers"][0]["zaehler"] == 0
+    assert len(r["data"]["schedulers"]) == 1 and r["data"]["schedulers"][0]["id"] == sid
     assert not set(alt) & set(_ids(sch.a)) and len(sch.a.ftp.adj_dateien()) == 1 and len(sch.a.ftp.eintraege()) == 2
 
 
 def test_api_scheduler_aus_traegt_die_scheduler_instanzen_aus_und_behaelt_die_einstellungen(monkeypatch, sch):
     befehl = _platziere(sch.a, x=15000, z=15000, restarts=9)
-    dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert())
-    status, r = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert(aktiv=False))
+    sid = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert())[1]["data"]["schedulers"][0]["id"]
+    status, r = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert(id=sid, aktiv=False))
     assert status == 200 and [i["id"] for i in r["data"]["instanzen"]] == [befehl["id"]]
-    assert r["data"]["scheduler"]["aktiv"] is False and r["data"]["scheduler"]["anzahl"] == 2 and len(r["data"]["scheduler"]["airdrops"]) == 2
+    s0 = r["data"]["schedulers"][0]
+    assert s0["aktiv"] is False and s0["anzahl"] == 2 and len(s0["airdrops"]) == 2
     assert sch.a.ftp.eintraege() == ["custom/alt.json", befehl["datei"]] and len(sch.a.ftp.adj_dateien()) == 1
     neustart(sch.a, 3)                                                  # ausgeschaltet: kein Neustart bringt neue Scheduler-Airdrops
     assert _ids(sch.a, "scheduler") == []
@@ -2360,17 +2372,17 @@ def test_api_scheduler_ftp_fehler_ergibt_502_und_setzt_die_einstellung_zurueck(m
     status, r = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert())
     assert status == 502 and "fehlgeschlagen" in r["error"]
     z = bot._adj_zustand(sch.a)
-    assert z["scheduler"] == {"aktiv": False, "anzahl": 1, "alle_neustarts": 1, "zaehler": 0, "airdrops": [], "positionen": []}
+    assert z["schedulers"] == []                          # der neue Scheduler wird bei einem Fehler nicht angelegt
     assert z["instanzen"] == [] and sch.a.ftp.adj_dateien() == [] and sch.a.ftp.eintraege() == ["custom/alt.json"]
     assert not any(a_.startswith("Tool: Airdrop-Scheduler") for a_ in _audit_aktionen())
 
 
 def test_api_scheduler_ftp_fehler_behaelt_die_vorige_aktive_einstellung_und_belegung(monkeypatch, sch):
-    dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert())
+    sid = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert())[1]["data"]["schedulers"][0]["id"]
     vorher = copy.deepcopy(bot._adj_zustand(sch.a))
     eintraege = list(sch.a.ftp.eintraege())
     sch.a.ftp.write_fehler = {"cfggameplay.json"}
-    status, _ = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert(anzahl=1, alle_neustarts=9))
+    status, _ = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert(id=sid, anzahl=1, alle_neustarts=9))
     assert status == 502
     assert bot._adj_zustand(sch.a) == vorher and sch.a.ftp.eintraege() == eintraege and len(sch.a.ftp.adj_dateien()) == 2
 
@@ -2379,7 +2391,7 @@ def test_api_scheduler_ohne_ftp_aktivieren_ist_409(monkeypatch, sch):
     sch.a.ftp = None
     status, r = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert())
     assert status == 409 and r["error"] == bot._ADJ_FEHLER_FTP
-    assert bot._adj_zustand(sch.a)["scheduler"]["aktiv"] is False
+    assert bot._adj_zustand(sch.a)["schedulers"] == []
     sch.a.ftp = FTP()
     sch.a.data["ftp_mission_dir"] = ""
     assert dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert())[0] == 409
@@ -2388,15 +2400,15 @@ def test_api_scheduler_ohne_ftp_aktivieren_ist_409(monkeypatch, sch):
 def test_api_scheduler_aus_ohne_ftp_braucht_keinen_ftp_zugang_wenn_nie_aktiv(monkeypatch, sch):
     sch.a.ftp = None
     status, r = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert(aktiv=False, anzahl=4))
-    assert status == 200 and r["data"]["scheduler"]["aktiv"] is False and r["data"]["scheduler"]["anzahl"] == 4
-    assert r["data"]["ftp"] is False and _platte("1000")["airdrop_json"]["scheduler"]["anzahl"] == 4
+    assert status == 200 and r["data"]["schedulers"][0]["aktiv"] is False and r["data"]["schedulers"][0]["anzahl"] == 4
+    assert r["data"]["ftp"] is False and _platte("1000")["airdrop_json"]["schedulers"][0]["anzahl"] == 4
 
 
 def test_api_scheduler_aus_ohne_ftp_aber_mit_scheduler_instanzen_ist_409(monkeypatch, sch):
-    dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert())
+    sid = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert())[1]["data"]["schedulers"][0]["id"]
     sch.a.ftp = None
-    status, r = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert(aktiv=False))
-    assert status == 409 and bot._adj_zustand(sch.a)["scheduler"]["aktiv"] is True and len(_ids(sch.a, "scheduler")) == 2
+    status, r = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert(id=sid, aktiv=False))
+    assert status == 409 and _s0(bot._adj_zustand(sch.a))["aktiv"] is True and len(_ids(sch.a, "scheduler")) == 2
 
 
 @pytest.mark.parametrize("aenderung,teil", [
@@ -2410,7 +2422,7 @@ def test_api_scheduler_validierungsfehler_sind_400_und_aendern_nichts(monkeypatc
     status, r = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert(**aenderung))
     assert status == 400 and teil in r["error"]
     z = bot._adj_zustand(sch.a)
-    assert z["scheduler"]["aktiv"] is False and z["instanzen"] == [] and sch.a.ftp.protokoll == []
+    assert z["schedulers"] == [] and z["instanzen"] == [] and sch.a.ftp.protokoll == []
 
 
 def test_api_scheduler_position_mit_riesiger_zahl_ist_400_kein_500(monkeypatch, sch):
@@ -2423,7 +2435,7 @@ def test_api_scheduler_nur_mit_bearbeiten_recht_und_je_server(monkeypatch, sch):
     assert gast(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert())[0] == 403
     assert dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert(), ohne_sitzung=True)[0] == 401
     assert besitzer(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert())[0] == 200
-    assert bot._adj_zustand(sch.b)["scheduler"]["aktiv"] is False and sch.b.ftp.protokoll == []
+    assert bot._adj_zustand(sch.b)["schedulers"] == [] and sch.b.ftp.protokoll == []
 
 
 def test_api_scheduler_wird_gedrosselt(monkeypatch, sch):
@@ -2660,7 +2672,7 @@ def test_kaputter_zustand_stoppt_den_poll_nicht(env):
     env.a.data["airdrop_json"] = {"instanzen": [], "neustarts_offen": "x", "laeufe": [], "scheduler": {"zaehler": None, "anzahl": "?"}}
     bot._adj_poll(env.a, True)                       # darf nicht werfen
     z = bot._adj_zustand(env.a)
-    assert z["neustarts_offen"] == 0 and z["laeufe"] == 0 and z["scheduler"]["anzahl"] == 1
+    assert z["neustarts_offen"] == 0 and z["laeufe"] == 0 and z["schedulers"] == []
 
 
 def test_autocomplete_zeigt_ohne_recht_nichts(monkeypatch, env):
@@ -2758,7 +2770,7 @@ def test_scheduler_kuendigt_nur_mit_schalter_an(slash, kanal):
     scheduler_an(slash.a, anzahl=2)
     assert kanal.gesendet == []
     _ank(slash.a, scheduler=True)
-    assert run(bot._adj_scheduler_anwenden(slash.a)) is None
+    assert run(bot._adj_scheduler_anwenden(slash.a, _s0(bot._adj_zustand(slash.a))["id"])) is None
     assert len(kanal.gesendet) == 1 and len(kanal.gesendet[0]["embed"].fields) == 2
 
 
@@ -2811,3 +2823,224 @@ def test_warten_auf_a2s_ist_begrenzt_und_haengt_nie_45_minuten(monkeypatch, env)
     monkeypatch.setattr(bot, "a2s_query", lambda ip, port, timeout=3.0: {"name": "x"})
     run(bot._adj_warten_bis_online(a))
     assert uhr[0] == 1000.0                                            # antwortet er, geht es sofort weiter
+
+
+# ── Mehrere Scheduler ────────────────────────────────────────────────────
+def _neuer(conn, name, airdrops, positionen, anzahl=1, alle=1, aktiv=True, sid=None):
+    sauber = {"name": name, "aktiv": aktiv, "anzahl": anzahl, "alle_neustarts": alle,
+              "airdrops": [{"quelle": "premade", "name": n} for n in airdrops], "positionen": copy.deepcopy(list(positionen))}
+    sid, fehler = run(bot._adj_scheduler_speichern(conn, sid, sauber))
+    assert fehler is None
+    return sid
+
+
+def test_mehrere_scheduler_arbeiten_getrennt(env):
+    _premade("drop1")
+    _premade("drop2")
+    s1 = _neuer(env.a, "Nord", ["drop1"], POSITIONEN[:2], alle=1)
+    s2 = _neuer(env.a, "Sued", ["drop2"], POSITIONEN[2:4], alle=2)
+    z = bot._adj_zustand(env.a)
+    assert [x["name"] for x in z["schedulers"]] == ["Nord", "Sued"] and s1 != s2
+    inst = {i["scheduler_id"]: i for i in z["instanzen"]}
+    assert inst[s1]["name"] == "drop1" and inst[s2]["name"] == "drop2" and len(z["instanzen"]) == 2
+    vorher1, vorher2 = inst[s1]["id"], inst[s2]["id"]
+    neustart(env.a)                                    # Nord wechselt (alle 1), Sued zählt nur (1 von 2)
+    z = bot._adj_zustand(env.a)
+    inst = {i["scheduler_id"]: i for i in z["instanzen"]}
+    assert inst[s1]["id"] != vorher1 and inst[s2]["id"] == vorher2
+    assert [x["zaehler"] for x in z["schedulers"]] == [0, 1]
+    neustart(env.a)                                    # jetzt wechseln beide
+    inst = {i["scheduler_id"]: i for i in bot._adj_zustand(env.a)["instanzen"]}
+    assert inst[s2]["id"] != vorher2
+
+
+def test_scheduler_teilen_sich_keine_position(env):
+    _premade("drop1")
+    gemeinsam = POSITIONEN[:2]
+    for n in range(2):
+        _neuer(env.a, f"S{n}", ["drop1"], gemeinsam)
+    pos = [(i["x"], i["z"]) for i in bot._adj_zustand(env.a)["instanzen"]]
+    assert len(pos) == 2 and len(set(pos)) == 2
+
+
+def test_scheduler_einzeln_aendern_loescht_nur_dessen_airdrops(env):
+    _premade("drop1")
+    _premade("drop2")
+    s1 = _neuer(env.a, "Nord", ["drop1"], POSITIONEN[:2])
+    s2 = _neuer(env.a, "Sued", ["drop2"], POSITIONEN[2:4])
+    z = bot._adj_zustand(env.a)
+    id2 = next(i["id"] for i in z["instanzen"] if i["scheduler_id"] == s2)
+    _neuer(env.a, "Nord neu", ["drop1"], POSITIONEN[:3], anzahl=2, sid=s1)
+    z = bot._adj_zustand(env.a)
+    assert [x["name"] for x in z["schedulers"]] == ["Nord neu", "Sued"]
+    assert sum(1 for i in z["instanzen"] if i["scheduler_id"] == s1) == 2
+    assert [i["id"] for i in z["instanzen"] if i["scheduler_id"] == s2] == [id2]
+    assert len(env.a.ftp.adj_dateien()) == 3
+
+
+def test_scheduler_loeschen_entfernt_dessen_airdrops_und_dateien(env):
+    _premade("drop1")
+    _premade("drop2")
+    s1 = _neuer(env.a, "Nord", ["drop1"], POSITIONEN[:2])
+    s2 = _neuer(env.a, "Sued", ["drop2"], POSITIONEN[2:4])
+    assert run(bot._adj_scheduler_loeschen(env.a, s1)) is None
+    z = bot._adj_zustand(env.a)
+    assert [x["id"] for x in z["schedulers"]] == [s2] and [i["scheduler_id"] for i in z["instanzen"]] == [s2]
+    assert len(env.a.ftp.adj_dateien()) == 1
+    assert run(bot._adj_scheduler_loeschen(env.a, s1)) == "Diesen Scheduler gibt es nicht (mehr)."
+
+
+def test_scheduler_fehler_beim_anlegen_hinterlaesst_nichts(env):
+    _premade("drop1")
+    env.a.ftp.write_fehler = {"cfggameplay.json"}
+    sid, fehler = run(bot._adj_scheduler_speichern(env.a, None, {
+        "name": "X", "aktiv": True, "anzahl": 1, "alle_neustarts": 1,
+        "airdrops": [{"quelle": "premade", "name": "drop1"}], "positionen": copy.deepcopy(POSITIONEN[:2])}))
+    assert sid is None and fehler and bot._adj_zustand(env.a)["schedulers"] == []
+
+
+def test_scheduler_hoechstens_zehn(env):
+    _premade("drop1")
+    for n in range(bot._ADJ_MAX_SCHEDULER):
+        _neuer(env.a, f"S{n}", ["drop1"], POSITIONEN[:2], aktiv=False)
+    sid, fehler = run(bot._adj_scheduler_speichern(env.a, None, {"name": "elf", "aktiv": False, "anzahl": 1, "alle_neustarts": 1,
+                                                                 "airdrops": [], "positionen": []}))
+    assert sid is None and "10 Scheduler" in fehler
+
+
+def test_altbestand_mit_einem_scheduler_wird_uebernommen(env):
+    _premade("drop1")
+    env.a.data["airdrop_json"] = {
+        "instanzen": [{"id": "abcdef", "name": "drop1", "von": "scheduler", "x": 1, "y": 2, "z": 3, "restarts": 2, "gesehen": 0}],
+        "scheduler": {"aktiv": True, "anzahl": 1, "alle_neustarts": 2, "zaehler": 1,
+                      "airdrops": [{"quelle": "premade", "name": "drop1"}], "positionen": [{"x": 1, "y": 2, "z": 3}]}}
+    z = bot._adj_zustand(env.a)
+    assert "scheduler" not in z and len(z["schedulers"]) == 1
+    s = z["schedulers"][0]
+    assert s["name"] == "Scheduler 1" and s["aktiv"] is True and s["zaehler"] == 1 and s["id"] == "000001"
+    assert z["instanzen"][0]["scheduler_id"] == s["id"]
+
+
+def test_api_mehrere_scheduler_anlegen_aendern_loeschen(monkeypatch, sch):
+    a = sch.a
+    r1 = dash(monkeypatch, a, bot.api_tools_airdropjson_scheduler_post, sch_wert(name="Nord", anzahl=1))[1]["data"]
+    r2 = dash(monkeypatch, a, bot.api_tools_airdropjson_scheduler_post, sch_wert(name="Sued", anzahl=1))[1]["data"]
+    assert [x["name"] for x in r2["schedulers"]] == ["Nord", "Sued"]
+    id1, id2 = r2["schedulers"][0]["id"], r2["schedulers"][1]["id"]
+    status, r = dash(monkeypatch, a, bot.api_tools_airdropjson_scheduler_post, sch_wert(id=id1, name="Nord 2", anzahl=1, alle_neustarts=7))
+    assert status == 200 and [x["name"] for x in r["data"]["schedulers"]] == ["Nord 2", "Sued"]
+    assert r["data"]["schedulers"][0]["alle_neustarts"] == 7 and r["data"]["schedulers"][1]["alle_neustarts"] == 3
+    status, r = dash(monkeypatch, a, bot.api_tools_airdropjson_scheduler_post, sch_wert(id="ffffff"))
+    assert status == 404
+    status, r = dash(monkeypatch, a, bot.api_tools_airdropjson_scheduler_delete, None, methode="DELETE", match={"id": id1})
+    assert status == 200 and [x["id"] for x in r["data"]["schedulers"]] == [id2]
+    assert all(i["scheduler_id"] == id2 for i in r["data"]["instanzen"])
+    assert dash(monkeypatch, a, bot.api_tools_airdropjson_scheduler_delete, None, methode="DELETE", match={"id": id1})[0] == 404
+    assert dash(monkeypatch, a, bot.api_tools_airdropjson_scheduler_delete, None, methode="DELETE", match={"id": "../x"})[0] == 404
+    assert gast(monkeypatch, a, bot.api_tools_airdropjson_scheduler_delete, None, methode="DELETE", match={"id": id2})[0] == 403
+    assert bot._adj_zustand(sch.b)["schedulers"] == []
+
+
+def test_api_scheduler_summe_der_aktiven_ist_begrenzt(monkeypatch, sch):
+    a = sch.a
+    pos = [{"x": 100 + i, "y": 5, "z": 100 + i} for i in range(12)]
+    assert dash(monkeypatch, a, bot.api_tools_airdropjson_scheduler_post, sch_wert(anzahl=10, positionen=pos))[0] == 200
+    assert dash(monkeypatch, a, bot.api_tools_airdropjson_scheduler_post, sch_wert(anzahl=10, positionen=pos))[0] == 200
+    status, r = dash(monkeypatch, a, bot.api_tools_airdropjson_scheduler_post, sch_wert(anzahl=1))
+    assert status == 400 and "zusammen" in r["error"]
+
+
+# ── Wechsel nach Zeit (Sekunden) ─────────────────────────────────────────
+def _zeit_scheduler(conn, sekunden=120, alle=1, aktiv=True, name="Zeit"):
+    sauber = {"name": name, "aktiv": aktiv, "anzahl": 1, "alle_neustarts": alle, "modus": "sekunden", "sekunden": sekunden,
+              "airdrops": [{"quelle": "premade", "name": "drop1"}], "positionen": copy.deepcopy(POSITIONEN[:2])}
+    sid, fehler = run(bot._adj_scheduler_speichern(conn, None, sauber))
+    assert fehler is None
+    return sid
+
+
+def test_zeit_validierung():
+    ok_, _ = bot._adj_scheduler_validieren(_sch(modus="sekunden", sekunden=60, alle_neustarts=None))
+    assert ok_["modus"] == "sekunden" and ok_["sekunden"] == 60 and ok_["alle_neustarts"] == 1
+    for kaputt in (None, "x", 29, 2_592_001, 10 ** 400):
+        sauber, fehler = bot._adj_scheduler_validieren(_sch(modus="sekunden", sekunden=kaputt))
+        assert sauber is None and ("Sekunden" in fehler)
+    assert bot._adj_scheduler_validieren(_sch(modus="sekunden", sekunden=30))[0] is not None
+    assert bot._adj_scheduler_validieren(_sch(modus="sekunden", sekunden=2_592_000))[0] is not None
+    assert bot._adj_scheduler_validieren(_sch(modus="quatsch"))[0]["modus"] == "neustarts"
+
+
+def test_zeit_scheduler_wechselt_nach_ablauf_und_nicht_bei_neustarts(env, monkeypatch):
+    _premade("drop1")
+    uhr = [10_000.0]
+    monkeypatch.setattr(bot.time, "time", lambda: uhr[0])
+    sid = _zeit_scheduler(env.a, sekunden=120)
+    z = bot._adj_zustand(env.a)
+    s = _s0(z)
+    assert s["naechster_ts"] == 10_120.0 and bot._adj_zeit_faellig(z) == []
+    vorher = [i["id"] for i in z["instanzen"]]
+    neustart(env.a, 3)                                     # Neustarts bringen bei einem Zeit-Scheduler nichts
+    assert [i["id"] for i in bot._adj_zustand(env.a)["instanzen"]] == vorher
+    uhr[0] = 10_119.0
+    assert bot._adj_zeit_faellig(bot._adj_zustand(env.a)) == []
+    uhr[0] = 10_121.0
+    assert bot._adj_zeit_faellig(bot._adj_zustand(env.a)) == [sid]
+    assert run(bot._adj_zeit_wechsel(env.a)) is None
+    z = bot._adj_zustand(env.a)
+    assert [i["id"] for i in z["instanzen"]] != vorher and len(z["instanzen"]) == 1
+    assert _s0(z)["naechster_ts"] == 10_241.0 and bot._adj_zeit_faellig(z) == []
+
+
+def test_zeit_aus_und_neustart_modus_haben_keinen_zeitpunkt(env, monkeypatch):
+    _premade("drop1")
+    _zeit_scheduler(env.a, aktiv=False)
+    assert _s0(bot._adj_zustand(env.a))["naechster_ts"] == 0.0
+    scheduler_an(env.b, anzahl=1)
+    assert _s0(bot._adj_zustand(env.b))["naechster_ts"] == 0.0
+
+
+def test_poll_startet_zeit_wechsel_nur_wenn_faellig(env, monkeypatch):
+    _premade("drop1")
+    uhr = [10_000.0]
+    monkeypatch.setattr(bot.time, "time", lambda: uhr[0])
+    _zeit_scheduler(env.a, sekunden=60)
+    vorher = [i["id"] for i in bot._adj_zustand(env.a)["instanzen"]]
+
+    async def lauf():
+        bot._adj_poll(env.a, False)
+        assert "1000" not in bot._ADJ_TASKS                # noch nicht fällig
+        uhr[0] = 10_061.0
+        bot._adj_poll(env.a, False)
+        await bot._ADJ_TASKS["1000"]
+    run(lauf())
+    assert [i["id"] for i in bot._adj_zustand(env.a)["instanzen"]] != vorher
+
+
+def test_zeit_wechsel_fehler_laesst_den_zeitpunkt_stehen_und_wiederholt(env, monkeypatch):
+    _premade("drop1")
+    uhr = [10_000.0]
+    monkeypatch.setattr(bot.time, "time", lambda: uhr[0])
+    sid = _zeit_scheduler(env.a, sekunden=60)
+    uhr[0] = 10_100.0
+    env.a.ftp.write_fehler = {"cfggameplay.json"}
+    assert run(bot._adj_zeit_wechsel(env.a))
+    assert bot._adj_zeit_faellig(bot._adj_zustand(env.a)) == [sid]      # bleibt fällig
+    env.a.ftp.write_fehler = set()
+    assert run(bot._adj_zeit_wechsel(env.a)) is None
+    assert bot._adj_zeit_faellig(bot._adj_zustand(env.a)) == []
+
+
+def test_api_zeit_modus_speichern_und_anzeigen(monkeypatch, sch):
+    d = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert(modus="sekunden", sekunden=300))[1]["data"]
+    s = d["schedulers"][0]
+    assert s["modus"] == "sekunden" and s["sekunden"] == 300 and 0 < s["rest_sekunden"] <= 300
+    status, r = dash(monkeypatch, sch.a, bot.api_tools_airdropjson_scheduler_post, sch_wert(id=s["id"], modus="sekunden", sekunden=5))
+    assert status == 400 and "Sekunden" in r["error"]
+
+
+def test_list_scheduler_zeigt_zeit_modus(slash):
+    _zeit_scheduler(slash.a, sekunden=600, name="Zeit")
+    text = liste(art="scheduler").response.gesendet[0]["embed"].description
+    assert "**Zeit:** an · 1 gleichzeitig · Wechsel alle 600 Sekunden · nächster Wechsel in" in text
+    en = liste(art="scheduler", locale=EN).response.gesendet[0]["embed"].description
+    assert "rotation every 600 seconds" in en

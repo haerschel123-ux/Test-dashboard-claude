@@ -31109,6 +31109,9 @@ _ADJ_MAX_EIGENE = 20
 _ADJ_MAX_INSTANZEN = 20
 _ADJ_MAX_RESTARTS = 100
 _ADJ_MAX_SCHEDULER_ANZAHL = 10
+_ADJ_MAX_SCHEDULER = 10
+_ADJ_MIN_SEKUNDEN = 30
+_ADJ_MAX_SEKUNDEN = 2_592_000      # 30 Tage
 _ADJ_MAX_POSITIONEN = 50
 _ADJ_STANDARD_KARTE = 20480
 _ADJ_FEHLER_FTP = "Für diesen Server fehlt der FTP-Zugang."
@@ -31312,26 +31315,47 @@ def _adj_zustand(conn: ServerConnection) -> Dict[str, Any]:
     z = roh if isinstance(roh, dict) else {}
     if not isinstance(z.get("instanzen"), list):
         z["instanzen"] = []
-    sch = z.get("scheduler")
-    if not isinstance(sch, dict):
-        sch = {}
-    sch.setdefault("aktiv", False)
-    sch.setdefault("anzahl", 1)
-    sch.setdefault("alle_neustarts", 1)
-    sch.setdefault("zaehler", 0)
-    for k in ("airdrops", "positionen"):
-        if not isinstance(sch.get(k), list):
-            sch[k] = []
-    for obj, felder in ((sch, ("anzahl", "alle_neustarts", "zaehler")),
-                        (z, ("neustarts_offen", "laeufe", "laeufe_verarbeitet"))):
-        for feld in felder:               # kaputte Werte (handgeaenderte connections.json) duerfen den Poll nie stoppen
-            try:
-                obj[feld] = max(0, int(obj.get(feld) or 0))
+    roh_liste = z.get("schedulers")
+    if not isinstance(roh_liste, list):
+        roh_liste = []
+        alt = z.get("scheduler")                       # Altbestand: es gab genau einen Scheduler
+        if isinstance(alt, dict) and (alt.get("aktiv") or alt.get("airdrops") or alt.get("positionen")):
+            roh_liste.append(dict(alt, id="000001", name="Scheduler 1"))
+    z.pop("scheduler", None)
+    liste: List[Dict[str, Any]] = []
+    for n, sch in enumerate(roh_liste[:_ADJ_MAX_SCHEDULER], start=1):
+        if not isinstance(sch, dict):
+            continue
+        if not re.fullmatch(r"[0-9a-f]{6}", str(sch.get("id") or "")) or any(sch["id"] == o["id"] for o in liste):
+            sch["id"] = secrets.token_hex(3)
+        sch["name"] = " ".join(str(sch.get("name") or "").split())[:40] or f"Scheduler {n}"
+        sch["aktiv"] = bool(sch.get("aktiv"))
+        for k in ("airdrops", "positionen"):
+            if not isinstance(sch.get(k), list):
+                sch[k] = []
+        for feld in ("anzahl", "alle_neustarts", "zaehler", "lauf"):
+            try:                       # kaputte Werte (handgeaenderte connections.json) duerfen den Poll nie stoppen
+                sch[feld] = max(0, int(sch.get(feld) or 0))
             except (TypeError, ValueError, OverflowError):
-                obj[feld] = 0
-    sch["anzahl"] = max(1, sch["anzahl"])
-    sch["alle_neustarts"] = max(1, sch["alle_neustarts"])
-    z["scheduler"] = sch
+                sch[feld] = 0
+        sch["anzahl"] = max(1, sch["anzahl"])
+        sch["alle_neustarts"] = max(1, sch["alle_neustarts"])
+        sch["modus"] = "sekunden" if sch.get("modus") == "sekunden" else "neustarts"
+        try:
+            sch["sekunden"] = min(_ADJ_MAX_SEKUNDEN, max(_ADJ_MIN_SEKUNDEN, int(sch.get("sekunden") or 3600)))
+            sch["naechster_ts"] = max(0.0, float(sch.get("naechster_ts") or 0.0))
+        except (TypeError, ValueError, OverflowError):
+            sch["sekunden"], sch["naechster_ts"] = 3600, 0.0
+        liste.append(sch)
+    for feld in ("neustarts_offen", "laeufe", "laeufe_verarbeitet"):
+        try:
+            z[feld] = max(0, int(z.get(feld) or 0))
+        except (TypeError, ValueError, OverflowError):
+            z[feld] = 0
+    z["schedulers"] = liste
+    for i in z["instanzen"]:                           # Altbestand: Scheduler-Airdrops gehoeren dem ersten Scheduler
+        if isinstance(i, dict) and i.get("von") == "scheduler" and not i.get("scheduler_id"):
+            i["scheduler_id"] = liste[0]["id"] if liste else "000001"
     ank = z.get("ankuendigung")
     if not isinstance(ank, dict):
         ank = {}
@@ -31562,15 +31586,19 @@ async def _adj_entfernen_roh(conn: ServerConnection, inst_ids: List[str]) -> Opt
 # ── Scheduler: Rotation alle X Neustarts ──────────────────────────────────
 def _adj_scheduler_validieren(daten: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Scheduler-Einstellungen aus der API pruefen: (bereinigt, Fehlertext)."""
+    modus = "sekunden" if daten.get("modus") == "sekunden" else "neustarts"
     try:
         anzahl = int(daten.get("anzahl"))
-        alle = int(daten.get("alle_neustarts"))
+        alle = int(daten.get("alle_neustarts") or 1) if modus == "sekunden" else int(daten.get("alle_neustarts"))
+        sekunden = int(daten.get("sekunden") or 3600) if modus == "neustarts" else int(daten.get("sekunden"))
     except (TypeError, ValueError, OverflowError):
-        return None, "Anzahl und Neustarts müssen ganze Zahlen sein."
+        return None, "Anzahl, Neustarts und Sekunden müssen ganze Zahlen sein."
     if not 1 <= anzahl <= _ADJ_MAX_SCHEDULER_ANZAHL:
         return None, "Die Zahl gleichzeitiger Airdrops muss zwischen 1 und 10 liegen."
     if not 1 <= alle <= _ADJ_MAX_RESTARTS:
         return None, "Der Wechsel „alle X Neustarts“ muss zwischen 1 und 100 liegen."
+    if not _ADJ_MIN_SEKUNDEN <= sekunden <= _ADJ_MAX_SEKUNDEN:
+        return None, f"Der Wechsel „alle X Sekunden“ muss zwischen {_ADJ_MIN_SEKUNDEN} und {_ADJ_MAX_SEKUNDEN} liegen."
     airdrops: List[Dict[str, str]] = []
     roh_a = daten.get("airdrops") or []
     if not isinstance(roh_a, list) or len(roh_a) > 100:
@@ -31600,21 +31628,22 @@ def _adj_scheduler_validieren(daten: Dict[str, Any]) -> Tuple[Optional[Dict[str,
         return None, "Bitte mindestens einen Airdrop auswählen."
     if aktiv and len(positionen) < anzahl:
         return None, "Es braucht mindestens so viele Positionen wie gleichzeitige Airdrops."
-    return {"aktiv": aktiv, "anzahl": anzahl, "alle_neustarts": alle,
-            "airdrops": airdrops, "positionen": positionen}, None
+    name = " ".join(str(daten.get("name") or "").split())[:40]
+    return {"name": name, "aktiv": aktiv, "anzahl": anzahl, "alle_neustarts": alle, "modus": modus,
+            "sekunden": sekunden, "airdrops": airdrops, "positionen": positionen}, None
 
 
-def _adj_rotation_waehlen(conn: ServerConnection, zustand: Dict[str, Any], vorher: List[Dict[str, Any]]
-                          ) -> List[Tuple[str, str, Dict[str, float]]]:
-    """Zufaellige Belegung: [(quelle, name, position)]. Airdrops moeglichst ohne Wiederholung,
-    Positionen nie doppelt, nicht auf einer per Befehl gesetzten Position und moeglichst nicht
-    dieselben wie zuvor."""
-    sch = zustand["scheduler"]
+def _adj_rotation_waehlen(conn: ServerConnection, zustand: Dict[str, Any], sch: Dict[str, Any],
+                          vorher: List[Dict[str, Any]]) -> List[Tuple[str, str, Dict[str, float]]]:
+    """Zufaellige Belegung fuer EINEN Scheduler: [(quelle, name, position)]. Airdrops moeglichst ohne
+    Wiederholung, Positionen nie doppelt, nicht auf einer Position, die ein Befehl oder ein anderer
+    Scheduler gerade belegt, und moeglichst nicht dieselben wie zuvor."""
     verfuegbar = [a for a in sch["airdrops"]
                   if os.path.exists(os.path.join(_adj_verz(a["quelle"], conn.service_id), a["name"] + ".json"))]
     if not verfuegbar or not sch["positionen"]:
         return []
-    belegt = [(i["x"], i["z"]) for i in zustand["instanzen"] if i.get("von") == "befehl"]
+    vorher_ids = {i.get("id") for i in vorher}
+    belegt = [(i["x"], i["z"]) for i in zustand["instanzen"] if i.get("id") not in vorher_ids]
     frei = [p for p in sch["positionen"] if all(abs(p["x"] - bx) > 1 or abs(p["z"] - bz) > 1 for bx, bz in belegt)]
     n = min(int(sch["anzahl"]), len(frei))
     if n <= 0:
@@ -31630,31 +31659,78 @@ def _adj_rotation_waehlen(conn: ServerConnection, zustand: Dict[str, Any], vorhe
     return [(a["quelle"], a["name"], p) for a, p in zip(auswahl, positionen)]
 
 
-async def _adj_scheduler_anwenden(conn: ServerConnection) -> Optional[str]:
-    """Scheduler-Belegung neu setzen: alte Scheduler-Airdrops raus, neue rein (aktiv) bzw. nur raus
-    (aus). Setzt den Zaehler zurueck. Fehlertext oder None."""
+def _adj_scheduler_von(zustand: Dict[str, Any], sid: str) -> Optional[Dict[str, Any]]:
+    return next((x for x in zustand["schedulers"] if x["id"] == sid), None)
+
+
+async def _adj_scheduler_anwenden(conn: ServerConnection, sid: str) -> Optional[str]:
+    """Belegung EINES Schedulers neu setzen: seine alten Airdrops raus, neue rein (aktiv) bzw. nur
+    raus (aus). Setzt dessen Zaehler zurueck. Fehlertext oder None."""
     async with _adj_lock(conn.service_id):
-        return await _adj_scheduler_anwenden_roh(conn)
+        return await _adj_scheduler_anwenden_roh(conn, sid)
 
 
-async def _adj_scheduler_speichern(conn: ServerConnection, sauber: Dict[str, Any]) -> Optional[str]:
-    """Scheduler-Einstellungen uebernehmen UND anwenden - alles unter der Sperre; bei einem Fehler
-    bleiben die alten Einstellungen stehen."""
+async def _adj_scheduler_speichern(conn: ServerConnection, sid: Optional[str], sauber: Dict[str, Any]
+                                   ) -> Tuple[Optional[str], Optional[str]]:
+    """Einen Scheduler anlegen (sid=None) oder aendern UND anwenden - alles unter der Sperre; bei einem
+    Fehler bleibt der alte Stand stehen. Rueckgabe: (id, Fehlertext)."""
     async with _adj_lock(conn.service_id):
         zustand = _adj_zustand(conn)
-        alt = copy.deepcopy(zustand["scheduler"])
-        zustand["scheduler"].update(sauber)
-        fehler = await _adj_scheduler_anwenden_roh(conn)
+        if sid is None:
+            if len(zustand["schedulers"]) >= _ADJ_MAX_SCHEDULER:
+                return None, f"Es gibt schon {_ADJ_MAX_SCHEDULER} Scheduler – bitte erst einen löschen."
+            sid = secrets.token_hex(3)
+            while _adj_scheduler_von(zustand, sid) is not None:
+                sid = secrets.token_hex(3)
+            sch = {"id": sid, "zaehler": 0, "lauf": zustand["laeufe_verarbeitet"]}
+            zustand["schedulers"].append(sch)
+            alt: Optional[Dict[str, Any]] = None
+        else:
+            sch = _adj_scheduler_von(zustand, sid)
+            if sch is None:
+                return None, "Diesen Scheduler gibt es nicht (mehr)."
+            alt = copy.deepcopy(sch)
+        sch.update(sauber)
+        if not sch.get("name"):
+            sch["name"] = f"Scheduler {len(zustand['schedulers'])}"
+        fehler = await _adj_scheduler_anwenden_roh(conn, sid)
         if fehler:
-            zustand["scheduler"] = alt
-        return fehler
+            if alt is None:
+                zustand["schedulers"].remove(sch)
+            else:
+                sch.clear()
+                sch.update(alt)
+            return None, fehler
+        _adj_zustand_speichern(conn)
+        return sid, None
 
 
-async def _adj_scheduler_anwenden_roh(conn: ServerConnection) -> Optional[str]:
+async def _adj_scheduler_loeschen(conn: ServerConnection, sid: str) -> Optional[str]:
+    """Einen Scheduler samt seinen gerade gesetzten Airdrops entfernen."""
+    async with _adj_lock(conn.service_id):
+        zustand = _adj_zustand(conn)
+        if _adj_scheduler_von(zustand, sid) is None:
+            return "Diesen Scheduler gibt es nicht (mehr)."
+        alte_ids = [str(i["id"]) for i in zustand["instanzen"]
+                    if i.get("von") == "scheduler" and i.get("scheduler_id") == sid]
+
+        def entfernt() -> None:
+            zustand["schedulers"] = [x for x in zustand["schedulers"] if x["id"] != sid]
+            zustand["instanzen"] = [i for i in zustand["instanzen"] if str(i.get("id")) not in alte_ids]
+            _adj_zustand_speichern(conn)
+        if alte_ids:
+            return await _adj_transaktion(conn, [], alte_ids, None, entfernt)
+        entfernt()
+        return None
+
+
+async def _adj_scheduler_anwenden_roh(conn: ServerConnection, sid: str) -> Optional[str]:
     zustand = _adj_zustand(conn)
-    sch = zustand["scheduler"]
-    alte = [i for i in zustand["instanzen"] if i.get("von") == "scheduler"]
-    neue_plan = _adj_rotation_waehlen(conn, zustand, alte) if sch["aktiv"] else []
+    sch = _adj_scheduler_von(zustand, sid)
+    if sch is None:
+        return "Diesen Scheduler gibt es nicht (mehr)."
+    alte = [i for i in zustand["instanzen"] if i.get("von") == "scheduler" and i.get("scheduler_id") == sid]
+    neue_plan = _adj_rotation_waehlen(conn, zustand, sch, alte) if sch["aktiv"] else []
     loop = asyncio.get_running_loop()
     neue: List[Tuple[str, List[Dict[str, Any]]]] = []
     neue_inst: List[Dict[str, Any]] = []
@@ -31670,17 +31746,23 @@ async def _adj_scheduler_anwenden_roh(conn: ServerConnection) -> Optional[str]:
         neue.append((inst_id, verschoben))
         neue_inst.append({"id": inst_id, "name": name, "quelle": quelle, "datei": f"custom/adj_{inst_id}.json",
                           "x": pos["x"], "y": pos["y"], "z": pos["z"], "restarts": int(sch["alle_neustarts"]),
-                          "gesehen": 0, "ab_lauf": _adj_ab_lauf(zustand), "von": "scheduler", "user": "scheduler",
-                          "erstellt": datetime.now(timezone.utc).isoformat(), "objekte": len(verschoben)})
+                          "gesehen": 0, "ab_lauf": _adj_ab_lauf(zustand), "von": "scheduler", "scheduler_id": sid,
+                          "user": "scheduler", "erstellt": datetime.now(timezone.utc).isoformat(),
+                          "objekte": len(verschoben)})
     alte_ids = [str(i["id"]) for i in alte]
+
+    def zeit_setzen() -> None:
+        sch["naechster_ts"] = (time.time() + int(sch["sekunden"])) if sch["modus"] == "sekunden" and sch["aktiv"] else 0.0
     if not neue and not alte_ids:
         sch["zaehler"] = 0
+        zeit_setzen()
         _adj_zustand_speichern(conn)
         return None
 
     def uebernehmen() -> None:
-        zustand["instanzen"] = [i for i in zustand["instanzen"] if i.get("von") != "scheduler"] + neue_inst
+        zustand["instanzen"] = [i for i in zustand["instanzen"] if str(i.get("id")) not in alte_ids] + neue_inst
         sch["zaehler"] = 0
+        zeit_setzen()
         _adj_zustand_speichern(conn)
     fehler_tx = await _adj_transaktion(conn, neue, alte_ids, None, uebernehmen)
     if fehler_tx is None and neue_inst and zustand["ankuendigung"]["scheduler"]:
@@ -31697,7 +31779,8 @@ _ADJ_ONLINE_WARTEN_MAX = 300
 
 def _adj_hat_arbeit(conn: ServerConnection) -> bool:
     z = conn.data.get("airdrop_json")
-    return isinstance(z, dict) and bool(z.get("instanzen") or (z.get("scheduler") or {}).get("aktiv"))
+    return isinstance(z, dict) and bool(z.get("instanzen") or any(
+        isinstance(x, dict) and x.get("aktiv") for x in (z.get("schedulers") or [])))
 
 
 def _adj_poll(conn: ServerConnection, restart_erkannt: bool) -> None:
@@ -31714,7 +31797,7 @@ def _adj_poll(conn: ServerConnection, restart_erkannt: bool) -> None:
             zustand["laeufe"] += 1
             _adj_zustand_speichern(conn)
             log.info(f"[AIRDROPJSON] {conn.service_id}: Neustart erkannt (offen: {zustand['neustarts_offen']})")
-        if zustand["neustarts_offen"] <= 0:
+        if zustand["neustarts_offen"] <= 0 and not _adj_zeit_faellig(zustand):
             return
         laufend = _ADJ_TASKS.get(conn.service_id)
         if laufend is not None and not laufend.done():
@@ -31747,18 +31830,42 @@ async def _adj_warten_bis_online(conn: ServerConnection) -> None:
              f"{_ADJ_ONLINE_WARTEN_MAX // 60} Min trotzdem weiter")
 
 
+def _adj_zeit_faellig(zustand: Dict[str, Any]) -> List[str]:
+    """IDs der aktiven Scheduler im Zeit-Modus, deren Wechselzeitpunkt erreicht ist."""
+    jetzt = time.time()
+    return [x["id"] for x in zustand["schedulers"]
+            if x["aktiv"] and x["modus"] == "sekunden" and x["naechster_ts"] and jetzt >= x["naechster_ts"]]
+
+
+async def _adj_zeit_wechsel(conn: ServerConnection) -> Optional[str]:
+    """Faellige Zeit-Scheduler rotieren. Die Datei wird jetzt getauscht, der Server liest sie erst beim
+    naechsten Start (also nicht auf A2S warten)."""
+    async with _adj_lock(conn.service_id):
+        for sid in _adj_zeit_faellig(_adj_zustand(conn)):
+            fehler = await _adj_scheduler_anwenden_roh(conn, sid)
+            if fehler:
+                return fehler
+            log.info(f"[AIRDROPJSON] {conn.service_id}: Scheduler {sid} nach Zeit gewechselt")
+    return None
+
+
 async def _adj_neustarts_verarbeiten(conn: ServerConnection) -> None:
     try:
-        await _adj_warten_bis_online(conn)
+        if _adj_zustand(conn)["neustarts_offen"] > 0:
+            await _adj_warten_bis_online(conn)
         while True:
             zustand = _adj_zustand(conn)
             if zustand["neustarts_offen"] <= 0:
-                return
+                break
             fehler = await _adj_einen_neustart(conn)
             if fehler:
                 log.warning(f"[AIRDROPJSON] {conn.service_id}: Neustart-Verarbeitung wird wiederholt ({fehler})")
                 _ADJ_RETRY_AB[conn.service_id] = time.time() + _ADJ_RETRY_SEKUNDEN
                 return
+        fehler = await _adj_zeit_wechsel(conn)
+        if fehler:
+            log.warning(f"[AIRDROPJSON] {conn.service_id}: Zeit-Wechsel wird wiederholt ({fehler})")
+            _ADJ_RETRY_AB[conn.service_id] = time.time() + _ADJ_RETRY_SEKUNDEN
     except Exception as ex:  # noqa: BLE001 – darf den Poll nie stoeren
         log.error(f"[AIRDROPJSON] {conn.service_id}: {type(ex).__name__}")
         _ADJ_RETRY_AB[conn.service_id] = time.time() + _ADJ_RETRY_SEKUNDEN
@@ -31776,16 +31883,14 @@ async def _adj_einen_neustart(conn: ServerConnection) -> Optional[str]:
 
 async def _adj_einen_neustart_roh(conn: ServerConnection) -> Optional[str]:
     zustand = _adj_zustand(conn)
-    sch = zustand["scheduler"]
     lauf = zustand["laeufe_verarbeitet"] + 1
     # Nur Airdrops, die in diesem Lauf schon in der Config standen (ab_lauf <= lauf), werden gezaehlt;
     # ein nach dem Serverstart gesetzter war in diesem Lauf noch nicht sichtbar.
     sichtbar = [i for i in zustand["instanzen"] if int(i.get("ab_lauf", 1)) <= lauf]
-    abgelaufen = [str(i["id"]) for i in sichtbar if int(i.get("gesehen", 0)) + 1 >= int(i.get("restarts", 1))]
-    rotieren = bool(sch["aktiv"]) and int(sch["zaehler"]) + 1 >= int(sch["alle_neustarts"])
-    if sch["aktiv"]:
-        # Scheduler-Airdrops folgen der Rotation (alle X Neustarts), nicht ihrem eigenen Ablauf
-        abgelaufen = [i for i in abgelaufen if (_adj_instanz_von(zustand, i) or {}).get("von") != "scheduler"]
+    aktive = {x["id"] for x in zustand["schedulers"] if x["aktiv"]}
+    # Airdrops eines aktiven Schedulers folgen dessen Rotation (alle X Neustarts), nicht ihrem eigenen Ablauf
+    abgelaufen = [str(i["id"]) for i in sichtbar if int(i.get("gesehen", 0)) + 1 >= int(i.get("restarts", 1))
+                  and not (i.get("von") == "scheduler" and i.get("scheduler_id") in aktive)]
     if abgelaufen:
         def entfernt() -> None:
             zustand["instanzen"] = [i for i in zustand["instanzen"] if i.get("id") not in abgelaufen]
@@ -31796,15 +31901,19 @@ async def _adj_einen_neustart_roh(conn: ServerConnection) -> Optional[str]:
     for i in zustand["instanzen"]:
         if int(i.get("ab_lauf", 1)) <= lauf:
             i["gesehen"] = int(i.get("gesehen", 0)) + 1
-    if rotieren:
-        fehler = await _adj_scheduler_anwenden_roh(conn)
-        if fehler:
-            for i in zustand["instanzen"]:          # Zaehlung zuruecknehmen, damit die Wiederholung stimmt
-                if int(i.get("ab_lauf", 1)) <= lauf:
-                    i["gesehen"] = max(0, int(i.get("gesehen", 0)) - 1)
-            return fehler
-    elif sch["aktiv"]:
-        sch["zaehler"] = int(sch["zaehler"]) + 1
+    for sch in list(zustand["schedulers"]):
+        if not sch["aktiv"] or sch["modus"] == "sekunden" or int(sch["lauf"]) >= lauf:
+            continue                               # aus, nach Zeit (siehe _adj_zeit_wechsel) bzw. in diesem Lauf schon erledigt
+        if int(sch["zaehler"]) + 1 >= int(sch["alle_neustarts"]):
+            fehler = await _adj_scheduler_anwenden_roh(conn, sch["id"])
+            if fehler:
+                for i in zustand["instanzen"]:     # Zaehlung zuruecknehmen, damit die Wiederholung stimmt
+                    if int(i.get("ab_lauf", 1)) <= lauf:
+                        i["gesehen"] = max(0, int(i.get("gesehen", 0)) - 1)
+                return fehler
+        else:
+            sch["zaehler"] = int(sch["zaehler"]) + 1
+        sch["lauf"] = lauf
     zustand["neustarts_offen"] = max(0, zustand["neustarts_offen"] - 1)
     zustand["laeufe_verarbeitet"] = lauf
     _adj_zustand_speichern(conn)
@@ -31967,18 +32076,30 @@ async def airdrop_list(interaction: discord.Interaction, art: Optional[app_comma
     scheduler = bool(art is not None and art.value == "scheduler")
     von = "scheduler" if scheduler else "befehl"
     zeilen = [_adj_zeile(interaction, conn, i, False) for i in zustand["instanzen"] if i.get("von") == von]
-    sch = zustand["scheduler"]
     kopf = ""
     if scheduler:
-        kopf = _t(interaction,
-                  f"**Scheduler:** {'an' if sch['aktiv'] else 'aus'} · {sch['anzahl']} gleichzeitig · "
-                  f"Wechsel alle {sch['alle_neustarts']} Neustarts · nächster Wechsel in "
-                  f"{max(0, int(sch['alle_neustarts']) - int(sch['zaehler']))} Neustart(s) · "
-                  f"{len(sch['airdrops'])} Airdrops · {len(sch['positionen'])} Positionen\n\n",
-                  f"**Scheduler:** {'on' if sch['aktiv'] else 'off'} · {sch['anzahl']} at a time · "
-                  f"rotation every {sch['alle_neustarts']} restarts · next rotation in "
-                  f"{max(0, int(sch['alle_neustarts']) - int(sch['zaehler']))} restart(s) · "
-                  f"{len(sch['airdrops'])} airdrops · {len(sch['positionen'])} positions\n\n")
+        for sch in zustand["schedulers"]:
+            rest = max(0, int(sch["alle_neustarts"]) - int(sch["zaehler"]))
+            if sch["modus"] == "sekunden":
+                rest_s = max(0, int(sch["naechster_ts"] - time.time())) if sch["naechster_ts"] else int(sch["sekunden"])
+                kopf += _t(interaction,
+                           f"**{sch['name']}:** {'an' if sch['aktiv'] else 'aus'} · {sch['anzahl']} gleichzeitig · "
+                           f"Wechsel alle {sch['sekunden']} Sekunden · nächster Wechsel in {rest_s} s · "
+                           f"{len(sch['airdrops'])} Airdrops · {len(sch['positionen'])} Positionen\n",
+                           f"**{sch['name']}:** {'on' if sch['aktiv'] else 'off'} · {sch['anzahl']} at a time · "
+                           f"rotation every {sch['sekunden']} seconds · next rotation in {rest_s} s · "
+                           f"{len(sch['airdrops'])} airdrops · {len(sch['positionen'])} positions\n")
+                continue
+            kopf += _t(interaction,
+                       f"**{sch['name']}:** {'an' if sch['aktiv'] else 'aus'} · {sch['anzahl']} gleichzeitig · "
+                       f"Wechsel alle {sch['alle_neustarts']} Neustarts · nächster Wechsel in {rest} Neustart(s) · "
+                       f"{len(sch['airdrops'])} Airdrops · {len(sch['positionen'])} Positionen\n",
+                       f"**{sch['name']}:** {'on' if sch['aktiv'] else 'off'} · {sch['anzahl']} at a time · "
+                       f"rotation every {sch['alle_neustarts']} restarts · next rotation in {rest} restart(s) · "
+                       f"{len(sch['airdrops'])} airdrops · {len(sch['positionen'])} positions\n")
+        if not zustand["schedulers"]:
+            kopf = _t(interaction, "Noch kein Scheduler angelegt.\n", "No scheduler created yet.\n")
+        kopf += "\n"
     if not zeilen:
         text = _t(interaction, "Keine aktiven Airdrops.", "No active airdrops.")
     else:
@@ -32066,13 +32187,16 @@ async def _adj_gate(request: web.Request, recht: str):
 
 
 def _adj_instanz_view(i: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: i.get(k) for k in ("id", "name", "quelle", "x", "y", "z", "restarts", "gesehen", "von", "objekte", "erstellt")}
+    return {k: i.get(k) for k in ("id", "name", "quelle", "x", "y", "z", "restarts", "gesehen", "von", "scheduler_id", "objekte", "erstellt")}
 
 
-def _adj_scheduler_view(zustand: Dict[str, Any]) -> Dict[str, Any]:
-    s = zustand["scheduler"]
-    return {"aktiv": bool(s["aktiv"]), "anzahl": int(s["anzahl"]), "alle_neustarts": int(s["alle_neustarts"]),
-            "airdrops": list(s["airdrops"]), "positionen": list(s["positionen"]), "zaehler": int(s["zaehler"])}
+def _adj_scheduler_view(zustand: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [{"id": x["id"], "name": x["name"], "aktiv": bool(x["aktiv"]), "anzahl": int(x["anzahl"]),
+             "alle_neustarts": int(x["alle_neustarts"]), "airdrops": list(x["airdrops"]),
+             "positionen": list(x["positionen"]), "zaehler": int(x["zaehler"]), "modus": x["modus"],
+             "sekunden": int(x["sekunden"]),
+             "rest_sekunden": max(0, int(x["naechster_ts"] - time.time())) if x["naechster_ts"] else int(x["sekunden"])}
+            for x in zustand["schedulers"]]
 
 
 async def _adj_uebersicht(request: web.Request, conn: ServerConnection) -> Dict[str, Any]:
@@ -32086,7 +32210,7 @@ async def _adj_uebersicht(request: web.Request, conn: ServerConnection) -> Dict[
     return {"premade": premade, "eigene": eigene,
             "kann_edit": _dash_perm_allowed(_sess_get(request), conn, "tools", "edit"),
             "instanzen": [_adj_instanz_view(i) for i in zustand["instanzen"]],
-            "scheduler": _adj_scheduler_view(zustand),
+            "schedulers": _adj_scheduler_view(zustand),
             "ankuendigung": dict(zustand["ankuendigung"], kanal_id=str(zustand["ankuendigung"]["kanal_id"] or "")),
             "ist_betreiber": bool((_sess_get(request) or {}).get("is_admin")),
             "karte": _adj_kartengroesse(conn), "warn_objekte": _ADJ_WARN_OBJEKTE,
@@ -32212,14 +32336,41 @@ async def api_tools_airdropjson_scheduler_post(request: web.Request) -> web.Resp
     if any(not (0 <= p["x"] <= groesse and 0 <= p["z"] <= groesse and -1000 <= p["y"] <= 10000)
            for p in sauber["positionen"]):
         return err("Eine Position liegt außerhalb der Karte.")
-    if (sauber["aktiv"] or zustand["scheduler"].get("aktiv") or any(i.get("von") == "scheduler" for i in zustand["instanzen"])) \
+    sid = str(data.get("id") or "").strip() or None
+    if sid is not None and (not re.fullmatch(r"[0-9a-f]{6}", sid) or _adj_scheduler_von(zustand, sid) is None):
+        return err("Diesen Scheduler gibt es nicht (mehr).", 404)
+    andere = sum(int(x["anzahl"]) for x in zustand["schedulers"] if x["aktiv"] and x["id"] != sid)
+    if sauber["aktiv"] and andere + sauber["anzahl"] > _ADJ_MAX_INSTANZEN:
+        return err(f"Alle aktiven Scheduler zusammen dürfen höchstens {_ADJ_MAX_INSTANZEN} Airdrops gleichzeitig setzen.")
+    if (sauber["aktiv"] or any(x["aktiv"] for x in zustand["schedulers"])
+            or any(i.get("von") == "scheduler" for i in zustand["instanzen"])) \
             and (conn.ftp is None or not _mission_dir_of(conn)):
         return err(_ADJ_FEHLER_FTP, 409)
-    fehler_text = await _adj_scheduler_speichern(conn, sauber)
+    sid, fehler_text = await _adj_scheduler_speichern(conn, sid, sauber)
     if fehler_text:
         return err(fehler_text, 502)
     _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Airdrop-Scheduler gespeichert",
-               f"{'an' if sauber['aktiv'] else 'aus'} · {sauber['anzahl']} · alle {sauber['alle_neustarts']} · {conn.name}")
+               f"{sid} · {'an' if sauber['aktiv'] else 'aus'} · {sauber['anzahl']} · alle {sauber['alle_neustarts']} · {conn.name}")
+    return ok(await _adj_uebersicht(request, conn))
+
+
+async def api_tools_airdropjson_scheduler_delete(request: web.Request) -> web.Response:
+    conn, fehler = await _adj_gate(request, "edit")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "tools.airdropjson.scheduler", 3)
+    if fehler is not None:
+        return fehler
+    sid = str(request.match_info.get("id", "")).strip()
+    zustand = _adj_zustand(conn)
+    if not re.fullmatch(r"[0-9a-f]{6}", sid) or _adj_scheduler_von(zustand, sid) is None:
+        return err("Diesen Scheduler gibt es nicht (mehr).", 404)
+    if any(i.get("scheduler_id") == sid for i in zustand["instanzen"]) and (conn.ftp is None or not _mission_dir_of(conn)):
+        return err(_ADJ_FEHLER_FTP, 409)
+    fehler_text = await _adj_scheduler_loeschen(conn, sid)
+    if fehler_text:
+        return err(fehler_text, 502)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Airdrop-Scheduler gelöscht", f"{sid} · {conn.name}")
     return ok(await _adj_uebersicht(request, conn))
 
 
@@ -45154,6 +45305,7 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/airdropjson/eigene", api_tools_airdropjson_eigene_post)
     r.add_delete("/api/tools/airdropjson/eigene/{name}", api_tools_airdropjson_eigene_delete)
     r.add_post("/api/tools/airdropjson/scheduler", api_tools_airdropjson_scheduler_post)
+    r.add_delete("/api/tools/airdropjson/scheduler/{id}", api_tools_airdropjson_scheduler_delete)
     r.add_post("/api/tools/airdropjson/ankuendigung", api_tools_airdropjson_ankuendigung_post)
     r.add_post("/api/tools/airdropjson/platziert/{id}/entfernen", api_tools_airdropjson_instanz_entfernen)
     r.add_get("/api/tools/skymessage", api_tools_skymessage_get)
@@ -46178,6 +46330,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "f169190c2d442781198586a16d175f96ab3fed801907cc259c9057d3bfcc9539",
         "21d81dd050e63dacb661d3d04183b759ff1a5941f56afd0abba9e6628b2ad73b",
         "2bfaa56a43995635ef4fa977ed9a01777e6fbdd339143c1938c1797727a8790d",
+        "1a54be7839e1621f945f0baeaf95d6113316d8e24977cf1b6ff2eb435ecb25e4",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
