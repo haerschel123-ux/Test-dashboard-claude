@@ -2706,9 +2706,9 @@ def _ank(conn, **w):
 
 
 def test_ankuendigung_standard_ist_aus_und_kaputte_werte_werden_repariert(slash):
-    assert bot._adj_zustand(slash.a)["ankuendigung"] == {"kanal_id": 0, "scheduler": False, "befehl": False}
+    assert bot._adj_zustand(slash.a)["ankuendigung"] == {"kanal_id": 0, "scheduler": False, "befehl": False, "sprache": "de"}
     slash.a.data["airdrop_json"] = {"ankuendigung": {"kanal_id": "x", "befehl": 1}}
-    assert bot._adj_zustand(slash.a)["ankuendigung"] == {"kanal_id": 0, "scheduler": False, "befehl": True}
+    assert bot._adj_zustand(slash.a)["ankuendigung"] == {"kanal_id": 0, "scheduler": False, "befehl": True, "sprache": "de"}
 
 
 def test_befehl_kuendigt_nach_dashboardstandard_und_per_option_an(slash, kanal):
@@ -2717,8 +2717,15 @@ def test_befehl_kuendigt_nach_dashboardstandard_und_per_option_an(slash, kanal):
     _ank(slash.a, befehl=True)
     add(x=7000.0)
     assert len(kanal.gesendet) == 1
-    text = kanal.gesendet[0]["embed"].description
-    assert "drop1" in text and "7000.0" in text and "izurvive" in text and "next restart" in text
+    emb = kanal.gesendet[0]["embed"]
+    assert emb.title == "🪂 Airdrop im Anflug" and "Versorgungsabwurf" in emb.description
+    assert "drop1" in emb.fields[0].name and "X 7000 · Z 6000" in emb.fields[0].value and "izurvive" in emb.fields[0].value
+    assert "2 Neustarts" in emb.fields[0].value and "nächsten Server-Neustart" in emb.footer.text
+    _ank(slash.a, befehl=True, sprache="en")
+    add(x=7100.0, restarts=1)
+    en = kanal.gesendet.pop()["embed"]
+    assert en.title == "🪂 Airdrop incoming" and "1 restart**" in en.fields[0].value and "next server restart" in en.footer.text
+    _ank(slash.a, befehl=True, sprache="de")
     add(x=8000.0, ankuendigen=False)                              # Option überschreibt den Standard
     assert len(kanal.gesendet) == 1
     _ank(slash.a, befehl=False)
@@ -2752,14 +2759,14 @@ def test_scheduler_kuendigt_nur_mit_schalter_an(slash, kanal):
     assert kanal.gesendet == []
     _ank(slash.a, scheduler=True)
     assert run(bot._adj_scheduler_anwenden(slash.a)) is None
-    assert len(kanal.gesendet) == 1 and kanal.gesendet[0]["embed"].description.count("🪂") == 4      # 2 Airdrops × (DE + EN)
+    assert len(kanal.gesendet) == 1 and len(kanal.gesendet[0]["embed"].fields) == 2
 
 
 def test_api_ankuendigung_speichern_validieren_und_mandantentrennung(monkeypatch, slash, kanal):
     a = slash.a
     status, r = dash(monkeypatch, a, bot.api_tools_airdropjson_ankuendigung_post,
                      {"kanal_id": "555", "scheduler": True, "befehl": False})
-    assert status == 200 and r["data"]["ankuendigung"] == {"kanal_id": "555", "scheduler": True, "befehl": False}
+    assert status == 200 and r["data"]["ankuendigung"] == {"kanal_id": "555", "scheduler": True, "befehl": False, "sprache": "de"}
     assert bot._adj_zustand(slash.b)["ankuendigung"]["kanal_id"] == 0
     status, _ = dash(monkeypatch, a, bot.api_tools_airdropjson_ankuendigung_post, {"kanal_id": "", "befehl": True})
     assert status == 400                                          # Schalter an, aber kein Channel

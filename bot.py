@@ -31341,6 +31341,7 @@ def _adj_zustand(conn: ServerConnection) -> Dict[str, Any]:
         ank["kanal_id"] = 0
     ank["scheduler"] = bool(ank.get("scheduler"))
     ank["befehl"] = bool(ank.get("befehl"))
+    ank["sprache"] = "en" if ank.get("sprache") == "en" else "de"
     z["ankuendigung"] = ank
     conn.data["airdrop_json"] = z
     return z
@@ -31477,16 +31478,26 @@ async def _adj_ankuendigen(conn: ServerConnection, instanzen: List[Dict[str, Any
         if kanal is None or getattr(getattr(kanal, "guild", None), "id", None) not in conn.guild_ids:
             return                      # nur ein Channel einer Guild dieses Servers (nie ein fremder)
         karte = str(conn.get("map_name") or "ChernarusPlus")
-        zeilen_de, zeilen_en = [], []
+        en = _adj_zustand(conn)["ankuendigung"]["sprache"] == "en"
+        emb = discord.Embed(
+            title="🪂 Airdrop incoming" if en else "🪂 Airdrop im Anflug",
+            description=("A supply drop has been marked on the map." if en
+                         else "Ein Versorgungsabwurf wurde auf der Karte markiert."),
+            colour=discord.Colour.orange())
         for i in instanzen[:10]:
             link = _izurvive_url(float(i["x"]), float(i["z"]), karte)
-            rest = f"{i.get('restarts')} Neustart(s)"
-            zeilen_de.append(f"🪂 **{i.get('name')}** – [{i['x']}, {i['z']}]({link}) · {rest}")
-            zeilen_en.append(f"🪂 **{i.get('name')}** – [{i['x']}, {i['z']}]({link}) · {i.get('restarts')} restart(s)")
-        emb = discord.Embed(title="🪂 Airdrop gelandet / Airdrop incoming",
-                            description="\n".join(zeilen_de) + "\n\n*Aktiv ab dem nächsten Neustart.*\n"
-                            + "\n".join(zeilen_en) + "\n*Active from the next restart.*",
-                            colour=discord.Colour.orange())
+            n = int(i.get("restarts") or 1)
+            if en:
+                dauer = f"{n} restart{'s' if n != 1 else ''}"
+            else:
+                dauer = f"{n} Neustart{'s' if n != 1 else ''}"
+            emb.add_field(
+                name=f"📦 {str(i.get('name'))[:200]}",
+                value=(f"📍 [{'Open on map' if en else 'Auf der Karte öffnen'}]({link}) · `X {i['x']:g} · Z {i['z']:g}`\n"
+                       f"⏳ {'Stays for' if en else 'Bleibt für'} **{dauer}**"),
+                inline=False)
+        emb.set_footer(text=("Active from the next server restart." if en
+                             else "Aktiv ab dem nächsten Server-Neustart.") + f" · {conn.name}")
         await kanal.send(embed=emb)
     except Exception as ex:  # noqa: BLE001
         log.warning(f"[AIRDROPJSON] {getattr(conn, 'service_id', '?')}: Ankündigung {type(ex).__name__}")
@@ -32226,10 +32237,11 @@ async def api_tools_airdropjson_ankuendigung_post(request: web.Request) -> web.R
         if fehler is not None:
             return fehler
     scheduler, befehl = bool(data.get("scheduler")), bool(data.get("befehl"))
+    sprache = "en" if data.get("sprache") == "en" else "de"
     if (scheduler or befehl) and not kid:
         return err("Bitte zuerst einen Channel wählen.")
     ank = _adj_zustand(conn)["ankuendigung"]
-    ank.update({"kanal_id": kid, "scheduler": scheduler, "befehl": befehl})
+    ank.update({"kanal_id": kid, "scheduler": scheduler, "befehl": befehl, "sprache": sprache})
     _adj_zustand_speichern(conn)
     _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Airdrop-Ankündigung gespeichert",
                f"{'an' if kid else 'aus'} · {conn.name}")
@@ -46154,6 +46166,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "d0eef5ce76711ee541fadf83fe4567f35015d884cae9ac12f45ff28ce1330741",
         "f169190c2d442781198586a16d175f96ab3fed801907cc259c9057d3bfcc9539",
         "21d81dd050e63dacb661d3d04183b759ff1a5941f56afd0abba9e6628b2ad73b",
+        "2bfaa56a43995635ef4fa977ed9a01777e6fbdd339143c1938c1797727a8790d",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
