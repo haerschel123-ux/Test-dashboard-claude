@@ -1963,6 +1963,21 @@ def test_premium_und_modulstufe_gelten_fuer_airdrop(slash):
     assert pruefen()[0] is False
 
 
+def test_beta_sperre_nennt_die_beta_rolle_nicht_premium(monkeypatch, slash):
+    async def keine_rolle(*_a, **_k):
+        return False
+    monkeypatch.setattr(bot, "_user_hat_rolle", keine_rolle)
+    bot.cfg.config["module_tiers"] = {"tools": "beta"}                      # Kategorie auf Beta, Server hat Premium
+    inter = _Interaktion()
+    assert run(bot._premium_check(inter)) is False
+    antwort = inter.response.gesendet[0]["content"]
+    assert bot.BETA_GESPERRT_TEXT in antwort and "kein Premium" not in antwort
+    async def hat_rolle(*_a, **_k):
+        return True
+    monkeypatch.setattr(bot, "_user_hat_rolle", hat_rolle)
+    assert run(bot._premium_check(_Interaktion())) is True
+
+
 @pytest.mark.parametrize("locale,erwartet", [(None, "Tool: Dashboard → „Airdrops JSON“."), (EN, "Tool: dashboard → “Airdrops JSON”.")])
 def test_hilfe_nennt_den_airdrop_befehl(slash, locale, erwartet):
     inter = _Interaktion(locale=locale, befehl="hilfe")

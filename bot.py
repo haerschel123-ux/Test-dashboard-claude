@@ -5022,6 +5022,7 @@ async def _premium_check(interaction: discord.Interaction) -> bool:
                 if erlaubt:
                     return True
                 gesperrt = True
+                text = BETA_GESPERRT_TEXT      # nicht „kein Premium“: der Grund ist die fehlende Beta-Rolle
         if not gesperrt:
             if interaction.guild_id is None:
                 return True                  # Direktnachricht: nichts zu sperren
