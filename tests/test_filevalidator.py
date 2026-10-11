@@ -168,3 +168,25 @@ def test_zeilennummer_gleich_alter_zaehlung_und_schnell_bei_riesiger_einzeile():
     start = time.perf_counter()
     bot._fv_validate_all({"db/types.xml": riesig}, "ChernarusPlus")
     assert time.perf_counter() - start < 10     # frueher: quadratisch (Minuten)
+
+
+def test_dateiliste_ueberspringt_den_spielstand_und_nennt_den_grund_bei_leerer_liste(monkeypatch, servers):
+    from types import SimpleNamespace
+    a, _ = servers
+    aufrufe = []
+
+    def walk(root, **kw):
+        aufrufe.append((root, kw))
+        return ([("db/types.xml", 100), ("cfggameplay.json", 50), ("init.c", 10), ("env/zmb_territories.xml", 5),
+                 ("db/messages.xml", 7), ("readme.txt", 1)], "ok")
+    a.ftp = SimpleNamespace(walk=walk)
+    status, r = call(monkeypatch, a, bot.api_tools_filevalidator_get)
+    assert status == 200 and r["data"]["status"] == "ok" and r["data"]["kein_mission_ordner"] is False
+    # alle .xml/.json (auch unbekannte wie db/messages.xml) und init.c, sortiert; readme.txt nicht
+    assert [f["name"] for f in r["data"]["files"]] == ["cfggameplay.json", "db/messages.xml", "db/types.xml", "env/zmb_territories.xml", "init.c"]
+    wurzel, kw = aufrufe[0]
+    assert wurzel == "/mission" and "storage_1" in kw["ueberspringen"] and kw["max_dateien"] >= 3000
+    for grund in ("leer", "zu_viele_dateien", "zu_gross"):
+        a.ftp = SimpleNamespace(walk=lambda root, g=grund, **kw: ([], g))
+        status, r = call(monkeypatch, a, bot.api_tools_filevalidator_get)
+        assert status == 200 and r["data"]["files"] == [] and r["data"]["status"] == grund

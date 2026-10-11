@@ -21537,14 +21537,24 @@ def _fv_detect_name(name: str, text: str) -> str:
     return "init.c" if "void " in text else "eingefuegt.txt"
 
 
+# Ordner, die der Validator nie braucht: der Spielstand (storage_N) hat tausende grosse Dateien und
+# liess das Auflisten still scheitern (Obergrenze 500 Dateien / 20 MB) - die Dateiliste blieb leer.
+_FV_UEBERSPRINGEN = frozenset({f"storage_{n}" for n in range(1, 10)} | {"backup", "backups", "logs", "profiles"})
+
+
 async def api_tools_filevalidator_get(request: web.Request) -> web.Response:
     conn, failure = await _brlc_prepare(request, "tools.filevalidator", "view")
     if failure is not None: return failure
     if not _mission_dir_of(conn) or conn.ftp is None: return ok({"files": [], "kein_mission_ordner": True})
     def gather():
-        entries, status = conn.ftp.walk(_mission_dir_of(conn), max_dateien=500, max_bytes=20 * 1024 * 1024)
-        return [{"name": name, "size": str(size), "date": None} for name, size in entries if status == "ok" and (_fv_base(name) in _FV_ROOTS or _fv_base(name) in ("cfggameplay.json", "cfgeffectarea.json", "cfgundergroundtriggers.json", "cfgplayerspawnpoints.json", "init.c") or name.lower().startswith("env/"))]
-    return ok({"files": await asyncio.get_running_loop().run_in_executor(None, gather), "kein_mission_ordner": False})
+        entries, status = conn.ftp.walk(_mission_dir_of(conn), max_dateien=3000, max_bytes=512 * 1024 * 1024,
+                                        ueberspringen=_FV_UEBERSPRINGEN)
+        # ALLE .xml/.json (und init.c) zeigen: geladen und geprueft wird erst, was der Nutzer auswaehlt.
+        return [{"name": name, "size": str(size), "date": None} for name, size in sorted(entries)
+                if status == "ok" and (name.lower().endswith((".xml", ".json")) or _fv_base(name) == "init.c")], status
+    files, status = await asyncio.get_running_loop().run_in_executor(None, gather)
+    # status sagt, WARUM die Liste leer ist (leer = nichts gefunden/FTP, zu_viele_dateien, zu_gross, ok = nichts Pruefbares)
+    return ok({"files": files, "kein_mission_ordner": False, "status": status})
 
 
 async def api_tools_filevalidator_check(request: web.Request) -> web.Response:
@@ -46331,6 +46341,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "21d81dd050e63dacb661d3d04183b759ff1a5941f56afd0abba9e6628b2ad73b",
         "2bfaa56a43995635ef4fa977ed9a01777e6fbdd339143c1938c1797727a8790d",
         "1a54be7839e1621f945f0baeaf95d6113316d8e24977cf1b6ff2eb435ecb25e4",
+        "650837c3a14cf487e210670d2341a13e78151efa6f565bc650aedb719dd9a71c",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
