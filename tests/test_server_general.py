@@ -370,6 +370,9 @@ def test_general_wert_pruefen():
     assert bot._general_wert_pruefen("combat_log_seconds", "90") == (90, None)
     assert bot._general_wert_pruefen("map_link_provider", "xam") == ("xam", None)
     assert bot._general_wert_pruefen("map_link_style", "3d")[1]
+    assert bot._general_wert_pruefen("feed_sprache", "en") == ("en", None)
+    assert bot._general_wert_pruefen("feed_sprache", "de") == ("de", None)
+    assert bot._general_wert_pruefen("feed_sprache", "fr")[1] and bot._general_wert_pruefen("feed_sprache", None)[1]
     assert bot._general_wert_pruefen("ban_immune_role_ids", ["1", 2, "1"]) == (["1", "2"], None)
     assert bot._general_wert_pruefen("ban_immune_role_ids", list(range(6)))[1]
     assert bot._general_wert_pruefen("location_privacy_names", [" A ", "a", "B"]) == (["A", "B"], None)
@@ -388,6 +391,7 @@ def test_general_payload_und_andere_server(monkeypatch):
                         lambda uid: [c for c in (a, b, d, fremd) if c.data.get("owner_discord_id") == str(uid)])
     g = bot._general_payload(a)
     assert g["combat_log_seconds"] == 90 and g["ban_immune_role_ids"] == ["5"]
+    assert g["feed_sprache"] == "de" and "feed_sprache" in bot._GENERAL_KARTEN_SCHLUESSEL["mapping"]
     assert g["long_range_kill_meter"] == 300 and g["heatmap_limits"]["pvp_kill"] == 50
     andere = bot._general_andere_server(a)
     assert [(x["service_id"], x["gleiche_guild"]) for x in andere] == [("2000", True), ("3000", False)]
@@ -400,3 +404,12 @@ def test_eigene_einstellungen_fallen_nicht_auf_betreiber_zurueck(monkeypatch):
     assert c.get("long_range_kill_meter") == 300
     assert c.get("keep_server_running") is False
     assert c.get("ban_immune_role_ids", []) == []
+
+
+def test_feed_sprache_kein_rueckfall_auf_betreiberwert():
+    assert "feed_sprache" in bot.ServerConnection._EIGENE_EINSTELLUNGEN
+    bot.cfg.config["feed_sprache"] = "en"
+    try:
+        assert _conn("1000", 111).get("feed_sprache") == "de"
+    finally:
+        bot.cfg.config.pop("feed_sprache", None)

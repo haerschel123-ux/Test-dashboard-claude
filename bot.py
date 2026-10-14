@@ -325,6 +325,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "map_link_provider":        "izurvive",   # izurvive | xam
     "map_link_style":           "sat",        # sat | topo | tourist
     "map_image_style":          "sat",        # sat | topo (Kacheln Dashboard/Kartenbilder)
+    "feed_sprache":             "de",         # de | en - Sprache ALLER Feeds und Bot-Posts dieses Servers
     "keep_server_running":      False,
     "keep_server_running_haenger": False,
     "combat_log_seconds":       60,
@@ -892,6 +893,17 @@ _CE_EVENT_SCHALTER_LABEL: Dict[str, Tuple[str, str]] = {
     "airplane_crate":    ("✈️", "Airplane Crate"),
     "santa_crash":       ("🎅", "Santa Crash"),
 }
+# Deutsche Anzeigenamen fuer die Feed-Meldung (die englischen stehen oben; Dashboard nutzt sie unveraendert).
+_CE_EVENT_LABEL_DE: Dict[str, str] = {
+    "helicopter_crash": "Hubschrauberabsturz",
+    "convoy": "Konvoi",
+    "checkpoint": "Polizeikontrolle",
+    "abandoned_train": "Verlassener Zug",
+    "vehicle_event": "Fahrzeug-Ereignis",
+    "contaminated_zone": "Kontaminierte Zone",
+    "airplane_crate": "Flugzeug-Kiste",
+    "santa_crash": "Weihnachtsmann-Absturz",
+}
 _CE_EVENT_ZEILE_RE = re.compile(
     r"^\s*(?:\d+:\d+:\d+\.\d+\s+)?([A-Za-z_][A-Za-z0-9_ ]*?)\s+\((\d+)\)\s*$")
 
@@ -945,15 +957,13 @@ def _ce_events_spawn_positionen_erkennen(zeilen: List[str]) -> List[Tuple[str, f
     return ergebnisse
 
 
-# Kurztexte je Abandoned-Bases-Regel für die Digest-Zeilen - _tt() braucht
-# eine feste Sprache je Server, nicht die des jeweiligen Discord-Nutzers,
-# darum hier ein einfaches Dict statt _t()/_tt() (Sprache kommt vom Digest-
-# Aufrufer, der aktuell immer Deutsch sendet - siehe _abandoned_bases_digest_for).
+# Kurztexte je Abandoned-Bases-Regel für die Digest-Zeilen: (Deutsch, Englisch); die Sprache kommt
+# aus der Server-Einstellung (_feed_sprache), siehe _abandoned_bases_digest_for.
 _ABANDONED_GRUND_TEXT = {
-    "builder_inactive": "Erbauer inaktiv",
-    "no_flag": "keine Flagge",
-    "flag_lowered": "Flagge gesenkt",
-    "no_activity": "keine Bauaktivität",
+    "builder_inactive": ("Erbauer inaktiv", "builder inactive"),
+    "no_flag": ("keine Flagge", "no flag"),
+    "flag_lowered": ("Flagge gesenkt", "flag lowered"),
+    "no_activity": ("keine Bauaktivität", "no building activity"),
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -3203,6 +3213,23 @@ def _karten_einstellung(key: str, vorgabe: str, erlaubt: Tuple[str, ...],
     return wert if wert in erlaubt else vorgabe
 
 
+# Sprache aller Feeds und Bot-Posts eines Nitrado-Servers (Dashboard: Server -> Generell -> Karte & Standort).
+# Unabhaengig von der Dashboard-Sprache und der Discord-Sprache der Nutzer; Slash-Befehlsantworten bleiben
+# bei _t(interaction, ...).
+_FEED_SPRACHEN = ("de", "en")
+
+
+def _feed_sprache(conn: Optional["ServerConnection"] = None) -> str:
+    """"de" oder "en" fuer diesen Server (ServerConnection oder GuildSicht). Ohne Angabe gilt der
+    gerade bearbeitete Server (_AKTUELLER_SERVER), sonst Deutsch."""
+    return _karten_einstellung("feed_sprache", "de", _FEED_SPRACHEN, conn)
+
+
+def _ft(conn: Optional["ServerConnection"], de: str, en: str) -> str:
+    """Text in der Feed-Sprache des Servers."""
+    return en if _feed_sprache(conn) == "en" else de
+
+
 def _karten_link(x: float, y: float, map_name: str = "ChernarusPlus", z: float = 0.0,
                  conn: Optional["ServerConnection"] = None) -> str:
     """Deep-Link mit Markierung beim gewaehlten Anbieter/Stil DIESES Servers
@@ -3222,7 +3249,7 @@ def _karten_link(x: float, y: float, map_name: str = "ChernarusPlus", z: float =
     return f"https://www.izurvive.com/{slug}/#location={x:.0f};{y:.0f};{z:.0f}"
 
 
-def _location_field_value(pos_str: Optional[str]) -> Optional[str]:
+def _location_field_value(pos_str: Optional[str], sprache: str = "de") -> Optional[str]:
     """
     Parst 'X, Y, Z' aus pos_str (DayZ pos=<X,Y,Z>: X=Ost, Y=Nord, Z=Hoehe)
     und gibt einen Discord-Markdown-String mit klickbarem iZurvive-Link zurueck.
@@ -3241,7 +3268,7 @@ def _location_field_value(pos_str: Optional[str]) -> Optional[str]:
     map_name = _aktuelle_karte()
     url  = _izurvive_url(x, y, map_name, z)
     loc  = _nearest_location(x, y, map_name)
-    near = f"\n*(Near {loc})*" if loc else ""
+    near = (f"\n*({'Near' if sprache == 'en' else 'Nahe'} {loc})*") if loc else ""
     return f"[{x:.1f}, {y:.1f}, {z:.1f}]({url}){near}"
 
 
@@ -3256,9 +3283,8 @@ def _footer(ev: Dict) -> str:
 def _tx(sprache: str, de: str, en: str) -> str:
     """Wie _t(interaction, de, en), aber wenn nur die bereits aufgeloeste
     Sprachkennung vorliegt statt einer Interaction - EmbedBuilder.build laeuft
-    serverseitig beim Posten ganz ohne Interaktion (siehe _FeedTranslateView,
-    die dem einzelnen Klickenden per _sprache(interaction) doch noch eine
-    mitbringt)."""
+    serverseitig beim Posten ganz ohne Interaktion; die Sprache kommt aus der
+    Server-Einstellung (_feed_sprache)."""
     return en if sprache == "en" else de
 
 def _dist(d: str, sprache: str = "de") -> str:
@@ -3287,7 +3313,7 @@ def _emote_label(roh: Optional[str]) -> str:
     return _EMOTE_CAMEL_RE.sub(" ", name).strip() or "Emote"
 
 def _add_location_field(e: discord.Embed, ev: Dict, player_key: str,
-                        positions: Optional[Dict[str, Dict]] = None):
+                        positions: Optional[Dict[str, Dict]] = None, sprache: str = "de"):
     """Fügt das '📍 • Player Location'-Feld hinzu (gleiches Aussehen wie bei
     Connect/Disconnect): Position aus dem Event selbst oder die zuletzt
     getrackte Position des Spielers, als klickbarer iZurvive-Link."""
@@ -3295,9 +3321,10 @@ def _add_location_field(e: discord.Embed, ev: Dict, player_key: str,
     if _position_privat(_AKTUELLER_SERVER.get(), str(name)):
         return      # Location Privacy: Position dieses Spielers nie zeigen
     pos = ev.get("position") or (positions or {}).get(name, {}).get("position")
-    loc_val = _location_field_value(pos)
+    loc_val = _location_field_value(pos, sprache)
     if loc_val:
-        e.add_field(name="📍 • Player Location", value=loc_val, inline=False)
+        e.add_field(name=_LOCATION_PRAEFIX + _tx(sprache, "Spieler-Standort", "Player Location"),
+                   value=loc_val, inline=False)
 
 
 _LOCATION_FELD = "📍 • Player Location"
@@ -3317,7 +3344,7 @@ def _add_named_location_field(e: discord.Embed, name: str, eigene_position: Opti
     if _position_privat(_AKTUELLER_SERVER.get(), str(name)):
         return      # Location Privacy
     pos = eigene_position or (positions or {}).get(name, {}).get("position")
-    loc_val = _location_field_value(pos)
+    loc_val = _location_field_value(pos, sprache)
     if loc_val:
         e.add_field(name=_LOCATION_PRAEFIX + _tx(sprache, "Standort", "Location"),
                    value=loc_val, inline=False)
@@ -3370,7 +3397,7 @@ class EmbedBuilder:
             e.add_field(name=_tx(sprache, "Waffe", "Weapon"), value=ev["weapon"], inline=True)
             e.add_field(name=_tx(sprache, "Distanz", "Distance"),
                        value=_dist(ev["distance"], sprache), inline=True)
-            e.add_field(name="Killer ID", value=f"`{ev['killer_id']}`", inline=False)
+            e.add_field(name=_tx(sprache, "Killer-ID", "Killer ID"), value=f"`{ev['killer_id']}`", inline=False)
             # Killer-Position steht NIE in der Kill-Zeile selbst (die ADM
             # schreibt dort nur die Todesposition des Opfers) - deshalb nur
             # ueber die zuletzt GETRACKTE Position des Killers moeglich, also
@@ -3387,7 +3414,7 @@ class EmbedBuilder:
                                 f"**{ev['player']}** ended their own life"),
                 color=0x7F8C8D
             )
-            _add_location_field(e, ev, "player", positions)
+            _add_location_field(e, ev, "player", positions, sprache)
             e.add_field(name=_tx(sprache, "Steam-ID", "Steam ID"),
                        value=f"`{ev['player_id']}`", inline=False)
 
@@ -3399,7 +3426,7 @@ class EmbedBuilder:
                 color=0xE67E22
             )
             e.add_field(name=_tx(sprache, "Ursache", "Cause"), value=ev["cause"], inline=True)
-            _add_location_field(e, ev, "player", positions)
+            _add_location_field(e, ev, "player", positions, sprache)
             e.add_field(name=_tx(sprache, "Steam-ID", "Steam ID"),
                        value=f"`{ev['player_id']}`", inline=False)
 
@@ -3415,7 +3442,7 @@ class EmbedBuilder:
             e.add_field(name=_tx(sprache, "Waffe", "Weapon"), value=ev["weapon"], inline=True)
             e.add_field(name=_tx(sprache, "Distanz", "Distance"),
                        value=_dist(ev["distance"], sprache), inline=True)
-            _add_location_field(e, ev, "victim", positions)
+            _add_location_field(e, ev, "victim", positions, sprache)
 
         elif t == "connect":
             e = discord.Embed(
@@ -3424,7 +3451,7 @@ class EmbedBuilder:
                                 f"**{ev['player']}** connected to the game server."),
                 color=0x5865F2
             )
-            _add_location_field(e, ev, "player", positions)
+            _add_location_field(e, ev, "player", positions, sprache)
             e.add_field(name=_tx(sprache, "Steam-ID", "Steam ID"),
                        value=f"`{ev['player_id']}`", inline=False)
 
@@ -3435,7 +3462,7 @@ class EmbedBuilder:
                                 f"**{ev['player']}** left the game server."),
                 color=0xE74C3C
             )
-            _add_location_field(e, ev, "player", positions)
+            _add_location_field(e, ev, "player", positions, sprache)
             e.add_field(name=_tx(sprache, "Steam-ID", "Steam ID"),
                        value=f"`{ev['player_id']}`", inline=False)
 
@@ -3446,7 +3473,7 @@ class EmbedBuilder:
                                 f"**{ev['player']}** is connecting..."),
                 color=0x3498DB
             )
-            _add_location_field(e, ev, "player", positions)
+            _add_location_field(e, ev, "player", positions, sprache)
             e.add_field(name=_tx(sprache, "Steam-ID", "Steam ID"),
                        value=f"`{ev['player_id']}`", inline=False)
 
@@ -3479,7 +3506,7 @@ class EmbedBuilder:
                                 f"**{ev['player']}** built: **{ev['item']}**"),
                 color=0x8B4513
             )
-            _add_location_field(e, ev, "player", positions)
+            _add_location_field(e, ev, "player", positions, sprache)
             e.add_field(name=_tx(sprache, "Steam-ID", "Steam ID"),
                        value=f"`{ev['player_id']}`", inline=False)
 
@@ -3501,7 +3528,7 @@ class EmbedBuilder:
                     f"fighting **{ev.get('gegner', '?')}**."),
                 color=0xE67E22
             )
-            _add_location_field(e, ev, "player", positions)
+            _add_location_field(e, ev, "player", positions, sprache)
             e.add_field(name=_tx(sprache, "Steam-ID", "Steam ID"),
                        value=f"`{ev.get('player_id', '?')}`", inline=False)
 
@@ -3516,7 +3543,7 @@ class EmbedBuilder:
                     f"being killed by **{ev.get('killer', '?')}**."),
                 color=0xC0392B
             )
-            _add_location_field(e, ev, "player", positions)
+            _add_location_field(e, ev, "player", positions, sprache)
             e.add_field(name=_tx(sprache, "Steam-ID", "Steam ID"),
                        value=f"`{ev.get('player_id', '?')}`", inline=False)
 
@@ -3531,8 +3558,8 @@ class EmbedBuilder:
                     f"– latest victim **{ev.get('victim', '?')}**."),
                 color=0xF1C40F
             )
-            _add_location_field(e, ev, "player", positions)
-            e.add_field(name="Killer ID", value=f"`{ev.get('player_id', '?')}`", inline=False)
+            _add_location_field(e, ev, "player", positions, sprache)
+            e.add_field(name=_tx(sprache, "Killer-ID", "Killer ID"), value=f"`{ev.get('player_id', '?')}`", inline=False)
 
         elif t == "loot":
             action_icons = {"spawned":"✅", "despawned":"❌", "created":"✅", "deleted":"❌"}
@@ -3567,7 +3594,7 @@ class EmbedBuilder:
                                     f"**{ev['player']}** has regained consciousness")),
                 color=0x8E44AD if bewusstlos else 0x9B59B6
             )
-            _add_location_field(e, ev, "player", positions)
+            _add_location_field(e, ev, "player", positions, sprache)
             e.add_field(name=_tx(sprache, "Steam-ID", "Steam ID"),
                        value=f"`{ev['player_id']}`", inline=False)
 
@@ -3582,7 +3609,7 @@ class EmbedBuilder:
                 description=beschreibung,
                 color=0x00BCD4
             )
-            _add_location_field(e, ev, "player", positions)
+            _add_location_field(e, ev, "player", positions, sprache)
             e.add_field(name=_tx(sprache, "Steam-ID", "Steam ID"),
                        value=f"`{ev['player_id']}`", inline=False)
 
@@ -3595,67 +3622,6 @@ class EmbedBuilder:
         elif _footer(ev):
             e.set_footer(text=_footer(ev))
         return _feed_anwenden(e, feed)
-
-
-class _FeedTranslateView(discord.ui.View):
-    """An jedem Feed-Post: uebersetzt das Embed live in die Discord-App-
-    Sprache des Klickenden. Der oeffentliche Post bleibt fuer alle anderen
-    unveraendert (Deutsch) - nur die private Antwort passt sich an. Baut das
-    Embed aus denselben Rohdaten neu, mit denen der Post entstand (ev,
-    positions, feed sind reine In-Memory-Werte - kein neuer FTP-/DB-Zugriff
-    noetig). Bewusst NICHT persistent (kein custom_id, kein bot.add_view):
-    ein Feed-Post, dessen Button nach einem Neustart nicht mehr reagiert, ist
-    verschmerzbar - bei potenziell tausenden Feed-Events ueber lange Laufzeit
-    waere ein dauerhaft (timeout=None) im Speicher gehaltener View pro
-    Nachricht dagegen ein echtes Speicherproblem. timeout bewusst auf 24h
-    hochgesetzt (View-Standard waere 180s) - Feed-Kanaele werden oft Stunden
-    oder Tage spaeter noch durchgescrollt."""
-
-    def __init__(self, ev: Dict, positions: Optional[Dict[str, Dict]],
-                 feed: Optional[Dict[str, Any]] = None):
-        super().__init__(timeout=86400)
-        self.ev = ev
-        self.positions = positions
-        self.feed = feed
-        knopf = discord.ui.Button(label="Translate / Übersetzen", emoji="🌐",
-                                  style=discord.ButtonStyle.secondary)
-        knopf.callback = self._translate
-        self.add_item(knopf)
-
-    async def _translate(self, interaction: discord.Interaction):
-        embed = EmbedBuilder.build(self.ev, self.positions, self.feed,
-                                   sprache=_sprache(interaction))
-        if not embed:
-            return await interaction.response.send_message(_t(
-                interaction, "❌ Konnte nicht übersetzt werden.",
-                "❌ Could not translate this message."), ephemeral=True)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-class _SimpleTranslateView(discord.ui.View):
-    """Wie _FeedTranslateView, aber fuer einfache, rein statische Embeds ohne
-    Event-Rohdaten (z. B. Neustart-Ankuendigungen) - Titel/Beschreibung/Footer
-    liegen hier direkt als de/en-Paar vor, kein EmbedBuilder-Rebuild noetig."""
-
-    def __init__(self, titel_de: str, titel_en: str, text_de: str, text_en: str,
-                 color: int, footer_de: str = "", footer_en: str = ""):
-        super().__init__(timeout=86400)
-        self.titel = {"de": titel_de, "en": titel_en}
-        self.text = {"de": text_de, "en": text_en}
-        self.footer = {"de": footer_de, "en": footer_en}
-        self.color = color
-        knopf = discord.ui.Button(label="Translate / Übersetzen", emoji="🌐",
-                                  style=discord.ButtonStyle.secondary)
-        knopf.callback = self._translate
-        self.add_item(knopf)
-
-    async def _translate(self, interaction: discord.Interaction):
-        sprache = _sprache(interaction)
-        embed = discord.Embed(title=self.titel[sprache], description=self.text[sprache],
-                              color=self.color)
-        if self.footer.get(sprache):
-            embed.set_footer(text=self.footer[sprache])
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -4044,6 +4010,7 @@ class ServerConnection:
         # Betreiberwert darf nicht mitwandern (long_range_kill_meter fiel
         # bisher auf cfg.config zurueck).
         "long_range_kill_meter", "map_link_provider", "map_link_style", "map_image_style",
+        "feed_sprache",
         "keep_server_running", "keep_server_running_haenger",
         "combat_log_seconds", "rage_quit_seconds", "killstreak_min", "killstreak_step",
         "link_set_nickname", "heatmap_limits",
@@ -4921,6 +4888,40 @@ def _ce_events_zeilen_auswerten(zeilen: List[str], counts: Dict[str, int]
     return ergebnisse
 
 
+# Englische Fassungen der (deutschen) Poll-Gruende fuer den Kunden-Feed. Der deutsche Text bleibt der
+# Vergleichsschluessel (conn.poll_zustand) und geht an den Betreiber-Alarm; nur die Anzeige im Feed wird
+# uebersetzt, wenn der Server auf Englisch steht.
+_POLL_GRUND_EN: List[Tuple["re.Pattern[str]", str]] = [
+    (re.compile(r"^kein FTP aufgebaut \(.*\)$", re.S),
+     "no FTP connection established (credentials incomplete or connection not set up yet)"),
+    (re.compile(r"^keinem Discord-Server zugeordnet \(.*\)$", re.S),
+     "not assigned to a Discord server (the assignment is missing in the dashboard under \"Server list\")"),
+    (re.compile(r"^noch kein Log-Verzeichnis gefunden \(.*\)$", re.S),
+     "no log directory found yet (auto-detection retries every 120s)"),
+    (re.compile(r"^keine \.ADM-Dateien in (?P<d>.+?) gefunden \(.*\)$", re.S),
+     "no .ADM files found in {d} (ADM logging enabled on the server? FTP path correct?)"),
+    (re.compile(r"^Dateigröße nicht ermittelbar \(.*\) – Erststart wird wiederholt$", re.S),
+     "file size could not be determined (FTP error on the SIZE command?) – first start will be retried"),
+    (re.compile(r"^Dateigröße nicht ermittelbar \(.*\) – Zyklus wird wiederholt$", re.S),
+     "file size could not be determined (FTP error on the SIZE command?) – cycle will be retried"),
+    (re.compile(r"^Rest der vorherigen Log-Datei nicht lesbar \((?P<d>.+?)\) – Rotation wird wiederholt$", re.S),
+     "rest of the previous log file not readable ({d}) – rotation will be retried"),
+    (re.compile(r"^Log-Datei (?P<d>.+?) nicht lesbar \(.*\)$", re.S),
+     "log file {d} not readable (FTP error while reading from offset)"),
+]
+
+
+def _poll_grund_anzeige(conn: ServerConnection, grund: str) -> str:
+    """Den Poll-Grund in der Feed-Sprache des Servers darstellen (unbekannte Texte bleiben unveraendert)."""
+    if _feed_sprache(conn) != "en" or not grund:
+        return grund
+    for muster, en in _POLL_GRUND_EN:
+        m = muster.match(grund)
+        if m:
+            return en.format(**m.groupdict())
+    return grund
+
+
 async def _poll_zustand_melden(conn: ServerConnection, grund: Optional[str]) -> None:
     """Loggt, WARUM der Poll-Zyklus diesen Server gerade uebergeht oder wieder
     normal laeuft – aber nur bei einer AENDERUNG des Grundes, nicht bei jedem
@@ -4940,7 +4941,8 @@ async def _poll_zustand_melden(conn: ServerConnection, grund: Optional[str]) -> 
         await _betreiber_alarm(f"⚠️ **{conn.name}**: {grund}", farbe=0xE74C3C)
         if conn.guild_ids:
             warnung = discord.Embed(
-                title="⚠️ Automatische Betriebswarnung", description=grund,
+                title=_ft(conn, "⚠️ Automatische Betriebswarnung", "⚠️ Automatic operating warning"),
+                description=_poll_grund_anzeige(conn, grund),
                 color=0xE74C3C, timestamp=datetime.now(timezone.utc))
             await _post_feed(conn.guild_ids, "adminlog", warnung, service_id=conn.service_id)
     elif conn.poll_zustand:
@@ -4949,8 +4951,9 @@ async def _poll_zustand_melden(conn: ServerConnection, grund: Optional[str]) -> 
         await _betreiber_alarm(f"✅ **{conn.name}** läuft wieder normal.", farbe=0x2ECC71)
         if conn.guild_ids:
             erholt = discord.Embed(
-                title="✅ Läuft wieder normal",
-                description=f"Vorheriger Grund: {conn.poll_zustand}",
+                title=_ft(conn, "✅ Läuft wieder normal", "✅ Running normally again"),
+                description=_ft(conn, f"Vorheriger Grund: {conn.poll_zustand}",
+                                f"Previous reason: {_poll_grund_anzeige(conn, conn.poll_zustand)}"),
                 color=0x2ECC71, timestamp=datetime.now(timezone.utc))
             await _post_feed(conn.guild_ids, "adminlog", erholt, service_id=conn.service_id)
     conn.poll_zustand = grund
@@ -5215,11 +5218,8 @@ class _BefehlsUebersetzer(app_commands.Translator):
 #  Deckt bewusst NUR interaktive Befehls-Antworten ab - proaktive
 #  Nachrichten (Feeds, Neustart-Meldungen, Auto-Aufgaben-Bestaetigungen)
 #  haben keine ausloesende Interaktion und damit keine Nutzersprache.
-#  AUSNAHME: der 🌐-Uebersetzen-Button an Feed-Posts (_FeedTranslateView,
-#  siehe EmbedBuilder) bringt seine eigene Interaktion mit und nutzt darueber
-#  _sprache()/EmbedBuilder.build(..., sprache=...) - der urspruengliche POST
-#  selbst bleibt weiterhin ohne Interaktion und damit unuebersetzt fuer alle,
-#  die nicht klicken.
+#  Proaktive Posts folgen stattdessen der Server-Einstellung feed_sprache
+#  (_feed_sprache/_ft, Dashboard: Server -> Generell -> Karte & Standort).
 # ══════════════════════════════════════════════════════════════
 def _sprache(interaction: discord.Interaction) -> str:
     """'en' bei englischer Discord-App-Sprache des Nutzers, sonst 'de'."""
@@ -5358,7 +5358,7 @@ class DayZBot(discord.Client):
                     _s = guild_sicht(_c, _gid) if _gid else _c
                     for _g in _giveaways(_s or _c):
                         if isinstance(_g, dict) and _g.get("status") == "running" and _g.get("id"):
-                            self.add_view(GiveawayEntryView(_c.service_id, int(_g["id"])))
+                            self.add_view(GiveawayEntryView(_c.service_id, int(_g["id"]), _feed_sprache(_c)))
         except Exception as e:
             log.error(f"[BOT] Persistente Gewinnspiel-Views konnten nicht registriert werden: {e}")
 
@@ -6169,10 +6169,15 @@ class DayZBot(discord.Client):
                     log.info(f"[POLL] Bot war {mins} Min offline – überspringe Alt-Events, Offset={state['offset']} ({latest})")
                     if gap >= 0:
                         info = discord.Embed(
-                            title="⏭️ Alte Log-Events übersprungen",
-                            description=(f"Der Bot war ca. **{mins} Minuten** offline. Log-Events aus "
-                                         f"dieser Zeit werden nicht nachgepostet, um die Feeds nicht zu "
-                                         f"fluten (Grenze: `max_backlog_minutes` in config.json)."),
+                            title=_ft(conn, "⏭️ Alte Log-Events übersprungen", "⏭️ Old log events skipped"),
+                            description=_ft(
+                                conn,
+                                f"Der Bot war ca. **{mins} Minuten** offline. Log-Events aus "
+                                f"dieser Zeit werden nicht nachgepostet, um die Feeds nicht zu "
+                                f"fluten (Grenze: `max_backlog_minutes` in config.json).",
+                                f"The bot was offline for about **{mins} minutes**. Log events from "
+                                f"that time are not posted afterwards to avoid flooding the feeds "
+                                f"(limit: `max_backlog_minutes` in config.json)."),
                             color=0x95A5A6)
                         await _post_feed(conn.guild_ids, "adminlog", info,
                                          service_id=conn.service_id)
@@ -6336,18 +6341,23 @@ class DayZBot(discord.Client):
         for site in kandidaten[:20]:
             gemeldete_ids.append(site["site_id"])
             url = _izurvive_url(site["x"], site["z"], map_name)
-            gruende_text = ", ".join(_ABANDONED_GRUND_TEXT.get(g[0], g[0]) for g in site["gruende"])
-            zeilen.append(f"• [{site['x']:.0f} / {site['z']:.0f}]({url}) – {site['part_count']} Teile\n"
+            gruende_text = ", ".join(
+                _ft(conn, *_ABANDONED_GRUND_TEXT.get(g[0], (g[0], g[0]))) for g in site["gruende"])
+            zeilen.append(f"• [{site['x']:.0f} / {site['z']:.0f}]({url}) – "
+                         f"{site['part_count']} {_ft(conn, 'Teile', 'parts')}\n"
                          f"  {gruende_text}")
         rest = len(kandidaten) - 20
         beschreibung = "\n".join(zeilen)
         if rest > 0:
-            beschreibung += f"\n\n… und {rest} weitere Standorte."
+            beschreibung += "\n\n" + _ft(conn, f"… und {rest} weitere Standorte.",
+                                          f"… and {rest} more sites.")
         embed = discord.Embed(
-            title="🏚️ Verlassene Basen – Bericht",
-            description=(f"{len(kandidaten)} Standort(e) benötigen eine Prüfung.\n\n{beschreibung}"),
+            title=_ft(conn, "🏚️ Verlassene Basen – Bericht", "🏚️ Abandoned bases – report"),
+            description=_ft(conn, f"{len(kandidaten)} Standort(e) benötigen eine Prüfung.\n\n{beschreibung}",
+                            f"{len(kandidaten)} site(s) need a review.\n\n{beschreibung}"),
             color=farbe)
-        embed.set_footer(text="Meldungen sind Prüfhinweise und löschen keine Objekte.")
+        embed.set_footer(text=_ft(conn, "Meldungen sind Prüfhinweise und löschen keine Objekte.",
+                                  "Reports are review hints and do not delete any objects."))
         ok_gesendet, _ = await _post_feed(conn.guild_ids, "abandoned_bases", embed,
                                           service_id=conn.service_id)
         if ok_gesendet:
@@ -6460,8 +6470,10 @@ class DayZBot(discord.Client):
             status = str((ninfo or {}).get("status") or (ninfo or {}).get("state") or "").lower()
             if status == "stopped":
                 grund = "Nitrado meldet „gestoppt“, kein absichtlicher Stopp bekannt"
+                grund_en = "Nitrado reports \"stopped\", no intentional stop known"
             elif status == "started" and conn.get("keep_server_running_haenger", False):
                 grund = "Nitrado meldet „gestartet“, aber keine A2S-Antwort (hängt)"
+                grund_en = "Nitrado reports \"started\", but no A2S response (hung)"
             else:
                 return      # Uebergang (stopping/restarting), gesperrt oder unbekannt
             _conn_store(conn, "watchdog_letzter_start_ts", jetzt)
@@ -6472,11 +6484,14 @@ class DayZBot(discord.Client):
             conn.neustart_erwartet_ts = jetzt
             minuten = int((jetzt - conn.offline_seit) // 60)
             e = discord.Embed(
-                title="🛠️ Server automatisch gestartet" if ok_ else "❌ Automatischer Start fehlgeschlagen",
-                description=(f"**{conn.name}** war seit {minuten} Min offline.\n{grund}.\n"
-                             f"Nitrado: {msg}"),
+                title=(_ft(conn, "🛠️ Server automatisch gestartet", "🛠️ Server started automatically") if ok_
+                       else _ft(conn, "❌ Automatischer Start fehlgeschlagen", "❌ Automatic start failed")),
+                description=_ft(conn,
+                                f"**{conn.name}** war seit {minuten} Min offline.\n{grund}.\nNitrado: {msg}",
+                                f"**{conn.name}** was offline for {minuten} min.\n{grund_en}.\nNitrado: {msg}"),
                 color=0x2ECC71 if ok_ else 0xE74C3C)
-            e.set_footer(text="„Server am Laufen halten“ · Server-Seite → Generell")
+            e.set_footer(text=_ft(conn, "„Server am Laufen halten“ · Server-Seite → Generell",
+                                  "\"Keep server running\" · Server page → General"))
             e.timestamp = datetime.now(timezone.utc)
             await _post_feed(conn.guild_ids, "adminlog", e, service_id=conn.service_id)
             _audit_add("system", conn.name, "Offline-Wächter: Start ausgelöst",
@@ -6490,24 +6505,28 @@ class DayZBot(discord.Client):
         if info:
             e = discord.Embed(title="🟢 Server ONLINE", color=0x2ECC71)
             e.add_field(name="Server", value=str(info.get("name") or "?"), inline=False)
-            e.add_field(name="👥 Spieler",
+            e.add_field(name=_ft(conn, "👥 Spieler", "👥 Players"),
                         value=f"{info.get('players', '?')} / {info.get('max_players', '?')}",
                         inline=True)
             e.add_field(name="🗺️ Map", value=str(info.get("map") or "?"), inline=True)
             if conn is not None and conn.online_since:
                 h, m = divmod(int((time.time() - conn.online_since) // 60), 60)
-                e.add_field(name="⏱️ Online seit (Bot-Sicht)",
-                            value=f"{h} Std {m} Min", inline=True)
+                e.add_field(name=_ft(conn, "⏱️ Online seit (Bot-Sicht)", "⏱️ Online for (bot view)"),
+                            value=_ft(conn, f"{h} Std {m} Min", f"{h} h {m} min"), inline=True)
         else:
             e = discord.Embed(
                 title="🔴 Server OFFLINE",
-                description=("Keine Antwort auf die A2S-Abfrage – Server ist aus, "
-                             "startet gerade oder der Query-Port stimmt nicht."),
+                description=_ft(conn, "Keine Antwort auf die A2S-Abfrage – Server ist aus, "
+                                      "startet gerade oder der Query-Port stimmt nicht.",
+                                "No response to the A2S query – the server is off, "
+                                "is starting up or the query port is wrong."),
                 color=0xE74C3C)
         nxt = self._next_scheduled_restart(conn)
         if nxt:
-            e.add_field(name="⏰ Nächster Auto-Restart", value=f"<t:{int(nxt)}:R>", inline=True)
-        e.set_footer(text="Auto-Status · aktualisiert sich automatisch")
+            e.add_field(name=_ft(conn, "⏰ Nächster Auto-Restart", "⏰ Next auto restart"),
+                        value=f"<t:{int(nxt)}:R>", inline=True)
+        e.set_footer(text=_ft(conn, "Auto-Status · aktualisiert sich automatisch",
+                              "Auto status · updates automatically"))
         e.timestamp = datetime.now(timezone.utc)
         return e
 
@@ -6668,8 +6687,8 @@ class DayZBot(discord.Client):
             for zone in waechter:
                 if _player_in_allowlist(zone, pname) or await _player_hat_allowlist_rolle(zone, pname):
                     return      # in dieser Zone freigestellt -> kein Ban
-            grund = ("Kill außerhalb der Zonen" if etype == "kill_pvp"
-                     else "Treffer außerhalb der Zonen")
+            grund = (_ft(conn, "Kill außerhalb der Zonen", "Kill outside the zones") if etype == "kill_pvp"
+                     else _ft(conn, "Treffer außerhalb der Zonen", "Hit outside the zones"))
             await self._zone_auto_ban(conn, waechter[0], pname, grund, ev, pos_str,
                                       ereignis=("kill" if etype == "kill_pvp" else "hit"))
         except Exception as e:  # noqa: BLE001 – darf den Dispatch nie stoeren
@@ -6736,25 +6755,32 @@ class DayZBot(discord.Client):
             expires_at=expires_at, zone=str(zone["name"]), ereignis=ereignis)
         farbe = _zone_farbe(zone)
         if fehler:
-            e = discord.Embed(title="❌ Auto-Ban fehlgeschlagen",
+            e = discord.Embed(title=_ft(conn, "❌ Auto-Ban fehlgeschlagen", "❌ Auto-ban failed"),
                               description=f"**{pname}** · {grund}\n`{fehler}`", color=0xE74C3C)
             _audit_add("system", conn.name, "Zonen-Ban fehlgeschlagen",
                       f"{pname}: {grund} – {fehler}", success=False)
         else:
-            titel = "🔨 Auto-Ban (zeitlich)" if expires_at else "🔨 Auto-Ban"
-            e = discord.Embed(title=titel, description=f"**{pname}** wurde automatisch gebannt.",
+            titel = (_ft(conn, "🔨 Auto-Ban (zeitlich)", "🔨 Auto-ban (temporary)") if expires_at
+                     else "🔨 Auto-Ban")
+            e = discord.Embed(title=titel,
+                              description=_ft(conn, f"**{pname}** wurde automatisch gebannt.",
+                                              f"**{pname}** was banned automatically."),
                               color=farbe)
-            e.add_field(name="Grund", value=grund, inline=False)
+            e.add_field(name=_ft(conn, "Grund", "Reason"), value=grund, inline=False)
             if expires_at:
-                e.add_field(name="Dauer", value=f"{stunden} h · endet <t:{int(expires_at)}:R>",
+                e.add_field(name=_ft(conn, "Dauer", "Duration"),
+                            value=_ft(conn, f"{stunden} h · endet <t:{int(expires_at)}:R>",
+                                      f"{stunden} h · ends <t:{int(expires_at)}:R>"),
                             inline=True)
             if schon and not hinzu:
-                e.add_field(name="Nitrado", value="ℹ️ stand bereits auf der Banliste", inline=True)
+                e.add_field(name="Nitrado", value=_ft(conn, "ℹ️ stand bereits auf der Banliste",
+                                                       "ℹ️ was already on the ban list"), inline=True)
             if _zone_wert(zone, "verbose") and ev is not None:
                 roh = str(ev.get("raw") or "")[:300]
                 if roh:
-                    e.add_field(name="Logzeile", value=f"`{roh}`", inline=False)
-            e.set_footer(text="Änderung greift ggf. erst nach einem Server-Neustart.")
+                    e.add_field(name=_ft(conn, "Logzeile", "Log line"), value=f"`{roh}`", inline=False)
+            e.set_footer(text=_ft(conn, "Änderung greift ggf. erst nach einem Server-Neustart.",
+                                  "The change may only take effect after a server restart."))
             _audit_add("system", conn.name, "Zonen-Auto-Ban",
                       f"{pname}: {grund}" + (f" ({stunden} h)" if expires_at else ""))
         e.timestamp = datetime.now(timezone.utc)
@@ -6780,23 +6806,30 @@ class DayZBot(discord.Client):
         # die global eingestellte (siehe _aktuelle_karte).
         _setze_aktuellen_server(conn)
         if ereignis and ereignis != "entry":
-            label = _ZONE_EREIGNIS_LABEL.get(ereignis, (ereignis, ereignis))[0]
+            label = _ft(conn, *_ZONE_EREIGNIS_LABEL.get(ereignis, (ereignis, ereignis)))
             titel = f"🛡️ • Zone: {label}"
-            beschreibung = (f"**{player}** · **{label}** in Zone **{zone['name']}**.")
+            beschreibung = _ft(conn, f"**{player}** · **{label}** in Zone **{zone['name']}**.",
+                               f"**{player}** · **{label}** in zone **{zone['name']}**.")
         else:
-            titel = "🛡️ • Ping On Detection"
-            beschreibung = f"**{player}** was located within the zone **{zone['name']}**."
+            titel = _ft(conn, "🛡️ • Ping bei Erkennung", "🛡️ • Ping On Detection")
+            beschreibung = _ft(conn, f"**{player}** wurde in der Zone **{zone['name']}** erkannt.",
+                               f"**{player}** was located within the zone **{zone['name']}**.")
         e = discord.Embed(title=titel, description=beschreibung, color=_zone_farbe(zone))
         loc = None
         if _zone_wert(zone, "ping_location") and not _position_privat(conn, player):
-            loc = _location_field_value(info.get("position"))
+            loc = _location_field_value(info.get("position"), _feed_sprache(conn))
         if loc:
-            e.add_field(name="📍 • Player Location", value=loc, inline=False)
+            e.add_field(name=_LOCATION_PRAEFIX + _ft(conn, "Spieler-Standort", "Player Location"),
+                        value=loc, inline=False)
         if _zone_wert(zone, "verbose") and ev is not None:
             details = []
-            for feld, name in (("weapon", "Waffe"), ("distance", "Distanz"), ("item", "Gegenstand"),
-                               ("victim", "Opfer"), ("attacker", "Angreifer"), ("killer", "Killer"),
-                               ("cause", "Ursache"), ("emote", "Emote"), ("hit_zone", "Körperteil")):
+            for feld, name in (("weapon", _ft(conn, "Waffe", "Weapon")),
+                               ("distance", _ft(conn, "Distanz", "Distance")),
+                               ("item", _ft(conn, "Gegenstand", "Item")),
+                               ("victim", _ft(conn, "Opfer", "Victim")),
+                               ("attacker", _ft(conn, "Angreifer", "Attacker")), ("killer", "Killer"),
+                               ("cause", _ft(conn, "Ursache", "Cause")), ("emote", "Emote"),
+                               ("hit_zone", _ft(conn, "Körperteil", "Body part"))):
                 wert = ev.get(feld)
                 if wert and str(wert) not in ("?", "Unbekannt"):
                     details.append(f"**{name}:** {wert}")
@@ -6804,7 +6837,7 @@ class DayZBot(discord.Client):
                 e.add_field(name="🔎 Details", value="\n".join(details)[:1000], inline=False)
             roh = str(ev.get("raw") or "")[:300]
             if roh:
-                e.add_field(name="Logzeile", value=f"`{roh}`", inline=False)
+                e.add_field(name=_ft(conn, "Logzeile", "Log line"), value=f"`{roh}`", inline=False)
         # Ping-Auszahlung: Geld an den erkannten, in dieser Guild verknuepften
         # Spieler (0 = keine).
         try:
@@ -6819,7 +6852,7 @@ class DayZBot(discord.Client):
                 for lk in links:
                     uid = int(lk["user_id"])
                     await loop.run_in_executor(None, db.add_wallet, gid_pay, uid, betrag)
-                    e.add_field(name="💰 Ping-Auszahlung",
+                    e.add_field(name=_ft(conn, "💰 Ping-Auszahlung", "💰 Ping payout"),
                                 value=f"+{_fmt_money(betrag, conn)} → <@{uid}>", inline=False)
                     break
             except Exception as ex:  # noqa: BLE001
@@ -6830,14 +6863,16 @@ class DayZBot(discord.Client):
             try:
                 summe = _offenes_kopfgeld(int(zone["guild_id"]), player)
                 if summe >= max(0, int(_zone_wert(zone, "bounty_min") or 0)) and summe > 0:
-                    e.add_field(name="🎯 Kopfgeld", value=f"**{_fmt_money(summe, conn)}** offen auf **{player}**",
+                    e.add_field(name=_ft(conn, "🎯 Kopfgeld", "🎯 Bounty"),
+                                value=_ft(conn, f"**{_fmt_money(summe, conn)}** offen auf **{player}**",
+                                          f"**{_fmt_money(summe, conn)}** open on **{player}**"),
                                 inline=False)
             except Exception as ex:  # noqa: BLE001
                 log.warning(f"[ZONE] Kopfgeld-Prüfung fehlgeschlagen: {ex}")
         if zone.get("type") == "polygon":
-            zone_val = f"Polygon · {len(zone.get('points') or [])} Punkte"
+            zone_val = f"Polygon · {len(zone.get('points') or [])} {_ft(conn, 'Punkte', 'points')}"
         else:
-            zone_val = f"`{zone.get('x')}, {zone.get('z')}` · Radius **{zone.get('radius')} m**"
+            zone_val = f"`{zone.get('x')}, {zone.get('z')}` · {_ft(conn, 'Radius', 'Radius')} **{zone.get('radius')} m**"
         e.add_field(name="🎯 Zone", value=zone_val, inline=False)
         e.set_footer(text=f"Zone: {zone['name']}")
         e.timestamp = datetime.now(timezone.utc)
@@ -6938,31 +6973,28 @@ class DayZBot(discord.Client):
         cutoff = time.time() - 3600
         self._restart_announced = {k for k in self._restart_announced if k[1] > cutoff}
 
-    def _restart_countdown_bauen(self, nxt: float, mins: int) -> Tuple[discord.Embed, discord.ui.View]:
-        """Baut NUR Embed+View der Countdown-Ankuendigung (60/30/15/10/5/3 Min
+    def _restart_countdown_bauen(self, conn: ServerConnection, nxt: float, mins: int) -> discord.Embed:
+        """Baut NUR das Embed der Countdown-Ankuendigung (60/30/15/10/5/3 Min
         vorher) - reine Bausteine, kein Versand. Gemeinsam genutzt von
         /auto restart (postet in den restart-Feed, siehe _restart_countdown_post)
         und der Auto-Aufgabe "Server neu starten" (postet in DEREN eigenen
         konfigurierten Channel, siehe _restart_task_countdown) - beide sollen
         optisch identisch ankuendigen, aber an unterschiedliche Ziele."""
-        dauer_de = _restart_dauer_text(mins, "de")
-        dauer_en = _restart_dauer_text(mins, "en")
-        titel_de = f"🔄 Noch {dauer_de} bis zum nächsten Neustart!"
-        titel_en = f"🔄 {dauer_en} until the next restart!"
-        text_de = (f"Geplanter Neustart um <t:{int(nxt)}:t> Uhr – "
-                  f"bitte sichere Position und Loot.")
-        text_en = (f"Scheduled restart at <t:{int(nxt)}:t> – "
-                  f"please secure your position and loot.")
+        sprache = _feed_sprache(conn)
+        dauer = _restart_dauer_text(mins, sprache)
+        titel = _tx(sprache, f"🔄 Noch {dauer} bis zum nächsten Neustart!",
+                    f"🔄 {dauer} until the next restart!")
+        text = _tx(sprache, f"Geplanter Neustart um <t:{int(nxt)}:t> Uhr – "
+                            f"bitte sichere Position und Loot.",
+                   f"Scheduled restart at <t:{int(nxt)}:t> – "
+                   f"please secure your position and loot.")
         color = 0xE74C3C if mins <= 5 else (0xE67E22 if mins <= 15 else 0xF1C40F)
-        e = discord.Embed(title=titel_de, description=text_de, color=color)
-        view = _SimpleTranslateView(titel_de, titel_en, text_de, text_en, color)
-        return e, view
+        return discord.Embed(title=titel, description=text, color=color)
 
     async def _restart_countdown_post(self, conn: ServerConnection, nxt: float, mins: int):
         """Baut die Countdown-Ankuendigung und postet sie in den restart-Feed
         (fuer /auto restart, siehe _restart_scheduler_conn)."""
-        e, view = self._restart_countdown_bauen(nxt, mins)
-        await self._post_restart_feed(e, conn, view=view)
+        await self._post_restart_feed(self._restart_countdown_bauen(conn, nxt, mins), conn)
 
     async def _restart_scheduler_conn(self, conn: ServerConnection):
         sid = conn.service_id
@@ -6994,10 +7026,11 @@ class DayZBot(discord.Client):
                 conn.neustart_markieren()
             log.info(f"[AUTO-RESTART] {conn.name}: Neustart ausgelöst: ok={ok} – {msg}")
             e = discord.Embed(
-                title="🔄 Server wird jetzt neu gestartet" if ok
-                      else "❌ Geplanter Neustart fehlgeschlagen",
-                description=("Der geplante Neustart wurde über die Nitrado-API ausgelöst."
-                             if ok else f"Nitrado-API-Fehler: {msg}"),
+                title=(_ft(conn, "🔄 Server wird jetzt neu gestartet", "🔄 Server is restarting now") if ok
+                       else _ft(conn, "❌ Geplanter Neustart fehlgeschlagen", "❌ Scheduled restart failed")),
+                description=(_ft(conn, "Der geplante Neustart wurde über die Nitrado-API ausgelöst.",
+                                 "The scheduled restart was triggered via the Nitrado API.")
+                             if ok else _ft(conn, f"Nitrado-API-Fehler: {msg}", f"Nitrado API error: {msg}")),
                 color=0x2ECC71 if ok else 0xE74C3C)
             await self._post_restart_feed(e, conn)
 
@@ -7047,9 +7080,9 @@ class DayZBot(discord.Client):
                 ch = await self._resolve_channel(int(task["channel_id"]))
                 if ch is None:
                     continue
-                e, view = self._restart_countdown_bauen(nxt, mins)
+                e = self._restart_countdown_bauen(conn, nxt, mins)
                 try:
-                    await ch.send(embed=e, view=view)
+                    await ch.send(embed=e)
                 except Exception as ex:  # noqa: BLE001
                     log.error(f"[AUTO-AUFGABEN] Countdown-Versand fehlgeschlagen: {ex}")
 
@@ -7078,10 +7111,10 @@ class DayZBot(discord.Client):
                     # eine Quittung "✅ ausgeführt" waere hier nur Rauschen.
                     e = eigenes
                 else:
-                    meta = SCHEDULED_TASK_TYPES.get(task.get("task"), {})
                     e = discord.Embed(
-                        title=("✅ " if ok_ else "❌ ") + meta.get("label", str(task.get("task"))),
-                        description=(f"Fehler: {msg}" if not ok_ else (task.get("note") or None)),
+                        title=("✅ " if ok_ else "❌ ") + _aufgabe_label(conn, task.get("task")),
+                        description=(_ft(conn, f"Fehler: {msg}", f"Error: {msg}") if not ok_
+                                     else (task.get("note") or None)),
                         color=0x2ECC71 if ok_ else 0xE74C3C,
                         timestamp=datetime.now(timezone.utc))
                 ch = await self._resolve_channel(int(task["channel_id"]))
@@ -7106,7 +7139,7 @@ class DayZBot(discord.Client):
         art = task.get("task")
         if art == "restart_server":
             if conn.api is None:
-                return False, "Keine Nitrado-Verbindung.", None
+                return False, _ft(conn, "Keine Nitrado-Verbindung.", "No Nitrado connection."), None
             try:
                 ok_, msg = await conn.api.restart()
                 if ok_:
@@ -7195,8 +7228,10 @@ class DayZBot(discord.Client):
                     task["_online_faellig_seit"] = seit
                 if jetzt - seit < _ONLINE_LISTE_MAX_WARTE_SEKUNDEN:
                     task["next_execution"] = jetzt + _ONLINE_LISTE_RETRY_SEKUNDEN
-                    return (True, "Namen laut Log-Tracking noch nicht bekannt – "
-                                 "warte auf den nächsten PlayerList-Block.", False)
+                    return (True, _ft(conn, "Namen laut Log-Tracking noch nicht bekannt – "
+                                            "warte auf den nächsten PlayerList-Block.",
+                                      "Names not known from log tracking yet – "
+                                      "waiting for the next PlayerList block."), False)
                 # Laenger als das Zeitlimit erfolglos gewartet (z.B. Log-Tracking
                 # dauerhaft kaputt) - jetzt trotzdem posten, mit dem bisherigen
                 # Platzhaltertext, statt fuer immer stumm zu bleiben.
@@ -7212,11 +7247,13 @@ class DayZBot(discord.Client):
                 # ``False`` statt ``None``: der Aufrufer soll HIER GAR NICHTS
                 # posten, auch keine allgemeine "erledigt"-Bestaetigung -
                 # genau die Kachel, die vorher bei 0 Spielern trotzdem kam.
-                return True, "0 Spieler online – kein Post („bei leerer Liste posten“ nicht aktiviert)", False
+                return True, _ft(conn, "0 Spieler online – kein Post („bei leerer Liste posten“ nicht aktiviert)",
+                                 "0 players online – no post (\"post when empty\" not enabled)"), False
             if task.get("nachricht_ersetzen"):
                 geklappt, msg = await self._online_liste_ersetzen(conn, task, namen, gesamt)
                 return geklappt, msg, False
-            return (True, f"{max(gesamt or 0, len(namen))} Spieler online",
+            return (True, _ft(conn, f"{max(gesamt or 0, len(namen))} Spieler online",
+                              f"{max(gesamt or 0, len(namen))} players online"),
                     _online_liste_embed(conn, namen, str(task.get("note") or ""), gesamt))
         schaden = SCHEDULED_TASK_TYPES.get(art, {}).get("schaden")
         if schaden:
@@ -7225,21 +7262,31 @@ class DayZBot(discord.Client):
             # gleichzeitig faellige Aufgabe einander ueberschreiben.
             schluessel, neuer_wert = schaden
             code, infos = await _schaden_datei_setzen(conn, schluessel, neuer_wert)
-            # Kein _t: eine Auto-Aufgabe hat keinen ausloesenden Nutzer, dessen
-            # Discord-Sprache man fragen koennte – proaktive Posts bleiben deutsch.
-            an_aus = "AUS" if neuer_wert else "AN"
+            # Eine Auto-Aufgabe hat keinen ausloesenden Nutzer: die Sprache kommt aus der
+            # Server-Einstellung (feed_sprache).
+            an_aus = _ft(conn, "AUS" if neuer_wert else "AN", "OFF" if neuer_wert else "ON")
             meldungen = {
-                "ok": f"{schluessel} = {str(neuer_wert).lower()} (Schaden {an_aus}) – "
-                      f"wirkt nach dem nächsten Server-Neustart",
-                "unveraendert": f"stand bereits auf {an_aus} – Datei nicht angefasst",
-                "kein_ftp": "Kein FTP-Zugang für diesen Server.",
-                "kein_pfad": "Mission-Ordner unbekannt – /ftp_scan nötig.",
-                "lesefehler": "cfggameplay.json nicht lesbar (FTP-Fehler) – nichts geändert.",
-                "fehlt": "Keine cfggameplay.json im Mission-Ordner – nichts geändert.",
-                "kaputt": f"cfggameplay.json ist kein gültiges JSON: {infos['fehler']}",
-                "kein_abschnitt": f"{schluessel} steht nicht in der cfggameplay.json "
-                                  f"und es gibt keinen Abschnitt GeneralData.",
-                "schreibfehler": "Schreiben per FTP fehlgeschlagen – Datei unverändert.",
+                "ok": _ft(conn, f"{schluessel} = {str(neuer_wert).lower()} (Schaden {an_aus}) – "
+                                f"wirkt nach dem nächsten Server-Neustart",
+                          f"{schluessel} = {str(neuer_wert).lower()} (damage {an_aus}) – "
+                          f"takes effect after the next server restart"),
+                "unveraendert": _ft(conn, f"stand bereits auf {an_aus} – Datei nicht angefasst",
+                                    f"was already {an_aus} – file not touched"),
+                "kein_ftp": _ft(conn, "Kein FTP-Zugang für diesen Server.", "No FTP access for this server."),
+                "kein_pfad": _ft(conn, "Mission-Ordner unbekannt – /ftp_scan nötig.",
+                                 "Mission folder unknown – /ftp_scan required."),
+                "lesefehler": _ft(conn, "cfggameplay.json nicht lesbar (FTP-Fehler) – nichts geändert.",
+                                  "cfggameplay.json not readable (FTP error) – nothing changed."),
+                "fehlt": _ft(conn, "Keine cfggameplay.json im Mission-Ordner – nichts geändert.",
+                             "No cfggameplay.json in the mission folder – nothing changed."),
+                "kaputt": _ft(conn, f"cfggameplay.json ist kein gültiges JSON: {infos['fehler']}",
+                              f"cfggameplay.json is not valid JSON: {infos['fehler']}"),
+                "kein_abschnitt": _ft(conn, f"{schluessel} steht nicht in der cfggameplay.json "
+                                            f"und es gibt keinen Abschnitt GeneralData.",
+                                      f"{schluessel} is not in cfggameplay.json "
+                                      f"and there is no GeneralData section."),
+                "schreibfehler": _ft(conn, "Schreiben per FTP fehlgeschlagen – Datei unverändert.",
+                                     "Writing via FTP failed – file unchanged."),
             }
             geklappt = code in ("ok", "unveraendert")
             meldung = meldungen.get(code, code)
@@ -7250,14 +7297,15 @@ class DayZBot(discord.Client):
             # Eigenes Embed statt der schlichten ✅-Quittung: der Hinweis auf
             # den noetigen Neustart ist bei einer Aufgabe, die nachts allein
             # laeuft, wichtiger als beim Befehl – dort steht ja ein Admin davor.
-            label = SCHEDULED_TASK_TYPES[art]["label"]
+            label = _aufgabe_label(conn, art)
             e = discord.Embed(
                 title=f"🧱 {label}",
                 description=str(task.get("note") or "") or None,
                 color=0x2ECC71 if not neuer_wert else 0xE67E22,
                 timestamp=datetime.now(timezone.utc))
-            e.add_field(name="Ergebnis", value=meldung, inline=False)
-            e.set_footer(text=f"⚠️ Wirkt erst nach einem Server-Neustart · {conn.name}")
+            e.add_field(name=_ft(conn, "Ergebnis", "Result"), value=meldung, inline=False)
+            e.set_footer(text=_ft(conn, f"⚠️ Wirkt erst nach einem Server-Neustart · {conn.name}",
+                                  f"⚠️ Takes effect only after a server restart · {conn.name}"))
             return True, meldung, e
         return False, f"Unbekannter Aufgaben-Typ: {art}", None
 
@@ -7354,10 +7402,11 @@ class DayZBot(discord.Client):
                 eimer.pop(k, None)
             cfg.save_bans()
             e = discord.Embed(
-                title="⏳ Zeitlicher Ban abgelaufen",
+                title=_ft(conn, "⏳ Zeitlicher Ban abgelaufen", "⏳ Temporary ban expired"),
                 description="\n".join(f"`{n}`" for n in faellig),
                 color=0x2ECC71)
-            e.set_footer(text=f"{conn.name} · Änderung greift ggf. erst nach einem Server-Neustart.")
+            e.set_footer(text=f"{conn.name} · " + _ft(conn, "Änderung greift ggf. erst nach einem Server-Neustart.",
+                                                      "The change may only take effect after a server restart."))
             e.timestamp = datetime.now(timezone.utc)
             if conn.guild_ids:
                 await _post_feed(conn.guild_ids, "adminlog", e, service_id=conn.service_id)
@@ -7394,7 +7443,7 @@ class DayZBot(discord.Client):
         sieger = random.sample(entrants, min(anzahl, len(entrants))) if entrants else []
         eintrag["winners"] = sieger
         eintrag["status"] = "ended"
-        sprache = str(eintrag.get("sprache") or "de")
+        sprache = _feed_sprache(conn)
         kanal = await self._resolve_channel(int(eintrag.get("channel_id") or 0))
         if kanal is None:
             return
@@ -7741,8 +7790,11 @@ class DayZBot(discord.Client):
         GENAU diesen Typ vorliegt (siehe conn.ce_pending_positionen) - sonst
         bleibt die Ortszeile schlicht weg."""
         emoji, label = _CE_EVENT_SCHALTER_LABEL[schalter]
-        kopf = (f"{delta}× neu aufgetaucht (jetzt {neuer_stand} aktiv)" if delta > 1
-               else f"ist aufgetaucht (jetzt {neuer_stand} aktiv)")
+        label = _ft(conn, _CE_EVENT_LABEL_DE.get(schalter, label), label)
+        kopf = (_ft(conn, f"{delta}× neu aufgetaucht (jetzt {neuer_stand} aktiv)",
+                    f"{delta}× newly appeared ({neuer_stand} active now)") if delta > 1
+                else _ft(conn, f"ist aufgetaucht (jetzt {neuer_stand} aktiv)",
+                         f"has appeared ({neuer_stand} active now)"))
         if schalter == "vehicle_event":
             kopf = f"**{typ_name}** {kopf}"
         beschreibung = kopf
@@ -7752,7 +7804,7 @@ class DayZBot(discord.Client):
             karte = _canonical_map_name(conn.get("map_name", "")) or "ChernarusPlus"
             url = _izurvive_url(x, z, karte)
             nah = _nearest_location(x, z, karte)
-            nah_text = f" *(Nahe {nah})*" if nah else ""
+            nah_text = f" *({_ft(conn, 'Nahe', 'Near')} {nah})*" if nah else ""
             beschreibung = f"{kopf}\n📍 [{x:.0f} / {z:.0f}]({url}){nah_text}"
         return discord.Embed(title=f"{emoji} {label}", description=beschreibung,
                              color=FEED_TYPES["ce_events"]["farbe"])
@@ -7910,22 +7962,32 @@ class DayZBot(discord.Client):
                     # keine Ausfall-Warnung nötig
                     conn.ftp_warn_active = False
                     embed = discord.Embed(
-                        title="🔄 FTP-Zugang automatisch erneuert",
-                        description=("Die FTP-Zugriffe schlugen wiederholt fehl – der Bot "
-                                     "hat die Zugangsdaten über den Nitrado-Token neu "
-                                     "geholt und die Verbindung neu aufgebaut."),
+                        title=_ft(conn, "🔄 FTP-Zugang automatisch erneuert", "🔄 FTP access renewed automatically"),
+                        description=_ft(conn, "Die FTP-Zugriffe schlugen wiederholt fehl – der Bot "
+                                              "hat die Zugangsdaten über den Nitrado-Token neu "
+                                              "geholt und die Verbindung neu aufgebaut.",
+                                        "FTP access failed repeatedly – the bot fetched new "
+                                        "credentials via the Nitrado token and re-established "
+                                        "the connection."),
                         color=0x2ECC71)
                     await _post_feed(conn.guild_ids, "adminlog", embed,
                                      service_id=conn.service_id)
                     return
                 conn.ftp_warn_active = True
                 embed = discord.Embed(
-                    title="🚨 FTP-Verbindung gestört",
-                    description=(f"**{fails} FTP-Zugriffe in Folge fehlgeschlagen** "
-                                 f"(Host `{conn.get('ftp_host') or '–'}`).\n"
-                                 f"Log-Feeds und Shop-Lieferungen sind unterbrochen!\n"
-                                 f"Mögliche Ursachen: FTP-Passwort geändert, Nitrado-Wartung.\n"
-                                 f"Letzter Fehler: `{letzter_fehler or 'unbekannt'}`"),
+                    title=_ft(conn, "🚨 FTP-Verbindung gestört", "🚨 FTP connection disrupted"),
+                    description=_ft(
+                        conn,
+                        f"**{fails} FTP-Zugriffe in Folge fehlgeschlagen** "
+                        f"(Host `{conn.get('ftp_host') or '–'}`).\n"
+                        f"Log-Feeds und Shop-Lieferungen sind unterbrochen!\n"
+                        f"Mögliche Ursachen: FTP-Passwort geändert, Nitrado-Wartung.\n"
+                        f"Letzter Fehler: `{letzter_fehler or 'unbekannt'}`",
+                        f"**{fails} FTP accesses failed in a row** "
+                        f"(host `{conn.get('ftp_host') or '–'}`).\n"
+                        f"Log feeds and shop deliveries are interrupted!\n"
+                        f"Possible causes: FTP password changed, Nitrado maintenance.\n"
+                        f"Last error: `{letzter_fehler or 'unknown'}`"),
                     color=0xE74C3C)
                 await _post_feed(conn.guild_ids, "adminlog", embed,
                                  service_id=conn.service_id)
@@ -7933,8 +7995,9 @@ class DayZBot(discord.Client):
             conn.ftp_warn_active = False
             conn.ftp_warned_ts   = 0.0
             embed = discord.Embed(
-                title="✅ FTP-Verbindung wiederhergestellt",
-                description="Der FTP-Zugriff funktioniert wieder – die Feeds laufen normal weiter.",
+                title=_ft(conn, "✅ FTP-Verbindung wiederhergestellt", "✅ FTP connection restored"),
+                description=_ft(conn, "Der FTP-Zugriff funktioniert wieder – die Feeds laufen normal weiter.",
+                                "FTP access works again – the feeds continue as normal."),
                 color=0x2ECC71)
             await _post_feed(conn.guild_ids, "adminlog", embed,
                              service_id=conn.service_id)
@@ -8021,14 +8084,22 @@ class DayZBot(discord.Client):
             vorheriger_name = db.alt_account_seen(conn.service_id, ev.get("player_id"), ev["player"])
             if vorheriger_name:
                 alarm = discord.Embed(
-                    title="🔎 Alt Account erkannt",
-                    description=(f"Neue Identität: **{ev['player']}**\n"
-                                f"Vorher bekannt als: **{vorheriger_name}**\n"
-                                f"DayZ-Account-ID: `{ev.get('player_id')}`\n"
-                                f"Server: {conn.name}"),
+                    title=_ft(conn, "🔎 Alt Account erkannt", "🔎 Alt account detected"),
+                    description=_ft(
+                        conn,
+                        f"Neue Identität: **{ev['player']}**\n"
+                        f"Vorher bekannt als: **{vorheriger_name}**\n"
+                        f"DayZ-Account-ID: `{ev.get('player_id')}`\n"
+                        f"Server: {conn.name}",
+                        f"New identity: **{ev['player']}**\n"
+                        f"Previously known as: **{vorheriger_name}**\n"
+                        f"DayZ account ID: `{ev.get('player_id')}`\n"
+                        f"Server: {conn.name}"),
                     color=0xF39C12)
-                alarm.set_footer(text="Account-ID mit anderem Gamertag wiedererkannt. "
-                                      "Bitte manuell prüfen.")
+                alarm.set_footer(text=_ft(conn, "Account-ID mit anderem Gamertag wiedererkannt. "
+                                                "Bitte manuell prüfen.",
+                                          "Account ID recognised under a different gamertag. "
+                                          "Please check manually."))
                 await _post_feed(conn.guild_ids, "alt_account", alarm, service_id=conn.service_id)
         # Rückfallkette statt einem einzelnen Schlüssel: erst die feine
         # Zuordnung (Zombie Death statt "Umwelttod"), dann die grobe
@@ -8077,7 +8148,8 @@ class DayZBot(discord.Client):
             # Combat-Log / Rage-Quit / Killstreak als abgeleitete Ereignisse
             await self._feed_erweiterungen(ev, conn)
         _p = conn.parser if conn is not None else self.parser
-        embed = EmbedBuilder.build(ev, _p.player_positions if _p else None)
+        embed = EmbedBuilder.build(ev, _p.player_positions if _p else None,
+                                   sprache=_feed_sprache(conn))
         if not embed:
             self._dispatch_merken(conn, ev, "kein Embed erzeugt", kandidaten=kandidaten)
             return
@@ -8111,17 +8183,11 @@ class DayZBot(discord.Client):
             send_embed = _feed_anwenden(embed.copy(), feed)
             reward_line = rewards.get(int(gid_str))
             if reward_line:
-                send_embed.add_field(name="💰 Belohnung", value=reward_line, inline=False)
+                send_embed.add_field(name=_ft(conn, "💰 Belohnung", "💰 Reward"), value=reward_line, inline=False)
             ch = await self._resolve_channel(int(ch_id))
             if ch:
                 try:
-                    # Frisch je Guild, NICHT vor der Schleife wiederverwendet:
-                    # "feed" (Farbe/Standort-Schalter) unterscheidet sich pro
-                    # Ziel-Guild, ein geteilter View wuerde ab der zweiten
-                    # Guild mit den falschen Einstellungen uebersetzen.
-                    await ch.send(embed=send_embed,
-                                  view=_FeedTranslateView(
-                                      ev, _p.player_positions if _p else None, feed))
+                    await ch.send(embed=send_embed)
                     self._dispatch_merken(conn, ev, "gepostet",
                                          feed_typ=treffer_schluessel, channel=str(ch_id))
                 except discord.Forbidden:
@@ -8273,12 +8339,12 @@ class DayZBot(discord.Client):
                             total = 0
                             if reward > 0:
                                 total += reward
-                                parts.append(f"+{_fmt_money(reward)} Kill-Belohnung")
+                                parts.append(f"+{_fmt_money(reward)} " + _ft(conn, "Kill-Belohnung", "kill reward"))
                             bounty = await loop.run_in_executor(
                                 None, db.claim_bounties, gid, victim, uid)
                             if bounty > 0:
                                 total += bounty
-                                parts.append(f"+{_fmt_money(bounty)} Kopfgeld 🎯")
+                                parts.append(f"+{_fmt_money(bounty)} " + _ft(conn, "Kopfgeld 🎯", "bounty 🎯"))
                             if total > 0:
                                 await loop.run_in_executor(None, db.add_wallet, gid, uid, total)
                                 out[gid] = f"{' · '.join(parts)} → <@{uid}>"
@@ -9513,18 +9579,24 @@ auto_status.autocomplete("server")(_server_autocomplete)
 # ``schaden``: (Schluessel in der cfggameplay.json, neuer Wert). Der Wert ist
 # das VERBOT, nicht die Erlaubnis – "Schaden an" heisst disableXxxDamage=False.
 SCHEDULED_TASK_TYPES: Dict[str, Dict[str, Any]] = {
-    "restart_server": {"label": "Server neu starten"},
-    "online_list": {"label": "Online-Liste posten", "channel_pflicht": True,
-                    "online_liste_optionen": True},
-    "base_damage_on":       {"label": "Base Damage anschalten",
+    "restart_server": {"label": "Server neu starten", "label_en": "Restart server"},
+    "online_list": {"label": "Online-Liste posten", "label_en": "Post online list",
+                    "channel_pflicht": True, "online_liste_optionen": True},
+    "base_damage_on":       {"label": "Base Damage anschalten", "label_en": "Turn base damage on",
                              "schaden": ("disableBaseDamage", False)},
-    "base_damage_off":      {"label": "Base Damage ausschalten",
+    "base_damage_off":      {"label": "Base Damage ausschalten", "label_en": "Turn base damage off",
                              "schaden": ("disableBaseDamage", True)},
-    "container_damage_on":  {"label": "Container Damage anschalten",
+    "container_damage_on":  {"label": "Container Damage anschalten", "label_en": "Turn container damage on",
                              "schaden": ("disableContainerDamage", False)},
-    "container_damage_off": {"label": "Container Damage ausschalten",
+    "container_damage_off": {"label": "Container Damage ausschalten", "label_en": "Turn container damage off",
                              "schaden": ("disableContainerDamage", True)},
 }
+
+
+def _aufgabe_label(conn: Optional[ServerConnection], art: Any) -> str:
+    """Anzeigename einer Auto-Aufgabe in der Feed-Sprache des Servers."""
+    meta = SCHEDULED_TASK_TYPES.get(art, {})
+    return _ft(conn, meta.get("label", str(art)), meta.get("label_en", meta.get("label", str(art))))
 
 # Zwei unabhaengige Grenzen: zu VIELE Namen machen den Post nur unlesbar
 # (_ONLINE_LISTE_MAX), zu LANGE Namen (Klammer-/Stern-Dekoration in
@@ -9653,7 +9725,8 @@ def _online_spieler_namen(positions: Dict[str, Dict],
 
 def _online_liste_embed(conn: ServerConnection, namen: List[str],
                         notiz: str = "",
-                        gesamt: Optional[int] = None) -> discord.Embed:
+                        gesamt: Optional[int] = None,
+                        sprache: Optional[str] = None) -> discord.Embed:
     """Wer ist gerade online? Kopfzeile mit Anzahl, darunter die Namen.
 
     ``gesamt`` ist die Spielerzahl, die der Server selbst per A2S meldet
@@ -9666,6 +9739,8 @@ def _online_liste_embed(conn: ServerConnection, namen: List[str],
     Die Namen kommen aus dem Spiel und sind Fremdeingabe: ohne
     ``escape_markdown`` wuerde aus ``ICH_MAG_HUNDE_xD`` kursiver Text.
     """
+    # Sprache: Server-Einstellung (Post); /online uebergibt die Sprache des Nutzers.
+    sprache = sprache or _feed_sprache(conn)
     anzahl = max(int(gesamt), len(namen)) if gesamt is not None else len(namen)
     gezeigt = namen[:_ONLINE_LISTE_MAX]
     zeilen: List[str] = []
@@ -9682,8 +9757,9 @@ def _online_liste_embed(conn: ServerConnection, namen: List[str],
         laenge += len(zeile) + 1
     rest = len(namen) - len(gezeigt)
     if rest > 0:
-        zeilen.append(f"… und {rest} weitere"
-                      + (" (Namen zu lang für einen Post)" if abgeschnitten else ""))
+        zeilen.append(_tx(sprache, f"… und {rest} weitere", f"… and {rest} more")
+                      + (_tx(sprache, " (Namen zu lang für einen Post)", " (names too long for one post)")
+                         if abgeschnitten else ""))
     if zeilen:
         beschreibung = "\n".join(zeilen)
     elif anzahl > 0:
@@ -9692,12 +9768,15 @@ def _online_liste_embed(conn: ServerConnection, namen: List[str],
         # Kopfzeile. Kennt der Log-Parser (noch) keine Namen (z. B. direkt
         # nach einem Bot-Neustart, bevor der naechste PlayerList-Block kam),
         # muss das auch so dastehen statt eine leere Liste vorzutaeuschen.
-        beschreibung = (f"{anzahl} Spieler laut Server – Namen aktuell nicht "
-                        f"bekannt (Log-Tracking noch nicht aufgebaut).")
+        beschreibung = _tx(sprache,
+                           f"{anzahl} Spieler laut Server – Namen aktuell nicht "
+                           f"bekannt (Log-Tracking noch nicht aufgebaut).",
+                           f"{anzahl} player(s) according to the server – names currently "
+                           f"unknown (log tracking not established yet).")
     else:
-        beschreibung = "Gerade ist niemand online."
+        beschreibung = _tx(sprache, "Gerade ist niemand online.", "Nobody is online right now.")
     e = discord.Embed(
-        title=f"📡 • Online-Liste • {anzahl} Spieler",
+        title=_tx(sprache, f"📡 • Online-Liste • {anzahl} Spieler", f"📡 • Online list • {anzahl} players"),
         description=beschreibung,
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc))
@@ -10278,23 +10357,24 @@ async def _ban_log_senden(conn: ServerConnection, art: str, namen: List[str], gr
         if not ziele or not namen:
             return False
         if art == "temp":
-            titel, farbe = "🔨 Zeitlicher Ban", 0xE67E22
+            titel, farbe = _ft(conn, "🔨 Zeitlicher Ban", "🔨 Temporary ban"), 0xE67E22
         elif art == "perm":
-            titel, farbe = "🔨 Permanenter Ban", 0xE74C3C
+            titel, farbe = _ft(conn, "🔨 Permanenter Ban", "🔨 Permanent ban"), 0xE74C3C
         else:
-            titel, farbe = "✅ Entbannt", 0x2ECC71
+            titel, farbe = _ft(conn, "✅ Entbannt", "✅ Unbanned"), 0x2ECC71
         e = discord.Embed(title=titel, color=farbe)
-        e.add_field(name="Spieler", value="\n".join(f"`{n}`" for n in namen[:25]), inline=False)
+        e.add_field(name=_ft(conn, "Spieler", "Player"), value="\n".join(f"`{n}`" for n in namen[:25]), inline=False)
         if grund:
-            e.add_field(name="Grund", value=str(grund)[:1000], inline=False)
-        e.add_field(name="Von", value=str(von)[:200] or "–", inline=True)
+            e.add_field(name=_ft(conn, "Grund", "Reason"), value=str(grund)[:1000], inline=False)
+        e.add_field(name=_ft(conn, "Von", "By"), value=str(von)[:200] or "–", inline=True)
         if zone:
             e.add_field(name="Zone", value=str(zone)[:100], inline=True)
         if ereignis:
-            e.add_field(name="Ereignis", value=str(ereignis)[:100], inline=True)
+            e.add_field(name=_ft(conn, "Ereignis", "Event"), value=str(ereignis)[:100], inline=True)
         if expires_at:
-            e.add_field(name="Endet", value=f"<t:{int(expires_at)}:R>", inline=True)
-        e.set_footer(text=f"{conn.name} · Änderung greift ggf. erst nach einem Server-Neustart.")
+            e.add_field(name=_ft(conn, "Endet", "Ends"), value=f"<t:{int(expires_at)}:R>", inline=True)
+        e.set_footer(text=f"{conn.name} · " + _ft(conn, "Änderung greift ggf. erst nach einem Server-Neustart.",
+                                                  "The change may only take effect after a server restart."))
         e.timestamp = datetime.now(timezone.utc)
         irgendwo = False
         for gid, kanal in ziele:
@@ -11409,7 +11489,7 @@ async def cmd_online(interaction: discord.Interaction,
         await bot._rehydrate_versuch(conn)
         positions = dict(conn.parser.player_positions) if conn.parser else {}
         namen = _online_spieler_namen(positions)
-    embed = _online_liste_embed(conn, namen, "", gesamt)
+    embed = _online_liste_embed(conn, namen, "", gesamt, _sprache(interaction))
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -11803,14 +11883,14 @@ WHITELIST_PANEL_TEXT_EN = ("Click the button and enter your PlayStation name "
                            "to be added to the whitelist")
 
 
-def _whitelist_request_embed(requester_id: int, psn: str) -> discord.Embed:
+def _whitelist_request_embed(requester_id: int, psn: str, sprache: str = "de") -> discord.Embed:
     embed = discord.Embed(
-        title="🎮 Neue Whitelist-Anfrage",
-        description="Ein Admin muss diese Anfrage prüfen.",
+        title=_tx(sprache, "🎮 Neue Whitelist-Anfrage", "🎮 New whitelist request"),
+        description=_tx(sprache, "Ein Admin muss diese Anfrage prüfen.", "An admin has to review this request."),
         color=0x5865F2,
         timestamp=datetime.now(timezone.utc))
-    embed.add_field(name="Angefragt von", value=f"<@{requester_id}>", inline=True)
-    embed.add_field(name="PlayStation-Name", value=f"`{psn}`", inline=True)
+    embed.add_field(name=_tx(sprache, "Angefragt von", "Requested by"), value=f"<@{requester_id}>", inline=True)
+    embed.add_field(name=_tx(sprache, "PlayStation-Name", "PlayStation name"), value=f"`{psn}`", inline=True)
     return embed
 
 
@@ -11898,8 +11978,8 @@ class WhitelistRequestModal(discord.ui.Modal, title="🎮 PSN Name eintragen"):
         }
         try:
             msg = await admin_ch.send(
-                embed=_whitelist_request_embed(interaction.user.id, psn),
-                view=WhitelistApprovalView(reqid))
+                embed=_whitelist_request_embed(interaction.user.id, psn, _feed_sprache(connections.for_service(sid))),
+                view=WhitelistApprovalView(reqid, _feed_sprache(connections.for_service(sid))))
         except discord.Forbidden:
             return await interaction.response.send_message(_t(
                 interaction,
@@ -12169,7 +12249,7 @@ class TicketDeleteConfirmView(discord.ui.View):
     """Kurzlebige, NICHT-persistente Sicherheitsabfrage vor dem endgueltigen
     Loeschen eines Ticket-Kanals - muss keinen Bot-Neustart ueberleben, ein
     normaler Timeout reicht (Vorbild fuer nicht-persistente Views:
-    _FeedTranslateView, siehe Kommentar dort)."""
+    _ticket_sprache, Server-Sprache)."""
 
     def __init__(self, service_id: str, ticket_id: int, guild_id: Optional[int] = None):
         super().__init__(timeout=60)
@@ -12430,14 +12510,14 @@ class WhitelistApprovalView(discord.ui.View):
     """Persistente Freigabe-Buttons (Akzeptieren/Ablehnen) für eine Anfrage.
     custom_ids tragen die reqid, damit sie einen Neustart überleben."""
 
-    def __init__(self, reqid: str):
+    def __init__(self, reqid: str, sprache: str = "de"):
         super().__init__(timeout=None)
         self.reqid = reqid
         approve = discord.ui.Button(
-            label="Akzeptieren", emoji="✅",
+            label=_tx(sprache, "Akzeptieren", "Accept"), emoji="✅",
             style=discord.ButtonStyle.success, custom_id=f"wl_approve:{reqid}")
         reject = discord.ui.Button(
-            label="Ablehnen", emoji="❌",
+            label=_tx(sprache, "Ablehnen", "Reject"), emoji="❌",
             style=discord.ButtonStyle.danger, custom_id=f"wl_reject:{reqid}")
         approve.callback = self._approve
         reject.callback  = self._reject
@@ -12565,14 +12645,15 @@ async def send_whitelist_panel(interaction: discord.Interaction,
     cfg.set_channel(interaction.guild_id, "whitelist_request", admin_channel.id,
                     service_id=_conn.service_id)
 
+    _fs = _feed_sprache(_conn)          # Das Panel ist ein Post im Channel: Server-Sprache (feed_sprache)
     panel_embed = discord.Embed(
-        title=_t(interaction, "✅ Whitelist-Anmeldung", "✅ Whitelist Signup"),
-        description=_t(interaction, WHITELIST_PANEL_TEXT, WHITELIST_PANEL_TEXT_EN),
+        title=_tx(_fs, "✅ Whitelist-Anmeldung", "✅ Whitelist Signup"),
+        description=_tx(_fs, WHITELIST_PANEL_TEXT, WHITELIST_PANEL_TEXT_EN),
         color=0x5865F2)
     try:
         await panel_channel.send(
             embed=panel_embed,
-            view=WhitelistPanelView(_conn.service_id, _sprache(interaction)))
+            view=WhitelistPanelView(_conn.service_id, _fs))
     except discord.Forbidden:
         return await interaction.response.send_message(_t(
             interaction,
@@ -12623,10 +12704,11 @@ async def send_ticket_panel(interaction: discord.Interaction,
             "❌ No ticket category is set up yet. Add at least one category in the dashboard "
             "under „Discord Management → Ticket Tool“ first."), ephemeral=True)
 
+    _ts = _ticket_sprache(_conn)         # Das Panel ist ein Post im Channel: Server-Sprache (feed_sprache)
     panel_embed = discord.Embed(
-        title=_t(interaction, "🎫 Support-Ticket erstellen", "🎫 Create a support ticket"),
-        description=_t(
-            interaction,
+        title=_tt(_ts, "🎫 Support-Ticket erstellen", "🎫 Create a support ticket"),
+        description=_tt(
+            _ts,
             "Klicke unten auf die passende Kategorie – es entsteht automatisch ein privater "
             "Ticket-Kanal, den nur du und der zuständige Support sehen können.",
             "Click the matching category below – a private ticket channel will be created "
@@ -24253,7 +24335,7 @@ async def cmd_test(interaction: discord.Interaction, zeilen: int = 500,
                                   "Channel not found (outdated ID?)")))
             continue
 
-        embed = EmbedBuilder.build(ev)
+        embed = EmbedBuilder.build(ev, sprache=_feed_sprache(conn))
         if not embed:
             errors.append((lt, _t(interaction, "Embed konnte nicht erstellt werden",
                                   "Could not build the embed")))
@@ -25651,8 +25733,9 @@ async def _giveaway_erstellen(interaction: discord.Interaction, conn: ServerConn
         "winners": [],
         "status": "running",
     }
-    embed = _giveaway_embed(eintrag, sprache, beendet=False)
-    view = GiveawayEntryView(conn.service_id, neue_id)
+    eintrag["sprache"] = _feed_sprache(conn)       # Server-Sprache (feed_sprache), nicht die des Erstellers
+    embed = _giveaway_embed(eintrag, eintrag["sprache"], beendet=False)
+    view = GiveawayEntryView(conn.service_id, neue_id, eintrag["sprache"])
     try:
         nachricht = await interaction.channel.send(embed=embed, view=view)
     except discord.Forbidden:
@@ -25672,12 +25755,12 @@ class GiveawayEntryView(discord.ui.View):
     traegt Service-ID + Gewinnspiel-ID, damit ein Bot-Neustart ihn nicht
     verwaist (siehe Wiederanmeldung in setup_hook)."""
 
-    def __init__(self, service_id: str, giveaway_id: int):
+    def __init__(self, service_id: str, giveaway_id: int, sprache: str = "de"):
         super().__init__(timeout=None)
         self.service_id = str(service_id)
         self.giveaway_id = int(giveaway_id)
         knopf = discord.ui.Button(
-            label="Teilnehmen", emoji="🎉", style=discord.ButtonStyle.primary,
+            label=_tx(sprache, "Teilnehmen", "Enter"), emoji="🎉", style=discord.ButtonStyle.primary,
             custom_id=f"giveaway_enter:{self.service_id}:{self.giveaway_id}")
         knopf.callback = self._teilnehmen
         self.add_item(knopf)
@@ -25707,7 +25790,7 @@ class GiveawayEntryView(discord.ui.View):
         entrants.append(interaction.user.id)
         _conn_store(conn, "giveaways", _giveaways(conn))
         try:
-            embed = _giveaway_embed(eintrag, str(eintrag.get("sprache") or "de"), beendet=False)
+            embed = _giveaway_embed(eintrag, _feed_sprache(conn), beendet=False)
             await interaction.message.edit(embed=embed)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             log.debug(f"[GEWINNSPIELE] Teilnehmerzahl-Update fehlgeschlagen: {e}")
@@ -25874,7 +25957,7 @@ async def cmd_greroll(interaction: discord.Interaction, giveaway_id: int,
     neue_sieger = random.sample(kandidaten, min(int(count), len(kandidaten)))
     eintrag["winners"] = list(bisherige_sieger) + neue_sieger
     _conn_store(conn, "giveaways", _giveaways(conn))
-    sprache = str(eintrag.get("sprache") or "de")
+    sprache = _feed_sprache(conn)
     mentions = ", ".join(f"<@{uid}>" for uid in neue_sieger)
     text = _tt(sprache, f"🎉 Neue Auslosung für **{eintrag.get('prize')}**: Herzlichen Glückwunsch {mentions}!",
               f"🎉 New draw for **{eintrag.get('prize')}**: Congratulations {mentions}!")
@@ -27790,6 +27873,35 @@ async def _link_hooks_zuruecknehmen(guild_id: int, user_id: int) -> str:
     return " ".join(hinweise)
 
 
+# Englische Fassungen der Username-Hook-Hinweise (Rollen/Nickname) fuer die Admin-Meldung.
+_HOOK_HINWEIS_EN: List[Tuple["re.Pattern[str]", str]] = [
+    (re.compile(r"Username Hooks: Bot erreicht die Guild nicht\."), "Username Hooks: the bot cannot reach the guild."),
+    (re.compile(r"Username Hooks: Mitglied nicht gefunden\."), "Username Hooks: member not found."),
+    (re.compile(r"Rolle „([^“]*)“ konnte nicht vergeben werden \(Rechte/Hierarchie\)\."),
+     r"Role “\1” could not be assigned (permissions/hierarchy)."),
+    (re.compile(r"Rolle „([^“]*)“ konnte nicht entfernt werden \(Rechte/Hierarchie\)\."),
+     r"Role “\1” could not be removed (permissions/hierarchy)."),
+    (re.compile(r"Rolle „([^“]*)“ nicht entfernt:"), r"Role “\1” not removed:"),
+    (re.compile(r"Rolle „([^“]*)“ nicht zurückgegeben:"), r"Role “\1” not given back:"),
+    (re.compile(r"Rolle „([^“]*)“:"), r"Role “\1”:"),
+    (re.compile(r"Nickname des Server-Eigentümers kann nicht geändert werden\."),
+     "The server owner's nickname cannot be changed."),
+    (re.compile(r"Nickname konnte nicht gesetzt werden \(Recht „Nicknames verwalten“\)\."),
+     "Nickname could not be set (missing permission “Manage Nicknames”)."),
+    (re.compile(r"Nickname nicht zurückgesetzt:"), "Nickname not reset:"),
+    (re.compile(r"Nickname:"), "Nickname:"),
+]
+
+
+def _hook_hinweis_anzeige(conn: Optional[ServerConnection], text: str) -> str:
+    """Username-Hook-Hinweis in der Feed-Sprache des Servers (nur bekannte Satzbausteine)."""
+    if not text or _feed_sprache(conn) != "en":
+        return text
+    for muster, en in _HOOK_HINWEIS_EN:
+        text = muster.sub(en, text)
+    return text
+
+
 async def _notify_link_change(guild_id: Optional[int], embed: discord.Embed):
     """Meldet /link- und /unlink-Aktionen an die Admins:
     bevorzugt im adminlog-Feed, sonst im economy_log-Feed.
@@ -28192,11 +28304,18 @@ class ShopManager:
                       "automatischer neuer Versuch beim nächsten Poll-Zyklus.")
             for warn_gid in {int(r["guild_id"]) for r in rows}:
                 warn = discord.Embed(
-                    title="⚠️ Delivery cleanup failed",
-                    description=("Could not remove delivered `SHOP_` entries from "
-                                 "`cfgEffectArea.json` (FTP error). Items would respawn on "
-                                 "every restart. The bot retries automatically – admins can "
-                                 "also run `/shop cleanup`."),
+                    title=_ft(self.conn, "⚠️ Lieferung: Bereinigung fehlgeschlagen",
+                              "⚠️ Delivery cleanup failed"),
+                    description=_ft(
+                        self.conn,
+                        "Gelieferte `SHOP_`-Einträge konnten nicht aus der "
+                        "`cfgEffectArea.json` entfernt werden (FTP-Fehler). Die Items würden bei "
+                        "jedem Neustart erneut spawnen. Der Bot versucht es automatisch erneut – "
+                        "Admins können auch `/shop cleanup` ausführen.",
+                        "Could not remove delivered `SHOP_` entries from "
+                        "`cfgEffectArea.json` (FTP error). Items would respawn on "
+                        "every restart. The bot retries automatically – admins can "
+                        "also run `/shop cleanup`."),
                     color=0xE67E22)
                 await _post_feed(warn_gid, "shop_log", warn,
                                  service_id=self.conn.service_id)
@@ -28204,11 +28323,14 @@ class ShopManager:
         db.mark_delivered(ids)
         for r in rows:
             embed = discord.Embed(
-                title="📦 DELIVERED",
-                description=(f"**{r['amount']}× {r['item_name']}** for <@{r['user_id']}> "
-                             f"spawned after the server restart."),
+                title=_ft(self.conn, "📦 GELIEFERT", "📦 DELIVERED"),
+                description=_ft(self.conn,
+                                f"**{r['amount']}× {r['item_name']}** für <@{r['user_id']}> "
+                                f"ist nach dem Server-Neustart gespawnt.",
+                                f"**{r['amount']}× {r['item_name']}** for <@{r['user_id']}> "
+                                f"spawned after the server restart."),
                 color=0x2ECC71)
-            embed.set_footer(text=f"Purchase #{r['id']}")
+            embed.set_footer(text=_ft(self.conn, f"Kauf #{r['id']}", f"Purchase #{r['id']}"))
             await _post_feed(int(r["guild_id"]), "shop_log", embed,
                              service_id=self.conn.service_id)
 
@@ -28392,10 +28514,11 @@ class RentalManager:
 
     async def _melde_ablauf(self, row: sqlite3.Row):
         embed = discord.Embed(
-            title="🚗 Miete abgelaufen",
-            description=f"**{row['item_name']}** von <@{row['user_id']}> wurde entfernt.",
+            title=_ft(self.conn, "🚗 Miete abgelaufen", "🚗 Rental expired"),
+            description=_ft(self.conn, f"**{row['item_name']}** von <@{row['user_id']}> wurde entfernt.",
+                            f"**{row['item_name']}** of <@{row['user_id']}> was removed."),
             color=0xE67E22)
-        embed.set_footer(text=f"Miete #{row['id']}")
+        embed.set_footer(text=_ft(self.conn, f"Miete #{row['id']}", f"Rental #{row['id']}"))
         await _post_feed(int(row["guild_id"]), "shop_log", embed,
                          service_id=str(row["service_id"] or self.conn.service_id))
 
@@ -28631,17 +28754,28 @@ async def cmd_withdraw(interaction: discord.Interaction,
 # ══════════════════════════════════════════════════════════════
 #  ECONOMY-ADMIN-COMMANDS – /addmoney /removemoney /setbalance
 # ══════════════════════════════════════════════════════════════
+# Deutsche Titel der Economy-Admin-Log-Embeds (die Aufrufer uebergeben die englische Fassung).
+_ECONOMY_LOG_TITEL_DE = {
+    "💰 ADMIN: ADD MONEY": "💰 ADMIN: GELD HINZUGEFÜGT",
+    "💸 ADMIN: REMOVE MONEY": "💸 ADMIN: GELD ENTFERNT",
+    "🎯 ADMIN: SET BALANCE": "🎯 ADMIN: KONTOSTAND GESETZT",
+}
+
+
 async def _post_economy_admin_log(interaction: discord.Interaction, title: str,
                                   target: discord.Member, amount_text: str,
                                   wallet: int, color: int):
     """Jede Admin-Geldaktion in den economy_log-Feed posten."""
-    embed = discord.Embed(
-        title=title,
-        description=(f"**{interaction.user.display_name}** → {target.mention}\n"
-                     f"Amount: **{amount_text}**"),
-        color=color)
-    embed.set_footer(text=f"New wallet: {_fmt_money(wallet)}")
     _leit = connections.for_guild(interaction.guild_id)
+    embed = discord.Embed(
+        title=_ft(_leit, _ECONOMY_LOG_TITEL_DE.get(title, title), title),
+        description=_ft(_leit, f"**{interaction.user.display_name}** → {target.mention}\n"
+                               f"Betrag: **{amount_text}**",
+                        f"**{interaction.user.display_name}** → {target.mention}\n"
+                        f"Amount: **{amount_text}**"),
+        color=color)
+    embed.set_footer(text=_ft(_leit, f"Neues Wallet: {_fmt_money(wallet)}",
+                              f"New wallet: {_fmt_money(wallet)}"))
     await _post_feed(interaction.guild_id, "economy_log", embed,
                      service_id=_leit.service_id if _leit else None)
 
@@ -29041,10 +29175,14 @@ async def cmd_link(interaction: discord.Interaction, playstation_name: str):
     if ist_haupt:
         hook_hinweis = await _link_hooks_anwenden(_conn, interaction.guild_id,
                                                   interaction.user.id, name)
+    _lc = connections.for_guild(interaction.guild_id)
+    hook_hinweis = _hook_hinweis_anzeige(_lc, hook_hinweis)
     note = discord.Embed(
-        title="🔗 /link verwendet",
-        description=(f"{interaction.user.mention} (`{interaction.user}`) hat sich mit **{name}** "
-                     f"verknüpft ({'Hauptaccount' if ist_haupt else 'Zusatz-Account'})."
+        title=_ft(_lc, "🔗 /link verwendet", "🔗 /link used"),
+        description=(_ft(_lc, f"{interaction.user.mention} (`{interaction.user}`) hat sich mit **{name}** "
+                              f"verknüpft ({'Hauptaccount' if ist_haupt else 'Zusatz-Account'}).",
+                         f"{interaction.user.mention} (`{interaction.user}`) linked to **{name}** "
+                         f"({'main account' if ist_haupt else 'additional account'}).")
                      + (f"\n⚠️ {hook_hinweis}" if hook_hinweis else "")),
         color=0x2ECC71)
     await _notify_link_change(interaction.guild_id, note)
@@ -29094,9 +29232,12 @@ async def cmd_unlink(interaction: discord.Interaction, playstation_name: Optiona
     hook_hinweis = ""
     if not db.get_links_by_user(interaction.guild_id, interaction.user.id):
         hook_hinweis = await _link_hooks_zuruecknehmen(interaction.guild_id, interaction.user.id)
+    _lc = connections.for_guild(interaction.guild_id)
+    hook_hinweis = _hook_hinweis_anzeige(_lc, hook_hinweis)
     note = discord.Embed(
-        title="🔓 /unlink verwendet",
-        description=(f"{interaction.user.mention} (`{interaction.user}`) hat die Verknüpfung mit **{ziel}** entfernt."
+        title=_ft(_lc, "🔓 /unlink verwendet", "🔓 /unlink used"),
+        description=(_ft(_lc, f"{interaction.user.mention} (`{interaction.user}`) hat die Verknüpfung mit **{ziel}** entfernt.",
+                         f"{interaction.user.mention} (`{interaction.user}`) removed the link to **{ziel}**.")
                      + (f"\n⚠️ {hook_hinweis}" if hook_hinweis else "")),
         color=0xE67E22)
     await _notify_link_change(interaction.guild_id, note)
@@ -29126,10 +29267,14 @@ async def cmd_forcelink(interaction: discord.Interaction,
     if len(db.get_links_by_user(interaction.guild_id, user.id)) == 1:
         hook_hinweis = await _link_hooks_anwenden(_conn_of(interaction), interaction.guild_id,
                                                   user.id, name)
+    _lc = connections.for_guild(interaction.guild_id)
+    hook_hinweis = _hook_hinweis_anzeige(_lc, hook_hinweis)
     note = discord.Embed(
-        title="🔗 /forcelink verwendet",
-        description=(f"{interaction.user.mention} hat {user.mention} "
-                     f"mit **{name}** verknüpft."
+        title=_ft(_lc, "🔗 /forcelink verwendet", "🔗 /forcelink used"),
+        description=(_ft(_lc, f"{interaction.user.mention} hat {user.mention} "
+                              f"mit **{name}** verknüpft.",
+                         f"{interaction.user.mention} linked {user.mention} "
+                         f"to **{name}**.")
                      + (f"\n⚠️ {hook_hinweis}" if hook_hinweis else "")),
         color=0x2ECC71)
     await _notify_link_change(interaction.guild_id, note)
@@ -29186,10 +29331,14 @@ async def cmd_forceunlink(interaction: discord.Interaction, user: discord.Member
     hook_hinweis = ""
     if not db.get_links_by_user(interaction.guild_id, user.id):
         hook_hinweis = await _link_hooks_zuruecknehmen(interaction.guild_id, user.id)
+    _lc = connections.for_guild(interaction.guild_id)
+    hook_hinweis = _hook_hinweis_anzeige(_lc, hook_hinweis)
     note = discord.Embed(
-        title="🔓 /forceunlink verwendet",
-        description=(f"{interaction.user.mention} hat die Verknüpfung "
-                     f"{user.mention} ↔ **{ziel}** entfernt."
+        title=_ft(_lc, "🔓 /forceunlink verwendet", "🔓 /forceunlink used"),
+        description=(_ft(_lc, f"{interaction.user.mention} hat die Verknüpfung "
+                              f"{user.mention} ↔ **{ziel}** entfernt.",
+                         f"{interaction.user.mention} removed the link "
+                         f"{user.mention} ↔ **{ziel}**.")
                      + (f"\n⚠️ {hook_hinweis}" if hook_hinweis else "")),
         color=0xE67E22)
     await _notify_link_change(interaction.guild_id, note)
@@ -29351,12 +29500,14 @@ async def cmd_pay(interaction: discord.Interaction,
         description=f"{interaction.user.mention} → {user.mention}: **{_fmt_money(betrag)}**",
         color=0x2ECC71)
     await interaction.response.send_message(embed=e)
-    log_embed = discord.Embed(
-        title="💸 PLAYER TRANSFER",
-        description=(f"**{interaction.user.display_name}** → **{user.display_name}**\n"
-                     f"Betrag: **{_fmt_money(betrag)}**"),
-        color=0x3498DB)
     _leit = connections.for_guild(interaction.guild_id)
+    log_embed = discord.Embed(
+        title=_ft(_leit, "💸 SPIELER-ÜBERWEISUNG", "💸 PLAYER TRANSFER"),
+        description=_ft(_leit, f"**{interaction.user.display_name}** → **{user.display_name}**\n"
+                               f"Betrag: **{_fmt_money(betrag)}**",
+                        f"**{interaction.user.display_name}** → **{user.display_name}**\n"
+                        f"Amount: **{_fmt_money(betrag)}**"),
+        color=0x3498DB)
     await _post_feed(interaction.guild_id, "economy_log", log_embed,
                      service_id=_leit.service_id if _leit else None)
 
@@ -30739,10 +30890,14 @@ async def shop_buy_rental(interaction: discord.Interaction, item: str,
         if not rollback_ok:
             log.error(f"[RENTAL] Rollback fehlgeschlagen – verwaistes Event: {event_name}")
             warn = discord.Embed(
-                title="⚠️ Orphaned rental event",
-                description=(f"A cancelled rental purchase could not be rolled back "
-                             f"(`{event_name}`). It needs manual removal via the "
-                             f"Event-Vorlagen tool - `/shop check` also flags it."),
+                title=_ft(_conn, "⚠️ Verwaistes Miet-Event", "⚠️ Orphaned rental event"),
+                description=_ft(_conn,
+                                f"Ein abgebrochener Miet-Kauf konnte nicht zurückgerollt werden "
+                                f"(`{event_name}`). Es muss manuell über das Event-Vorlagen-Tool "
+                                f"entfernt werden – `/shop check` markiert es ebenfalls.",
+                                f"A cancelled rental purchase could not be rolled back "
+                                f"(`{event_name}`). It needs manual removal via the "
+                                f"Event templates tool - `/shop check` also flags it."),
                 color=0xE67E22)
             await _post_feed(gid, "shop_log", warn, service_id=_conn.service_id)
         wallet, _bank = db.get_balance(gid, uid)
@@ -30797,13 +30952,15 @@ async def shop_buy_rental(interaction: discord.Interaction, item: str,
     await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── 9. In den shop_log-Feed posten ─────────────────────────
+    near_feed = (f"\n*({_ft(_conn, 'Nahe', 'Near')} {near})*") if near else ""
     feed = discord.Embed(
-        title="🚗 RENTAL PURCHASE",
-        description=f"{interaction.user.mention} rented **{it['name']}** for **{restarts} restart(s)**",
+        title=_ft(_conn, "🚗 MIET-KAUF", "🚗 RENTAL PURCHASE"),
+        description=_ft(_conn, f"{interaction.user.mention} hat **{it['name']}** für **{restarts} Neustart(s)** gemietet",
+                        f"{interaction.user.mention} rented **{it['name']}** for **{restarts} restart(s)**"),
         color=0x3498DB)
-    feed.add_field(name="Price", value=_fmt_money(total), inline=True)
-    feed.add_field(name="Location", value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=True)
-    feed.set_footer(text=(f"Miete #{rental_id} · {event_name}")[:100])
+    feed.add_field(name=_ft(_conn, "Preis", "Price"), value=_fmt_money(total), inline=True)
+    feed.add_field(name=_ft(_conn, "Ort", "Location"), value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_feed}", inline=True)
+    feed.set_footer(text=(f"{_ft(_conn, 'Miete', 'Rental')} #{rental_id} · {event_name}")[:100])
     await _post_feed(gid, "shop_log", feed, service_id=_conn.service_id)
 
 shop_buy_rental.autocomplete("item")(_rental_buy_autocomplete)
@@ -31512,7 +31669,7 @@ async def _adj_ankuendigen(conn: ServerConnection, instanzen: List[Dict[str, Any
         if kanal is None or getattr(getattr(kanal, "guild", None), "id", None) not in conn.guild_ids:
             return                      # nur ein Channel einer Guild dieses Servers (nie ein fremder)
         karte = str(conn.get("map_name") or "ChernarusPlus")
-        en = _adj_zustand(conn)["ankuendigung"]["sprache"] == "en"
+        en = _feed_sprache(conn) == "en"            # Server-Sprache (feed_sprache)
         emb = discord.Embed(
             title="🪂 Airdrop incoming" if en else "🪂 Airdrop im Anflug",
             description=("A supply drop has been marked on the map." if en
@@ -32583,10 +32740,14 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
             # Verwaiste Einträge würden bei jedem Neustart gratis spawnen → Admins warnen
             log.error(f"[SHOP] Rollback fehlgeschlagen – verwaiste Areas: {area_names}")
             warn = discord.Embed(
-                title="⚠️ Orphaned shop entries",
-                description=("A cancelled purchase could not be rolled back in "
-                             "`cfgEffectArea.json`. Run `/shop cleanup` to remove the "
-                             "orphaned entries, otherwise the items respawn on every restart."),
+                title=_ft(_conn, "⚠️ Verwaiste Shop-Einträge", "⚠️ Orphaned shop entries"),
+                description=_ft(_conn,
+                                "Ein abgebrochener Kauf konnte in der `cfgEffectArea.json` nicht "
+                                "zurückgerollt werden. Führe `/shop cleanup` aus, um die verwaisten "
+                                "Einträge zu entfernen, sonst spawnen die Items bei jedem Neustart erneut.",
+                                "A cancelled purchase could not be rolled back in "
+                                "`cfgEffectArea.json`. Run `/shop cleanup` to remove the "
+                                "orphaned entries, otherwise the items respawn on every restart."),
                 color=0xE67E22)
             await _post_feed(gid, "shop_log", warn, service_id=_conn.service_id)
         wallet, _bank = db.get_balance(gid, uid)
@@ -32635,14 +32796,17 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
     await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ── 9. Kauf in den shop_log-Feed posten ───────────────────
+    near_feed = (f"\n*({_ft(_conn, 'Nahe', 'Near')} {near})*") if near else ""
     feed = discord.Embed(
-        title="🛒 SHOP PURCHASE",
-        description=f"{interaction.user.mention} bought **{amount}× {it['name']}**",
+        title=_ft(_conn, "🛒 SHOP-KAUF", "🛒 SHOP PURCHASE"),
+        description=_ft(_conn, f"{interaction.user.mention} hat **{amount}× {it['name']}** gekauft",
+                        f"{interaction.user.mention} bought **{amount}× {it['name']}**"),
         color=0x3498DB)
-    feed.add_field(name="Price",    value=_fmt_money(total), inline=True)
-    feed.add_field(name="Location", value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=True)
-    feed.add_field(name="Status",   value="⏳ pending (spawns after restart)", inline=False)
-    feed.set_footer(text=(f"Purchase #{purchase_id} · " + "+".join(cls_list))[:100])
+    feed.add_field(name=_ft(_conn, "Preis", "Price"),    value=_fmt_money(total), inline=True)
+    feed.add_field(name=_ft(_conn, "Ort", "Location"), value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_feed}", inline=True)
+    feed.add_field(name="Status",   value=_ft(_conn, "⏳ ausstehend (spawnt nach dem Neustart)",
+                                              "⏳ pending (spawns after restart)"), inline=False)
+    feed.set_footer(text=(f"{_ft(_conn, 'Kauf', 'Purchase')} #{purchase_id} · " + "+".join(cls_list))[:100])
     await _post_feed(gid, "shop_log", feed, service_id=_conn.service_id)
 
 cmd_buy.autocomplete("item")(_shop_buy_autocomplete)
@@ -38629,8 +38793,7 @@ async def _welcome_leave_posten(member: discord.Member, konn_liste: List["Server
             kanal = bot.get_channel(int(kanal_id)) if bot else None
             if kanal is None:
                 continue
-            sprache = einstellung.get("language") \
-                if einstellung.get("language") in _DISCORD_MGMT_SPRACHEN else "en"
+            sprache = _feed_sprache(conn)          # Server-Sprache (feed_sprache)
             embed = _welcome_leave_embed(member, member.guild, sprache, ist_willkommen,
                                          bool(einstellung.get("include_avatar", True)))
             await kanal.send(embed=embed)
@@ -38646,7 +38809,7 @@ def _discord_mgmt_payload(conn: "ServerConnection") -> Dict[str, Any]:
         return {
             "enabled": bool(d.get("enabled", False)),
             "channel_id": str(d["channel_id"]) if d.get("channel_id") else None,
-            "language": d.get("language") if d.get("language") in _DISCORD_MGMT_SPRACHEN else "en",
+            "language": _feed_sprache(conn),
             "include_avatar": bool(d.get("include_avatar", True)),
         }
     return {"welcome_message": _eintrag("welcome_message"),
@@ -38778,8 +38941,7 @@ def _level_einstellungen(conn: "ServerConnection") -> Dict[str, Any]:
                 e[key] = int(roh[key])
         except (TypeError, ValueError):
             pass
-    if roh.get("language") in _DISCORD_MGMT_SPRACHEN:
-        e["language"] = roh["language"]
+    e["language"] = _feed_sprache(conn)        # Server-Sprache (feed_sprache); gespeicherte Modulwahl entfaellt
     e["announce_channel_id"] = str(roh["announce_channel_id"]) if roh.get("announce_channel_id") else None
     e["role_rewards"] = sorted(
         ({"level": int(r.get("level")), "role_id": str(r.get("role_id"))}
@@ -39233,8 +39395,7 @@ def _honeypot_einstellungen(conn: "ServerConnection") -> Dict[str, Any]:
     for key in ("enabled", "delete_messages"):
         if key in roh:
             e[key] = bool(roh[key])
-    if roh.get("language") in _DISCORD_MGMT_SPRACHEN:
-        e["language"] = roh["language"]
+    e["language"] = _feed_sprache(conn)        # Server-Sprache (feed_sprache); gespeicherte Modulwahl entfaellt
     if roh.get("action") in _HONEYPOT_AKTIONEN:
         e["action"] = roh["action"]
     for key in ("channel_id", "log_channel_id", "warning_message_id"):
@@ -40927,9 +41088,7 @@ def _ticket_sprache(conn: Optional[ServerConnection]) -> str:
     Discord-Client-Sprache des jeweils klickenden Nutzers abgeleitet (siehe
     _t/_sprache), damit ein Ticket-Kanal nicht je nach Klickendem zwischen
     Deutsch und Englisch wechselt."""
-    if conn is None:
-        return "de"
-    return "en" if conn.get("ticket_language") == "en" else "de"
+    return _feed_sprache(conn) if conn is not None else "de"
 
 
 def _tt(sprache: str, de: str, en: str) -> str:
@@ -43424,7 +43583,7 @@ def _draw_heatmap(base: Any, world_size: int, punkte: List[Tuple[float, float]],
 
 # ── Server-Seite „Generell“: ein Endpunkt fuer alle Karten ──
 _GENERAL_KARTEN_SCHLUESSEL: Dict[str, Tuple[str, ...]] = {
-    "mapping": ("map_link_provider", "map_link_style", "map_image_style"),
+    "mapping": ("map_link_provider", "map_link_style", "map_image_style", "feed_sprache"),
     "game_server": ("keep_server_running", "keep_server_running_haenger"),
     "feed_thresholds": ("combat_log_seconds", "rage_quit_seconds", "killstreak_min",
                         "killstreak_step", "long_range_kill_meter"),
@@ -43509,6 +43668,10 @@ def _general_wert_pruefen(key: str, wert: Any) -> Tuple[Any, Optional[str]]:
     if key == "map_image_style":
         if wert not in _MAP_IMAGE_STYLES:
             return None, "map_image_style muss sat oder topo sein."
+        return wert, None
+    if key == "feed_sprache":
+        if wert not in _FEED_SPRACHEN:
+            return None, "feed_sprache muss de oder en sein."
         return wert, None
     if key in _GENERAL_CHANNELS:
         # leer = kein Log; sonst eine Discord-Channel-ID
@@ -46342,6 +46505,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "2bfaa56a43995635ef4fa977ed9a01777e6fbdd339143c1938c1797727a8790d",
         "1a54be7839e1621f945f0baeaf95d6113316d8e24977cf1b6ff2eb435ecb25e4",
         "650837c3a14cf487e210670d2341a13e78151efa6f565bc650aedb719dd9a71c",
+        "8b7b5c9304dcd49ea76cc9215718efbaf38f66a8385808febf94e7e3a3e6564a",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",

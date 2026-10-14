@@ -229,3 +229,14 @@ def test_gewinnspiele_je_guild_und_schleife_ueber_beide(monkeypatch, servers):
     monkeypatch.setattr(bot.connections, "all", lambda: [a])
     asyncio.run(bot.DayZBot._giveaways_once(_Selbst()))
     assert gesehen == [(G_A, 1), (G_B, 0)]
+
+
+def test_feed_sprache_speichern_und_kopieren_ueber_die_api(monkeypatch, servers):
+    a, b = servers
+    monkeypatch.setattr(bot, "bot", _Bot(bereit=True))
+    _zwei_guilds(a)
+    status, result = _call(monkeypatch, a, bot.api_server_general_set, {"feed_sprache": "en"}, guild_id=G_B)
+    assert status == 200 and result["data"]["general"]["feed_sprache"] == "en" and a.get("feed_sprache") == "en"
+    status, _ = _call(monkeypatch, a, bot.api_server_general_set, {"feed_sprache": "fr"}, guild_id=G_B)
+    assert status == 400 and a.get("feed_sprache") == "en"                      # ungültig ändert nichts
+    assert b.get("feed_sprache") == "de"                                        # anderer Kunde unberührt

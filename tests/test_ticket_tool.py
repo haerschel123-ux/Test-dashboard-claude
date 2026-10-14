@@ -27,7 +27,7 @@ bot_mod = pytest.importorskip("bot", reason="bot.py-Abhaengigkeiten nicht instal
 def test_ticket_sprache_default_de():
     conn = bot_mod.ServerConnection({"service_id": "9999", "guild_id": 111})
     assert bot_mod._ticket_sprache(conn) == "de"
-    conn.data["ticket_language"] = "en"
+    conn.data["feed_sprache"] = "en"
     assert bot_mod._ticket_sprache(conn) == "en"
     assert bot_mod._ticket_sprache(None) == "de"
 
@@ -42,7 +42,7 @@ def test_ticket_channel_view_buttons_nutzen_eingestellte_sprache():
     bot_mod.connections.upsert("english-service")
     bot_mod.connections.assign_guild("english-service", 222)
     conn = bot_mod.connections.for_service("english-service")
-    conn.data["ticket_language"] = "en"
+    conn.data["feed_sprache"] = "en"
     view = bot_mod.TicketChannelView("english-service", 1)
     labels = [c.label for c in view.children]
     assert labels == ["Claim", "Close"]
@@ -52,7 +52,7 @@ def test_ticket_archived_view_buttons_nutzen_eingestellte_sprache():
     bot_mod.connections.upsert("english-service")
     bot_mod.connections.assign_guild("english-service", 222)
     conn = bot_mod.connections.for_service("english-service")
-    conn.data["ticket_language"] = "en"
+    conn.data["feed_sprache"] = "en"
     view = bot_mod.TicketArchivedView("english-service", 1)
     labels = [c.label for c in view.children]
     assert labels == ["Reopen", "Delete"]

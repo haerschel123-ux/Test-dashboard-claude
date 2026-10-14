@@ -151,7 +151,8 @@ def test_entry_und_leave_ueber_positionen(_ruhe):
     c.parser._set_position("Bob", "id1", "1010, 1010, 5")
     _run(bot.bot._check_zones(c))
     assert ("1000", "base", "Bob") in bot.bot._zone_drin
-    assert any("Betreten" in str(p["embed"].title) or "Detection" in str(p["embed"].title) for p in posts)
+    assert any("Betreten" in str(p["embed"].title) or "Erkennung" in str(p["embed"].title)
+               or "Detection" in str(p["embed"].title) for p in posts)
     # Entry-Ping setzt den Cooldown -> kein zweiter Ping im selben Durchlauf
     assert len(posts) == 1
     posts.clear()

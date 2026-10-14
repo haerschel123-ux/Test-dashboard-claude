@@ -1790,7 +1790,7 @@ def test_ticket_marke_ohne_weiteren_text_ruft_support_ohne_embed(ticket_env, cha
 
 
 def test_ticket_support_ruf_englisch(ticket_env, chat):
-    ticket_env.a.data["ticket_language"] = "en"
+    ticket_env.a.data["feed_sprache"] = "en"
     chat.ergebnis = "Only a human can do this [[SUPPORT]]"
     ticket_env.schreiben("Unban please")
     gesendet = _einziges(ticket_env.kanal.gesendet)
@@ -1839,7 +1839,7 @@ def test_ticket_ki_fehler_ruft_support_mit_grundtext_ohne_details(ticket_env, ch
 
 
 def test_ticket_ki_fehler_englisch(ticket_env, chat):
-    ticket_env.a.data["ticket_language"] = "en"
+    ticket_env.a.data["feed_sprache"] = "en"
     chat.ergebnis = bot.KiFehler("limit")
     ticket_env.schreiben("Question")
     assert _einziges(ticket_env.kanal.gesendet)["content"] == f"<@&501> <@&502> 🔔 <@42> needs help – the AI is currently unavailable."
@@ -1981,7 +1981,7 @@ def test_support_knopf_custom_id_und_beschriftung(ticket_env):
     knopf = view.children[0]
     assert knopf.custom_id == "ticket_ki_support:1000:7" and knopf.label == "Support rufen" and str(knopf.emoji) == "👤"
     assert view.timeout is None and view.is_persistent()                       # überlebt einen Neustart
-    ticket_env.a.data["ticket_language"] = "en"
+    ticket_env.a.data["feed_sprache"] = "en"
     assert bot.TicketKiView("1000", 7, GID).children[0].label == "Call support"
     assert bot.TicketKiView("1000", "7").children[0].custom_id == "ticket_ki_support:1000:7"     # ohne Guild: erste zugeordnete
     assert bot.TicketKiView("9999", 1).children[0].label == "Support rufen"                      # unbekannter Server: Deutsch
@@ -2022,7 +2022,7 @@ def test_support_knopf_nach_ki_eskalation_ist_bereits_gerufen(ticket_env, chat):
 
 
 def test_support_knopf_englisch(ticket_env):
-    ticket_env.a.data["ticket_language"] = "en"
+    ticket_env.a.data["feed_sprache"] = "en"
     assert _einziges(_klick(ticket_env, _Member(80)).response.gesendet)["content"] == "❌ Only the creator or a support role can call support."
     antwort = _einziges(_klick(ticket_env, _Member(ERSTELLER_ID)).response.gesendet)
     assert antwort["content"] == "<@&501> <@&502> 🔔 <@42> needs help – please have a look at this ticket."
@@ -2071,7 +2071,7 @@ def test_ticket_erstellen_mit_ki_pingt_den_support_nicht_sofort(ticket_env):
 
 
 def test_ticket_erstellen_englisch_mit_ki(ticket_env):
-    ticket_env.a.data["ticket_language"] = "en"
+    ticket_env.a.data["feed_sprache"] = "en"
     erste = _einziges(_ticket_erstellen(ticket_env).gesendet)
     assert erste["content"] is None and "AI helper replies first" in erste["embed"].description
 

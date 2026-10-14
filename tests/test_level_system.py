@@ -178,7 +178,8 @@ def test_nachricht_xp_cooldown_ausnahmen_und_aufstieg(monkeypatch, level_setup):
 
 def test_aufstieg_fester_channel_englisch_und_rollen_nur_hoechste(monkeypatch, level_setup):
     a, guild, kanal = level_setup
-    a.data["level_system"].update({"language": "en", "announce_channel_id": "300", "stack_roles": False})
+    a.data["feed_sprache"] = "en"          # Server-Sprache (die Modul-Sprachwahl entfaellt)
+    a.data["level_system"].update({"announce_channel_id": "300", "stack_roles": False})
     nutzer = _Member(42, roles=[guild.get_role(501)])
     bot.db.level_set(GID, 42, 199, 2)
     _run(bot._level_nachricht_verarbeiten(_Message(nutzer, guild, kanal)))   # +10 → 209 → Level 3

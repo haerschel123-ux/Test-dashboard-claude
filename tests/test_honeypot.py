@@ -173,7 +173,8 @@ def test_treffer_bann_mit_dm_log_und_loeschen(honeypot_setup):
 
 def test_treffer_kick_englisch_ohne_loeschen_und_dm_geschlossen(honeypot_setup):
     a, guild, honig, log_kanal, normal = honeypot_setup
-    a.data["honeypot"].update({"action": "kick", "language": "en", "delete_messages": False, "log_channel_id": None})
+    a.data["feed_sprache"] = "en"          # Server-Sprache (die Modul-Sprachwahl entfaellt)
+    a.data["honeypot"].update({"action": "kick", "delete_messages": False, "log_channel_id": None})
     spam = _Member(43, name="Spam2", dm_ok=False)
     assert _run(bot._honeypot_nachricht_verarbeiten(_Message(spam, guild, honig))) is True
     assert spam.kicked and guild.bans == [] and spam.dms == [] and log_kanal.sent == []
@@ -219,6 +220,7 @@ def test_api_get_post_warnung_repost_und_validierung(monkeypatch, honeypot_setup
     _, b = bot.connections._conns["1000"], bot.connections._conns["2000"]
     status, result = call(monkeypatch, a, bot.get_discord_mgmt_honeypot)
     assert status == 200 and result["data"]["channel_id"] == "100" and result["data"]["warning_posted"] is False
+    a.data["feed_sprache"] = "en"          # Server-Sprache (die Modul-Sprachwahl entfaellt)
     gut = {"enabled": True, "channel_id": "100", "language": "en", "action": "kick", "delete_messages": False,
            "exempt_roles": ["501"], "log_channel_id": "200", "custom_text": "Appeal via ticket."}
     status, result = call(monkeypatch, a, bot.post_discord_mgmt_honeypot, gut)
@@ -230,8 +232,8 @@ def test_api_get_post_warnung_repost_und_validierung(monkeypatch, honeypot_setup
     # Unverändert speichern → keine neue Warnung
     status, _ = call(monkeypatch, a, bot.post_discord_mgmt_honeypot, gut)
     assert status == 200 and len(honig.sent) == 1
-    # Sprache ändern → alte Warnung gelöscht, neue gepostet
-    status, _ = call(monkeypatch, a, bot.post_discord_mgmt_honeypot, {**gut, "language": "de"})
+    # Text ändern → alte Warnung gelöscht, neue gepostet (die Sprache kommt aus der Server-Einstellung)
+    status, _ = call(monkeypatch, a, bot.post_discord_mgmt_honeypot, {**gut, "custom_text": "Other text."})
     assert status == 200 and len(honig.sent) == 2 and honig.sent[0]["message"].deleted
     # Repost
     status, _ = call(monkeypatch, a, bot.post_discord_mgmt_honeypot_repost, {})

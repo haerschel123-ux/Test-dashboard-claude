@@ -2733,11 +2733,11 @@ def test_befehl_kuendigt_nach_dashboardstandard_und_per_option_an(slash, kanal):
     assert emb.title == "🪂 Airdrop im Anflug" and "Versorgungsabwurf" in emb.description
     assert "drop1" in emb.fields[0].name and "X 7000 · Z 6000" in emb.fields[0].value and "izurvive" in emb.fields[0].value
     assert "2 Neustarts" in emb.fields[0].value and "nächsten Server-Neustart" in emb.footer.text
-    _ank(slash.a, befehl=True, sprache="en")
+    slash.a.data["feed_sprache"] = "en"            # Server-Sprache (die Ankündigungs-Sprachwahl entfällt)
     add(x=7100.0, restarts=1)
     en = kanal.gesendet.pop()["embed"]
     assert en.title == "🪂 Airdrop incoming" and "1 restart**" in en.fields[0].value and "next server restart" in en.footer.text
-    _ank(slash.a, befehl=True, sprache="de")
+    slash.a.data["feed_sprache"] = "de"
     add(x=8000.0, ankuendigen=False)                              # Option überschreibt den Standard
     assert len(kanal.gesendet) == 1
     _ank(slash.a, befehl=False)

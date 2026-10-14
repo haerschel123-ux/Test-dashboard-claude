@@ -534,8 +534,17 @@ def test_lese_ce_events_neuer_typ_wird_nach_aktivierung_gemeldet(conn_mit_ce_eve
     conn.ftp.inhalte[(pfad, 500)] = _block_text(["StaticContaminatedArea (1)"])
     _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
     assert len(gesendet) == 1
-    assert "Contaminated Zone" in gesendet[0]["embed"].title
+    assert "Kontaminierte Zone" in gesendet[0]["embed"].title      # Standard: Deutsch
     assert "jetzt 1 aktiv" in gesendet[0]["embed"].description
+    # Server-Sprache Englisch (feed_sprache): derselbe Typ, englische Meldung
+    conn.data["feed_sprache"] = "en"
+    neu_text = _block_text(["StaticContaminatedArea (2)"])
+    neuer_offset = 500 + len(_block_text(["StaticContaminatedArea (1)"]).encode("utf-8"))
+    conn.ftp.groessen[pfad] = neuer_offset + len(neu_text.encode("utf-8"))
+    conn.ftp.inhalte[(pfad, neuer_offset)] = neu_text
+    _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
+    assert "Contaminated Zone" in gesendet[1]["embed"].title
+    assert "newly appeared" in gesendet[1]["embed"].description or "has appeared" in gesendet[1]["embed"].description
 
 
 def test_lese_ce_events_deaktivierter_neuer_schalter_postet_nicht(conn_mit_ce_events):
