@@ -8,6 +8,7 @@ markierten Bloecke nicht anfassen.
     python3 -m pytest tests/test_deployment.py -v
 """
 import asyncio
+import datetime
 import json
 import os
 import sys
@@ -351,6 +352,7 @@ def test_npc_ausruestung_nur_bekannte_classnames():
 
 # ── Fahrzeugliste 29.09.2026 ─────────────────────────────────────────────
 def test_motorrad_ist_gesperrt(monkeypatch):
+    monkeypatch.setattr(bot, "_DEPLOY_BALD_BIS", datetime.date(2999, 1, 1))
     conn = _server()
     status, _ = _deploy(monkeypatch, conn, commit=False, preset="jana_blue")
     assert status == 422
@@ -358,12 +360,13 @@ def test_motorrad_ist_gesperrt(monkeypatch):
 
 
 def test_jede_farbvariante_hat_eigenes_bild(monkeypatch):
+    monkeypatch.setattr(bot, "_DEPLOY_BALD_BIS", datetime.date(2999, 1, 1))
     conn = _server()
     req = _request(monkeypatch, conn, "GET", "/api/tools/deployment")
     presets = _json(_run(bot.api_tools_deployment_get(req)))[1]["data"]["presets"]
-    ohne = [p["key"] for p in presets if p["key"] != "boat_black"
+    ohne = [p["key"] for p in presets if p["key"] not in ("boat_black", "humvee_beige")
             and p["image"] != f"/static/vehicles/{p['klasse']}.webp"]
     assert not ohne, ohne
     assert {p["key"] for p in presets if p["bald"]} == {
         "jana_blue", "jana_red", "jana_yellow",
-        "bitrak_blue", "bitrak_green", "bitrak_red", "bitrak_yellow"}
+        "bitrak_blue", "bitrak_green", "bitrak_red", "bitrak_yellow", "humvee_beige"}

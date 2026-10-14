@@ -13639,11 +13639,43 @@ TOOL_VEHICLES = {
         ["Truck_01_Door_1_1_Orange", 1], ["Truck_01_Door_2_1_Orange", 1],
         ["Truck_01_Hood_Blue", 1], ["Truck_01_Hood_Orange", 1],
         ["TruckBattery", 1], ["GlowPlug", 1], ["HeadlightH7", 2]]},
-    "Offroad_02": {"label": "M1025 Humvee", "farben": [], "parts": [
+    "Offroad_02": {"label": "M1025 Humvee", "farben": ["Beige"], "parts": [
         ["Offroad_02_Wheel", 4], ["Offroad_02_Hood", 1], ["Offroad_02_Trunk", 1],
         ["Offroad_02_Door_1_1", 1], ["Offroad_02_Door_1_2", 1],
         ["Offroad_02_Door_2_1", 1], ["Offroad_02_Door_2_2", 1],
+        # Beige Variante: neu in DayZ 1.30 - die Klasse Offroad_02_Beige samt
+        # Karosserieteilen steht in den Bohemia-Skripten (Experimental,
+        # Vorabstand 14.10.2026, offroad_02.c).
+        ["Offroad_02_Door_1_1_Beige", 1], ["Offroad_02_Door_1_2_Beige", 1],
+        ["Offroad_02_Door_2_1_Beige", 1], ["Offroad_02_Door_2_2_Beige", 1],
+        ["Offroad_02_Hood_Beige", 1], ["Offroad_02_Trunk_Beige", 1],
         ["CarBattery", 1], ["GlowPlug", 1], ["HeadlightH7", 2]]},
+    # Motorraeder (neu in DayZ 1.30, Vorabstand 14.10.2026): jede Farbe ist
+    # eine eigene Fahrzeugklasse, deshalb je ein Eintrag ohne "farben". Die
+    # Teilenamen stammen aus der Bohemia-Referenz (Raeder, Schutzbleche);
+    # weitere Anbauteile sind noch nicht belegt und fehlen bewusst.
+    "Motorbike_01_Blue": {"label": "Jana 50 blau", "farben": [], "parts": [
+        ["Motorbike_01_Wheel_1", 1], ["Motorbike_01_Wheel_2", 1]]},
+    "Motorbike_01_Red": {"label": "Jana 50 rot", "farben": [], "parts": [
+        ["Motorbike_01_Wheel_1", 1], ["Motorbike_01_Wheel_2", 1]]},
+    "Motorbike_01_Yellow": {"label": "Jana 50 gelb", "farben": [], "parts": [
+        ["Motorbike_01_Wheel_1", 1], ["Motorbike_01_Wheel_2", 1]]},
+    "Motorbike_02_Blue": {"label": "Bitrak 682 blau", "farben": [], "parts": [
+        ["Motorbike_02_Wheel_1", 1], ["Motorbike_02_Wheel_2", 1],
+        ["Motorbike_02_ShieldFront_Blue", 1], ["Motorbike_02_ShieldLeft_Blue", 1],
+        ["Motorbike_02_ShieldRight_Blue", 1]]},
+    "Motorbike_02_Green": {"label": "Bitrak 682 grün", "farben": [], "parts": [
+        ["Motorbike_02_Wheel_1", 1], ["Motorbike_02_Wheel_2", 1],
+        ["Motorbike_02_ShieldFront_Green", 1], ["Motorbike_02_ShieldLeft_Green", 1],
+        ["Motorbike_02_ShieldRight_Green", 1]]},
+    "Motorbike_02_Red": {"label": "Bitrak 682 rot", "farben": [], "parts": [
+        ["Motorbike_02_Wheel_1", 1], ["Motorbike_02_Wheel_2", 1],
+        ["Motorbike_02_ShieldFront_Red", 1], ["Motorbike_02_ShieldLeft_Red", 1],
+        ["Motorbike_02_ShieldRight_Red", 1]]},
+    "Motorbike_02_Yellow": {"label": "Bitrak 682 gelb", "farben": [], "parts": [
+        ["Motorbike_02_Wheel_1", 1], ["Motorbike_02_Wheel_2", 1],
+        ["Motorbike_02_ShieldFront_Yellow", 1], ["Motorbike_02_ShieldLeft_Yellow", 1],
+        ["Motorbike_02_ShieldRight_Yellow", 1]]},
     # Boot: nur Pflichtteil, keine Wheels/Lights/Doors/Body Parts und kein
     # Kofferraum-Inhalt (siehe "kein_inventar" - Referenzseite zeigt dort
     # "Inventory not available for boats"). Kein eigenes Bild vorhanden.
@@ -13680,6 +13712,10 @@ TOOL_DEPLOY_VEHICLES: Dict[str, Dict[str, Any]] = {
                       "bild": "Truck_01_Covered", "karten": None},
     "humvee":        {"label": "Humvee", "klasse": "Offroad_02",
                       "bild": "Offroad_02", "karten": ["ChernarusPlus", "Livonia"]},
+    # Beiger Humvee: erst mit DayZ 1.30, Sperre wie bei den Motorraedern. Das
+    # Bild ist das Modellbild des Humvee (ein eigenes Beige-Bild gibt es nicht).
+    "humvee_beige":  {"label": "Beiger Humvee", "klasse": "Offroad_02_Beige",
+                      "bild": "Offroad_02", "karten": ["ChernarusPlus", "Livonia"], "bald": True},
     "boat_black":    {"label": "Schwarzes Boot", "klasse": "Boat_01_Black",
                       "bild": None, "karten": None},
     # Ergaenzt aus Brigardes Fahrzeugliste (29.09.2026, Classnames aus Bohemias
@@ -13696,7 +13732,8 @@ TOOL_DEPLOY_VEHICLES: Dict[str, Dict[str, Any]] = {
     "truck_green":   {"label": "Grüner Truck", "klasse": "Truck_01_Covered",
                       "bild": "Truck_01_Covered", "karten": None},
     # Motorraeder kommen erst mit DayZ 1.30 (angekuendigt 15.10.2026) - bis
-    # dahin nur angezeigt, Einsetzen gesperrt ("bald").
+    # dahin nur angezeigt, Einsetzen gesperrt ("bald"). Ab _DEPLOY_BALD_BIS
+    # (Erscheinungstag) entfaellt die Sperre von selbst, siehe _deploy_bald.
     "jana_blue":     {"label": "Jana 50 blau", "klasse": "Motorbike_01_Blue",
                       "bild": None, "karten": None, "bald": True},
     "jana_red":      {"label": "Jana 50 rot", "klasse": "Motorbike_01_Red",
@@ -13712,6 +13749,15 @@ TOOL_DEPLOY_VEHICLES: Dict[str, Dict[str, Any]] = {
     "bitrak_yellow": {"label": "Bitrak 682 gelb", "klasse": "Motorbike_02_Yellow",
                       "bild": None, "karten": None, "bald": True},
 }
+
+
+_DEPLOY_BALD_BIS = date(2026, 10, 15)
+
+
+def _deploy_bald(v: Dict[str, Any]) -> bool:
+    """True, solange eine mit "bald" markierte Vorlage noch gesperrt ist: bis zum
+    Erscheinungstag von DayZ 1.30 (_DEPLOY_BALD_BIS), danach ist sie frei."""
+    return bool(v.get("bald")) and date.today() < _DEPLOY_BALD_BIS
 
 
 def _deploy_bild(v: Dict[str, Any]) -> Optional[str]:
@@ -14924,7 +14970,9 @@ async def api_tools_meta(request: web.Request) -> web.Response:
                          "farben": v.get("farben", []),
                          "kein_inventar": v.get("kein_inventar", False),
                          "image": (f"/static/vehicles/{k}.png"
-                                  if f"vehicles/{k}.png" in _EMBEDDED_ASSETS else None),
+                                  if f"vehicles/{k}.png" in _EMBEDDED_ASSETS
+                                  else f"/static/vehicles/{k}.webp"
+                                  if f"vehicles/{k}.webp" in _EMBEDDED_ASSETS else None),
                          "parts_kategorisiert": [
                              {"classname": cn, "anzahl": anzahl,
                               "kategorie": _vehicle_part_kategorie(cn)}
@@ -17106,7 +17154,7 @@ async def api_tools_deployment_get(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     presets = [{"key": k, "label": v["label"], "klasse": v["klasse"],
-                "image": _deploy_bild(v), "bald": bool(v.get("bald"))}
+                "image": _deploy_bild(v), "bald": _deploy_bald(v)}
                for k, v in _deploy_presets_fuer(conn).items()]
     npc_presets = [{"key": k, "label": v["label"], "event": v["event"],
                     "items": [i for _art, i in v["items"]],
@@ -17172,7 +17220,7 @@ async def api_tools_deployment_deploy(request: web.Request) -> web.Response:
         preset = _deploy_presets_fuer(conn).get(str(data.get("preset") or ""))
         if preset is None:
             return err("Diese Vorlage gibt es für die Karte dieses Servers nicht.", 422)
-        if preset.get("bald"):
+        if _deploy_bald(preset):
             return err("Dieses Fahrzeug kommt erst mit DayZ 1.30 – Einsetzen noch gesperrt.", 422)
         klasse = preset["klasse"]
     try:
@@ -23199,33 +23247,39 @@ _TOOL_ORGANIZER_REGELN = tuple((kategorie, re.compile(muster, re.IGNORECASE)) fo
     ("Seeds", r'^Seeds?_'),
     ("Flags", r'^Flag_'),
     ("Infected", r'^Zmb'),
+    # DayZ 1.30 (Vorabstand 14.10.2026): Motorraeder, Humvee-Teile, Tiere
+    ("Vehicles", r'^(Motorbike_0\d_(Blue|Green|Red|Yellow)|Offroad_02)$'),
+    ("Vehicle Parts", r'^(Motorbike_0\d_(Wheel|Shield)|Offroad_02_(Door|Hood|Trunk))'),
+    ("Animals", r'^Animal_'),
     ("Armbands", r'Armband'),
-    ("Belts", r'Belt_'),
+    ("Belts", r'(Belt_|HipPack)'),
     ("Pelts", r'Pelt'),
     ("Suppressors", r'Suppressor'),
     ("Optics", r'(ACOG|Kobra|PSO\b|EOTech|Holosight|Reflex|NVGoggles|Nightvision|Scope|Buris|LRSight|IronSight)'),
-    ("Attachments", r'(Handguard|Foregrip|Bipod|CarryHandle|OpticRail|MuzzleBrake|FlashHider|Choke_|'
+    ("Attachments", r'(Bayonet|Handguard|Foregrip|Bipod|CarryHandle|OpticRail|MuzzleBrake|FlashHider|Choke_|'
                     r'Compensator|Buttstock|Stock_|PistolGrip|Riser|Barrel_|Battery9V)'),
+    ("Firearms", r'^(AKM_Gold|Luger|MP18|Magnum(_Gold)?|SawedoffMagnum(_Gold)?)$'),
     ("Firearms", r'\b(AK101|AK74|AKM|AKS74U|CZ527|CZ75|CR75|CR527|Deagle|FNX45|Glock19|IJ70|Izh18|'
                 r'Longhorn|M4A1|MP5K|Mosin|Repeater|SKS|Sporter22|SVAL|SVD|UMP45|VSS|Vikhr|Bizon|FAL|'
                 r'Blaze95|Winchester70|Tundra|ASVAL|Sawnoff|Colt1911|CZ61|B95|DMR|Aug|VSD|KAM|KA101|KA74)\b'),
     ("Melee Items", r'(Axe|Hatchet|Machete|Knife|Crowbar|Sledgehammer|Pitchfork|Pickaxe|Sickle|'
-                    r'BaseballBat|Bat_|Cleaver|FireAxe|Hoe_)'),
+                    r'BaseballBat|Bat_|Cleaver|FireAxe|Hoe_|Akinaka|Jambiya|Scimitar|PoliceBaton)'),
     ("Nades & Traps", r'(Grenade|BearTrap|Mine_|Claymore|TripFlare|Frag_)'),
     ("Vehicles", r'(OffroadHatchback|CivilianSedan|Sedan_02|Hatchback_02|Truck_01|Bus_01|Vodnik|Vybor|Scooter)'),
     ("Vehicle Parts", r'(Wheel|CarDoor|CarBattery|CarRadiator|SparkPlug|GlowPlug|CarSeat|Headlight|'
                       r'TailLight|Muffler|Carburetor|Radiator)'),
     ("Bags", r'(Backpack|Kotomka|Mochila|TaloonBag|CanvasBag|_Bag$|Bag_)'),
-    ("Storage Items", r'(Barrel|Crate_|Container|Chest_|Cabinet|Locker|GunSafe|Case_|TentSmall|'
+    ("Tools", r'Keys(_|$)'),
+    ("Storage Items", r'(StorageBox_|Barrel|Crate_|Container|Chest_|Cabinet|Locker|GunSafe|Case_|TentSmall|'
                       r'TentBig|CarTent|StorageShelf)'),
     ("Gas Masks", r'GasMask'),
     ("Gas Gear", r'(NBC|Hazmat|CBRN)'),
-    ("Masks", r'(Balaclava|HockeyMask|WolfMask|BearMask|RabbitMask|ClownMask|Bandana)'),
+    ("Masks", r'(Balaclava|HockeyMask|WolfMask|BearMask|RabbitMask|ClownMask|Bandana|Keffiyeh)'),
     ("Ghillies", r'Ghillie'),
     ("Clothing Improvised", r'Improvised'),
     ("Helmets", r'(Helmet|Ssh68|Kolpak|MotoHelmet|PSH77)'),
     ("Hats", r'(Ushanka|Beanie|CowboyHat|BoonieHat|PetrOldHat|HunterCap|BaseballCap|WoolHat|'
-            r'PanamaHat|WatchCap|Cap_|Hat_)'),
+            r'PanamaHat|WatchCap|Cap_|Hat_|Beret)'),
     ("Gloves", r'(Gloves|Mitten)'),
     ("Vests", r'(Vest_|PlateCarrier|ChestHolster|Vestpouch)'),
     ("Feet", r'(Boots_|Shoes_|Sneakers|CombatBoots|WorkingBoots|HikingBoots|Sandals|RainBoots)'),
@@ -23234,6 +23288,8 @@ _TOOL_ORGANIZER_REGELN = tuple((kategorie, re.compile(muster, re.IGNORECASE)) fo
     ("Lights", r'(Flashlight|Headlamp|Chemlight|Lightstick|Lantern)'),
     ("Static Objects", r'(StaticObj|Watchtower|Barricade|Fence_)'),
     ("Plants", r'(Plant_|Mushroom|Bush_|Tree_|Garden)'),
+    ("Food", r'^(Achar|Ayran|Lassi_|Catfish|Figs$|HalvaCan|SarmaCan|RoundGoby|LizardMeat|DeadLizard|'
+            r'SodaCan_|SmallGlassBottle_|WineBottle|Waterskin_)'),
     ("Food", r'(Apple|Pear|Plum|Tomato|Potato|Pumpkin|Zucchini|Cucumber|BakedBeans|CannedFood|Pasta|'
             r'Rice|Powdered|Canned|Fish_|Meat_|Steak|Sausage|Bacon|TunaCan|PeachesCan|SpaghettiCan|'
             r'Water_|Cooking)'),
@@ -23241,9 +23297,9 @@ _TOOL_ORGANIZER_REGELN = tuple((kategorie, re.compile(muster, re.IGNORECASE)) fo
                       r'SalineBag|BloodBag|Disinfectant|PainKiller|Adrenaline|SurgicalKit)'),
     ("Animals", r'(Cow_|Wolf_|Bear_|Deer_|Goat_|Boar_|Rabbit_|Chicken_|Hen_)'),
     ("Supplies", r'(Rope|Duct|Sewing|Fireplace|Matches|Lighter|Sharpening|WhetStone|Tarp|Wire_|'
-                r'Nail_|Stick_|WoodenPlank|Log_)'),
-    ("Tools", r'(Wrench|Screwdriver|Pliers|Shovel|Hammer_|Handsaw|WoodAxe|CanOpener|Radio_|Binocular)'),
-    ("Clothing", r'(Jacket|Shirt_|Coat_|Pants_|Jeans_|Sweater|Hoodie|TShirt|Dress_|Trousers|Suit_|Robe_)'),
+                r'Nail_|Stick_|WoodenPlank|Log_|Brick|MortarMix|Bark_)'),
+    ("Tools", r'(Wrench|Screwdriver|Pliers|Shovel|Hammer_|Handsaw|WoodAxe|CanOpener|Radio_|Binocular|Trowel|DrillKit|CodeLock)'),
+    ("Clothing", r'(Kameez|Shalwar|FNO(Jacket|Pants)|OBR(Jacket|Pants)|ShortSleeveShirt|Jacket|Shirt_|Coat_|Pants_|Jeans_|Sweater|Hoodie|TShirt|Dress_|Trousers|Suit_|Robe_)'),
 ))
 
 
@@ -46277,6 +46333,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
     ),
     "app.js": (
+        "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
         "2d7c460099f2c20e50d9b4b075f4a4f4c075237bc77ead8adce3ddc324f9e231",
         "c4da26626e1adddb6ad1bd6f641dba6da3750e91c7f3724c767564453fa4ce25",
         "bc65fa1acb74aa6f9222564542583125944b77a7fec02787b374f774b1333a1e",
@@ -46535,6 +46592,9 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
     ),
     "locations/Sakhal.json": (
         "68a7708a1b2fa4ad5689eb31005e2397f1fca1c1a02a6b7cdb0643655b909f4f",
+    ),
+    "loadout-catalog.js": (
+        "ea21ff70ffa86a16ed17536e350838b8382e7020eaa45d62f59547d27506ea20",
     ),
 }
 
