@@ -14849,6 +14849,15 @@ def _tool_spawnpoint_allow_in_water_schreiben(text: str, allow_in_water: bool) -
     return neu
 
 
+def _spawn_zahl(v: Any) -> str:
+    """Koordinate wie in Bohemias Dateien (bis 6 Nachkommastellen, ohne Nullen am
+    Ende): unveraenderte Punkte bleiben beim Speichern Zeichen fuer Zeichen gleich,
+    statt still auf eine Nachkommastelle gerundet zu werden."""
+    n = float(v)
+    text = f"{n:.6f}".rstrip("0").rstrip(".")
+    return text if text not in ("", "-0") else "0"
+
+
 _SPAWN_GRUPPE_RE = re.compile(r"[A-Za-z0-9_ .\-]{1,64}")
 
 
@@ -14889,10 +14898,10 @@ def _tool_spawnpoint_positionen_schreiben(text: str, positions: List[Dict[str, A
     for name, punkte in gruppen.items():
         lines += f'            <group name="{name}">' + nl
         for p in punkte:
-            lines += f'                <pos x="{_tool_fmt_zahl(p["x"])}" z="{_tool_fmt_zahl(p["z"])}" />' + nl
+            lines += f'                <pos x="{_spawn_zahl(p["x"])}" z="{_spawn_zahl(p["z"])}" />' + nl
         lines += '            </group>' + nl
     for p in lose:
-        lines += f'            <pos x="{_tool_fmt_zahl(p["x"])}" z="{_tool_fmt_zahl(p["z"])}" />' + nl
+        lines += f'            <pos x="{_spawn_zahl(p["x"])}" z="{_spawn_zahl(p["z"])}" />' + nl
     block = re.sub(r'([ \t]*)</generator_posbubbles\s*>$',
                    lambda m: lines + m.group(1) + "</generator_posbubbles>", block)
     return text[:found["start"]] + block + text[found["end"]:]
@@ -22884,29 +22893,66 @@ async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
         except (TypeError, ValueError, KeyError):
             return err("Ungültige Position.")
     loop = asyncio.get_running_loop()
-    text, status = await _tools_datei_lesen(conn, "cfgplayerspawnpoints.xml", loop)
+    try:
+        text, status = await _tools_datei_lesen(conn, "cfgplayerspawnpoints.xml", loop)
+    except Exception as e:  # noqa: BLE001 - FTP-Abbruch/Zeitueberschreitung klar melden
+        log.exception("[TOOLS] Spawn-Punkte: Lesen fehlgeschlagen")
+        return err(f"cfgplayerspawnpoints.xml per FTP nicht lesbar ({type(e).__name__}: {e}).", 502)
     if status == "error":
         return err("cfgplayerspawnpoints.xml per FTP nicht lesbar.", 502)
     basis = text if status == "ok" else _TOOL_LEERE_SPAWNPOINTS
     try:
         neu = _tool_spawnpoint_positionen_schreiben(basis, positions, mode)
         neu = _tool_spawnpoint_allow_in_water_schreiben(neu, bool(data_in.get("allow_in_water")))
+        # Vor jedem Schreiben gegenpruefen: nur gueltiges XML darf auf den Server.
+        ET.fromstring(neu)
     except ValueError as e:
         return err(str(e))
-    if not await _tools_datei_schreiben_wenn(commit, conn, "cfgplayerspawnpoints.xml", neu, loop):
+    except ET.ParseError as e:
+        log.error(f"[TOOLS] Spawn-Punkte: berechnete Datei ist kein gültiges XML: {e}")
+        return err(f"Die berechnete cfgplayerspawnpoints.xml wäre kein gültiges XML ({e}) – "
+                   "nichts wurde gespeichert.", 422)
+    except Exception as e:  # noqa: BLE001 - statt namenlosem HTTP 500 die Ursache zeigen
+        log.exception("[TOOLS] Spawn-Punkte: Berechnung fehlgeschlagen")
+        return err(f"Spawn-Punkte konnten nicht berechnet werden ({type(e).__name__}: {e}) – "
+                   "nichts wurde gespeichert.", 500)
+    try:
+        geschrieben = await _tools_datei_schreiben_wenn(commit, conn, "cfgplayerspawnpoints.xml", neu, loop)
+    except Exception as e:  # noqa: BLE001
+        log.exception("[TOOLS] Spawn-Punkte: Schreiben fehlgeschlagen")
+        return err(f"cfgplayerspawnpoints.xml konnte nicht gespeichert werden ({type(e).__name__}: {e}).", 502)
+    if not geschrieben:
         return err("cfgplayerspawnpoints.xml konnte nicht gespeichert werden.", 502)
     if commit:
         _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Spawn-Punkte gespeichert",
                   f"{len(positions)} Punkt(e) · {conn.name}")
     root = ET.fromstring(neu)
-    total = len(_tool_spawnpoint_positionen_lesen(root))
+    punkte_neu = _tool_spawnpoint_positionen_lesen(root)
+    total = len(punkte_neu)
+    # Was sich gegenueber dem Server aendert (zaehlt das Vorschau-Fenster mit an, damit
+    # nichts unbemerkt gespeichert wird): Punkte werden nach gerundeter Position verglichen.
+    def _schluessel(pts):
+        out = set()
+        for q in pts:
+            try:
+                out.add((round(float(q["x"])), round(float(q["z"]))))
+            except (TypeError, ValueError, KeyError):
+                pass
+        return out
+    try:
+        alt_pts = _tool_spawnpoint_positionen_lesen(ET.fromstring(text)) if status == "ok" else []
+    except ET.ParseError:
+        alt_pts = []
+    k_alt, k_neu = _schluessel(alt_pts), _schluessel(punkte_neu)
+    aenderung = {"vorher": len(alt_pts), "nachher": total,
+                 "neu": len(k_neu - k_alt), "entfernt": len(k_alt - k_neu)}
     # Anders als bei den anderen Tools (die nur einen einfuegbaren Block in eine
     # groessere Datei zeigen) ist cfgplayerspawnpoints.xml komplett das, was
     # gebraucht wird - der Download muss deshalb die GANZE Datei sein (inkl.
     # <?xml?>-Kopfzeile, <playerspawnpoints>, <hop>/<travel>), sonst laedt der
     # Kunde nur ein <fresh>-Fragment herunter, das server-seitig ungueltig ist.
     generated = [{"filename": "cfgplayerspawnpoints.xml", "content": neu}]
-    return ok({"total": total, "generated": generated})
+    return ok({"total": total, "generated": generated, "aenderung": aenderung})
 
 
 # ──────────────────────────────────────────────────────────────────────────

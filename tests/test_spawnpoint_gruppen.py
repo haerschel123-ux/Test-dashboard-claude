@@ -109,3 +109,88 @@ def test_flache_ausgabe_wie_bisher_ohne_gruppen():
         flach, [{"x": 5.0, "z": 6.0}, {"x": 7.0, "z": 8.0}], "replace")
     assert neu.count("<pos ") == 2 and "<group" not in neu
     assert '            <pos x="5" z="6" />' in neu
+
+
+# ── API: Vorschau schreibt nichts, Fehler werden benannt statt "HTTP 500" ──
+import asyncio
+import json
+import re
+
+sys.path.insert(0, os.path.join(REPO, "tests"))
+import test_deployment as td  # noqa: E402  (nutzt dessen FTP-Attrappe)
+
+
+class _MP:
+    def setattr(self, o, n, v):
+        setattr(o, n, v)
+
+
+def _datei_mit_wasser():
+    return DATEI.replace("<grid_density>4</grid_density>",
+                         "<grid_density>4</grid_density>\n            <allow_in_water>false</allow_in_water>")
+
+
+def _post(conn, daten):
+    req = td._request(_MP(), conn, "POST", "/api/tools/spawnpoint", daten)
+    r = asyncio.run(bot.api_tools_spawnpoint_post(req))
+    return r.status, json.loads(r.body.decode("utf-8"))
+
+
+def _punkte():
+    return [{"x": float(p["x"]), "z": float(p["z"]), "group": p.get("group", "")}
+            for p in _lesen(DATEI)]
+
+
+def test_vorschau_schreibt_nichts_auf_den_server():
+    conn = td._server(map_name="Nasdara")
+    conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] = _datei_mit_wasser()
+    vorher = conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"]
+    status, j = _post(conn, {"positions": _punkte()[:2], "mode": "replace", "allow_in_water": False})
+    assert status == 200 and j["data"]["total"] == 2
+    assert conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] == vorher       # unveraendert
+
+
+def test_erst_commit_schreibt():
+    conn = td._server(map_name="Nasdara")
+    conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] = _datei_mit_wasser()
+    status, j = _post(conn, {"positions": _punkte()[:1], "mode": "replace", "allow_in_water": False,
+                             "commit": True})
+    assert status == 200
+    assert conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"].count("<pos ") == 1
+
+
+def test_unerwarteter_fehler_wird_benannt_statt_http_500(monkeypatch):
+    conn = td._server(map_name="Nasdara")
+    conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] = _datei_mit_wasser()
+
+    def kaputt(*a, **k):
+        raise RuntimeError("Testfehler")
+    monkeypatch.setattr(bot, "_tool_spawnpoint_positionen_schreiben", kaputt)
+    status, j = _post(conn, {"positions": _punkte(), "mode": "replace"})
+    assert status == 500 and "RuntimeError: Testfehler" in j["error"] and "nichts wurde gespeichert" in j["error"]
+
+
+def test_ftp_fehler_beim_lesen_und_schreiben_werden_benannt(monkeypatch):
+    conn = td._server(map_name="Nasdara")
+    conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] = _datei_mit_wasser()
+
+    async def lesen_kaputt(*a, **k):
+        raise OSError("Verbindung getrennt")
+    monkeypatch.setattr(bot, "_tools_datei_lesen", lesen_kaputt)
+    status, j = _post(conn, {"positions": _punkte(), "mode": "replace"})
+    assert status == 502 and "OSError: Verbindung getrennt" in j["error"]
+
+
+def test_vorschau_nennt_aenderung_gegenueber_dem_server():
+    conn = td._server(map_name="Nasdara")
+    conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] = _datei_mit_wasser()
+    pts = _punkte()[:2] + [{"x": 111.0, "z": 222.0}]         # einen alten Punkt weglassen, einen neuen dazu
+    status, j = _post(conn, {"positions": pts, "mode": "replace", "allow_in_water": False})
+    assert status == 200
+    assert j["data"]["aenderung"] == {"vorher": 3, "nachher": 3, "neu": 1, "entfernt": 1}
+
+
+def test_unveraendert_speichern_aendert_die_datei_nicht():
+    """Keine stille Rundung: Koordinaten behalten alle Nachkommastellen aus Bohemias Datei."""
+    neu = bot._tool_spawnpoint_positionen_schreiben(DATEI, _punkte(), "replace")
+    assert neu == DATEI
