@@ -194,3 +194,86 @@ def test_unveraendert_speichern_aendert_die_datei_nicht():
     """Keine stille Rundung: Koordinaten behalten alle Nachkommastellen aus Bohemias Datei."""
     neu = bot._tool_spawnpoint_positionen_schreiben(DATEI, _punkte(), "replace")
     assert neu == DATEI
+
+
+# ── Echte Dateien erklaeren ihre Tags in Kommentaren (Sakhal, Nasdara) ──
+MIT_KOMMENTAREN = '''<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>
+<playerspawnpoints>
+    <!--Spawn points settings for newly created player characters-->
+    <fresh>
+        <!--
+            Spawn points are generated around <pos> child elements under the <generator_posbubbles> element.
+            Example: <group name="Beispiel"><pos x="1" z="2" /></group>
+            Water: <allow_in_water>true</allow_in_water>
+        -->
+        <generator_params>
+            <grid_density>4</grid_density>
+            <!--Spawns in water (<allow_in_water>true</allow_in_water> allows it)-->
+            <allow_in_water>false</allow_in_water>
+        </generator_params>
+        <!--Centers for grids of spawn points-->
+        <generator_posbubbles>
+            <!--
+                Each <pos> is a bubble, optionally inside a <group name="X">...</group>.
+            -->
+            <group name="AllSpawnpoints">
+                <pos x="14069.808594" z="13083.109375" />
+                <pos x="13571.811523" z="12821.112305" />
+            </group>
+        </generator_posbubbles>
+    </fresh>
+    <!--Spawn points settings for server hoppers-->
+    <hop>
+        <generator_posbubbles>
+            <pos x="1" z="1" />
+        </generator_posbubbles>
+    </hop>
+    <travel></travel>
+</playerspawnpoints>
+'''
+
+
+def test_tags_in_kommentaren_werden_nicht_mit_echten_verwechselt():
+    pts = [{"x": float(p["x"]), "z": float(p["z"]), "group": p.get("group", "")}
+           for p in _lesen(MIT_KOMMENTAREN)]
+    assert len(pts) == 2
+    neu = bot._tool_spawnpoint_positionen_schreiben(MIT_KOMMENTAREN, pts, "replace")
+    neu = bot._tool_spawnpoint_allow_in_water_schreiben(neu, False)
+    ET.fromstring(neu)                                   # frueher: "not well-formed" (Zeile 141)
+    assert neu == MIT_KOMMENTAREN                         # unveraendert gespeichert = identisch
+
+
+def test_kommentare_und_hop_bleiben_bei_aenderungen_erhalten():
+    pts = [{"x": 14069.808594, "z": 13083.109375, "group": "AllSpawnpoints"},
+           {"x": 5.0, "z": 6.0, "group": ""}]
+    neu = bot._tool_spawnpoint_positionen_schreiben(MIT_KOMMENTAREN, pts, "replace")
+    neu = bot._tool_spawnpoint_allow_in_water_schreiben(neu, True)
+    ET.fromstring(neu)
+    assert neu.count("<!--") == MIT_KOMMENTAREN.count("<!--")
+    assert '<pos x="1" z="1" />' in neu                     # <hop> bleibt unangetastet
+    assert "<allow_in_water>true</allow_in_water>" in neu      # echte Zeile geaendert ...
+    assert "Water: <allow_in_water>true</allow_in_water>" in neu  # ... Kommentar bleibt wie er war
+    assert len(_lesen(neu)) == 2
+
+
+def test_selbstschliessende_posbubbles_werden_gefuellt():
+    text = MIT_KOMMENTAREN.replace(
+        '<generator_posbubbles>\n            <!--\n                Each <pos> is a bubble, optionally inside a '
+        '<group name="X">...</group>.\n            -->\n            <group name="AllSpawnpoints">\n'
+        '                <pos x="14069.808594" z="13083.109375" />\n                <pos x="13571.811523" '
+        'z="12821.112305" />\n            </group>\n        </generator_posbubbles>',
+        '<generator_posbubbles />')
+    assert "<generator_posbubbles />" in text
+    neu = bot._tool_spawnpoint_positionen_schreiben(text, [{"x": 5.0, "z": 6.0}], "replace")
+    ET.fromstring(neu)
+    assert len(_lesen(neu)) == 1
+
+
+def test_gruppen_attribute_wie_lifetime_bleiben_erhalten():
+    text = DATEI.replace('<group name="WestCherno">', '<group name="WestCherno" lifetime="0">')
+    assert 'lifetime="0"' in text
+    punkte = _lesen(text)
+    assert bot._tool_spawnpoint_positionen_schreiben(text, punkte, "replace") == text
+    neu = bot._tool_spawnpoint_positionen_schreiben(text, punkte[1:], "replace")
+    assert '<group name="WestCherno" lifetime="0">' in neu
+    ET.fromstring(neu)

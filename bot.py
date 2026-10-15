@@ -14086,14 +14086,26 @@ def _tool_fmt_zahl(v: Any) -> str:
     return str(int(n)) if n == int(n) else f"{n:.1f}"
 
 
+def _maskiere_xml_kommentare(text: str) -> str:
+    """Ersetzt den Inhalt aller <!-- ... -->-Kommentare durch Leerzeichen (gleiche Laenge,
+    Zeilenumbrueche bleiben). Bohemias Dateien erklaeren ihre Tags in Kommentaren
+    ("... unter dem <generator_posbubbles> Element"); eine Textsuche nach Tags darf
+    dort nichts finden. Positionen im maskierten Text gelten 1:1 fuer das Original."""
+    return re.sub(r'<!--[\s\S]*?-->',
+                  lambda m: re.sub(r'[^\r\n]', ' ', m.group(0)), text)
+
+
 def _tool_finde_einzigen_block(text: str, tag: str) -> Optional[Dict[str, Any]]:
     """Wie _tool_finde_benannten_block, aber fuer Tags ohne name="..."-Attribut,
-    von denen es in der Datei nur genau einen gibt (z. B. <generator_posbubbles>)."""
-    muster = r'[ \t]*<' + tag + r'(?=[\s/>])[^>]*(?:/>|>[\s\S]*?</' + tag + r'\s*>)'
-    m = re.search(muster, text)
+    von denen es in der Datei nur genau einen gibt (z. B. <generator_posbubbles>).
+    Tags in Kommentaren zaehlen nicht."""
+    # Attribute ohne das "/" vor ">" einlesen, sonst frisst [^>]* das "/" und ein
+    # selbstschliessendes <tag /> wuerde bis zu einem spaeteren </tag> reichen.
+    muster = r'[ \t]*<' + tag + r'(?=[\s/>])(?:[^>/]|/(?!>))*(?:/>|>[\s\S]*?</' + tag + r'\s*>)'
+    m = re.search(muster, _maskiere_xml_kommentare(text))
     if not m:
         return None
-    return {"start": m.start(), "end": m.end(), "block": m.group(0)}
+    return {"start": m.start(), "end": m.end(), "block": text[m.start():m.end()]}
 
 
 def _tool_finde_benannten_block(text: str, tag: str, name: str) -> Optional[Dict[str, Any]]:
@@ -14841,12 +14853,11 @@ def _tool_spawnpoint_allow_in_water_schreiben(text: str, allow_in_water: bool) -
     """Setzt <fresh><generator_params><allow_in_water> auf true/false - chirurgisch,
     der Rest von generator_params bleibt unangetastet."""
     wert = "true" if allow_in_water else "false"
-    neu, anzahl = re.subn(r'(<allow_in_water>)[^<]*(</allow_in_water>)',
-                          lambda m: m.group(1) + wert + m.group(2), text, count=1)
-    if anzahl == 0:
+    m = re.search(r'(<allow_in_water>)[^<]*(</allow_in_water>)', _maskiere_xml_kommentare(text))
+    if not m:
         raise ValueError("Kein <allow_in_water> in cfgplayerspawnpoints.xml gefunden – "
                          "ist das die richtige Datei?")
-    return neu
+    return text[:m.start()] + m.group(1) + wert + m.group(2) + text[m.end():]
 
 
 def _spawn_zahl(v: Any) -> str:
@@ -14874,13 +14885,25 @@ def _tool_spawnpoint_positionen_schreiben(text: str, positions: List[Dict[str, A
     block = found["block"]
     nl = _tool_eol(text)
     existing = set()
+    gruppen_kopf: Dict[str, str] = {}              # Gruppenname -> urspruengliches "<group name=.. lifetime=..".
+    maske = _maskiere_xml_kommentare(block)        # Kommentare (auch mit Beispiel-<pos>) bleiben unberuehrt
     if mode == "replace":
         # Gruppen samt Inhalt und lose Punkte raus; unten wird alles neu aufgebaut
         # (Gruppen bleiben dabei ueber das "group"-Feld je Punkt erhalten).
-        block = re.sub(r'[ \t]*<group\b[^>]*>[\s\S]*?</group\s*>[ \t]*\r?\n?', "", block)
-        block = re.sub(r'[ \t]*<pos\b[^>]*/>[ \t]*\r?\n?', "", block)
+        spannen = [m.span() for m in re.finditer(
+            r'[ \t]*<group\b[^>]*>[\s\S]*?</group\s*>[ \t]*\r?\n?', maske)]
+        for m in re.finditer(r'[ \t]*<pos\b[^>]*/>[ \t]*\r?\n?', maske):
+            if not any(a <= m.start() < b for a, b in spannen):
+                spannen.append(m.span())
+        for m in re.finditer(r'<group\b([^>]*)>', maske):       # z. B. lifetime="0" nicht verlieren
+            gn = re.search(r'\bname="([^"]*)"', m.group(1))
+            if gn:
+                gruppen_kopf.setdefault(gn.group(1), m.group(0)[:-1].rstrip())
+        for a, b in sorted(spannen, reverse=True):
+            block = block[:a] + block[b:]
+        maske = _maskiere_xml_kommentare(block)
     else:
-        for m in re.finditer(r'<pos\b[^>]*?\bx="([^"]+)"[^>]*?\bz="([^"]+)"', block):
+        for m in re.finditer(r'<pos\b[^>]*?\bx="([^"]+)"[^>]*?\bz="([^"]+)"', maske):
             existing.add(f"{round(float(m.group(1)))}/{round(float(m.group(2)))}")
     gruppen: Dict[str, List[Dict[str, Any]]] = {}
     lose: List[Dict[str, Any]] = []
@@ -14896,14 +14919,21 @@ def _tool_spawnpoint_positionen_schreiben(text: str, positions: List[Dict[str, A
             lose.append(p)
     lines = ""
     for name, punkte in gruppen.items():
-        lines += f'            <group name="{name}">' + nl
+        lines += '            ' + gruppen_kopf.get(name, f'<group name="{name}"') + '>' + nl
         for p in punkte:
             lines += f'                <pos x="{_spawn_zahl(p["x"])}" z="{_spawn_zahl(p["z"])}" />' + nl
         lines += '            </group>' + nl
     for p in lose:
         lines += f'            <pos x="{_spawn_zahl(p["x"])}" z="{_spawn_zahl(p["z"])}" />' + nl
-    block = re.sub(r'([ \t]*)</generator_posbubbles\s*>$',
-                   lambda m: lines + m.group(1) + "</generator_posbubbles>", block)
+    schluss = re.search(r'([ \t]*)</generator_posbubbles\s*>$', maske)
+    if schluss is not None:
+        block = block[:schluss.start()] + lines + schluss.group(1) + "</generator_posbubbles>"
+    elif maske.rstrip().endswith("/>"):           # <generator_posbubbles /> ohne Inhalt
+        offen = re.sub(r'\s*/>\s*$', ">", block.rstrip())
+        block = offen + nl + lines + "        </generator_posbubbles>"
+    else:
+        raise ValueError("<generator_posbubbles> in cfgplayerspawnpoints.xml ist nicht lesbar – "
+                         "ist das die richtige Datei?")
     return text[:found["start"]] + block + text[found["end"]:]
 
 
