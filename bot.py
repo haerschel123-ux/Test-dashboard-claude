@@ -6394,6 +6394,7 @@ class DayZBot(discord.Client):
     async def _status_update_for(self, conn: ServerConnection):
         if not conn.guild_ids:
             return          # keine Guild → nichts anzuzeigen, also auch nicht abfragen
+        await _karte_ueber_nitrado(conn)
         ip = str(conn.get("server_ip") or "").split(":")[0].strip()
         qport = int(conn.get("query_port", 0) or 0)
         if not ip or not qport:
@@ -6403,6 +6404,7 @@ class DayZBot(discord.Client):
         if info:
             if conn.online_since is None:
                 conn.online_since = time.time()
+            _karte_nachziehen(conn, info.get("map"))
         else:
             conn.online_since = None
         await self._offline_waechter(conn, info)
@@ -33153,6 +33155,62 @@ def _apply_gameserver_info(info: Dict, conn: Optional[ServerConnection] = None) 
             log.info(f"[NITRADO] Query-Port aktualisiert: {alt_port} → {neuer_port}")
 
 
+def _mission_dir_fuer_karte(alt_dir: str, karte: str) -> str:
+    """Tauscht im gespeicherten Mission-Ordner nur den ``dayzOffline.<karte>``-
+    Teil gegen den der neuen Karte aus; alles andere (eigene Pfade) bleibt."""
+    teile = str(alt_dir or "").rstrip("/").split("/")
+    if not teile or not teile[-1].lower().startswith("dayzoffline."):
+        return str(alt_dir or "")
+    teile[-1] = _mission_folder_for_map(karte)
+    return "/".join(teile)
+
+
+def _karte_nachziehen(conn: Optional[ServerConnection], roh_karte: Any) -> bool:
+    """Uebernimmt eine geaenderte Karte des Servers (Nitrado-Infos oder A2S).
+
+    Die Karte wurde frueher nur beim Auswaehlen des Servers erkannt: wechselte
+    der Betreiber bei Nitrado danach die Karte (z. B. Livonia -> Nasdara), zeigte
+    das Dashboard weiter die alte - und der gespeicherte Mission-Ordner blieb
+    ebenfalls auf der alten Karte. Hier wird beides nachgezogen. Gibt True
+    zurueck, wenn sich etwas geaendert hat."""
+    if conn is None:
+        return False
+    neu = _canonical_map_name(str(roh_karte or ""))
+    if not neu or neu == conn.get("map_name"):
+        return False
+    alt = conn.get("map_name")
+    log.info(f"[KARTE] {conn.name}: Karte hat gewechselt {alt} → {neu}")
+    _conn_store(conn, "map_name", neu)
+    alt_dir = str(conn.get("ftp_mission_dir") or "")
+    neu_dir = _mission_dir_fuer_karte(alt_dir, neu)
+    if neu_dir and neu_dir != alt_dir:
+        log.info(f"[KARTE] {conn.name}: Mission-Ordner {alt_dir} → {neu_dir}")
+        _conn_store(conn, "ftp_mission_dir", neu_dir)
+    return True
+
+
+_KARTE_NITRADO_GEPRUEFT: Dict[str, float] = {}
+_KARTE_NITRADO_ABSTAND = 1800.0      # Sekunden: hoechstens alle 30 Minuten je Server
+
+
+async def _karte_ueber_nitrado(conn: ServerConnection) -> None:
+    """Fragt die Karte bei Nitrado ab - fuer Server, die per A2S nie antworten
+    (Konsolen) und wenn niemand das Dashboard offen hat. Gedrosselt, damit die
+    Nitrado-API je Server nur selten belastet wird."""
+    if conn.api is None or not str(getattr(conn.api, "service_id", "") or "").strip():
+        return
+    jetzt = time.time()
+    if jetzt - _KARTE_NITRADO_GEPRUEFT.get(conn.service_id, 0.0) < _KARTE_NITRADO_ABSTAND:
+        return
+    _KARTE_NITRADO_GEPRUEFT[conn.service_id] = jetzt
+    try:
+        info = await conn.api.get_info()
+    except Exception:  # noqa: BLE001 - reines Beiwerk
+        return
+    if info:
+        _karte_nachziehen(conn, NitradoAPI.extract_map(info))
+
+
 async def auto_detect_from_nitrado() -> bool:
     """Erkennt service_id, FTP-Zugangsdaten und die aktuelle Karte über den
     Nitrado-Token und speichert sie in config.json. Gibt True zurück, wenn
@@ -44744,6 +44802,7 @@ async def api_server_status(request: web.Request) -> web.Response:
         try:
             info = await nit.get_info()
             if info:
+                _karte_nachziehen(conn, NitradoAPI.extract_map(info))
                 q = info.get("query") or {}
                 nit_info = {
                     "state": info.get("status") or info.get("state"),

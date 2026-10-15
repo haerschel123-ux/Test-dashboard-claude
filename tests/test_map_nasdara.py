@@ -134,3 +134,71 @@ def test_erkennung_ueber_mission_einstellung_und_ordnersuche(monkeypatch):
     bot._apply_gameserver_info(info, conn)
     assert conn.data["map_name"] == "Nasdara"
     assert bot._mission_folder_for_map(conn.data["map_name"]) == "dayzOffline.nasdara"
+
+
+# ── Kartenwechsel nach dem Auswaehlen (Livonia -> Nasdara) ──────────────
+def test_kartenwechsel_wird_nachgezogen_inklusive_mission_ordner(monkeypatch):
+    monkeypatch.setattr(bot.cfg, "config", {})
+    conn, _req = _conn_mit_session(monkeypatch, "nasdara-wechsel")
+    conn.data["map_name"] = "Livonia"
+    conn.data["ftp_mission_dir"] = "/dayzps/mpmissions/dayzOffline.enoch"
+    assert bot._karte_nachziehen(conn, "dayzOffline.nasdara") is True
+    assert conn.data["map_name"] == "Nasdara"
+    assert conn.data["ftp_mission_dir"] == "/dayzps/mpmissions/dayzOffline.nasdara"
+    assert bot._karte_nachziehen(conn, "dayzOffline.nasdara") is False       # nichts mehr zu tun
+
+
+def test_kartenwechsel_laesst_eigene_pfade_und_unbekanntes_in_ruhe(monkeypatch):
+    monkeypatch.setattr(bot.cfg, "config", {})
+    conn, _req = _conn_mit_session(monkeypatch, "nasdara-wechsel-2")
+    conn.data["map_name"] = "Livonia"
+    conn.data["ftp_mission_dir"] = "/eigener/ordner/mission"
+    assert bot._karte_nachziehen(conn, "dayzOffline.nasdara") is True
+    assert conn.data["ftp_mission_dir"] == "/eigener/ordner/mission"
+    assert bot._karte_nachziehen(conn, "irgendwas-unbekanntes") is False
+    assert bot._karte_nachziehen(conn, "") is False
+    assert bot._karte_nachziehen(None, "nasdara") is False
+    assert conn.data["map_name"] == "Nasdara"
+
+
+def test_status_abfrage_zieht_karte_nach(monkeypatch):
+    """Die Kopfzeile fragt /api/server/status regelmaessig - dort wird die Karte korrigiert."""
+    monkeypatch.setattr(bot.cfg, "config", {})
+    conn, _req = _conn_mit_session(monkeypatch, "nasdara-status")
+    conn.data["map_name"] = "Livonia"
+    conn.data["ftp_mission_dir"] = "/m/dayzOffline.enoch"
+
+    class _Api:
+        service_id = "1"
+
+        async def get_info(self):
+            return {"status": "started", "query": {"map": "dayzOffline.nasdara", "player_current": 3,
+                                                   "player_max": 20}}
+    conn.api = _Api()
+    req = make_mocked_request("GET", "/api/server/status",
+                              headers={"Cookie": _req.headers["Cookie"]})
+    resp = asyncio.run(bot.api_server_status(req))
+    d = json.loads(resp.body.decode("utf-8"))["data"]
+    assert d["map_name"] == "Nasdara"
+    assert conn.data["ftp_mission_dir"] == "/m/dayzOffline.nasdara"
+
+
+def test_hintergrundabfrage_ueber_nitrado_ist_gedrosselt(monkeypatch):
+    monkeypatch.setattr(bot.cfg, "config", {})
+    conn, _req = _conn_mit_session(monkeypatch, "nasdara-hintergrund")
+    conn.data["map_name"] = "Livonia"
+    aufrufe = []
+
+    class _Api:
+        service_id = "1"
+
+        async def get_info(self):
+            aufrufe.append(1)
+            return {"query": {"map": "dayzOffline.nasdara"}}
+    conn.api = _Api()
+    monkeypatch.setattr(bot, "_KARTE_NITRADO_GEPRUEFT", {})
+    asyncio.run(bot._karte_ueber_nitrado(conn))
+    assert conn.data["map_name"] == "Nasdara" and len(aufrufe) == 1
+    conn.data["map_name"] = "Livonia"
+    asyncio.run(bot._karte_ueber_nitrado(conn))          # innerhalb der Drosselung: keine zweite Abfrage
+    assert len(aufrufe) == 1 and conn.data["map_name"] == "Livonia"
