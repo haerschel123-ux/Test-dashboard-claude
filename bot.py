@@ -1317,6 +1317,7 @@ MISSION_FOLDERS: Dict[str, str] = {
     "livonia":       "dayzOffline.enoch",
     "enoch":         "dayzOffline.enoch",
     "sakhal":        "dayzOffline.sakhal",
+    "nasdara":       "dayzOffline.nasdara",
 }
 
 def _mission_folder_for_map(map_name: str) -> str:
@@ -1330,6 +1331,7 @@ _CANONICAL_MAPS: Dict[str, str] = {
     "enoch":         "Livonia",
     "livonia":       "Livonia",
     "sakhal":        "Sakhal",
+    "nasdara":       "Nasdara",
 }
 
 def _canonical_map_name(raw: str) -> Optional[str]:
@@ -3071,6 +3073,16 @@ _MAP_LOCATIONS: Dict[str, List[Tuple[str, float, float]]] = {
         ("Podgorsk",    4000, 10000),
         ("Volcanka",    2500, 4000),
     ],
+    # DayZ 1.30 Badlands: grobe Auswahl der Staedte (inoffizielle Daten von
+    # thedayz.ru, 15.10.2026) - die volle Liste liegt in locations/Nasdara.json.
+    "Nasdara": [
+        ("Dashtabad",    10655, 10792),
+        ("Kamar Zir",     9432, 11924),
+        ("Shah Yailaq",  10334,  8226),
+        ("Bam-e Sabz",    8740,  8572),
+        ("Pesh Kuh",      3714, 10925),
+        ("Gandomabad",    7871, 12477),
+    ],
 }
 
 def _nearest_location(x: float, y: float, map_name: str = "ChernarusPlus") -> Optional[str]:
@@ -3237,7 +3249,8 @@ def _karten_link(x: float, y: float, map_name: str = "ChernarusPlus", z: float =
     Koordinate (DayZ pos = <Ost, Nord, Hoehe>)."""
     anbieter = _karten_einstellung("map_link_provider", "izurvive", _MAP_LINK_PROVIDER, conn)
     stil = _karten_einstellung("map_link_style", "sat", _MAP_LINK_STYLES, conn)
-    if anbieter == "xam":
+    # iZurvive kennt Nasdara noch nicht (404) - dort immer der XAM-Link.
+    if anbieter == "xam" or map_name == "Nasdara":
         folder = _XAM_FOLDER.get(map_name, "chernarusplus")
         pfad = "satmap" if stil == "sat" else "topographic"
         return f"https://dayz.xam.nu/{folder}/{pfad}#location={x:.0f};{y:.0f};5"
@@ -43366,6 +43379,9 @@ DEFAULT_MAP_SIZES = {
     "ChernarusPlus": 15360,
     "Livonia": 12800,
     "Sakhal": 15360,
+    # Nasdara (DayZ 1.30 Badlands): 16384 m laut thedayz.ru, dayz.xam.nu und
+    # einem GitHub-Projekt (inoffiziell, Bohemia hat nichts veroeffentlicht).
+    "Nasdara": 16384,
 }
 
 # Kanonischer Map-Name → Ordner der öffentlichen Kachelquelle (xam.nu).
@@ -43374,9 +43390,21 @@ _XAM_FOLDER = {
     "ChernarusPlus": "chernarusplus",
     "Livonia": "livonia",
     "Sakhal": "sakhal",
+    # Nur fuer Kartenlinks (dayz.xam.nu/nasdara/...); die xam-Kacheln sind noch
+    # ein Platzhalter, deshalb gilt fuer Kacheln _MAP_TILE_TEMPLATES.
+    "Nasdara": "nasdara",
+}
+# Kachelquellen, die den xam-Pfad ersetzen. Nasdara: inoffizielle, vollstaendige
+# Topo-Kacheln von thedayz.ru/exodus (nur topografisch, native Zoomstufen 0-6).
+# Der Browser laedt sie direkt, eingebettet wird nichts (Bohemia-Urheberrecht);
+# ueber config["dashboard_map_tiles"] austauschbar.
+_MAP_TILE_TEMPLATES = {
+    "Nasdara": "https://exodus.anomaly-pve.ru/maksim_abdul/nasdara/{z}/{x}/{y}.jpg?v=20261015-1",
 }
 _XAM_TEMPLATE = "https://static.xam.nu/dayz/maps/{folder}/1.27/topographic/{{z}}/{{x}}/{{y}}.webp"
 TILE_MAX_NATIVE_ZOOM = 7
+# Hoechste echte Zoomstufe je Karte, falls abweichend von TILE_MAX_NATIVE_ZOOM.
+_MAP_MAX_NATIVE_ZOOM = {"Nasdara": 6}
 
 _MAP_POS_RE = re.compile(r"(-?\d+(?:\.\d+)?)")
 
@@ -43394,6 +43422,8 @@ def _tile_url(map_name: str, stil: str = "topo") -> str:
     override = (cfg.config.get("dashboard_map_tiles") or {}).get(map_name)
     if override:
         return str(override)
+    if map_name in _MAP_TILE_TEMPLATES:
+        return _MAP_TILE_TEMPLATES[map_name]   # nur Topo vorhanden, fuer jeden Stil
     folder = _XAM_FOLDER.get(map_name)
     if not folder:
         return ""
@@ -44007,7 +44037,7 @@ async def api_map_meta(request: web.Request) -> web.Response:
         "world_size": _world_size(map_name),
         "tile_url": _tile_url(map_name, stil),      # XYZ-Template ({z}/{x}/{y}), Browser lädt es
         "tile_style": stil,
-        "tile_max_native_zoom": TILE_MAX_NATIVE_ZOOM,
+        "tile_max_native_zoom": _MAP_MAX_NATIVE_ZOOM.get(map_name, TILE_MAX_NATIVE_ZOOM),
         "image": f"/maps/{map_name}.jpg",     # optionales eigenes Bild (ImageOverlay), falls vorhanden
         "locations": _locations(map_name),
         "izurvive": f"https://www.izurvive.com/?m={map_name}",
