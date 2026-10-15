@@ -43394,17 +43394,20 @@ _XAM_FOLDER = {
     # ein Platzhalter, deshalb gilt fuer Kacheln _MAP_TILE_TEMPLATES.
     "Nasdara": "nasdara",
 }
-# Kachelquellen, die den xam-Pfad ersetzen. Nasdara: inoffizielle, vollstaendige
-# Topo-Kacheln von thedayz.ru/exodus (nur topografisch, native Zoomstufen 0-6).
-# Der Browser laedt sie direkt, eingebettet wird nichts (Bohemia-Urheberrecht);
-# ueber config["dashboard_map_tiles"] austauschbar.
+# Kachelquellen, die den xam-Pfad ersetzen. Nasdara: inoffizielle Kacheln von
+# nasdaramap.com (Satellit: native Zoomstufen 0-6, "Papierkarte" fuer Topo:
+# 0-4). Der Browser laedt sie direkt, eingebettet wird nichts (Bohemia-
+# Urheberrecht); ueber config["dashboard_map_tiles"] austauschbar.
 _MAP_TILE_TEMPLATES = {
-    "Nasdara": "https://exodus.anomaly-pve.ru/maksim_abdul/nasdara/{z}/{x}/{y}.jpg?v=20261015-1",
+    "Nasdara": {
+        "sat": "https://nasdaramap.com/tiles/nasdara/{z}/{x}/{y}.webp",
+        "topo": "https://nasdaramap.com/tiles/nasdara_paper/{z}/{x}/{y}.webp",
+    },
 }
 _XAM_TEMPLATE = "https://static.xam.nu/dayz/maps/{folder}/1.27/topographic/{{z}}/{{x}}/{{y}}.webp"
 TILE_MAX_NATIVE_ZOOM = 7
-# Hoechste echte Zoomstufe je Karte, falls abweichend von TILE_MAX_NATIVE_ZOOM.
-_MAP_MAX_NATIVE_ZOOM = {"Nasdara": 6}
+# Hoechste echte Zoomstufe je Karte und Stil, falls abweichend von TILE_MAX_NATIVE_ZOOM.
+_MAP_MAX_NATIVE_ZOOM = {"Nasdara": {"sat": 6, "topo": 4}}
 
 _MAP_POS_RE = re.compile(r"(-?\d+(?:\.\d+)?)")
 
@@ -43423,7 +43426,8 @@ def _tile_url(map_name: str, stil: str = "topo") -> str:
     if override:
         return str(override)
     if map_name in _MAP_TILE_TEMPLATES:
-        return _MAP_TILE_TEMPLATES[map_name]   # nur Topo vorhanden, fuer jeden Stil
+        vorlagen = _MAP_TILE_TEMPLATES[map_name]
+        return vorlagen.get(stil) or vorlagen["sat"]
     folder = _XAM_FOLDER.get(map_name)
     if not folder:
         return ""
@@ -44037,7 +44041,7 @@ async def api_map_meta(request: web.Request) -> web.Response:
         "world_size": _world_size(map_name),
         "tile_url": _tile_url(map_name, stil),      # XYZ-Template ({z}/{x}/{y}), Browser lädt es
         "tile_style": stil,
-        "tile_max_native_zoom": _MAP_MAX_NATIVE_ZOOM.get(map_name, TILE_MAX_NATIVE_ZOOM),
+        "tile_max_native_zoom": _MAP_MAX_NATIVE_ZOOM.get(map_name, {}).get(stil, TILE_MAX_NATIVE_ZOOM),
         "image": f"/maps/{map_name}.jpg",     # optionales eigenes Bild (ImageOverlay), falls vorhanden
         "locations": _locations(map_name),
         "izurvive": f"https://www.izurvive.com/?m={map_name}",

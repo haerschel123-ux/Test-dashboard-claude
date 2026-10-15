@@ -60,14 +60,16 @@ def test_naechster_ort_fuer_feed_texte():
     assert bot._nearest_location(100, 100, "Nasdara") is None       # weiter als 1500 m von jeder Stadt
 
 
-def test_kacheln_nur_topo_zoom_6(monkeypatch):
+def test_kacheln_satellit_und_papierkarte(monkeypatch):
     monkeypatch.setattr(bot.cfg, "config", {})
+    sat = bot._tile_url("Nasdara", "sat")
     topo = bot._tile_url("Nasdara", "topo")
-    assert topo == bot._tile_url("Nasdara", "sat")
-    assert topo.startswith("https://") and all(p in topo for p in ("{z}", "{x}", "{y}"))
-    assert bot._MAP_MAX_NATIVE_ZOOM["Nasdara"] == 6
+    assert sat != topo and "nasdara_paper" in topo and "nasdara_paper" not in sat
+    for url in (sat, topo):
+        assert url.startswith("https://") and all(p in url for p in ("{z}", "{x}", "{y}"))
+    assert bot._MAP_MAX_NATIVE_ZOOM["Nasdara"] == {"sat": 6, "topo": 4}
     # Faction-Map (Zoom 2) baut daraus genau die Kachel-Adressen
-    assert "/2/1/3.jpg" in topo.format(z=2, x=1, y=3)
+    assert "/2/1/3.webp" in sat.format(z=2, x=1, y=3)
     # andere Karten behalten die xam-Kacheln
     assert "static.xam.nu/dayz/maps/sakhal/" in bot._tile_url("Sakhal", "topo")
 
