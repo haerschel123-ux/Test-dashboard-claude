@@ -13751,7 +13751,10 @@ TOOL_DEPLOY_VEHICLES: Dict[str, Dict[str, Any]] = {
 }
 
 
-_DEPLOY_BALD_BIS = date(2026, 10, 15)
+# Brigarde hat die Fahrzeuge vorab freigegeben (14.10.2026, Update am Folgetag):
+# Stichtag liegt deshalb schon heute - die Sperre ist damit aufgehoben. Der
+# Mechanismus bleibt fuer kuenftige "bald"-Vorlagen erhalten.
+_DEPLOY_BALD_BIS = date(2026, 10, 14)
 
 
 def _deploy_bald(v: Dict[str, Any]) -> bool:
@@ -23259,6 +23262,7 @@ _TOOL_ORGANIZER_REGELN = tuple((kategorie, re.compile(muster, re.IGNORECASE)) fo
     ("Attachments", r'(Bayonet|Handguard|Foregrip|Bipod|CarryHandle|OpticRail|MuzzleBrake|FlashHider|Choke_|'
                     r'Compensator|Buttstock|Stock_|PistolGrip|Riser|Barrel_|Battery9V)'),
     ("Firearms", r'^(AKM_Gold|Luger|MP18|Magnum(_Gold)?|SawedoffMagnum(_Gold)?)$'),
+    ("Firearms", r'^((SKS|CZ527|Mosin9130|SawedoffMosin9130)_(Desert|Winter|Woodland)|Glock19_Tan)$'),
     ("Firearms", r'\b(AK101|AK74|AKM|AKS74U|CZ527|CZ75|CR75|CR527|Deagle|FNX45|Glock19|IJ70|Izh18|'
                 r'Longhorn|M4A1|MP5K|Mosin|Repeater|SKS|Sporter22|SVAL|SVD|UMP45|VSS|Vikhr|Bizon|FAL|'
                 r'Blaze95|Winchester70|Tundra|ASVAL|Sawnoff|Colt1911|CZ61|B95|DMR|Aug|VSD|KAM|KA101|KA74)\b'),
@@ -46595,6 +46599,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
     ),
     "loadout-catalog.js": (
         "ea21ff70ffa86a16ed17536e350838b8382e7020eaa45d62f59547d27506ea20",
+        "d2ffb19852cd2e53141039292b200f12dbaa037fffbddc43ab7f6bc314c11ada",
     ),
 }
 

@@ -128,6 +128,13 @@ def test_humvee_beige_in_builder_und_deployment(monkeypatch):
     assert bot._deploy_bald(p) is False
 
 
+def test_motorraeder_und_beiger_humvee_sind_freigegeben():
+    """Brigarde hat die 1.30-Fahrzeuge am 14.10.2026 vorab freigegeben (Standardwert, ohne Patch)."""
+    for k in ("jana_blue", "jana_red", "jana_yellow", "bitrak_blue", "bitrak_green", "bitrak_red",
+              "bitrak_yellow", "humvee_beige"):
+        assert bot._deploy_bald(bot.TOOL_DEPLOY_VEHICLES[k]) is False, k
+
+
 def test_motorrad_sperre_endet_am_erscheinungstag(monkeypatch):
     preset = bot.TOOL_DEPLOY_VEHICLES["jana_blue"]
     monkeypatch.setattr(bot, "_DEPLOY_BALD_BIS", datetime.date.today() + datetime.timedelta(days=1))
@@ -164,3 +171,31 @@ def test_organizer_bestand_unveraendert():
                       ("LeatherBelt_Black", "Belts"), ("SKS_Bayonet", "Attachments")):
         got = bot._tool_organizer_kategorie_von_classname(name)
         assert got == kat, (name, got)
+
+
+# Gegenprobe gegen die hochgeladene 1.30-types.xml (Brigarde, 14.10.2026)
+TYPES_130_WAFFEN = ["SKS_Desert", "SKS_Winter", "SKS_Woodland", "CZ527_desert", "CZ527_winter", "CZ527_Woodland",
+                    "Mosin9130_Desert", "Mosin9130_Winter", "Mosin9130_Woodland", "SawedoffMosin9130_Desert",
+                    "SawedoffMosin9130_Winter", "SawedoffMosin9130_Woodland", "Glock19_Tan"]
+
+
+def test_neue_waffen_aus_types_xml_im_loadout():
+    k = _katalog()
+    for n in TYPES_130_WAFFEN:
+        assert n in k["LOADOUT_CATALOG"]["Hands"], n
+        assert n in k["LOADOUT_WEAPONS"], n
+        assert bot._tool_organizer_kategorie_von_classname(n) == "Firearms", n
+
+
+TYPES_130_FAHRZEUGE = frozenset(['Motorbike_01_Blue', 'Motorbike_01_Red', 'Motorbike_01_Wheel_1', 'Motorbike_01_Wheel_1_Ruined', 'Motorbike_01_Wheel_2', 'Motorbike_01_Wheel_2_Ruined', 'Motorbike_01_Yellow', 'Motorbike_02_Blue', 'Motorbike_02_Green', 'Motorbike_02_Red', 'Motorbike_02_ShieldFront_Blue', 'Motorbike_02_ShieldFront_Green', 'Motorbike_02_ShieldFront_Red', 'Motorbike_02_ShieldFront_Yellow', 'Motorbike_02_ShieldLeft_Blue', 'Motorbike_02_ShieldLeft_Green', 'Motorbike_02_ShieldLeft_Red', 'Motorbike_02_ShieldLeft_Yellow', 'Motorbike_02_ShieldRight_Blue', 'Motorbike_02_ShieldRight_Green', 'Motorbike_02_ShieldRight_Red', 'Motorbike_02_ShieldRight_Yellow', 'Motorbike_02_Wheel_1', 'Motorbike_02_Wheel_1_Ruined', 'Motorbike_02_Wheel_2', 'Motorbike_02_Wheel_2_Ruined', 'Motorbike_02_Yellow', 'Offroad_02_Beige', 'Offroad_02_Door_1_1_Beige', 'Offroad_02_Door_1_1_BeigeRust', 'Offroad_02_Door_1_2_Beige', 'Offroad_02_Door_1_2_BeigeRust', 'Offroad_02_Door_2_1_Beige', 'Offroad_02_Door_2_1_BeigeRust', 'Offroad_02_Door_2_2_Beige', 'Offroad_02_Door_2_2_BeigeRust', 'Offroad_02_Hood_Beige', 'Offroad_02_Trunk_Beige', 'Offroad_02_Trunk_BeigeRust'])
+
+
+def test_fahrzeugklassen_stehen_in_der_types_xml():
+    """Klassen und Teile der Motorraeder/des beigen Humvee kommen alle in der 1.30-types.xml vor."""
+    teile = {t[0] for k, v in bot.TOOL_VEHICLES.items() if k.startswith("Motorbike_") for t in v["parts"]}
+    teile |= {t[0] for t in bot.TOOL_VEHICLES["Offroad_02"]["parts"] if t[0].endswith("_Beige")}
+    klassen = {p["klasse"] for p in bot.TOOL_DEPLOY_VEHICLES.values()
+               if p["klasse"].startswith(("Motorbike_", "Offroad_02_"))}
+    klassen |= {k for k in bot.TOOL_VEHICLES if k.startswith("Motorbike_")}
+    assert len(klassen) == 8 and len(teile) >= 20
+    assert not (klassen | teile) - TYPES_130_FAHRZEUGE, sorted((klassen | teile) - TYPES_130_FAHRZEUGE)
