@@ -14803,15 +14803,31 @@ _TOOL_LEERE_SPAWNPOINTS = (
 
 
 def _tool_spawnpoint_positionen_lesen(root: Optional[ET.Element]) -> List[Dict[str, Any]]:
-    """Liest <fresh><generator_posbubbles><pos x=".." z=".."/> - das echte
-    DayZ-Format kennt weder Namen/Gruppen noch y/dir je Punkt."""
+    """Liest ALLE <pos x=".." z=".."/> in <fresh><generator_posbubbles> - sowohl
+    lose als auch die in <group name="..."> (so liefert Bohemia die Dateien aus:
+    z. B. 149 Punkte in Gruppen wie "WestCherno"). Jeder Punkt aus einer Gruppe
+    traegt deren Namen; y/dir kennt das Format nicht."""
     if root is None:
         return []
     bubbles = root.find("fresh/generator_posbubbles")
     if bubbles is None:
         return []
-    return [{"x": p.get("x"), "z": p.get("z")} for p in bubbles.findall("pos")
-           if p.get("x") is not None and p.get("z") is not None]
+    out: List[Dict[str, Any]] = []
+    for kind in list(bubbles):
+        if kind.tag == "pos":
+            gruppe, knoten = "", [kind]
+        elif kind.tag == "group":
+            gruppe, knoten = str(kind.get("name") or ""), kind.findall("pos")
+        else:
+            continue
+        for p in knoten:
+            if p.get("x") is None or p.get("z") is None:
+                continue
+            eintrag: Dict[str, Any] = {"x": p.get("x"), "z": p.get("z")}
+            if gruppe:
+                eintrag["group"] = gruppe
+            out.append(eintrag)
+    return out
 
 
 def _tool_spawnpoint_allow_in_water_lesen(root: Optional[ET.Element]) -> bool:
@@ -14833,6 +14849,9 @@ def _tool_spawnpoint_allow_in_water_schreiben(text: str, allow_in_water: bool) -
     return neu
 
 
+_SPAWN_GRUPPE_RE = re.compile(r"[A-Za-z0-9_ .\-]{1,64}")
+
+
 def _tool_spawnpoint_positionen_schreiben(text: str, positions: List[Dict[str, Any]],
                                           mode: str) -> str:
     """Ersetzt den Inhalt von <fresh><generator_posbubbles>...</generator_posbubbles>
@@ -14847,16 +14866,32 @@ def _tool_spawnpoint_positionen_schreiben(text: str, positions: List[Dict[str, A
     nl = _tool_eol(text)
     existing = set()
     if mode == "replace":
+        # Gruppen samt Inhalt und lose Punkte raus; unten wird alles neu aufgebaut
+        # (Gruppen bleiben dabei ueber das "group"-Feld je Punkt erhalten).
+        block = re.sub(r'[ \t]*<group\b[^>]*>[\s\S]*?</group\s*>[ \t]*\r?\n?', "", block)
         block = re.sub(r'[ \t]*<pos\b[^>]*/>[ \t]*\r?\n?', "", block)
     else:
         for m in re.finditer(r'<pos\b[^>]*?\bx="([^"]+)"[^>]*?\bz="([^"]+)"', block):
             existing.add(f"{round(float(m.group(1)))}/{round(float(m.group(2)))}")
-    lines = ""
+    gruppen: Dict[str, List[Dict[str, Any]]] = {}
+    lose: List[Dict[str, Any]] = []
     for p in positions:
         key = f"{round(float(p['x']))}/{round(float(p['z']))}"
         if key in existing:
             continue
         existing.add(key)
+        name = str(p.get("group") or "").strip() if mode == "replace" else ""
+        if name and _SPAWN_GRUPPE_RE.fullmatch(name):
+            gruppen.setdefault(name, []).append(p)
+        else:
+            lose.append(p)
+    lines = ""
+    for name, punkte in gruppen.items():
+        lines += f'            <group name="{name}">' + nl
+        for p in punkte:
+            lines += f'                <pos x="{_tool_fmt_zahl(p["x"])}" z="{_tool_fmt_zahl(p["z"])}" />' + nl
+        lines += '            </group>' + nl
+    for p in lose:
         lines += f'            <pos x="{_tool_fmt_zahl(p["x"])}" z="{_tool_fmt_zahl(p["z"])}" />' + nl
     block = re.sub(r'([ \t]*)</generator_posbubbles\s*>$',
                    lambda m: lines + m.group(1) + "</generator_posbubbles>", block)
@@ -22842,7 +22877,10 @@ async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
     positions = []
     for p in positions_in:
         try:
-            positions.append({"x": float(p["x"]), "z": float(p["z"])})
+            eintrag = {"x": float(p["x"]), "z": float(p["z"])}
+            if isinstance(p, dict) and p.get("group"):
+                eintrag["group"] = str(p["group"])
+            positions.append(eintrag)
         except (TypeError, ValueError, KeyError):
             return err("Ungültige Position.")
     loop = asyncio.get_running_loop()
@@ -46681,6 +46719,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "1a54be7839e1621f945f0baeaf95d6113316d8e24977cf1b6ff2eb435ecb25e4",
         "650837c3a14cf487e210670d2341a13e78151efa6f565bc650aedb719dd9a71c",
         "8b7b5c9304dcd49ea76cc9215718efbaf38f66a8385808febf94e7e3a3e6564a",
+        "fc8cc40683aa1c1e187f328a8fe0d2ed96dca3214c0e195a56b2855e4559e21a",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
@@ -46695,6 +46734,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "51e3f7410f2c57907075abe96b5cb5a44c3a35c327133810c46c82d0d73fdbf8",
         "ad3d41b110860daddbaccf68b9e6581b3f5805168b5220e0319f8e1356adb6ee",
         "984982ae088d79c9d5f2114c836982a8bc0abf4e5a50f72bba2b52b518bd2fa2",
+        "809788cd6ced8e63a60305894ac9361fdf3c7f0889f3b1fae2055c0b1bfe561a",
     ),
     "vendor/leaflet.css": (
         "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",
