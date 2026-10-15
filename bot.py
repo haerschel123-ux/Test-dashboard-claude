@@ -3074,14 +3074,14 @@ _MAP_LOCATIONS: Dict[str, List[Tuple[str, float, float]]] = {
         ("Volcanka",    2500, 4000),
     ],
     # DayZ 1.30 Badlands: grobe Auswahl der Staedte (inoffizielle Daten von
-    # thedayz.ru, 15.10.2026) - die volle Liste liegt in locations/Nasdara.json.
+    # nasdaramap.com, 15.10.2026) - die volle Liste liegt in locations/Nasdara.json.
     "Nasdara": [
-        ("Dashtabad",    10655, 10792),
-        ("Kamar Zir",     9432, 11924),
-        ("Shah Yailaq",  10334,  8226),
-        ("Bam-e Sabz",    8740,  8572),
-        ("Pesh Kuh",      3714, 10925),
-        ("Gandomabad",    7871, 12477),
+        ("Nasdara",      9505,  4496),
+        ("Dashtabad",   10272, 11267),
+        ("Gandomabad",   7880, 12619),
+        ("Kamar Zir",    9313, 12082),
+        ("Pesh Kuh",     3781, 11116),
+        ("Khorramabad",  4756, 11023),
     ],
 }
 
@@ -44058,7 +44058,8 @@ async def api_map_meta(request: web.Request) -> web.Response:
         "tile_max_native_zoom": _MAP_MAX_NATIVE_ZOOM.get(map_name, {}).get(stil, TILE_MAX_NATIVE_ZOOM),
         "image": f"/maps/{map_name}.jpg",     # optionales eigenes Bild (ImageOverlay), falls vorhanden
         "locations": _locations(map_name),
-        "izurvive": f"https://www.izurvive.com/?m={map_name}",
+        "izurvive": ("https://dayz.xam.nu/nasdara/" if map_name == "Nasdara"   # iZurvive hat Nasdara nicht
+                     else f"https://www.izurvive.com/?m={map_name}"),
         "heatmap_typen": [{"key": k, "label_de": de, "label_en": en, "emoji": em}
                           for k, de, en, em in HEATMAP_TYPEN],
     })
@@ -46641,6 +46642,9 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
     ),
     "locations/Livonia.json": (
         "0596b35bfbc53850d1f9495eb282480993e3354819bad1b610d29916b224fb7b",
+    ),
+    "locations/Nasdara.json": (
+        "fc4f13a48381b62ad583b0c39487170429eb4fb520e7a5a7341c7c520eca2eb6",
     ),
     "locations/Sakhal.json": (
         "68a7708a1b2fa4ad5689eb31005e2397f1fca1c1a02a6b7cdb0643655b909f4f",

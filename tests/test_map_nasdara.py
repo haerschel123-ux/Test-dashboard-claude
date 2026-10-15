@@ -47,16 +47,17 @@ def test_weltgroesse(monkeypatch):
 def test_orte_liegen_in_der_welt(monkeypatch):
     monkeypatch.setattr(bot, "_locations_cache", {})
     orte = bot._locations("Nasdara")
-    assert len(orte) == 156
+    assert len(orte) == 88
     assert all(0 <= o["x"] <= 16384 and 0 <= o["z"] <= 16384 for o in orte)
-    assert {o["t"] for o in orte} >= {"capital", "city", "village", "local"}
-    # Eine bekannte Stadt: Dashtabad
+    assert {o["t"] for o in orte} >= {"capital", "city", "village", "local", "camp"}
+    # Eine bekannte Stadt: Dashtabad (nasdaramap.com)
     d = next(o for o in orte if o["name"] == "Dashtabad")
-    assert (round(d["x"]), round(d["z"])) == (10655, 10792)
+    assert (round(d["x"]), round(d["z"])) == (10272, 11267)
+    assert next(o for o in orte if o["name"] == "Nasdara")["t"] == "capital"
 
 
 def test_naechster_ort_fuer_feed_texte():
-    assert bot._nearest_location(10655, 10792, "Nasdara") == "Dashtabad"
+    assert bot._nearest_location(10272, 11267, "Nasdara") == "Dashtabad"
     assert bot._nearest_location(100, 100, "Nasdara") is None       # weiter als 1500 m von jeder Stadt
 
 
@@ -90,3 +91,46 @@ def test_kartenlink_geht_zu_xam(monkeypatch, anbieter):
 def test_izurvive_fuer_andere_karten_unveraendert(monkeypatch):
     monkeypatch.setattr(bot.cfg, "config", {"map_link_provider": "izurvive"})
     assert bot._karten_link(1, 2, "Sakhal").startswith("https://www.izurvive.com/sakhalSat/")
+
+
+# ── Erkennung und Anzeige durchgehend (Nitrado-Daten -> Verbindung -> Dashboard) ──
+import asyncio
+import json
+import time
+
+from aiohttp.test_utils import make_mocked_request
+
+
+def _conn_mit_session(monkeypatch, sid_name):
+    conn = bot.connections.upsert(sid_name, nitrado_token="fake", owner_discord_id="1")
+    sid = f"nasdara-sid-{time.time_ns()}"
+    bot._SESS_STORE[sid] = {"token": "fake", "discord": {"id": "acct-nasdara"}, "is_admin": True,
+                            "service_id": conn.service_id, "seen": time.time()}
+    req = make_mocked_request("GET", "/api/map/meta", headers={"Cookie": f"{bot._SESS_COOKIE}={sid}"})
+    return conn, req
+
+
+def test_erkennung_aus_nitrado_infos_bis_zur_dashboard_karte(monkeypatch):
+    monkeypatch.setattr(bot.cfg, "config", {})
+    conn, req = _conn_mit_session(monkeypatch, "nasdara-e2e")
+    conn.data.pop("map_name", None)
+    info = {"query": {"map": "dayzOffline.nasdara", "server_name": "Test"}, "ip": "1.2.3.4"}
+    bot._apply_gameserver_info(info, conn)
+    assert conn.data["map_name"] == "Nasdara"                   # Anzeige in Kopfzeile/Uebersicht
+    resp = asyncio.run(bot.api_map_meta(req))
+    assert resp.status == 200
+    d = json.loads(resp.body.decode("utf-8"))["data"]
+    assert d["map_name"] == "Nasdara" and d["world_size"] == 16384
+    assert d["tile_url"].startswith("https://nasdaramap.com/tiles/nasdara") and d["tile_max_native_zoom"] == 6
+    assert len(d["locations"]) == 88
+    assert "izurvive.com" not in d["izurvive"]
+
+
+def test_erkennung_ueber_mission_einstellung_und_ordnersuche(monkeypatch):
+    monkeypatch.setattr(bot.cfg, "config", {})
+    conn, _req = _conn_mit_session(monkeypatch, "nasdara-e2e-2")
+    conn.data.pop("map_name", None)
+    info = {"query": {}, "settings": {"config": {"mission": "dayzOffline.nasdara"}}}   # Server offline
+    bot._apply_gameserver_info(info, conn)
+    assert conn.data["map_name"] == "Nasdara"
+    assert bot._mission_folder_for_map(conn.data["map_name"]) == "dayzOffline.nasdara"
