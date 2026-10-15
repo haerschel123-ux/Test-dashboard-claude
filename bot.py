@@ -13888,6 +13888,7 @@ TOOL_BAGS = {
     "ArmyPouch_Beige": {"label": "Army Pouch (Beige)", "kategorie": "Alice / Army", "slots": 20},
     "ArmyPouch_Black": {"label": "Army Pouch (Black)", "kategorie": "Alice / Army", "slots": 20},
     "ArmyPouch_Camo": {"label": "Army Pouch (Camo)", "kategorie": "Alice / Army", "slots": 20},
+    "ArmyPouch_Green": {"label": "Army Pouch (Green)", "kategorie": "Alice / Army", "slots": 20},
     "AssaultBag_Black": {"label": "Assault Bag (Black)", "kategorie": "Assault", "slots": 30},
     "AssaultBag_Green": {"label": "Assault Bag (Green)", "kategorie": "Assault", "slots": 30},
     "AssaultBag_Ttsko": {"label": "Assault Bag (TTsKO)", "kategorie": "Assault", "slots": 30},
@@ -13899,6 +13900,10 @@ TOOL_BAGS = {
     "DryBag_Black": {"label": "Dry Bag (Black)", "kategorie": "Dry Bags", "slots": 20},
     "DryBag_Blue": {"label": "Dry Bag (Blue)", "kategorie": "Dry Bags", "slots": 20},
     "DryBag_Green": {"label": "Dry Bag (Green)", "kategorie": "Dry Bags", "slots": 20},
+    # Weitere Farben derselben Grundklasse (Nasdara-types.xml), Slotzahl wie die uebrigen Farben.
+    "DryBag_Orange": {"label": "Dry Bag (Orange)", "kategorie": "Dry Bags", "slots": 20},
+    "DryBag_Red": {"label": "Dry Bag (Red)", "kategorie": "Dry Bags", "slots": 20},
+    "DryBag_Yellow": {"label": "Dry Bag (Yellow)", "kategorie": "Dry Bags", "slots": 20},
     "Slingbag_Black": {"label": "Slingbag (Black)", "kategorie": "Sling", "slots": 12},
     "Slingbag_Brown": {"label": "Slingbag (Brown)", "kategorie": "Sling", "slots": 12},
     "Slingbag_Gray": {"label": "Slingbag (Gray)", "kategorie": "Sling", "slots": 12},
@@ -13917,6 +13922,7 @@ TOOL_BAGS = {
     "CoyoteBag_Desert": {"label": "Tactical Backpack (Desert)", "kategorie": "Coyote", "slots": 56},
     "AssaultBag_Desert": {"label": "Assault Bag (Desert)", "kategorie": "Assault", "slots": 30},
     "TortillaBag_Desert": {"label": "Combat Backpack (Desert)", "kategorie": "Smersh / Taloon", "slots": 56},
+    "TortillaBag_Winter": {"label": "Combat Backpack (Winter)", "kategorie": "Smersh / Taloon", "slots": 56},
     "CoyoteBag_Winter": {"label": "Tactical Backpack (Winter)", "kategorie": "Coyote", "slots": 56},
     "ImprovisedBag": {"label": "Burlap Backpack", "kategorie": "Improvised", "slots": 20},
     "FurImprovisedBag": {"label": "Fur Backpack", "kategorie": "Improvised", "slots": 35},
@@ -46712,6 +46718,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "ea21ff70ffa86a16ed17536e350838b8382e7020eaa45d62f59547d27506ea20",
         "d2ffb19852cd2e53141039292b200f12dbaa037fffbddc43ab7f6bc314c11ada",
         "acb304f4a961b2cd493b9b36796cf814604e4b44ac43263615ff782d9a6175c9",
+        "bc146edd75a677338267fa4bd92e61a68eedd87744f1afa126aeb4eec4e95668",
     ),
 }
 

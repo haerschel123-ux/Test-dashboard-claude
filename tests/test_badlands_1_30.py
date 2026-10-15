@@ -221,7 +221,9 @@ def test_weitere_items_aus_der_nasdara_types_xml():
 
 
 def test_neue_ruecksaecke_im_rucksack_builder():
-    for k, slots in (("CoyoteBag_Desert", 56), ("AssaultBag_Desert", 30), ("TortillaBag_Desert", 56)):
+    for k, slots in (("CoyoteBag_Desert", 56), ("AssaultBag_Desert", 30), ("TortillaBag_Desert", 56),
+                     ("TortillaBag_Winter", 56), ("ArmyPouch_Green", 20), ("DryBag_Orange", 20),
+                     ("DryBag_Red", 20), ("DryBag_Yellow", 20)):
         assert bot.TOOL_BAGS[k]["slots"] == slots, k
 
 
@@ -242,3 +244,32 @@ def test_neue_infizierte_im_horden_generator():
 ])
 def test_organizer_weitere_klassen(name, kategorie):
     assert bot._tool_organizer_kategorie_von_classname(name) == kategorie
+
+
+def test_jedes_katalog_item_ist_einem_slot_oder_inhalt_zugeordnet():
+    """Nur ueber die Suche erreichbare Items (z. B. Rucksaecke, Balaclavas) darf es nicht geben."""
+    k = _katalog()
+    platziert = {c.lower() for v in k["LOADOUT_CATALOG"].values() for c in v}
+    platziert |= {c.lower() for v in k["LOADOUT_CONTENT"].values() for c in v}
+    ohne = [x for x in k["LOADOUT_ALL"] if x.lower() not in platziert]
+    erlaubt = {"1911", "drybag_green.png", "fnx45_arrow", "placeholder", "Boat_01_Black", "CivilianSedan",
+               "Hatchback_02", "Offroad_02", "OffroadHatchback", "Sedan_02", "Truck_01_Covered"}
+    assert set(ohne) <= erlaubt, sorted(set(ohne) - erlaubt)
+
+
+def test_bisher_nur_per_suche_erreichbare_items_haben_jetzt_einen_slot():
+    k = _katalog()
+    c = k["LOADOUT_CATALOG"]
+    assert "Balaclava3Holes_Black" in c["Mask"] and "GhillieBushrag_Tan" in c["Body"]
+    assert {"PlateCarrierPouches", "PlateCarrierHolster_Camo"} <= set(c["Vest"])
+    assert {"ArmyPouch_Beige", "FurCourierBag", "FurImprovisedBag"} <= set(c["Back"])
+    assert "NBCBootsYellow" in c["Feet"] and "Armband_Zenit" in c["Armband"] and "Iceaxe" in c["Hands"]
+    assert "Mag_PM73_25Rnd" in k["LOADOUT_CONTENT"]["complex"]
+    assert "Ammo_762x54" in k["LOADOUT_CONTENT"]["looseAmmo"]
+    assert "Chemlight_Red" in k["LOADOUT_CONTENT"]["misc"]
+
+
+def test_neue_item_icons_sind_eingebettet():
+    namen = _asset_namen()
+    for n in ("scarh", "ushanka_black", "waterproofbag_green", "tortillabag_desert", "mag_scarh_20rnd", "wrench"):
+        assert f"items/{n}.avif" in namen, n
