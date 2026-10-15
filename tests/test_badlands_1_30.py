@@ -174,7 +174,7 @@ def test_organizer_bestand_unveraendert():
 
 
 # Gegenprobe gegen die hochgeladene 1.30-types.xml (Brigarde, 14.10.2026)
-TYPES_130_WAFFEN = ["SKS_Desert", "SKS_Winter", "SKS_Woodland", "CZ527_desert", "CZ527_winter", "CZ527_Woodland",
+TYPES_130_WAFFEN = ["SKS_Desert", "SKS_Winter", "SKS_Woodland", "CZ527_Desert", "CZ527_Winter", "CZ527_Woodland",
                     "Mosin9130_Desert", "Mosin9130_Winter", "Mosin9130_Woodland", "SawedoffMosin9130_Desert",
                     "SawedoffMosin9130_Winter", "SawedoffMosin9130_Woodland", "Glock19_Tan"]
 
@@ -199,3 +199,46 @@ def test_fahrzeugklassen_stehen_in_der_types_xml():
     klassen |= {k for k in bot.TOOL_VEHICLES if k.startswith("Motorbike_")}
     assert len(klassen) == 8 and len(teile) >= 20
     assert not (klassen | teile) - TYPES_130_FAHRZEUGE, sorted((klassen | teile) - TYPES_130_FAHRZEUGE)
+
+
+# ── Gegenprobe gegen die komplette Nasdara-types.xml (15.10.2026) ─────────
+def test_weitere_items_aus_der_nasdara_types_xml():
+    k = _katalog()
+    hands = k["LOADOUT_CATALOG"]["Hands"]
+    for n in ("LeeEnfield", "SCARH", "SCARL_Black", "Glock_Tan", "SawedoffMagnum", "OrientalMachete", "Sickle"):
+        assert n in hands and n in k["LOADOUT_WEAPONS"], n
+    inhalt = k["LOADOUT_CONTENT"]
+    assert {"Mag_SCARH_20Rnd", "Mag_AKM_Drum75Rnd_Gold"} <= set(inhalt["complex"])
+    assert {"SCAR_StockBttstck", "AK_WoodHndgrd_Gold"} <= set(inhalt["simple"])
+    assert {"Mackerel", "SpicyCrackers", "SaltyMix", "CaninaBerry"} <= set(inhalt["food"])
+    slot = k["LOADOUT_CATALOG"]
+    assert "TurbanHat_Black" in slot["Headgear"] and "Ushanka_Green" in slot["Headgear"]
+    assert "HunterPants_Desert" in slot["Legs"] and "HuntingJacket_Desert" in slot["Body"]
+    assert "UKAssVest_Desert" in slot["Vest"] and "CoyoteBag_Desert" in slot["Back"]
+    assert "LeatherShoes_Natural" in slot["Feet"]
+    # types.xml schreibt CZ527_Desert/Winter gross - keine kleingeschriebene Altform mehr
+    assert "CZ527_desert" not in hands and "CZ527_Desert" in hands
+
+
+def test_neue_ruecksaecke_im_rucksack_builder():
+    for k, slots in (("CoyoteBag_Desert", 56), ("AssaultBag_Desert", 30), ("TortillaBag_Desert", 56)):
+        assert bot.TOOL_BAGS[k]["slots"] == slots, k
+
+
+def test_neue_infizierte_im_horden_generator():
+    z = bot.TOOL_ZOMBIE_DATA
+    assert "ZmbM_takiImam" in z["InfectedTakiSolitude"]
+    assert "ZmbM_takiPoliceman_Heavy" in z["InfectedTakiPolice"]
+    assert "ZmbM_IonSoldier_Normal_3" in z["InfectedIon"]
+    assert "Zmbf_IonSoldier_Normal_1" in z["InfectedIon"]       # Schreibweise laut types.xml
+    assert all(isinstance(g, list) and g for g in z.values())
+
+
+@pytest.mark.parametrize("name,kategorie", [
+    ("Offroad_02_Beige", "Vehicles"), ("Water_Well_N1", "Static Objects"), ("Wreck_UH1Y", "Static Objects"),
+    ("LeeEnfield", "Firearms"), ("SCARL_Black", "Firearms"), ("Glock_Tan", "Firearms"), ("SKS_Green", "Firearms"),
+    ("AK_WoodBttstck_Gold", "Attachments"), ("SCAR_StockBttstck", "Attachments"),
+    ("CeramicPot_Gray", "Storage Items"), ("SpicyCrackers", "Food"), ("SaltyMix", "Food"),
+])
+def test_organizer_weitere_klassen(name, kategorie):
+    assert bot._tool_organizer_kategorie_von_classname(name) == kategorie

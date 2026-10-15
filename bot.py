@@ -13585,6 +13585,13 @@ TOOL_ZOMBIE_DATA = {
     "InfectedReligious": ["ZmbM_priestPopSkinny"],
     "InfectedSanta": ["ZmbM_Santa"],
     "InfectedSolitude": ["ZmbF_HikerSkinny_Blue", "ZmbM_FishermanOld_Blue", "ZmbM_HermitSkinny_Beige", "ZmbM_HikerSkinny_Blue", "ZmbM_HunterOld_Autumn"],
+    # Neue Infizierte (DayZ 1.30 Badlands / Nasdara), Klassennamen laut Nasdara-types.xml
+    "InfectedTakiCitizen": ["ZmbF_takiCitizenRural_Black", "ZmbF_takiCitizenRural_Flowers", "ZmbF_takiCitizenRural_Olive", "ZmbF_takiCitizenRural_Orange", "ZmbF_takiCitizenRural_Pink", "ZmbF_takiCitizenRural_Purple", "ZmbF_takiCitizenRural_Red", "ZmbF_takiCitizenRural_Yellow", "ZmbF_takiCitizenUrbanA_Beige", "ZmbF_takiCitizenUrbanA_Blue", "ZmbF_takiCitizenUrbanA_Brown", "ZmbF_takiCitizenUrbanA_Grey", "ZmbF_takiCitizenUrbanB_Black", "ZmbF_takiCitizenUrbanB_Flowers", "ZmbF_takiCitizenUrbanB_Olive", "ZmbF_takiCitizenUrbanB_Orange", "ZmbF_takiCitizenUrbanB_Pink", "ZmbF_takiCitizenUrbanB_Purple", "ZmbF_takiCitizenUrbanB_Red", "ZmbF_takiCitizenUrbanB_Yellow", "ZmbF_takiCitizenUrbanC_NavyBlue", "ZmbF_takiCitizenUrbanC_Olive", "ZmbF_takiCitizenUrbanC_Orange", "ZmbF_takiCitizenUrbanC_Pink", "ZmbF_takiCitizenUrbanC_Purple", "ZmbF_takiCitizenUrbanC_Red", "ZmbF_takiCitizenUrbanD_Beige", "ZmbF_takiCitizenUrbanD_Brown", "ZmbF_takiCitizenUrbanD_Purple", "ZmbF_takiCitizenUrbanD_Red", "ZmbM_takiCitizenRural_Beige", "ZmbM_takiCitizenRural_Black", "ZmbM_takiCitizenRural_Brown", "ZmbM_takiCitizenRural_Grey", "ZmbM_takiCitizenRural_NavyBlue", "ZmbM_takiCitizenRural_SkyBlue", "ZmbM_takiCitizenRural_White", "ZmbM_takiCitizenUrbanA_Black", "ZmbM_takiCitizenUrbanA_Blue", "ZmbM_takiCitizenUrbanA_Cream", "ZmbM_takiCitizenUrbanA_Green", "ZmbM_takiCitizenUrbanB_Beige", "ZmbM_takiCitizenUrbanB_Black", "ZmbM_takiCitizenUrbanB_BlueBright", "ZmbM_takiCitizenUrbanB_Brown", "ZmbM_takiCitizenUrbanB_Grey", "ZmbM_takiCitizenUrbanB_NavyBlue", "ZmbM_takiCitizenUrbanB_SkyBlue", "ZmbM_takiCitizenUrbanB_White", "ZmbM_takiCitizenUrbanC_Black", "ZmbM_takiCitizenUrbanC_Blue", "ZmbM_takiCitizenUrbanC_Green", "ZmbM_takiCitizenUrbanC_Red", "ZmbM_takiCitizenUrbanC_White"],
+    "InfectedTakiSolitude": ["ZmbM_takiHermitA_Black", "ZmbM_takiHermitA_NavyBlue", "ZmbM_takiHermitB_Beige", "ZmbM_takiHermitB_Brown", "ZmbM_takiHiker_Beige", "ZmbM_takiHiker_Grey", "ZmbM_takiHiker_NavyBlue", "ZmbM_takiHiker_White", "ZmbM_takiImam", "ZmbM_takiImam_Green"],
+    "InfectedTakiIndustrial": ["ZmbF_takiOilRigWorker_Blue", "ZmbF_takiOilRigWorker_Red", "ZmbF_takiOilRigWorker_Yellow", "ZmbM_takiOilRigWorker_Blue", "ZmbM_takiOilRigWorker_Red", "ZmbM_takiOilRigWorker_Yellow"],
+    "InfectedTakiPolice": ["ZmbF_takiPoliceWoman", "ZmbF_takiPoliceWoman_Heavy", "ZmbM_takiPoliceman", "ZmbM_takiPoliceman_Heavy"],
+    "InfectedTakiArmy": ["ZmbF_SoldierNormal", "ZmbM_takiSoldier_Normal_Olive", "ZmbM_takiSoldier_Normal_Tan", "ZmbM_takiSoldier_Officer"],
+    "InfectedIon": ["Zmbf_IonSoldier_Normal_1", "ZmbM_IonSoldier_Normal_1_Green", "ZmbM_IonSoldier_Normal_1_Grey", "ZmbM_IonSoldier_Normal_1_Tan", "ZmbM_IonSoldier_Normal_2_Black", "ZmbM_IonSoldier_Normal_2_Blue", "ZmbM_IonSoldier_Normal_2_White", "ZmbM_IonSoldier_Normal_3"],
     "InfectedVillage": ["ZmbF_JoggerSkinny_Blue", "ZmbF_MilkMaidOld_Beige", "ZmbF_VillagerOld_Green", "ZmbM_FarmerFat_Blue", "ZmbM_Jacket_beige", "ZmbM_JoggerSkinny_Blue", "ZmbM_VillagerOld_Blue"],
 }
 
@@ -13903,6 +13910,11 @@ TOOL_BAGS = {
     "FurCourierBag": {"label": "Fur Courier Bag", "kategorie": "Child / Courier", "slots": 48},
     "CoyoteBag_Brown": {"label": "Tactical Backpack (Brown)", "kategorie": "Coyote", "slots": 56},
     "CoyoteBag_Green": {"label": "Tactical Backpack (Green)", "kategorie": "Coyote", "slots": 56},
+    # Desert-Varianten (neu in DayZ 1.30, stehen in der Nasdara-types.xml); die
+    # Slotzahl ist die der Grundklasse - ein eigener Wert ist nicht belegt.
+    "CoyoteBag_Desert": {"label": "Tactical Backpack (Desert)", "kategorie": "Coyote", "slots": 56},
+    "AssaultBag_Desert": {"label": "Assault Bag (Desert)", "kategorie": "Assault", "slots": 30},
+    "TortillaBag_Desert": {"label": "Combat Backpack (Desert)", "kategorie": "Smersh / Taloon", "slots": 56},
     "CoyoteBag_Winter": {"label": "Tactical Backpack (Winter)", "kategorie": "Coyote", "slots": 56},
     "ImprovisedBag": {"label": "Burlap Backpack", "kategorie": "Improvised", "slots": 20},
     "FurImprovisedBag": {"label": "Fur Backpack", "kategorie": "Improvised", "slots": 35},
@@ -23264,18 +23276,20 @@ _TOOL_ORGANIZER_REGELN = tuple((kategorie, re.compile(muster, re.IGNORECASE)) fo
     ("Flags", r'^Flag_'),
     ("Infected", r'^Zmb'),
     # DayZ 1.30 (Vorabstand 14.10.2026): Motorraeder, Humvee-Teile, Tiere
-    ("Vehicles", r'^(Motorbike_0\d_(Blue|Green|Red|Yellow)|Offroad_02)$'),
+    ("Vehicles", r'^(Motorbike_0\d_(Blue|Green|Red|Yellow)|Offroad_02(_Beige)?)$'),
     ("Vehicle Parts", r'^(Motorbike_0\d_(Wheel|Shield)|Offroad_02_(Door|Hood|Trunk))'),
     ("Animals", r'^Animal_'),
+    ("Static Objects", r'^(Water_Well|Static_|Wreck_)'),
     ("Armbands", r'Armband'),
     ("Belts", r'(Belt_|HipPack)'),
     ("Pelts", r'Pelt'),
     ("Suppressors", r'Suppressor'),
     ("Optics", r'(ACOG|Kobra|PSO\b|EOTech|Holosight|Reflex|NVGoggles|Nightvision|Scope|Buris|LRSight|IronSight)'),
-    ("Attachments", r'(Bayonet|Handguard|Foregrip|Bipod|CarryHandle|OpticRail|MuzzleBrake|FlashHider|Choke_|'
+    ("Attachments", r'(Bttstck|Hndgrd|Bayonet|Handguard|Foregrip|Bipod|CarryHandle|OpticRail|MuzzleBrake|FlashHider|Choke_|'
                     r'Compensator|Buttstock|Stock_|PistolGrip|Riser|Barrel_|Battery9V)'),
     ("Firearms", r'^(AKM_Gold|Luger|MP18|Magnum(_Gold)?|SawedoffMagnum(_Gold)?)$'),
-    ("Firearms", r'^((SKS|CZ527|Mosin9130|SawedoffMosin9130)_(Desert|Winter|Woodland)|Glock19_Tan)$'),
+    ("Firearms", r'^((SKS|CZ527|Mosin9130|SawedoffMosin9130)(_(Black|Green|Camo|Desert|Winter|Woodland))?|'
+                 r'Glock19_Tan|Glock_Tan|LeeEnfield|SCAR[HL](_Black)?)$'),
     ("Firearms", r'\b(AK101|AK74|AKM|AKS74U|CZ527|CZ75|CR75|CR527|Deagle|FNX45|Glock19|IJ70|Izh18|'
                 r'Longhorn|M4A1|MP5K|Mosin|Repeater|SKS|Sporter22|SVAL|SVD|UMP45|VSS|Vikhr|Bizon|FAL|'
                 r'Blaze95|Winchester70|Tundra|ASVAL|Sawnoff|Colt1911|CZ61|B95|DMR|Aug|VSD|KAM|KA101|KA74)\b'),
@@ -23287,7 +23301,7 @@ _TOOL_ORGANIZER_REGELN = tuple((kategorie, re.compile(muster, re.IGNORECASE)) fo
                       r'TailLight|Muffler|Carburetor|Radiator)'),
     ("Bags", r'(Backpack|Kotomka|Mochila|TaloonBag|CanvasBag|_Bag$|Bag_)'),
     ("Tools", r'Keys(_|$)'),
-    ("Storage Items", r'(StorageBox_|Barrel|Crate_|Container|Chest_|Cabinet|Locker|GunSafe|Case_|TentSmall|'
+    ("Storage Items", r'(CeramicPot_|StorageBox_|Barrel|Crate_|Container|Chest_|Cabinet|Locker|GunSafe|Case_|TentSmall|'
                       r'TentBig|CarTent|StorageShelf)'),
     ("Gas Masks", r'GasMask'),
     ("Gas Gear", r'(NBC|Hazmat|CBRN)'),
@@ -23305,7 +23319,7 @@ _TOOL_ORGANIZER_REGELN = tuple((kategorie, re.compile(muster, re.IGNORECASE)) fo
     ("Lights", r'(Flashlight|Headlamp|Chemlight|Lightstick|Lantern)'),
     ("Static Objects", r'(StaticObj|Watchtower|Barricade|Fence_)'),
     ("Plants", r'(Plant_|Mushroom|Bush_|Tree_|Garden)'),
-    ("Food", r'^(Achar|Ayran|Lassi_|Catfish|Figs$|HalvaCan|SarmaCan|RoundGoby|LizardMeat|DeadLizard|'
+    ("Food", r'^(SaltyMix|SpicyCrackers|Achar|Ayran|Lassi_|Catfish|Figs$|HalvaCan|SarmaCan|RoundGoby|LizardMeat|DeadLizard|'
             r'SodaCan_|SmallGlassBottle_|WineBottle|Waterskin_)'),
     ("Food", r'(Apple|Pear|Plum|Tomato|Potato|Pumpkin|Zucchini|Cucumber|BakedBeans|CannedFood|Pasta|'
             r'Rice|Powdered|Canned|Fish_|Meat_|Steak|Sausage|Bacon|TunaCan|PeachesCan|SpaghettiCan|'
@@ -46634,6 +46648,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
     "loadout-catalog.js": (
         "ea21ff70ffa86a16ed17536e350838b8382e7020eaa45d62f59547d27506ea20",
         "d2ffb19852cd2e53141039292b200f12dbaa037fffbddc43ab7f6bc314c11ada",
+        "acb304f4a961b2cd493b9b36796cf814604e4b44ac43263615ff782d9a6175c9",
     ),
 }
 
