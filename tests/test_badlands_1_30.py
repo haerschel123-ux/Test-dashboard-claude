@@ -273,3 +273,12 @@ def test_neue_item_icons_sind_eingebettet():
     namen = _asset_namen()
     for n in ("scarh", "ushanka_black", "waterproofbag_green", "tortillabag_desert", "mag_scarh_20rnd", "wrench"):
         assert f"items/{n}.avif" in namen, n
+
+
+def test_humvees_und_schwarzer_gunter_gibt_es_auf_nasdara():
+    """Nasdaras types.xml fuehrt Offroad_02, Offroad_02_Beige und Hatchback_02_Black."""
+    class _C:
+        def get(self, key, default=None):
+            return "dayzOffline.nasdara" if key == "map_name" else default
+    ids = bot._deploy_presets_fuer(_C())
+    assert {"humvee", "humvee_beige", "gunter_black"} <= set(ids)

@@ -13719,7 +13719,7 @@ TOOL_DEPLOY_VEHICLES: Dict[str, Dict[str, Any]] = {
     "gunter_blue":   {"label": "Blauer Gunter", "klasse": "Hatchback_02_Blue",
                       "bild": "Hatchback_02", "karten": None},
     "gunter_black":  {"label": "Schwarzer Gunter", "klasse": "Hatchback_02_Black",
-                      "bild": "Hatchback_02", "karten": ["ChernarusPlus", "Livonia"]},
+                      "bild": "Hatchback_02", "karten": ["ChernarusPlus", "Livonia", "Nasdara"]},
     "olga_black":    {"label": "Schwarze Olga", "klasse": "CivilianSedan_Black",
                       "bild": "CivilianSedan", "karten": None},
     "olga_wine":     {"label": "Rote Olga", "klasse": "CivilianSedan_Wine",
@@ -13733,11 +13733,11 @@ TOOL_DEPLOY_VEHICLES: Dict[str, Dict[str, Any]] = {
     "truck_orange":  {"label": "Oranger Truck", "klasse": "Truck_01_Covered_Orange",
                       "bild": "Truck_01_Covered", "karten": None},
     "humvee":        {"label": "Humvee", "klasse": "Offroad_02",
-                      "bild": "Offroad_02", "karten": ["ChernarusPlus", "Livonia"]},
+                      "bild": "Offroad_02", "karten": ["ChernarusPlus", "Livonia", "Nasdara"]},
     # Beiger Humvee: erst mit DayZ 1.30, Sperre wie bei den Motorraedern. Das
     # Bild ist das Modellbild des Humvee (ein eigenes Beige-Bild gibt es nicht).
     "humvee_beige":  {"label": "Beiger Humvee", "klasse": "Offroad_02_Beige",
-                      "bild": "Offroad_02", "karten": ["ChernarusPlus", "Livonia"], "bald": True},
+                      "bild": "Offroad_02", "karten": ["ChernarusPlus", "Livonia", "Nasdara"], "bald": True},
     "boat_black":    {"label": "Schwarzes Boot", "klasse": "Boat_01_Black",
                       "bild": None, "karten": None},
     # Ergaenzt aus Brigardes Fahrzeugliste (29.09.2026, Classnames aus Bohemias
