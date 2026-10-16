@@ -3211,6 +3211,9 @@ _IZURVIVE_SLUGS: Dict[str, Dict[str, str]] = {
                       "tourist": "chernarusplushiking"},
     "Livonia": {"topo": "livonia", "sat": "livoniaSat", "tourist": "livoniaHiking"},
     "Sakhal": {"topo": "sakhal", "sat": "sakhalSat", "tourist": "sakhal"},
+    # Nasdara: iZurvive hat bisher nur die Satellitenkarte (nasdaraSat; nasdara, nasdaraTopo,
+    # nasdaraHiking usw. liefern 404) - deshalb fuer jeden Stil dieselbe Adresse.
+    "Nasdara": {"topo": "nasdaraSat", "sat": "nasdaraSat", "tourist": "nasdaraSat"},
 }
 _MAP_LINK_PROVIDER = ("izurvive", "xam")
 _MAP_LINK_STYLES = ("sat", "topo", "tourist")
@@ -3249,8 +3252,7 @@ def _karten_link(x: float, y: float, map_name: str = "ChernarusPlus", z: float =
     Koordinate (DayZ pos = <Ost, Nord, Hoehe>)."""
     anbieter = _karten_einstellung("map_link_provider", "izurvive", _MAP_LINK_PROVIDER, conn)
     stil = _karten_einstellung("map_link_style", "sat", _MAP_LINK_STYLES, conn)
-    # iZurvive kennt Nasdara noch nicht (404) - dort immer der XAM-Link.
-    if anbieter == "xam" or map_name == "Nasdara":
+    if anbieter == "xam":
         folder = _XAM_FOLDER.get(map_name, "chernarusplus")
         pfad = "satmap" if stil == "sat" else "topographic"
         return f"https://dayz.xam.nu/{folder}/{pfad}#location={x:.0f};{y:.0f};5"
@@ -14849,15 +14851,29 @@ def _tool_spawnpoint_allow_in_water_lesen(root: Optional[ET.Element]) -> bool:
     return (el is not None) and (el.text or "").strip().lower() == "true"
 
 
-def _tool_spawnpoint_allow_in_water_schreiben(text: str, allow_in_water: bool) -> str:
+def _tool_spawnpoint_allow_in_water_schreiben(text: str, allow_in_water: bool,
+                                              ergaenzen: bool = False) -> str:
     """Setzt <fresh><generator_params><allow_in_water> auf true/false - chirurgisch,
-    der Rest von generator_params bleibt unangetastet."""
+    der Rest von generator_params bleibt unangetastet. Fehlt der Eintrag (so liefert
+    Bohemia z. B. die Chernarus-Datei aus), wird er NUR mit ergaenzen=True (vom Nutzer
+    aktiv gewaehlt) in <generator_params> angelegt, sonst gibt es einen Fehler."""
     wert = "true" if allow_in_water else "false"
-    m = re.search(r'(<allow_in_water>)[^<]*(</allow_in_water>)', _maskiere_xml_kommentare(text))
-    if not m:
+    maske = _maskiere_xml_kommentare(text)
+    m = re.search(r'(<allow_in_water>)[^<]*(</allow_in_water>)', maske)
+    if m:
+        return text[:m.start()] + m.group(1) + wert + m.group(2) + text[m.end():]
+    if not ergaenzen:
         raise ValueError("Kein <allow_in_water> in cfgplayerspawnpoints.xml gefunden – "
-                         "ist das die richtige Datei?")
-    return text[:m.start()] + m.group(1) + wert + m.group(2) + text[m.end():]
+                         "den Schalter „Fehlenden Eintrag <allow_in_water> ergänzen“ aktivieren, "
+                         "wenn das Tool ihn anlegen soll.")
+    zu = re.search(r'([ \t]*)</generator_params\s*>', maske)
+    if zu is None:
+        raise ValueError("Kein <generator_params> in cfgplayerspawnpoints.xml gefunden – "
+                         "<allow_in_water> kann nicht ergänzt werden.")
+    nl = _tool_eol(text)
+    einzug = zu.group(1) + "    "
+    neu = f"{einzug}<allow_in_water>{wert}</allow_in_water>{nl}"
+    return text[:zu.start()] + neu + text[zu.start():]
 
 
 def _spawn_zahl(v: Any) -> str:
@@ -14870,6 +14886,25 @@ def _spawn_zahl(v: Any) -> str:
 
 
 _SPAWN_GRUPPE_RE = re.compile(r"[A-Za-z0-9_ .\-]{1,64}")
+
+
+def _tool_spawnpoint_zusatz_abschnitte(text: str, positions: List[Dict[str, Any]], mode: str,
+                                       allow_in_water: bool, ergaenzen: bool,
+                                       abschnitte: Tuple[str, ...] = ("hop", "travel")) -> str:
+    """Schreibt dieselben Punkte (und denselben allow_in_water-Wert) zusaetzlich in <hop>/<travel>.
+    Nur auf ausdruecklichen Wunsch (Schalter im Tool) - Bohemia fuehrt die Abschnitte getrennt.
+    Arbeitet je Abschnitt auf dessen eigenem Textstueck, damit <fresh> nie davon beruehrt wird."""
+    for name in sorted(abschnitte, key=lambda n: -_maskiere_xml_kommentare(text).find("<" + n)):
+        maske = _maskiere_xml_kommentare(text)
+        m = re.search(r'[ \t]*<' + name + r'(?=[\s>])[^>]*>[\s\S]*?</' + name + r'\s*>', maske)
+        if m is None or "<generator_posbubbles" not in maske[m.start():m.end()]:
+            raise ValueError(f"In cfgplayerspawnpoints.xml gibt es keinen Abschnitt <{name}> mit "
+                             f"<generator_posbubbles> – „Auch hop und travel mit denselben Punkten füllen“ ausschalten "
+                             f"oder die Datei prüfen.")
+        teil = _tool_spawnpoint_positionen_schreiben(text[m.start():m.end()], positions, mode)
+        teil = _tool_spawnpoint_allow_in_water_schreiben(teil, allow_in_water, ergaenzen)
+        text = text[:m.start()] + teil + text[m.end():]
+    return text
 
 
 def _tool_spawnpoint_positionen_schreiben(text: str, positions: List[Dict[str, Any]],
@@ -22890,7 +22925,9 @@ async def api_tools_spawnpoint_get(request: web.Request) -> web.Response:
     if status == "error":
         return err("cfgplayerspawnpoints.xml per FTP nicht lesbar.", 502)
     return ok({"positions": _tool_spawnpoint_positionen_lesen(root),
-              "allow_in_water": _tool_spawnpoint_allow_in_water_lesen(root)})
+              "allow_in_water": _tool_spawnpoint_allow_in_water_lesen(root),
+              "allow_in_water_fehlt": root is not None
+              and root.find("fresh/generator_params/allow_in_water") is None})
 
 
 async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
@@ -22938,9 +22975,15 @@ async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
     if status == "error":
         return err("cfgplayerspawnpoints.xml per FTP nicht lesbar.", 502)
     basis = text if status == "ok" else _TOOL_LEERE_SPAWNPOINTS
+    wasser = bool(data_in.get("allow_in_water"))
+    ergaenzen = bool(data_in.get("allow_in_water_ergaenzen"))
+    auch_hop_travel = bool(data_in.get("auch_hop_travel"))
     try:
+        # hop/travel ZUERST (liegen hinter <fresh>), damit <fresh> auf dem Originaltext arbeitet
+        if auch_hop_travel:
+            basis = _tool_spawnpoint_zusatz_abschnitte(basis, positions, mode, wasser, ergaenzen)
         neu = _tool_spawnpoint_positionen_schreiben(basis, positions, mode)
-        neu = _tool_spawnpoint_allow_in_water_schreiben(neu, bool(data_in.get("allow_in_water")))
+        neu = _tool_spawnpoint_allow_in_water_schreiben(neu, wasser, ergaenzen)
         # Vor jedem Schreiben gegenpruefen: nur gueltiges XML darf auf den Server.
         ET.fromstring(neu)
     except ValueError as e:
@@ -22989,7 +23032,17 @@ async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
     # <?xml?>-Kopfzeile, <playerspawnpoints>, <hop>/<travel>), sonst laedt der
     # Kunde nur ein <fresh>-Fragment herunter, das server-seitig ungueltig ist.
     generated = [{"filename": "cfgplayerspawnpoints.xml", "content": neu}]
-    return ok({"total": total, "generated": generated, "aenderung": aenderung})
+    # Bohemias Dateien fuehren dieselben Punkte auch in <hop> und <travel>; das Tool aendert
+    # nur <fresh>. Die Vorschau nennt deshalb, was dort unveraendert stehen bleibt - sonst
+    # wirkt die (lange) Ausgabe, als waeren die geloeschten Punkte noch da.
+    unveraendert = {}
+    if not auch_hop_travel:
+        for abschnitt in ("hop", "travel"):
+            n_pos = len(root.findall(f"{abschnitt}/generator_posbubbles//pos"))
+            if n_pos:
+                unveraendert[abschnitt] = n_pos
+    return ok({"total": total, "generated": generated, "aenderung": aenderung,
+               "unveraendert": unveraendert, "auch_hop_travel": auch_hop_travel})
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -44243,7 +44296,7 @@ async def api_map_meta(request: web.Request) -> web.Response:
         "tile_max_native_zoom": _MAP_MAX_NATIVE_ZOOM.get(map_name, {}).get(stil, TILE_MAX_NATIVE_ZOOM),
         "image": f"/maps/{map_name}.jpg",     # optionales eigenes Bild (ImageOverlay), falls vorhanden
         "locations": _locations(map_name),
-        "izurvive": ("https://dayz.xam.nu/nasdara/" if map_name == "Nasdara"   # iZurvive hat Nasdara nicht
+        "izurvive": ("https://www.izurvive.com/nasdaraSat/" if map_name == "Nasdara"
                      else f"https://www.izurvive.com/?m={map_name}"),
         "heatmap_typen": [{"key": k, "label_de": de, "label_en": en, "emoji": em}
                           for k, de, en, em in HEATMAP_TYPEN],
@@ -46804,6 +46857,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "8b7b5c9304dcd49ea76cc9215718efbaf38f66a8385808febf94e7e3a3e6564a",
         "fc8cc40683aa1c1e187f328a8fe0d2ed96dca3214c0e195a56b2855e4559e21a",
         "8cb22f073e50cdf93632acadcab2f12b8997bb109a922e84139db1f54c33780f",
+        "84a1744741f2155793b399a8aeb40cb6e0da8fb9b0d350636f247195bb1ca68b",
+        "a6f68b52e73e990edbc87564f2d68ee3a4f87203bc2eaf90e36b32eb676cc9b5",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
@@ -46820,6 +46875,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "984982ae088d79c9d5f2114c836982a8bc0abf4e5a50f72bba2b52b518bd2fa2",
         "809788cd6ced8e63a60305894ac9361fdf3c7f0889f3b1fae2055c0b1bfe561a",
         "de91af9ec4192ff38005a4c65d825906f0e28f026c644e7b6aaf788aa9286052",
+        "e7f961dab2ab67545e45f774e8139a5c9e5517654cf8766592b210046d82ad5c",
     ),
     "vendor/leaflet.css": (
         "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",

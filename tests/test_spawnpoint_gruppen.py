@@ -290,3 +290,80 @@ def test_punkte_ausserhalb_der_karte_werden_abgelehnt_und_nichts_geschrieben():
     assert conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] == vorher
     status, _ = _post(conn, {"positions": [{"x": 0.0, "z": 16384.0}], "mode": "replace"})   # Rand ist erlaubt
     assert status == 200
+
+
+def test_vorschau_nennt_unveraenderte_hop_und_travel_punkte():
+    """Bohemias Dateien fuehren dieselben Punkte auch in hop/travel; nur fresh wird geaendert."""
+    conn = td._server(map_name="Nasdara")
+    hop = '<hop><generator_posbubbles><group name="G"><pos x="1" z="2"/><pos x="3" z="4"/></group></generator_posbubbles></hop>'
+    conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] = _datei_mit_wasser().replace("<hop></hop>", hop)
+    status, j = _post(conn, {"positions": [{"x": 5.0, "z": 6.0}], "mode": "replace", "allow_in_water": False})
+    assert status == 200 and j["data"]["unveraendert"] == {"hop": 2}
+    assert j["data"]["total"] == 1
+    assert j["data"]["generated"][0]["content"].count("<pos ") == 3        # 1 fresh + 2 hop bleiben
+
+
+# ── Schalter "auch hop und travel" und "allow_in_water ergaenzen" (beides nur auf Wunsch) ──
+def _drei_abschnitte():
+    """Wie Bohemias Dateien: fresh, hop und travel mit je eigenem generator_params/posbubbles."""
+    teil = ('<generator_params>\n<allow_in_water>false</allow_in_water>\n</generator_params>\n'
+            '<generator_posbubbles>\n<!-- <pos> und <group> im Kommentar -->\n'
+            '<group name="AllSpawnpoints" lifetime="0"><pos x="1" z="2"/><pos x="3" z="4"/></group>\n'
+            '</generator_posbubbles>\n')
+    return ('<?xml version="1.0"?>\n<playerspawnpoints>\n<fresh>\n' + teil + '</fresh>\n<hop>\n' + teil
+            + '</hop>\n<travel>\n' + teil + '</travel>\n</playerspawnpoints>\n')
+
+
+def _anzahl(text, abschnitt):
+    return len(ET.fromstring(text).findall(f"{abschnitt}/generator_posbubbles//pos"))
+
+
+def test_ohne_schalter_bleiben_hop_und_travel_unveraendert():
+    conn = td._server(map_name="Nasdara")
+    conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] = _drei_abschnitte()
+    status, j = _post(conn, {"positions": [{"x": 9.0, "z": 9.0}], "mode": "replace", "allow_in_water": True})
+    assert status == 200
+    neu = j["data"]["generated"][0]["content"]
+    assert (_anzahl(neu, "fresh"), _anzahl(neu, "hop"), _anzahl(neu, "travel")) == (1, 2, 2)
+    assert j["data"]["unveraendert"] == {"hop": 2, "travel": 2}
+    root = ET.fromstring(neu)
+    assert [root.findtext(f"{a}/generator_params/allow_in_water") for a in ("fresh", "hop", "travel")] == \
+        ["true", "false", "false"]
+
+
+def test_mit_schalter_bekommen_alle_drei_abschnitte_dieselben_punkte():
+    conn = td._server(map_name="Nasdara")
+    conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] = _drei_abschnitte()
+    pts = [{"x": 9.0, "z": 9.0}, {"x": 10.5, "z": 11.0, "group": "Nord"}]
+    status, j = _post(conn, {"positions": pts, "mode": "replace", "allow_in_water": True,
+                             "auch_hop_travel": True, "commit": True})
+    assert status == 200 and j["data"]["unveraendert"] == {}
+    neu = conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"]
+    root = ET.fromstring(neu)
+    for a in ("fresh", "hop", "travel"):
+        assert _anzahl(neu, a) == 2 and root.findtext(f"{a}/generator_params/allow_in_water") == "true"
+        assert root.find(f"{a}/generator_posbubbles/group").get("name") == "Nord"
+    assert neu.count("<!-- <pos> und <group> im Kommentar -->") == 3        # Kommentare bleiben
+
+
+def test_schalter_ohne_hop_abschnitt_meldet_klaren_fehler_und_schreibt_nichts():
+    conn = td._server(map_name="Nasdara")
+    vorher = _datei_mit_wasser()
+    conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] = vorher
+    status, j = _post(conn, {"positions": [{"x": 1.0, "z": 1.0}], "mode": "replace",
+                             "auch_hop_travel": True, "commit": True})
+    assert status == 400 and "keinen Abschnitt" in j["error"]
+    assert conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] == vorher
+
+
+def test_fehlendes_allow_in_water_wird_nur_auf_wunsch_ergaenzt():
+    conn = td._server(map_name="Nasdara")
+    conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] = _datei_mit_wasser().replace(
+        "<allow_in_water>false</allow_in_water>", "")
+    status, j = _post(conn, {"positions": [{"x": 1.0, "z": 1.0}], "mode": "replace", "allow_in_water": True})
+    assert status == 400 and "ergänzen" in j["error"]                   # ohne aktive Wahl: wie bisher Fehler
+    status, j = _post(conn, {"positions": [{"x": 1.0, "z": 1.0}], "mode": "replace", "allow_in_water": True,
+                             "allow_in_water_ergaenzen": True})
+    assert status == 200
+    root = ET.fromstring(j["data"]["generated"][0]["content"])
+    assert root.findtext("fresh/generator_params/allow_in_water") == "true"

@@ -80,12 +80,17 @@ def test_kachel_override_gewinnt(monkeypatch):
     assert bot._tile_url("Nasdara", "topo") == "https://example.invalid/{z}/{x}/{y}.png"
 
 
-@pytest.mark.parametrize("anbieter", ["izurvive", "xam"])
-def test_kartenlink_geht_zu_xam(monkeypatch, anbieter):
-    monkeypatch.setattr(bot.cfg, "config", {"map_link_provider": anbieter})
+def test_kartenlink_xam(monkeypatch):
+    monkeypatch.setattr(bot.cfg, "config", {"map_link_provider": "xam"})
     url = bot._karten_link(10655, 10792, "Nasdara")
     assert url.startswith("https://dayz.xam.nu/nasdara/") and "#location=10655;10792" in url
-    assert "izurvive" not in url
+
+
+@pytest.mark.parametrize("stil", ["sat", "topo", "tourist"])
+def test_kartenlink_izurvive_hat_nasdara_nur_als_satellit(monkeypatch, stil):
+    monkeypatch.setattr(bot.cfg, "config", {"map_link_provider": "izurvive", "map_link_style": stil})
+    assert bot._karten_link(10655, 10792, "Nasdara") == \
+        "https://www.izurvive.com/nasdaraSat/#location=10655;10792;0"
 
 
 def test_izurvive_fuer_andere_karten_unveraendert(monkeypatch):
@@ -123,7 +128,7 @@ def test_erkennung_aus_nitrado_infos_bis_zur_dashboard_karte(monkeypatch):
     assert d["map_name"] == "Nasdara" and d["world_size"] == 16384
     assert d["tile_url"].startswith("https://nasdaramap.com/tiles/nasdara") and d["tile_max_native_zoom"] == 6
     assert len(d["locations"]) == 88
-    assert "izurvive.com" not in d["izurvive"]
+    assert d["izurvive"] == "https://www.izurvive.com/nasdaraSat/"
 
 
 def test_erkennung_ueber_mission_einstellung_und_ordnersuche(monkeypatch):
