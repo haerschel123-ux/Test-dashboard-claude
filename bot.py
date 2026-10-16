@@ -22922,6 +22922,13 @@ async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
             positions.append(eintrag)
         except (TypeError, ValueError, KeyError):
             return err("Ungültige Position.")
+    # Punkte ausserhalb der Karte (z. B. Klick neben das Kartenbild) nie speichern.
+    welt = DEFAULT_MAP_SIZES.get(_canonical_map_name(str(conn.get("map_name") or "")) or "")
+    for q in positions:
+        if not (math.isfinite(q["x"]) and math.isfinite(q["z"])) or q["x"] < 0 or q["z"] < 0 \
+                or (welt and (q["x"] > welt or q["z"] > welt)):
+            return err(f"Spawn-Punkt ausserhalb der Karte (x={q['x']:g}, z={q['z']:g}) – "
+                       f"erlaubt sind Werte von 0{f' bis {welt}' if welt else ''}. Nichts wurde gespeichert.")
     loop = asyncio.get_running_loop()
     try:
         text, status = await _tools_datei_lesen(conn, "cfgplayerspawnpoints.xml", loop)
@@ -43593,7 +43600,7 @@ _XAM_FOLDER = {
 _MAP_TILE_TEMPLATES = {
     "Nasdara": {
         "sat": "https://nasdaramap.com/tiles/nasdara/{z}/{x}/{y}.webp",
-        "topo": "https://nasdaramap.com/tiles/nasdara_paper/{z}/{x}/{y}.webp",
+        "topo": "https://nasdaramap.com/tiles/nasdara/nasdara_paper/{z}/{x}/{y}.webp",
     },
 }
 _XAM_TEMPLATE = "https://static.xam.nu/dayz/maps/{folder}/1.27/topographic/{{z}}/{{x}}/{{y}}.webp"
@@ -46796,6 +46803,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "650837c3a14cf487e210670d2341a13e78151efa6f565bc650aedb719dd9a71c",
         "8b7b5c9304dcd49ea76cc9215718efbaf38f66a8385808febf94e7e3a3e6564a",
         "fc8cc40683aa1c1e187f328a8fe0d2ed96dca3214c0e195a56b2855e4559e21a",
+        "8cb22f073e50cdf93632acadcab2f12b8997bb109a922e84139db1f54c33780f",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
@@ -46811,6 +46819,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "ad3d41b110860daddbaccf68b9e6581b3f5805168b5220e0319f8e1356adb6ee",
         "984982ae088d79c9d5f2114c836982a8bc0abf4e5a50f72bba2b52b518bd2fa2",
         "809788cd6ced8e63a60305894ac9361fdf3c7f0889f3b1fae2055c0b1bfe561a",
+        "de91af9ec4192ff38005a4c65d825906f0e28f026c644e7b6aaf788aa9286052",
     ),
     "vendor/leaflet.css": (
         "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",

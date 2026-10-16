@@ -277,3 +277,16 @@ def test_gruppen_attribute_wie_lifetime_bleiben_erhalten():
     neu = bot._tool_spawnpoint_positionen_schreiben(text, punkte[1:], "replace")
     assert '<group name="WestCherno" lifetime="0">' in neu
     ET.fromstring(neu)
+
+
+def test_punkte_ausserhalb_der_karte_werden_abgelehnt_und_nichts_geschrieben():
+    conn = td._server(map_name="Nasdara")                       # Weltgroesse 16384
+    conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] = _datei_mit_wasser()
+    vorher = conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"]
+    for x, z in ((-3008.0, 100.0), (100.0, -1.0), (16385.0, 100.0), (100.0, 20000.0)):
+        status, j = _post(conn, {"positions": _punkte()[:1] + [{"x": x, "z": z}],
+                                 "mode": "replace", "commit": True})
+        assert status == 400 and "ausserhalb der Karte" in j["error"] and "Nichts wurde gespeichert" in j["error"]
+    assert conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] == vorher
+    status, _ = _post(conn, {"positions": [{"x": 0.0, "z": 16384.0}], "mode": "replace"})   # Rand ist erlaubt
+    assert status == 200
