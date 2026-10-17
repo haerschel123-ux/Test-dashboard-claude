@@ -42759,7 +42759,11 @@ async def list_items(request: web.Request) -> web.Response:
     total = len(items)
     start = (page - 1) * page_size
     view = [_item_view(it) for it in items[start:start + page_size]]
+    af = conn.data.get("shop_autofill_quelle") if isinstance(conn.data.get("shop_autofill_quelle"), dict) else None
     return ok({"items": view, "total": total, "page": page, "page_size": page_size,
+               "autofill": {"anzahl": len(conn.data.get("shop_autofill_classnames") or []),
+                            "quelle": (af or {}).get("quelle"), "stand": (af or {}).get("stand"),
+                            "eingebaut": len(_shop_eingebaute_classnames())},
                "source": getattr(katalog, "source", "?"),
                "server": conn.name, "service_id": conn.service_id,
                "kategorie_stufe": _module_tier("shop")})
@@ -42788,8 +42792,58 @@ async def api_shop_categories(request: web.Request) -> web.Response:
                "kategorie_stufe": _module_tier("shop")})
 
 
+_SHOP_EINGEBAUT_CACHE: Optional[List[Dict[str, str]]] = None
+
+
+def _shop_eingebaute_classnames() -> List[Dict[str, str]]:
+    """Alle Items des mitgelieferten Loadout-Katalogs (inkl. DayZ-1.30-Badlands) als Autofill-
+    Grundlage. So lassen sich auch NEUE Items ins Shop-Katalog uebernehmen, ohne dass vorher eine
+    types.xml hinterlegt wurde. Rein lesend und gecacht; legt nie Shop-Items an."""
+    global _SHOP_EINGEBAUT_CACHE  # noqa: PLW0603
+    if _SHOP_EINGEBAUT_CACHE is not None:
+        return _SHOP_EINGEBAUT_CACHE
+    out: List[Dict[str, str]] = []
+    try:
+        roh = _asset_from_memory("loadout-catalog.js")
+        daten: Dict[str, Any] = {}
+        for zeile in (roh or b"").decode("utf-8").splitlines():
+            m = re.match(r"window\.(\w+)\s*=\s*(.*);\s*$", zeile)
+            if m:
+                daten[m.group(1)] = json.loads(m.group(2))
+        namen = daten.get("LOADOUT_NAMES") or {}
+        for cn in daten.get("LOADOUT_ALL") or []:
+            out.append({"classname": str(cn), "name": str(namen.get(str(cn).lower()) or cn),
+                        "category": "DayZ 1.30 (Katalog)"})
+    except (ValueError, TypeError, AttributeError):
+        out = []
+    _SHOP_EINGEBAUT_CACHE = out
+    return out
+
+
+def _shop_autofill_treffer(quellen: List[List[Dict[str, Any]]], q: str, limit: int) -> List[Dict[str, str]]:
+    """Treffer fuers Autofill: erst Anfang des Classnames/Namens, dann irgendwo im Text.
+    Reihenfolge der Quellen = Vorrang beim Zusammenfuehren doppelter Classnames."""
+    q = q.strip().lower()
+    erst: List[Dict[str, str]] = []
+    dann: List[Dict[str, str]] = []
+    gesehen: set = set()
+    for quelle in quellen:
+        for e in quelle:
+            cn = str(e.get("classname") or "").strip()
+            key = cn.lower()
+            if not cn or key in gesehen:
+                continue
+            name = str(e.get("name") or cn)
+            eintrag = {"classname": cn, "name": name, "category": str(e.get("category", "Misc"))}
+            if not q or key.startswith(q) or name.lower().startswith(q):
+                gesehen.add(key); erst.append(eintrag)
+            elif q in key or q in name.lower():
+                gesehen.add(key); dann.append(eintrag)
+    return (erst + dann)[:limit]
+
+
 async def api_shop_classnames(request: web.Request) -> web.Response:
-    """Autofill: Classnames (Einzelitems) per Substring-Suche."""
+    """Autofill: Classnames (Einzelitems) per Suche (Anfang vor Teiltreffer)."""
     conn, fehler = _session_conn(request, "shop.catalog_admin")
     if fehler is not None:
         return fehler
@@ -42801,41 +42855,14 @@ async def api_shop_classnames(request: web.Request) -> web.Response:
         return fehler
     q = request.query.get("q", "").strip().lower()
     limit = min(50, max(1, int(request.query.get("limit", 25) or 25)))
-    out = []
-    seen = set()
-    for it in conn.catalog.items:
-        cls = _classnames(it)
-        if len(cls) != 1:
-            continue  # Bundles nicht als Classname vorschlagen
-        cn = cls[0]
-        key = cn.lower()
-        if key in seen:
-            continue
-        name = str(it.get("name") or cn)
-        if not q or key.startswith(q) or name.lower().startswith(q):
-            seen.add(key)
-            out.append({"classname": cn, "name": name,
-                        "category": str(it.get("category", "Misc"))})
-            if len(out) >= limit:
-                break
-    # Zusaetzlich Classnames aus einer per "types.xml hochladen" hinterlegten
-    # Referenzliste (siehe api_shop_upload_types) - die dient AUSSCHLIESSLICH
-    # dem Autofill, legt selbst nie Shop-Items an.
-    if len(out) < limit:
-        for entry in (conn.data.get("shop_autofill_classnames") or []):
-            cn = str(entry.get("classname") or "").strip()
-            if not cn:
-                continue
-            key = cn.lower()
-            if key in seen:
-                continue
-            name = str(entry.get("name") or cn)
-            if not q or key.startswith(q) or name.lower().startswith(q):
-                seen.add(key)
-                out.append({"classname": cn, "name": name,
-                            "category": str(entry.get("category", "Misc"))})
-                if len(out) >= limit:
-                    break
+    # Einzelitems des Katalogs, dann die hinterlegte Referenzliste (types.xml vom Server oder aus
+    # einer Datei - dient AUSSCHLIESSLICH dem Autofill, legt nie Shop-Items an), zuletzt der
+    # mitgelieferte DayZ-Katalog (damit auch neue 1.30-Items vorgeschlagen werden).
+    katalog_items = [{"classname": _classnames(it)[0], "name": it.get("name"), "category": it.get("category", "Misc")}
+                     for it in conn.catalog.items if len(_classnames(it)) == 1]
+    out = _shop_autofill_treffer(
+        [katalog_items, list(conn.data.get("shop_autofill_classnames") or []), _shop_eingebaute_classnames()],
+        q, limit)
     return ok({"classnames": out})
 
 
@@ -43522,20 +43549,40 @@ async def api_shop_upload_types(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     data = await body(request)
-    xml_text = str(data.get("xml") or "")
+    loop = asyncio.get_running_loop()
+    if data.get("vom_server"):
+        # Direkt vom eigenen Server (db/types.xml per FTP des gewaehlten Kunden-Servers) - gleicher
+        # Weg wie die anderen Tools. Konsolen-Server geben den Mission-Ordner nicht frei.
+        if not _mission_dir_of(conn):
+            return err("Für diesen Server ist kein Mission-Ordner erreichbar (z. B. bei Konsolen) – "
+                       "bitte die types.xml als Datei hochladen.", 409)
+        try:
+            xml_text, status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+        except Exception as e:  # noqa: BLE001
+            log.exception("[SHOP] types.xml vom Server lesen fehlgeschlagen")
+            return err(f"types.xml per FTP nicht lesbar ({type(e).__name__}: {e}).", 502)
+        if status == "missing":
+            return err("Auf dem Server wurde keine db/types.xml gefunden – bitte die types.xml als Datei hochladen.", 404)
+        if status != "ok" or not xml_text:
+            return err("types.xml per FTP nicht lesbar.", 502)
+        quelle = "server"
+    else:
+        xml_text = str(data.get("xml") or "")
+        quelle = "datei"
     if "<type" not in xml_text:
         return err("Das sieht nicht nach einer types.xml aus (kein <type>-Eintrag gefunden).")
 
-    loop = asyncio.get_running_loop()
     entries = await loop.run_in_executor(None, _types_xml_classnames_aus_text, xml_text)
     if not entries:
         return err("Die Datei konnte nicht ausgewertet werden – keine <type name=...>-Einträge gefunden.")
     conn.data["shop_autofill_classnames"] = entries
+    conn.data["shop_autofill_quelle"] = {"quelle": quelle, "anzahl": len(entries), "stand": int(time.time())}
     connections.save()
-    log.info(f"[SHOP] {conn.name}: {len(entries)} Classnames aus hochgeladener "
-             f"types.xml fürs Autofill übernommen (Katalog unverändert).")
-    return ok({"items": len(entries),
-               "message": f"{len(entries)} Classnames für Autofill übernommen.",
+    log.info(f"[SHOP] {conn.name}: {len(entries)} Classnames aus der types.xml ({quelle}) "
+             f"fürs Autofill übernommen (Katalog unverändert).")
+    return ok({"items": len(entries), "quelle": quelle,
+               "message": (f"{len(entries)} Classnames für Autofill von deinem Server übernommen." if quelle == "server"
+                           else f"{len(entries)} Classnames für Autofill aus der Datei übernommen."),
                "server": conn.name})
 
 
@@ -46932,6 +46979,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "a6f68b52e73e990edbc87564f2d68ee3a4f87203bc2eaf90e36b32eb676cc9b5",
         "0cdb1c21e8f5b5325a6f6f9c21d8d273d36825e8e182e4d71a09152f604e7261",
         "b25303931e3e5a9b4271f7ae01d428c1656bc460869f27a84f5d340b6a7c0701",
+        "9fcb6fd6f114856a900a51adeeb743facca822fa1bfe749542ffefab976da474",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
