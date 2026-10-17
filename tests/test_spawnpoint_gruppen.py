@@ -131,6 +131,8 @@ def _datei_mit_wasser():
 
 
 def _post(conn, daten):
+    if daten.get("commit") and "erwartet_hash" not in daten:        # wie das Dashboard: Hash der Vorschau mitschicken
+        daten = dict(daten, erwartet_hash=bot._spawn_datei_hash(conn.ftp.dateien.get("/mission/cfgplayerspawnpoints.xml")))
     req = td._request(_MP(), conn, "POST", "/api/tools/spawnpoint", daten)
     r = asyncio.run(bot.api_tools_spawnpoint_post(req))
     return r.status, json.loads(r.body.decode("utf-8"))
@@ -367,3 +369,63 @@ def test_fehlendes_allow_in_water_wird_nur_auf_wunsch_ergaenzt():
     assert status == 200
     root = ET.fromstring(j["data"]["generated"][0]["content"])
     assert root.findtext("fresh/generator_params/allow_in_water") == "true"
+
+
+# ── Sicherheit: Datei-Check zwischen Vorschau und Upload, Backup, Warnungen ──
+def test_upload_ohne_oder_mit_veraltetem_hash_wird_abgelehnt_und_schreibt_nichts():
+    conn = td._server(map_name="Nasdara")
+    pfad = "/mission/cfgplayerspawnpoints.xml"
+    conn.ftp.dateien[pfad] = _datei_mit_wasser()
+    vorher = conn.ftp.dateien[pfad]
+    for hash_ in ("", "veraltet", None):
+        status, j = _post(conn, {"positions": _punkte()[:1], "mode": "replace", "commit": True,
+                                 "erwartet_hash": hash_})
+        assert status == 409 and "seit der Vorschau geändert" in j["error"]
+    assert conn.ftp.dateien[pfad] == vorher and pfad + ".bak" not in conn.ftp.dateien
+
+
+def test_vorschau_liefert_hash_und_geaenderte_datei_verlangt_neue_vorschau():
+    conn = td._server(map_name="Nasdara")
+    pfad = "/mission/cfgplayerspawnpoints.xml"
+    conn.ftp.dateien[pfad] = _datei_mit_wasser()
+    status, j = _post(conn, {"positions": _punkte()[:1], "mode": "replace"})
+    h = j["data"]["datei_hash"]
+    assert status == 200 and h == bot._spawn_datei_hash(conn.ftp.dateien[pfad])
+    conn.ftp.dateien[pfad] = conn.ftp.dateien[pfad].replace("<hop></hop>", "<hop></hop><!-- fremd -->")   # jemand aendert die Datei
+    status, j = _post(conn, {"positions": _punkte()[:1], "mode": "replace", "commit": True, "erwartet_hash": h})
+    assert status == 409 and "<!-- fremd -->" in conn.ftp.dateien[pfad]
+    assert pfad + ".bak" not in conn.ftp.dateien
+
+
+def test_upload_sichert_vorher_die_alte_datei_als_bak():
+    conn = td._server(map_name="Nasdara")
+    pfad = "/mission/cfgplayerspawnpoints.xml"
+    alt = conn.ftp.dateien[pfad] = _datei_mit_wasser()
+    status, j = _post(conn, {"positions": _punkte()[:1], "mode": "replace", "commit": True})
+    assert status == 200 and j["data"]["backup"] == "cfgplayerspawnpoints.xml.bak"
+    assert conn.ftp.dateien[pfad + ".bak"] == alt and conn.ftp.dateien[pfad] != alt
+    # Vorschau (commit=False) legt kein Backup an
+    conn2 = td._server(map_name="Nasdara"); conn2.ftp.dateien[pfad] = _datei_mit_wasser()
+    status, j = _post(conn2, {"positions": _punkte()[:1], "mode": "replace"})
+    assert status == 200 and pfad + ".bak" not in conn2.ftp.dateien and j["data"]["backup"] is None
+
+
+def test_warnungen_doppelte_nahe_und_rechtecke_ueber_dem_kartenrand():
+    # Datei mit grid_width/height 200 -> Punkt bei x=50 ragt ueber den linken Rand (50-100 < 0)
+    text = _datei_mit_wasser().replace("<grid_density>4</grid_density>",
+        "<grid_density>4</grid_density><grid_width>200</grid_width><grid_height>200</grid_height>")
+    pts = [{"x": 5000.0, "z": 5000.0}, {"x": 5000.0, "z": 5000.2},          # doppelt
+           {"x": 6000.0, "z": 6000.0}, {"x": 6006.0, "z": 6000.0},          # nahe (6 m)
+           {"x": 50.0, "z": 8000.0}, {"x": 8000.0, "z": 16380.0}]            # beide ragen ueber den Rand
+    w = bot._spawn_warnungen(pts, text, 16384)
+    assert any("exakt übereinander" in x and x.startswith("1 ") for x in w)
+    assert any("weniger als 10 m" in x and x.startswith("1 ") for x in w)
+    assert any("Kartenrand" in x and x.startswith("2 ") for x in w)
+    assert bot._spawn_warnungen([{"x": 5000.0, "z": 5000.0}, {"x": 9000.0, "z": 9000.0}], text, 16384) == []
+
+
+def test_vorschau_antwort_enthaelt_warnungen():
+    conn = td._server(map_name="Nasdara")
+    conn.ftp.dateien["/mission/cfgplayerspawnpoints.xml"] = _datei_mit_wasser()
+    status, j = _post(conn, {"positions": [{"x": 100.0, "z": 100.0}, {"x": 101.0, "z": 100.0}], "mode": "replace"})
+    assert status == 200 and any("weniger als 10 m" in x for x in j["data"]["warnungen"])

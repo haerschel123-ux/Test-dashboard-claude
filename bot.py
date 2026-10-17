@@ -3074,14 +3074,15 @@ _MAP_LOCATIONS: Dict[str, List[Tuple[str, float, float]]] = {
         ("Volcanka",    2500, 4000),
     ],
     # DayZ 1.30 Badlands: grobe Auswahl der Staedte (inoffizielle Daten von
-    # nasdaramap.com, 15.10.2026) - die volle Liste liegt in locations/Nasdara.json.
+    # nasdaramap.com, Stand 17.10.2026 - die Quelle hat ihre Koordinaten seit dem 15.10.
+    # nachgezogen) - die volle Liste liegt in locations/Nasdara.json.
     "Nasdara": [
-        ("Nasdara",      9505,  4496),
-        ("Dashtabad",   10272, 11267),
-        ("Gandomabad",   7880, 12619),
-        ("Kamar Zir",    9313, 12082),
-        ("Pesh Kuh",     3781, 11116),
-        ("Khorramabad",  4756, 11023),
+        ("Nasdara",      10114,  4222),
+        ("Dashtabad",    10441, 10669),
+        ("Gandomabad",    7920, 12379),
+        ("Kamar Zir",     9353, 11842),
+        ("Pesh Kuh",      3821, 10876),
+        ("Khorramabad",   4576, 10920),
     ],
 }
 
@@ -22908,6 +22909,57 @@ async def api_tools_event_batch_post(request: web.Request) -> web.Response:
 
 
 # ── 8. Spawn Point Generator ──────────────────────────────────────────────
+def _spawn_datei_hash(text: Optional[str]) -> str:
+    """Kennung des Serverstands der cfgplayerspawnpoints.xml (fehlende Datei = Hash des leeren Texts).
+    Die Vorschau merkt sie sich; der Upload schreibt nur, wenn die Datei seitdem unveraendert ist."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+_SPAWN_NAH_METER = 10.0
+
+
+def _spawn_warnungen(positions: List[Dict[str, Any]], text: str, welt: Optional[int]) -> List[str]:
+    """Hinweise vor der Vorschau - blockieren nichts, sagen nur, was auffaellt:
+    doppelte/sehr nahe Zentren und Spawn-Rechtecke, die ueber den Kartenrand ragen."""
+    out: List[str] = []
+    punkte = [(float(q["x"]), float(q["z"])) for q in positions]
+    # Doppelte (gleiche Koordinate) und sehr nahe Zentren: Raster-Zellen von 10 m, nur Nachbarzellen pruefen
+    zellen: Dict[Tuple[int, int], List[int]] = {}
+    for i, (x, z) in enumerate(punkte):
+        zellen.setdefault((int(x // _SPAWN_NAH_METER), int(z // _SPAWN_NAH_METER)), []).append(i)
+    gleich = nah = 0
+    for i, (x, z) in enumerate(punkte):
+        cx, cz = int(x // _SPAWN_NAH_METER), int(z // _SPAWN_NAH_METER)
+        for dx in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                for j in zellen.get((cx + dx, cz + dz), ()):
+                    if j <= i:
+                        continue
+                    d = math.hypot(x - punkte[j][0], z - punkte[j][1])
+                    if d < 0.5:
+                        gleich += 1
+                    elif d < _SPAWN_NAH_METER:
+                        nah += 1
+    if gleich:
+        out.append(f"{gleich} Punkt(e) liegen exakt übereinander (doppelt).")
+    if nah:
+        out.append(f"{nah} Punktpaar(e) liegen weniger als {int(_SPAWN_NAH_METER)} m auseinander.")
+    # Spawn-Rechteck (Mitte = Punkt, Kantenlaenge grid_width x grid_height aus generator_params von <fresh>)
+    if welt:
+        try:
+            gp = ET.fromstring(text).find("fresh/generator_params")
+            w = float(gp.findtext("grid_width")) if gp is not None and gp.findtext("grid_width") else 0.0
+            hh = float(gp.findtext("grid_height")) if gp is not None and gp.findtext("grid_height") else 0.0
+        except (ET.ParseError, ValueError, TypeError):
+            w = hh = 0.0
+        if w > 0 or hh > 0:
+            ueber = sum(1 for x, z in punkte if x - w / 2 < 0 or z - hh / 2 < 0
+                        or x + w / 2 > welt or z + hh / 2 > welt)
+            if ueber:
+                out.append(f"{ueber} Spawn-Rechteck(e) ({w:g} × {hh:g} m) ragen über den Kartenrand hinaus.")
+    return out
+
+
 async def api_tools_spawnpoint_get(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request, "tools.spawnpoint")
     if fehler is not None:
@@ -22925,6 +22977,7 @@ async def api_tools_spawnpoint_get(request: web.Request) -> web.Response:
     if status == "error":
         return err("cfgplayerspawnpoints.xml per FTP nicht lesbar.", 502)
     return ok({"positions": _tool_spawnpoint_positionen_lesen(root),
+              "welt": DEFAULT_MAP_SIZES.get(_canonical_map_name(str(conn.get("map_name") or "")) or ""),
               "allow_in_water": _tool_spawnpoint_allow_in_water_lesen(root),
               "allow_in_water_fehlt": root is not None
               and root.find("fresh/generator_params/allow_in_water") is None})
@@ -22975,6 +23028,13 @@ async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
     if status == "error":
         return err("cfgplayerspawnpoints.xml per FTP nicht lesbar.", 502)
     basis = text if status == "ok" else _TOOL_LEERE_SPAWNPOINTS
+    datei_hash = _spawn_datei_hash(text if status == "ok" else "")
+    if commit and str(data_in.get("erwartet_hash") or "") != datei_hash:
+        # Die Vorschau gehoert zu einem bestimmten Serverstand. Hat sich die Datei seitdem geaendert
+        # (anderer Nutzer, Server, Update), wuerde der Upload etwas anderes schreiben als gezeigt.
+        return err("Die cfgplayerspawnpoints.xml auf dem Server hat sich seit der Vorschau geändert "
+                   "(oder die Vorschau fehlt) – bitte „Speichern“ erneut klicken und die neue Vorschau prüfen. "
+                   "Nichts wurde gespeichert.", 409)
     wasser = bool(data_in.get("allow_in_water"))
     ergaenzen = bool(data_in.get("allow_in_water_ergaenzen"))
     auch_hop_travel = bool(data_in.get("auch_hop_travel"))
@@ -22997,12 +23057,19 @@ async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
         return err(f"Spawn-Punkte konnten nicht berechnet werden ({type(e).__name__}: {e}) – "
                    "nichts wurde gespeichert.", 500)
     try:
-        geschrieben = await _tools_datei_schreiben_wenn(commit, conn, "cfgplayerspawnpoints.xml", neu, loop)
+        if commit:
+            # Erst die bisherige Fassung als cfgplayerspawnpoints.xml.bak sichern, dann schreiben
+            # (gleiches Verfahren wie bei den anderen Tools; ohne Original gibt es nichts zu sichern).
+            geschrieben = await _tool_ce_backup_commit(
+                conn, "cfgplayerspawnpoints.xml", text if status == "ok" else None, neu, None, None, loop)
+        else:
+            geschrieben = True
     except Exception as e:  # noqa: BLE001
         log.exception("[TOOLS] Spawn-Punkte: Schreiben fehlgeschlagen")
         return err(f"cfgplayerspawnpoints.xml konnte nicht gespeichert werden ({type(e).__name__}: {e}).", 502)
     if not geschrieben:
-        return err("cfgplayerspawnpoints.xml konnte nicht gespeichert werden.", 502)
+        return err("Sichern (cfgplayerspawnpoints.xml.bak) oder Speichern der cfgplayerspawnpoints.xml "
+                   "ist fehlgeschlagen – bitte erneut versuchen.", 502)
     if commit:
         _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Spawn-Punkte gespeichert",
                   f"{len(positions)} Punkt(e) · {conn.name}")
@@ -23041,8 +23108,11 @@ async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
             n_pos = len(root.findall(f"{abschnitt}/generator_posbubbles//pos"))
             if n_pos:
                 unveraendert[abschnitt] = n_pos
+    welt = DEFAULT_MAP_SIZES.get(_canonical_map_name(str(conn.get("map_name") or "")) or "")
     return ok({"total": total, "generated": generated, "aenderung": aenderung,
-               "unveraendert": unveraendert, "auch_hop_travel": auch_hop_travel})
+               "unveraendert": unveraendert, "auch_hop_travel": auch_hop_travel,
+               "datei_hash": datei_hash, "warnungen": _spawn_warnungen(positions, neu, welt),
+               "backup": "cfgplayerspawnpoints.xml.bak" if commit and status == "ok" else None})
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -46623,6 +46693,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "53e4ad609bb4d57bb0f07e4c050cc88586bcccd3a9d5954af67a669b1a3d49da",
         "9b4e2f56a40d6631eb5a2bc7ac19b8a13d2c50228f749653878c6d07fea8648d",
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
+        "08fca07211f88d28baea2e711898d50887c17e8afc4f0d8889f3cbc558d68a8f",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -46860,6 +46931,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "84a1744741f2155793b399a8aeb40cb6e0da8fb9b0d350636f247195bb1ca68b",
         "a6f68b52e73e990edbc87564f2d68ee3a4f87203bc2eaf90e36b32eb676cc9b5",
         "0cdb1c21e8f5b5325a6f6f9c21d8d273d36825e8e182e4d71a09152f604e7261",
+        "b25303931e3e5a9b4271f7ae01d428c1656bc460869f27a84f5d340b6a7c0701",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
@@ -46877,6 +46949,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "809788cd6ced8e63a60305894ac9361fdf3c7f0889f3b1fae2055c0b1bfe561a",
         "de91af9ec4192ff38005a4c65d825906f0e28f026c644e7b6aaf788aa9286052",
         "e7f961dab2ab67545e45f774e8139a5c9e5517654cf8766592b210046d82ad5c",
+        "4c782db81cb83ec74fa7d113c58ea6f3bfb73f530e10b5763748f3bf29714325",
     ),
     "vendor/leaflet.css": (
         "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",
@@ -46892,6 +46965,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
     ),
     "locations/Nasdara.json": (
         "fc4f13a48381b62ad583b0c39487170429eb4fb520e7a5a7341c7c520eca2eb6",
+        "6e9e619bd3247020bb14bc8d6c185da4def2130f83942534016deb85332805e5",
     ),
     "locations/Sakhal.json": (
         "68a7708a1b2fa4ad5689eb31005e2397f1fca1c1a02a6b7cdb0643655b909f4f",

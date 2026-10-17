@@ -47,17 +47,17 @@ def test_weltgroesse(monkeypatch):
 def test_orte_liegen_in_der_welt(monkeypatch):
     monkeypatch.setattr(bot, "_locations_cache", {})
     orte = bot._locations("Nasdara")
-    assert len(orte) == 88
+    assert len(orte) == 101
     assert all(0 <= o["x"] <= 16384 and 0 <= o["z"] <= 16384 for o in orte)
     assert {o["t"] for o in orte} >= {"capital", "city", "village", "local", "camp"}
     # Eine bekannte Stadt: Dashtabad (nasdaramap.com)
     d = next(o for o in orte if o["name"] == "Dashtabad")
-    assert (round(d["x"]), round(d["z"])) == (10272, 11267)
+    assert (round(d["x"]), round(d["z"])) == (10441, 10669)
     assert next(o for o in orte if o["name"] == "Nasdara")["t"] == "capital"
 
 
 def test_naechster_ort_fuer_feed_texte():
-    assert bot._nearest_location(10272, 11267, "Nasdara") == "Dashtabad"
+    assert bot._nearest_location(10441, 10669, "Nasdara") == "Dashtabad"
     assert bot._nearest_location(100, 100, "Nasdara") is None       # weiter als 1500 m von jeder Stadt
 
 
@@ -127,7 +127,7 @@ def test_erkennung_aus_nitrado_infos_bis_zur_dashboard_karte(monkeypatch):
     d = json.loads(resp.body.decode("utf-8"))["data"]
     assert d["map_name"] == "Nasdara" and d["world_size"] == 16384
     assert d["tile_url"].startswith("https://nasdaramap.com/tiles/nasdara") and d["tile_max_native_zoom"] == 6
-    assert len(d["locations"]) == 88
+    assert len(d["locations"]) == 101
     assert d["izurvive"] == "https://www.izurvive.com/nasdaraSat/"
 
 
