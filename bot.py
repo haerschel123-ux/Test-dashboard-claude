@@ -542,6 +542,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # /betreiber alarm_channel gesetzt (nur der Bot-Eigentuemer darf das).
     # Leer = keine Meldungen.
     "betreiber_alarm_channel_id": "",
+    # Bug-Report-Knopf im Dashboard: Channel im Betreiber-Discord (bug_report_guild_id), in den die
+    # Meldungen der Nutzer samt Screenshot als Embed gehen. Einstellbar im Dashboard unter
+    # Logs -> "Bug-Report-Channel" (nur Admins). Leer = Meldungen werden nicht angenommen.
+    "bug_report_channel_id": "",
+    "bug_report_guild_id": "1534352039713439855",
     # Premium-Rolle: Wird einem Kundenserver eine Discord-Guild zugeordnet
     # (= Freischaltung), bekommt der Kunde diese Rolle im Betreiber-Discord.
     # Wird die Freischaltung zurueckgenommen oder der Server entfernt, geht sie
@@ -34062,7 +34067,7 @@ _SESS_PUBLIC_EXACT = ("/", "/index.html", "/api/session", "/favicon.ico", "/api/
 # hinter dem Token. Die Mandantentrennung haengt davon nicht ab, die macht
 # _session_conn.
 _SESS_OHNE_TOKEN = ("/api/my-guilds", "/api/my-guilds/select", "/api/options",
-                     "/api/consent")
+                     "/api/consent", "/api/bugreport", "/api/bugreport/status")
 
 
 def _sess_prune() -> None:
@@ -34851,7 +34856,7 @@ _AUDIT_LABELS = {
     ("POST", "/api/announcements"): "Ankündigung angelegt",
     ("POST", "/api/auto-restart"): "Auto-Neustart geändert",
 }
-_AUDIT_SKIP_PREFIXES = ("/api/auth/discord/",)
+_AUDIT_SKIP_PREFIXES = ("/api/auth/discord/", "/api/bugreport")
 
 
 def _audit_label(method: str, path: str) -> str:
@@ -34972,6 +34977,201 @@ async def api_audit(request: web.Request) -> web.Response:
     entries = list(_audit_log)
     entries.reverse()                       # neueste zuerst
     return ok({"entries": entries, "max": _AUDIT_MAX})
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Bug-Report: schwebender Knopf im Dashboard -> Embed samt Screenshot im Betreiber-Discord
+# ══════════════════════════════════════════════════════════════════════════
+_BUG_TITEL_MAX = 100
+_BUG_TEXT_MAX = 1500
+_BUG_BILD_MAX_BYTES = 6 * 1024 * 1024              # unter Discords 8-MB-Grenze und dem 8-MB-Anfragelimit
+_BUG_MAX_PRO_STUNDE = 5
+_BUG_ZEITEN: Dict[str, List[float]] = {}
+
+
+def _bug_bild_pruefen(daten_url: Any) -> Optional[Tuple[bytes, str]]:
+    """Screenshot aus einer data:-URL: nur echte Bilder (Kennung der Datei wird geprueft, nicht der
+    angegebene Typ) und hoechstens 6 MB. Rueckgabe (Bytes, Dateiendung) oder None ohne Bild."""
+    if not daten_url:
+        return None
+    m = re.match(r"^data:image/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+/=\s]+)$", str(daten_url))
+    if not m:
+        raise ValueError("Der Screenshot ist kein gültiges Bild (erlaubt: PNG, JPEG, WebP, GIF).")
+    if len(m.group(2)) > _BUG_BILD_MAX_BYTES * 4 // 3 + 16:
+        raise ValueError("Der Screenshot ist zu groß (höchstens 6 MB).")
+    try:
+        roh = base64.b64decode(m.group(2), validate=False)
+    except Exception:  # noqa: BLE001
+        raise ValueError("Der Screenshot ist kein gültiges Bild.") from None
+    if len(roh) > _BUG_BILD_MAX_BYTES:
+        raise ValueError("Der Screenshot ist zu groß (höchstens 6 MB).")
+    if roh.startswith(b"\x89PNG\r\n\x1a\n"):
+        return roh, "png"
+    if roh.startswith(b"\xff\xd8\xff"):
+        return roh, "jpg"
+    if roh[:4] == b"RIFF" and roh[8:12] == b"WEBP":
+        return roh, "webp"
+    if roh[:4] in (b"GIF8",):
+        return roh, "gif"
+    raise ValueError("Der Screenshot ist kein gültiges Bild (erlaubt: PNG, JPEG, WebP, GIF).")
+
+
+def _bug_ziel() -> Tuple[Optional[int], Optional[int]]:
+    """(guild_id, channel_id) aus der Konfiguration; None, wenn nicht gesetzt/ungueltig."""
+    def als_int(v: Any) -> Optional[int]:
+        try:
+            return int(str(v).strip()) if str(v or "").strip() else None
+        except ValueError:
+            return None
+    return als_int(cfg.config.get("bug_report_guild_id")), als_int(cfg.config.get("bug_report_channel_id"))
+
+
+def _bug_kanal() -> Optional[Any]:
+    """Der Channel fuer Bug-Reports - NUR wenn er wirklich zum Betreiber-Discord gehoert (die Meldungen
+    duerfen nie in einen fremden Server umgeleitet werden), sonst None."""
+    gid, cid = _bug_ziel()
+    if not gid or not cid:
+        return None
+    guild = bot.get_guild(gid)
+    if guild is None:
+        return None
+    kanal = guild.get_channel(cid)
+    return kanal if kanal is not None and getattr(kanal, "guild", None) is guild else None
+
+
+def _bug_kuerzen(text: Any, maximum: int) -> str:
+    t = re.sub(r"[\u0000-\u0008\u000b\u000c\u000e-\u001f]", "", str(text or "")).strip()
+    return t[:maximum]
+
+
+async def api_bugreport_status(request: web.Request) -> web.Response:
+    return ok({"aktiv": _bug_kanal() is not None})
+
+
+async def api_bugreport_post(request: web.Request) -> web.Response:
+    sess = _sess_get(request)
+    nutzer = (sess or {}).get("discord") or {}
+    if not sess or not nutzer.get("id"):
+        return err("Bitte zuerst mit Discord anmelden, dann kann ein Fehler gemeldet werden.", 401)
+    data = await body(request)
+    titel = _bug_kuerzen(data.get("titel"), _BUG_TITEL_MAX)
+    text = _bug_kuerzen(data.get("beschreibung"), _BUG_TEXT_MAX)
+    if len(titel) < 3:
+        return err("Bitte einen Titel angeben (mindestens 3 Zeichen).")
+    if len(text) < 10:
+        return err("Bitte das Problem kurz beschreiben (mindestens 10 Zeichen).")
+    try:
+        bild = _bug_bild_pruefen(data.get("screenshot"))
+    except ValueError as e:
+        return err(str(e))
+    kanal = _bug_kanal()
+    if kanal is None:
+        return err("Bug-Reports sind noch nicht eingerichtet – bitte den Betreiber im Support-Discord informieren.", 503)
+    # Spam-Schutz: 60 s zwischen zwei Meldungen und hoechstens 5 pro Stunde und Konto.
+    fehler = _dash_rate_limited(request, "bugreport", 60)
+    if fehler is not None:
+        return fehler
+    uid = str(nutzer.get("id"))
+    jetzt = time.time()
+    zeiten = [t for t in _BUG_ZEITEN.get(uid, []) if jetzt - t < 3600]
+    if len(zeiten) >= _BUG_MAX_PRO_STUNDE:
+        _BUG_ZEITEN[uid] = zeiten
+        return err("Du hast gerade schon mehrere Meldungen gesendet – bitte in einer Stunde noch einmal versuchen.", 429)
+    conn = _conn_for_session(sess)
+    kontext = data.get("kontext") if isinstance(data.get("kontext"), dict) else {}
+
+    def feld(name: str, wert: Any, inline: bool = True) -> Tuple[str, str, bool]:
+        return (name, _bug_kuerzen(wert, 1000) or "—", inline)
+    embed = discord.Embed(title=f"🐞 {titel}", description=text, color=0xE74C3C,
+                          timestamp=datetime.now(timezone.utc))
+    for name, wert, inline in (
+            feld("Von", f"{_bug_kuerzen(nutzer.get('name'), 80)} (`{uid}`)"),
+            feld("Server", f"{conn.name} (`{conn.service_id}`)" if conn is not None else "kein Server verbunden"),
+            feld("Bereich", kontext.get("seite")),
+            feld("Sprache", kontext.get("sprache")),
+            feld("Bildschirm", kontext.get("bildschirm")),
+            feld("Dashboard-Version", kontext.get("version") or _frontend_version()),
+            feld("Browser", kontext.get("browser"), False)):
+        embed.add_field(name=name, value=wert, inline=inline)
+    dateien: List[Any] = []
+    if bild is not None:
+        dateiname = f"screenshot.{bild[1]}"
+        dateien.append(discord.File(io.BytesIO(bild[0]), filename=dateiname))
+        embed.set_image(url=f"attachment://{dateiname}")
+    else:
+        embed.set_footer(text="ohne Screenshot")
+    try:
+        await kanal.send(embed=embed, files=dateien, allowed_mentions=discord.AllowedMentions.none())
+    except discord.Forbidden:
+        log.error("[BUGREPORT] Bot darf im Bug-Report-Channel nicht schreiben (Rechte fehlen).")
+        return err("Der Bot darf im Bug-Report-Channel nicht schreiben – bitte den Betreiber informieren.", 502)
+    except Exception as e:  # noqa: BLE001
+        log.exception("[BUGREPORT] Senden fehlgeschlagen")
+        return err(f"Die Meldung konnte nicht gesendet werden ({type(e).__name__}).", 502)
+    zeiten.append(jetzt)
+    _BUG_ZEITEN[uid] = zeiten
+    _audit_add("dashboard", _audit_actor(sess), "Bug-Report gesendet",
+               f"{titel[:80]}" + (" · mit Screenshot" if bild is not None else ""))
+    return ok({"gesendet": True})
+
+
+async def api_admin_bugreport_get(request: web.Request) -> web.Response:
+    denied = await _require_admin(request)
+    if denied is not None:
+        return denied
+    gid, cid = _bug_ziel()
+    guild = bot.get_guild(gid) if gid else None
+    kanaele: List[Dict[str, str]] = []
+    if guild is not None:
+        for ch in guild.text_channels:
+            try:
+                rechte = ch.permissions_for(guild.me)
+                kann = rechte.send_messages and rechte.embed_links and rechte.attach_files
+            except Exception:  # noqa: BLE001
+                kann = False
+            kanaele.append({"id": str(ch.id), "name": ch.name, "bot_darf": bool(kann)})
+    return ok({"guild_id": str(gid or ""), "guild_name": guild.name if guild is not None else None,
+               "bot_in_guild": guild is not None, "channel_id": str(cid or ""),
+               "channel_ok": _bug_kanal() is not None, "channels": kanaele})
+
+
+async def api_admin_bugreport_post(request: web.Request) -> web.Response:
+    denied = await _require_admin(request)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    gid, _alt = _bug_ziel()
+    guild = bot.get_guild(gid) if gid else None
+    if guild is None:
+        return err("Der Bot ist nicht im Betreiber-Discord – Server-ID in der Konfiguration prüfen.", 409)
+    roh = str(data.get("channel_id") or "").strip()
+    if roh:
+        try:
+            kanal = guild.get_channel(int(roh))
+        except ValueError:
+            kanal = None
+        if kanal is None or not hasattr(kanal, "send"):
+            return err("Dieser Channel gehört nicht zum Betreiber-Discord.", 400)
+        rechte = kanal.permissions_for(guild.me)
+        if not (rechte.send_messages and rechte.embed_links and rechte.attach_files):
+            return err("Der Bot braucht in diesem Channel die Rechte „Nachrichten senden“, „Links einbetten“ "
+                       "und „Dateien anhängen“.", 409)
+    else:
+        kanal = None
+    cfg.config["bug_report_channel_id"] = str(kanal.id) if kanal is not None else ""
+    cfg.save_config()
+    sess = _sess_get(request)
+    _audit_add("dashboard", _audit_actor(sess), "Bug-Report-Channel geändert",
+               f"#{kanal.name}" if kanal is not None else "deaktiviert")
+    if kanal is not None and data.get("test"):
+        try:
+            await kanal.send(embed=discord.Embed(
+                title="🐞 Test: Bug-Report-Channel", description="Hier landen künftig die Fehlermeldungen aus dem Dashboard.",
+                color=0x2ECC71, timestamp=datetime.now(timezone.utc)),
+                allowed_mentions=discord.AllowedMentions.none())
+        except Exception as e:  # noqa: BLE001
+            return err(f"Gespeichert, aber die Testnachricht ging nicht raus ({type(e).__name__}).", 502)
+    return ok({"channel_id": cfg.config["bug_report_channel_id"]})
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -45814,6 +46014,10 @@ def build_app() -> web.Application:
 
     # ── Nur mit Dashboard-Admin-Rolle ──
     r.add_get("/api/audit", api_audit)
+    r.add_get("/api/bugreport/status", api_bugreport_status)
+    r.add_post("/api/bugreport", api_bugreport_post)
+    r.add_get("/api/admin/bugreport", api_admin_bugreport_get)
+    r.add_post("/api/admin/bugreport", api_admin_bugreport_post)
     r.add_get("/api/admin/guilds", api_admin_guilds)
     r.add_get("/api/admin/backup", api_admin_backup)
     r.add_get("/api/modules", api_modules)
@@ -46695,6 +46899,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "152129e7f2a553f94e03a5c2b733c21172c083ae9f64582f86efc56b5b6c63fb",
         "11a47d40ec27a3ad0e50ffac10130e3c10cb774cc3287979f6a1c89efee6728a",
         "ed353c1afacead0c5c54291a1665ec5078ab0dfc09b2bbe0e1977784f100a214",
+        "6b28d12e1c945fa02f90b360c2bc97a78077e2d8849668a7143c5c886ba4fd90",
     ),
     "styles.css": (
         "854cd5c0116ef9230d2534c486b88c6dff38df66194defb0c429309ea4add035",
@@ -46741,6 +46946,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "9b4e2f56a40d6631eb5a2bc7ac19b8a13d2c50228f749653878c6d07fea8648d",
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
         "08fca07211f88d28baea2e711898d50887c17e8afc4f0d8889f3cbc558d68a8f",
+        "92bac71a41b90fb4b2970fc337c5fbd762ae22a84b6d950162f7f8278a85ff72",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -46982,6 +47188,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "9fcb6fd6f114856a900a51adeeb743facca822fa1bfe749542ffefab976da474",
         "2fbab4942f701bcc00db8a50c01c270e3884c10a54df3c86453571324917f31e",
         "9b52da202221a726190609c94b8c2c64f18f7e1d2fc48ed4cbe2ecb96d18a01d",
+        "bbc2b131777fdf7125048ab9f16ac2470c414cb01ec776af56bb3651201791c7",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
