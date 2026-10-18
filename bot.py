@@ -18322,7 +18322,7 @@ async def api_tools_airstrike_remove(request: web.Request) -> web.Response:
 _AIRDROP_SUFFIX_RE = re.compile(r"[A-Za-z0-9_]{1,32}")
 # Loot-Träger: die drei Vanilla-SupplyBoxen von StaticAirplaneCrate. Ihr Loot
 # kommt aus mapgroupproto.xml (Container lootFloor, 11 Punkte) – dieser Block
-# existiert auf Chernarus, Livonia und Sakhal. Livonia hat nur keinen
+# existiert auf Chernarus, Livonia, Sakhal und Nasdara. Livonia hat nur keinen
 # types.xml-Eintrag; den liefert das Tool bei Bedarf mit (_AIRDROP_TYPES).
 # Relative Lage in der Gruppe (x, z, Winkel) wie bei Bohemias Konvoi-Gruppen.
 _AIRDROP_BOXES = (("StaticObj_Misc_SupplyBox1_DE", 0.0, 0.0, 0),
@@ -18377,11 +18377,16 @@ def _airdrops(conn: ServerConnection) -> List[Dict[str, Any]]:
 
 def _airdrop_status(conn: ServerConnection) -> Dict[str, Any]:
     map_name, world_size = _tool_world_size(conn)
-    if map_name in ("ChernarusPlus", "Livonia", "Sakhal"):
+    if map_name in ("ChernarusPlus", "Livonia", "Sakhal", "Nasdara"):
         hinweis = None
         if map_name == "Livonia":
             hinweis = ("Livonia hat keinen types.xml-Eintrag für die SupplyBoxen – "
                        "das Tool ergänzt ihn beim Anwenden automatisch.")
+        elif map_name == "Nasdara":
+            # Belegt in BohemiaInteractive/DayZ-Central-Economy (dayzOffline.nasdara): SupplyBox1-3 stehen
+            # in mapgroupproto.xml und types.xml. Dort gibt es aber keine Gaszone (kein ContaminatedArea).
+            hinweis = ("Nasdara: Die SupplyBoxen und der Mi-8-Wrack-Loot sind in Bohemias Dateien belegt. "
+                       "Eine Gaszone ist in Bohemias Nasdara-Dateien nicht vorgesehen – sie ist dort ungetestet.")
         return {"karte": map_name, "world_size": world_size, "freigegeben": True, "hinweis": hinweis,
                 "secondary": list(_AIRDROP_SECONDARY),
                 "dekor": [{"key": k, "klasse": kl, "belegt": b} for k, kl, _x, _z, _a, b in _AIRDROP_DEKOR]}
@@ -47189,6 +47194,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "2fbab4942f701bcc00db8a50c01c270e3884c10a54df3c86453571324917f31e",
         "9b52da202221a726190609c94b8c2c64f18f7e1d2fc48ed4cbe2ecb96d18a01d",
         "bbc2b131777fdf7125048ab9f16ac2470c414cb01ec776af56bb3651201791c7",
+        "5f26d2ea99d9ac256de12b5fd7e5182e7afb5a6704386dded975fd16edd991b8",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
