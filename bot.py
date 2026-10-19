@@ -6959,23 +6959,26 @@ class DayZBot(discord.Client):
         Zeitplan, sonst wuerde der Plan des Betreibers fremde Server neu starten.
         """
         _c = conn if conn is not None else connections.primary()
+        # Neustart-Plaene sind Auto-Aufgaben (Typ restart_server) - egal ob per /auto restart
+        # oder im Dashboard angelegt. Der fruehere Einzelplan (auto_restart_schedule) wird nur
+        # noch gelesen, solange er noch nicht in eine Aufgabe umgezogen wurde.
+        kandidaten: List[float] = []
+        if _c is not None:
+            for t in _restart_tasks(_c):
+                try:
+                    kandidaten.append(float(t.get("next_execution", 0)))
+                except (TypeError, ValueError):
+                    continue
         sched = ((_c.get("auto_restart_schedule") if _c
                   else cfg.config.get("auto_restart_schedule")) or {})
-        if not sched.get("enabled"):
-            return None
-        try:
-            hh, mm = str(sched.get("first_time", "04:00")).split(":")
-            step = timedelta(hours=max(1, int(sched.get("interval_hours", 4))))
-            anchor = datetime.now().replace(hour=int(hh), minute=int(mm),
-                                            second=0, microsecond=0)
-        except Exception:
-            return None
-        now = datetime.now()
-        while anchor > now:
-            anchor -= step
-        while anchor <= now:
-            anchor += step
-        return anchor.timestamp()
+        if sched.get("enabled"):
+            try:
+                kandidaten.append(_restart_zeitpunkt(sched.get("first_time", "04:00"),
+                                                     sched.get("interval_hours", 4)))
+            except Exception:  # noqa: BLE001 - kaputter Alt-Plan: so wie frueher ignorieren
+                pass
+        kandidaten = [k for k in kandidaten if k > 0]
+        return min(kandidaten) if kandidaten else None
 
     @tasks.loop(seconds=30)
     async def restart_scheduler(self):
@@ -7020,42 +7023,11 @@ class DayZBot(discord.Client):
         await self._post_restart_feed(self._restart_countdown_bauen(conn, nxt, mins), conn)
 
     async def _restart_scheduler_conn(self, conn: ServerConnection):
-        sid = conn.service_id
-        nxt = self._next_scheduled_restart(conn)
-        if nxt is None:
-            übrig = {k for k in self._restart_announced if k[0] != sid}
-            if übrig != self._restart_announced:
-                self._restart_announced = übrig
-            return
-        remaining = nxt - time.time()
-        # Ankündigungen 60/30/15/10/5/3 Minuten vorher (45s-Fenster > 30s-Loop-Takt)
-        for mins in (60, 30, 15, 10, 5, 3):
-            key = (sid, int(nxt), mins)
-            if (mins * 60 - 45) < remaining <= mins * 60 and key not in self._restart_announced:
-                self._restart_announced.add(key)
-                await self._restart_countdown_post(conn, nxt, mins)
-        # Restart auslösen
-        key0 = (sid, int(nxt), 0)
-        if remaining <= 30 and key0 not in self._restart_announced:
-            self._restart_announced.add(key0)
-            if conn.api is None:
-                log.warning(f"[AUTO-RESTART] {conn.name}: keine Nitrado-Verbindung.")
-                return
-            try:
-                ok, msg = await conn.api.restart()
-            except Exception as ex:  # noqa: BLE001
-                ok, msg = False, str(ex)
-            if ok:
-                conn.neustart_markieren()
-            log.info(f"[AUTO-RESTART] {conn.name}: Neustart ausgelöst: ok={ok} – {msg}")
-            e = discord.Embed(
-                title=(_ft(conn, "🔄 Server wird jetzt neu gestartet", "🔄 Server is restarting now") if ok
-                       else _ft(conn, "❌ Geplanter Neustart fehlgeschlagen", "❌ Scheduled restart failed")),
-                description=(_ft(conn, "Der geplante Neustart wurde über die Nitrado-API ausgelöst.",
-                                 "The scheduled restart was triggered via the Nitrado API.")
-                             if ok else _ft(conn, f"Nitrado-API-Fehler: {msg}", f"Nitrado API error: {msg}")),
-                color=0x2ECC71 if ok else 0xE74C3C)
-            await self._post_restart_feed(e, conn)
+        """Die Neustarts selbst laufen ueber scheduled_tasks_loop (Typ restart_server). Hier wird nur
+        ein noch aktiver Alt-Plan aus /auto restart (auto_restart_schedule) in eine solche Aufgabe
+        umgezogen - danach gibt es genau EINEN Plan, der sich per /auto off UND im Dashboard
+        (Auto-Aufgaben) loeschen laesst."""
+        _auto_restart_migrieren(conn)
 
     @restart_scheduler.before_loop
     async def _before_restart_scheduler(self):
@@ -7091,7 +7063,8 @@ class DayZBot(discord.Client):
         nxt = float(task.get("next_execution", 0))
         if nxt <= 0:
             return
-        if task.get("channel_ignore") or not task.get("channel_id"):
+        ueber_feed = bool(task.get("restart_feed"))
+        if not ueber_feed and (task.get("channel_ignore") or not task.get("channel_id")):
             return
         sid = conn.service_id
         tid = int(task.get("id", 0))
@@ -7100,6 +7073,13 @@ class DayZBot(discord.Client):
             key = (sid, tid, int(nxt), mins)
             if (mins * 60 - 45) < remaining <= mins * 60 and key not in self._task_restart_announced:
                 self._task_restart_announced.add(key)
+                if ueber_feed:
+                    # Per /auto restart angelegt: wie bisher in den restart-Feed (Fallback Adminlog)
+                    try:
+                        await self._restart_countdown_post(conn, nxt, mins)
+                    except Exception as ex:  # noqa: BLE001
+                        log.error(f"[AUTO-AUFGABEN] Countdown-Versand fehlgeschlagen: {ex}")
+                    continue
                 ch = await self._resolve_channel(int(task["channel_id"]))
                 if ch is None:
                     continue
@@ -7128,6 +7108,19 @@ class DayZBot(discord.Client):
                 # KEINEN gepostet, z. B. leere Online-Liste ohne "trotzdem
                 # posten") – hier gibt es nichts mehr zu tun.
                 pass
+            elif task.get("restart_feed") and task.get("task") == "restart_server":
+                # Per /auto restart angelegt: Meldung wie bisher in den restart-Feed (Fallback Adminlog)
+                e = discord.Embed(
+                    title=(_ft(conn, "🔄 Server wird jetzt neu gestartet", "🔄 Server is restarting now") if ok_
+                           else _ft(conn, "❌ Geplanter Neustart fehlgeschlagen", "❌ Scheduled restart failed")),
+                    description=(_ft(conn, "Der geplante Neustart wurde über die Nitrado-API ausgelöst.",
+                                     "The scheduled restart was triggered via the Nitrado API.")
+                                 if ok_ else _ft(conn, f"Nitrado-API-Fehler: {msg}", f"Nitrado API error: {msg}")),
+                    color=0x2ECC71 if ok_ else 0xE74C3C)
+                try:
+                    await self._post_restart_feed(e, conn)
+                except Exception as ex:  # noqa: BLE001 - sonst bliebe next_execution stehen -> Dauerneustart
+                    log.error(f"[AUTO-AUFGABEN] Restart-Feed-Versand fehlgeschlagen: {ex}")
             elif not task.get("channel_ignore") and task.get("channel_id"):
                 if ok_ and eigenes is not None:
                     # Die Aufgabe IST die Nachricht (z. B. Online-Liste) –
@@ -9463,11 +9456,8 @@ class AutoRestartView(discord.ui.View):
                 itx, "❌ Dir fehlt inzwischen die nötige Rolle.",
                 "❌ You no longer have the required role."), ephemeral=True)
         first = f"{self.hour:02d}:{self.minute:02d}"
-        _conn_store(conn, "auto_restart_schedule", {
-            "enabled": True, "first_time": first, "interval_hours": self.interval_hours})
-        bot._restart_announced = {k for k in bot._restart_announced
-                                  if k[0] != conn.service_id}
-        nxt = bot._next_scheduled_restart(conn)
+        # Der Plan ist eine Auto-Aufgabe: im Dashboard unter Auto-Aufgaben sichtbar und loeschbar
+        nxt = _auto_restart_task_setzen(conn, first, self.interval_hours)
         for child in self.children:
             child.disabled = True
         e = discord.Embed(
@@ -9527,12 +9517,9 @@ async def auto_off(interaction: discord.Interaction,
     if conn is None:
         return await interaction.response.send_message(
             _fehler or _premium_missing_text(interaction), ephemeral=True)
-    sched = dict(conn.get("auto_restart_schedule") or {})
-    was_on = bool(sched.get("enabled"))
-    sched["enabled"] = False
-    _conn_store(conn, "auto_restart_schedule", sched)
-    bot._restart_announced = {k for k in bot._restart_announced
-                              if k[0] != conn.service_id}
+    # Loescht ALLE Neustart-Plaene dieses Servers - auch die im Dashboard angelegten Auto-Aufgaben
+    entfernt, alt_an = _auto_restart_alle_loeschen(conn)
+    was_on = bool(entfernt) or alt_an
     await interaction.response.send_message(_t(
         interaction,
         "⏹️ Geplante Neustarts deaktiviert." if was_on
@@ -9549,23 +9536,29 @@ async def auto_status(interaction: discord.Interaction,
     if conn is None:
         return await interaction.response.send_message(
             _fehler or _premium_missing_text(interaction), ephemeral=True)
-    sched = conn.get("auto_restart_schedule") or {}
-    if not sched.get("enabled"):
+    plaene = sorted(_restart_tasks(conn), key=lambda t: float(t.get("next_execution", 0) or 0))
+    nxt = bot._next_scheduled_restart(conn)
+    if not plaene or nxt is None:
         return await interaction.response.send_message(_t(
             interaction,
             "ℹ️ Keine geplanten Neustarts aktiv. Einrichten: `/auto restart`.",
             "ℹ️ No scheduled restarts active. Set up with: `/auto restart`."), ephemeral=True)
-    nxt = bot._next_scheduled_restart(conn)
+
+    def _intervall(sek: Any, en: bool) -> str:
+        sek = int(sek or 0)
+        if sek and sek % 3600 == 0:
+            return f"every {sek // 3600} hour(s)" if en else f"alle {sek // 3600} Stunde(n)"
+        return f"every {max(1, sek // 60)} min" if en else f"alle {max(1, sek // 60)} Min"
+    zeilen_de = [f"• Intervall: **{_intervall(t.get('interval_seconds'), False)}** · "
+                 f"nächster: <t:{int(float(t.get('next_execution', 0)))}:F>" for t in plaene[:5]]
+    zeilen_en = [f"• Interval: **{_intervall(t.get('interval_seconds'), True)}** · "
+                 f"next: <t:{int(float(t.get('next_execution', 0)))}:F>" for t in plaene[:5]]
     e = discord.Embed(
         title=_t(interaction, "⏰ Auto-Restart Zeitplan", "⏰ Auto-Restart Schedule"),
         description=_t(
             interaction,
-            f"Startzeit: **{sched.get('first_time', '?')} Uhr** · "
-            f"Intervall: **alle {sched.get('interval_hours', '?')} Stunde(n)**\n"
-            f"Nächster Neustart: <t:{int(nxt)}:F> (<t:{int(nxt)}:R>)",
-            f"Start time: **{sched.get('first_time', '?')}** · "
-            f"Interval: **every {sched.get('interval_hours', '?')} hour(s)**\n"
-            f"Next restart: <t:{int(nxt)}:F> (<t:{int(nxt)}:R>)"),
+            "\n".join(zeilen_de) + f"\nNächster Neustart: <t:{int(nxt)}:F> (<t:{int(nxt)}:R>)",
+            "\n".join(zeilen_en) + f"\nNext restart: <t:{int(nxt)}:F> (<t:{int(nxt)}:R>)"),
         color=0x5865F2)
     await interaction.response.send_message(embed=e, ephemeral=True)
 
@@ -9831,6 +9824,87 @@ def _find_scheduled_task(conn: ServerConnection, task_id: int) -> Optional[Dict]
 def _naechste_scheduled_task_id(conn: ServerConnection) -> int:
     vorhandene = [int(t.get("id", 0)) for t in _scheduled_tasks(conn) if isinstance(t, dict)]
     return 1 + max(vorhandene or [0])
+
+
+def _restart_tasks(conn: ServerConnection) -> List[Dict]:
+    """Alle Neustart-Plaene EINES Servers (Auto-Aufgabe "Server neu starten")."""
+    return [t for t in _scheduled_tasks(conn) if isinstance(t, dict) and t.get("task") == "restart_server"]
+
+
+def _restart_zeitpunkt(first_time: Any, interval_hours: Any) -> float:
+    """Naechster Lauf der Reihe first_time + n * Intervall (lokale Botzeit)."""
+    hh, mm = str(first_time).split(":")
+    step = timedelta(hours=max(1, int(interval_hours)))
+    anchor = datetime.now().replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+    now = datetime.now()
+    while anchor > now:
+        anchor -= step
+    while anchor <= now:
+        anchor += step
+    return anchor.timestamp()
+
+
+def _auto_restart_alt_aus(conn: ServerConnection) -> bool:
+    """Schaltet den frueheren Einzelplan (auto_restart_schedule) ab. True = er war an."""
+    sched = dict(conn.get("auto_restart_schedule") or {})
+    war_an = bool(sched.get("enabled"))
+    if war_an:
+        sched["enabled"] = False
+        _conn_store(conn, "auto_restart_schedule", sched)
+    return war_an
+
+
+def _auto_restart_marker_leeren(conn: ServerConnection) -> None:
+    sid = conn.service_id
+    bot._restart_announced = {k for k in bot._restart_announced if k[0] != sid}
+    bot._task_restart_announced = {k for k in bot._task_restart_announced if k[0] != sid}
+
+
+def _auto_restart_task_setzen(conn: ServerConnection, first_time: Any, interval_hours: Any) -> float:
+    """/auto restart: legt den Neustart-Plan als Auto-Aufgabe an (sichtbar und loeschbar im Dashboard
+    unter Auto-Aufgaben) und ersetzt einen frueheren, per Befehl angelegten Plan. Gibt den ersten
+    Zeitpunkt zurueck."""
+    nxt = _restart_zeitpunkt(first_time, interval_hours)
+    alle = _scheduled_tasks(conn)
+    alle[:] = [t for t in alle if not (isinstance(t, dict) and t.get("quelle") == "auto_command")]
+    alle.append({"id": _naechste_scheduled_task_id(conn), "task": "restart_server",
+                 "initial_execution": nxt, "next_execution": nxt,
+                 "interval_seconds": max(1, int(interval_hours)) * 3600,
+                 "note": "/auto restart", "channel_id": None, "channel_ignore": False,
+                 "post_wenn_leer": False, "nachricht_ersetzen": False,
+                 "restart_feed": True, "quelle": "auto_command"})
+    _scheduled_tasks_save(conn)
+    _auto_restart_alt_aus(conn)
+    _auto_restart_marker_leeren(conn)
+    return nxt
+
+
+def _auto_restart_alle_loeschen(conn: ServerConnection) -> Tuple[int, bool]:
+    """/auto off und "Neustart ausschalten": entfernt ALLE Neustart-Plaene dieses Servers - die
+    Auto-Aufgaben (per Befehl oder im Dashboard angelegt) und den Alt-Plan. Gibt
+    (entfernte Aufgaben, Alt-Plan war an) zurueck."""
+    alle = _scheduled_tasks(conn)
+    vorher = len(alle)
+    alle[:] = [t for t in alle if not (isinstance(t, dict) and t.get("task") == "restart_server")]
+    entfernt = vorher - len(alle)
+    if entfernt:
+        _scheduled_tasks_save(conn)
+    war_an = _auto_restart_alt_aus(conn)
+    _auto_restart_marker_leeren(conn)
+    return entfernt, war_an
+
+
+def _auto_restart_migrieren(conn: ServerConnection) -> None:
+    """Zieht einen noch aktiven Alt-Plan (auto_restart_schedule) in eine Auto-Aufgabe um."""
+    sched = conn.get("auto_restart_schedule") or {}
+    if not sched.get("enabled"):
+        return
+    try:
+        _auto_restart_task_setzen(conn, sched.get("first_time", "04:00"), sched.get("interval_hours", 4))
+        log.info(f"[AUTO-RESTART] {conn.name}: Alt-Plan in eine Auto-Aufgabe umgezogen.")
+    except Exception as ex:  # noqa: BLE001 - kaputte Uhrzeit: der Alt-Plan lief auch frueher nie
+        log.warning(f"[AUTO-RESTART] {conn.name}: Alt-Plan unbrauchbar, wird abgeschaltet: {ex}")
+        _auto_restart_alt_aus(conn)
 
 
 def _scheduled_task_vorwaerts(next_execution: float, interval_seconds: int,
@@ -42275,9 +42349,9 @@ def _scheduled_task_aus_anfrage(data: dict, vorhanden: Optional[Dict] = None):
         if not channel_id:
             return None, ("Für diese Aufgabe ist ein Channel Pflicht – "
                           "sie besteht aus der Nachricht selbst.")
-    elif not channel_ignore and not channel_id:
+    elif not channel_ignore and not channel_id and not (vorhanden or {}).get("restart_feed"):
         return None, "Bitte einen Channel wählen oder „Channel ignorieren“ aktivieren."
-    if not channel_ignore and channel_id is not None:
+    if not channel_ignore and channel_id not in (None, ""):
         # Als Zahl pruefen, nicht erst beim spaeteren int() im Ausfuehrungspfad:
         # ein "abc" flog dort als unbehandelter ValueError raus (HTTP 500 samt
         # Stacktrace im Log), statt hier sauber abgelehnt zu werden.
@@ -42296,7 +42370,7 @@ def _scheduled_task_aus_anfrage(data: dict, vorhanden: Optional[Dict] = None):
     return {
         "task": task, "initial_execution": initial, "interval_seconds": interval,
         "note": note, "channel_ignore": channel_ignore,
-        "channel_id": None if channel_ignore else str(channel_id),
+        "channel_id": None if channel_ignore or channel_id in (None, "") else str(channel_id),
         "post_wenn_leer": post_wenn_leer, "nachricht_ersetzen": nachricht_ersetzen,
     }, None
 
@@ -42311,6 +42385,7 @@ async def list_scheduled_tasks(request: web.Request) -> web.Response:
     denied = await _dash_gate(request, _c, "autotasks", "view")
     if denied is not None:
         return denied
+    _auto_restart_migrieren(_c)   # noch aktiver Alt-Plan aus /auto restart erscheint hier als Aufgabe
     return ok({"tasks": [_scheduled_task_payload(t) for t in _scheduled_tasks(_c)],
                "task_types": [{"key": k, "label": v["label"],
                               "channel_pflicht": bool(v.get("channel_pflicht")),
@@ -42336,7 +42411,7 @@ async def create_scheduled_task(request: web.Request) -> web.Response:
     werte, fehler = _scheduled_task_aus_anfrage(data)
     if fehler:
         return err(fehler)
-    if not werte["channel_ignore"] and _c.guild_id is not None:
+    if not werte["channel_ignore"] and werte["channel_id"] and _c.guild_id is not None:
         denied = _kanal_gehoert_guild(int(_c.guild_id), int(werte["channel_id"]))
         if denied is not None:
             return denied
@@ -42373,7 +42448,7 @@ async def update_scheduled_task(request: web.Request) -> web.Response:
     werte, fehler = _scheduled_task_aus_anfrage(data, task)
     if fehler:
         return err(fehler)
-    if not werte["channel_ignore"] and _c.guild_id is not None:
+    if not werte["channel_ignore"] and werte["channel_id"] and _c.guild_id is not None:
         denied = _kanal_gehoert_guild(int(_c.guild_id), int(werte["channel_id"]))
         if denied is not None:
             return denied
@@ -42383,6 +42458,11 @@ async def update_scheduled_task(request: web.Request) -> web.Response:
     zeit_geaendert = (werte["initial_execution"] != task.get("initial_execution")
                       or werte["interval_seconds"] != task.get("interval_seconds"))
     task.update(werte)
+    if werte["channel_ignore"] or werte.get("channel_id") or task.get("task") != "restart_server":
+        # Eigener Channel gewaehlt (oder anderer Typ): nicht mehr "ueber den restart-Feed"
+        task.pop("restart_feed", None)
+    if task.get("task") != "restart_server":
+        task.pop("quelle", None)
     if zeit_geaendert:
         task["next_execution"] = werte["initial_execution"]
     _scheduled_tasks_save(_c)
@@ -42411,6 +42491,11 @@ async def delete_scheduled_task(request: web.Request) -> web.Response:
         return err("Aufgabe nicht gefunden.", 404)
     _scheduled_tasks(_c).remove(task)
     _scheduled_tasks_save(_c)
+    if task.get("task") == "restart_server":
+        # Ein Neustart-Plan ist weg: auch ein noch aktiver Alt-Plan aus /auto restart darf nicht
+        # weiterlaufen - sonst wird der Server trotz geloeschter Aufgabe weiter neu gestartet.
+        _auto_restart_alt_aus(_c)
+        _auto_restart_marker_leeren(_c)
     return ok({"removed": task_id})
 
 
@@ -42813,8 +42898,11 @@ async def get_auto_restart(request: web.Request) -> web.Response:
     denied = await _dash_gate(request, conn, "autotasks", "view")
     if denied is not None:
         return denied
-    sched = conn.get("auto_restart_schedule",
-                     {"enabled": False, "first_time": "04:00", "interval_hours": 4})
+    sched = dict(conn.get("auto_restart_schedule",
+                          {"enabled": False, "first_time": "04:00", "interval_hours": 4}))
+    # "AN" heisst: es gibt einen Neustart-Plan (Auto-Aufgabe, per /auto restart oder Dashboard)
+    plaene = _restart_tasks(conn)
+    sched["enabled"] = bool(plaene) or bool(sched.get("enabled"))
     nxt = _next_run(conn)
     return ok({
         "schedule": sched,
@@ -42857,7 +42945,15 @@ async def set_auto_restart(request: web.Request) -> web.Response:
             return err("Intervall muss zwischen 1 und 24 Stunden liegen.")
         sched["interval_hours"] = iv
 
+    # Der Plan selbst ist eine Auto-Aufgabe (siehe _auto_restart_task_setzen); das Feld
+    # auto_restart_schedule merkt sich nur Startzeit und Intervall als Vorgabe.
+    wollen_an = sched.get("enabled") if "enabled" in data else bool(_restart_tasks(conn)) or bool(sched.get("enabled"))
+    sched["enabled"] = False
     _conn_store(conn, "auto_restart_schedule", sched)
+    if not wollen_an:
+        _auto_restart_alle_loeschen(conn)
+    elif "enabled" in data or "first_time" in data or "interval_hours" in data:
+        _auto_restart_task_setzen(conn, sched.get("first_time", "04:00"), sched.get("interval_hours", 4))
 
     if "after_purchase" in data:
         _conn_store(conn, "auto_restart_after_purchase", bool(data["after_purchase"]))
@@ -42869,7 +42965,7 @@ async def set_auto_restart(request: web.Request) -> web.Response:
     except Exception:
         pass
 
-    return ok({"schedule": sched, "next_run_ts": _next_run(conn)})
+    return ok({"schedule": {**sched, "enabled": bool(_restart_tasks(conn))}, "next_run_ts": _next_run(conn)})
 
 
 # ──────────────────────────────────────────────────────────────────────────
