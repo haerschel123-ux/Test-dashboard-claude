@@ -1040,6 +1040,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.event":                       {"label": "Event-Vorlagen", "gruppe": "Tools"},
     "tools.spawnpoint":                  {"label": "Spawn Point Generator", "gruppe": "Tools"},
     "tools.territory":                   {"label": "Territory Zone Creator", "gruppe": "Tools"},
+    "tools.spawnabletypes":              {"label": "Visual SpawnableTypes Configurator", "gruppe": "Tools"},
     "tools.typesbooster":                {"label": "Types Booster", "gruppe": "Tools"},
     "tools.typesreducer":                 {"label": "Types Reducer", "gruppe": "Tools"},
     "tools.typesorganizer":              {"label": "Types Organizer", "gruppe": "Tools"},
@@ -15150,6 +15151,7 @@ _TOOL_LISTE = (
     ("event",     "📅", "Event-Vorlagen"),
     ("spawnpoint", "📍", "Spawn Point Generator"),
     ("territory", "🧭", "Territory Zone Creator"),
+    ("spawnabletypes", "🗃️", "Visual SpawnableTypes Configurator"),
     ("typesbooster", "📈", "Types Booster"),
     ("typesreducer", "📉", "Types Reducer"),
     ("typesorganizer", "🗂️", "Types Organizer"),
@@ -23637,6 +23639,424 @@ async def api_tools_territory_post(request: web.Request) -> web.Response:
                "aenderung": {k: ergebnis[k] for k in ("vorher", "nachher", "neu", "geaendert", "entfernt")},
                "unveraendert": ergebnis["unveraendert"], "datei_hash": datei_hash, "warnungen": warnungen,
                "backup": f"{dateiname}.bak" if commit and status == "ok" and not ergebnis["unveraendert"] else None})
+
+
+# ── 10. Visual SpawnableTypes Configurator ────────────────────────────────
+# Visueller Editor fuer cfgspawnabletypes.xml. Wie beim Territory Zone Creator wird die Datei NICHT neu gebaut:
+# nur geaenderte, geloeschte und neue <type>-Bloecke werden angefasst; alles andere (Kommentare, Reihenfolge,
+# Leerraum, Zahlenformat, unberuehrte Eintraege) bleibt Zeichen fuer Zeichen erhalten. Eintraege, die das Tool
+# nicht verlustfrei darstellen kann (unbekannte Elemente/Attribute, verschachtelte Gruppen, Kommentar im Block),
+# sind schreibgeschuetzt - loeschen geht, aendern nicht. Doppelte Namen sind moeglich (Bohemia hat welche);
+# ein Eintrag wird deshalb ueber seine Position in der Datei erkannt, nicht ueber den Namen.
+_SPT_DATEI = "cfgspawnabletypes.xml"
+_SPT_NAME_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,128}$')
+_SPT_PRESET_RE = re.compile(r'^[A-Za-z0-9_.\-]{1,64}$')
+_SPT_GRUPPEN = ("attachments", "cargo")
+_SPT_MAX_AENDERUNGEN = 5000
+
+
+def _spt_zahl(v: Any) -> Optional[str]:
+    """Wert aus der Datei/Oberflaeche als getrimmter Text (None = Attribut fehlt). Die Schreibweise bleibt erhalten."""
+    if v is None:
+        return None
+    return str(v).strip()
+
+
+def _spt_teile_lesen(el: ET.Element) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Zerlegt die Kinder eines <type> in geordnete Teile. Zweite Rueckgabe: Gruende, warum der Eintrag
+    nicht verlustfrei bearbeitbar ist (leer = bearbeitbar)."""
+    teile: List[Dict[str, Any]] = []
+    gruende: List[str] = []
+    if set(el.attrib) - {"name"}:
+        gruende.append("unbekanntes Attribut am <type>")
+    if (el.text or "").strip():
+        gruende.append("Text im <type>")
+    for kind in el:
+        art = kind.tag
+        if not isinstance(art, str):
+            continue
+        if (kind.text or "").strip():
+            gruende.append(f"Text in <{art}>")
+        if art == "hoarder" and not kind.attrib and not len(kind):
+            teile.append({"art": "hoarder"})
+        elif art == "tag" and set(kind.attrib) <= {"name"} and not len(kind):
+            teile.append({"art": "tag", "name": _spt_zahl(kind.get("name")) or ""})
+        elif art == "damage" and set(kind.attrib) <= {"min", "max"} and not len(kind):
+            teile.append({"art": "damage", "min": _spt_zahl(kind.get("min")), "max": _spt_zahl(kind.get("max"))})
+        elif art in _SPT_GRUPPEN and set(kind.attrib) <= {"chance", "preset"}:
+            items = []
+            for it in kind:
+                if it.tag == "item" and set(it.attrib) <= {"name", "chance"} and not len(it) and not (it.text or "").strip():
+                    items.append({"name": _spt_zahl(it.get("name")) or "", "chance": _spt_zahl(it.get("chance"))})
+                else:
+                    gruende.append(f"{'verschachteltes oder unbekanntes Element' if isinstance(it.tag, str) else 'Kommentar'} in <{art}>")
+            teile.append({"art": art, "chance": _spt_zahl(kind.get("chance")), "preset": _spt_zahl(kind.get("preset")),
+                          "items": items})
+        else:
+            gruende.append(f"unbekanntes Element oder Attribut: <{art}>")
+    return teile, gruende
+
+
+def _spt_scannen(text: str) -> Dict[str, Any]:
+    """Zerlegt die Datei in <type>-Bloecke mit Textposition. ValueError bei allem, was nicht sicher lesbar ist."""
+    try:
+        wurzel = ET.fromstring(text)
+    except ET.ParseError as e:
+        raise ValueError(f"Die Datei ist kein gültiges XML ({e}).") from e
+    if wurzel.tag != "spawnabletypes":
+        raise ValueError("Falsches Wurzelelement – erwartet wird <spawnabletypes>.")
+    m = _maskiere_xml_kommentare(text)
+    typen: List[Dict[str, Any]] = []
+    for x in re.finditer(r'<type(?=[\s/>])(?:[^>/]|/(?!>))*(?:/>|>[\s\S]*?</type\s*>)', m):
+        roh = text[x.start():x.end()]
+        try:
+            el = ET.fromstring(m[x.start():x.end()])
+        except ET.ParseError as e:
+            raise ValueError(f"Ein <type> ist nicht lesbar ({e}): {roh[:80]}") from e
+        teile, gruende = _spt_teile_lesen(el)
+        if not (el.get("name") or "").strip():
+            gruende.append("Eintrag ohne Namen")
+        if "<!--" in roh:
+            gruende.append("Kommentar im Eintrag (würde beim Ändern verloren gehen)")
+        z_start = text.rfind("\n", 0, x.start()) + 1
+        z_ende = text.find("\n", x.end())
+        z_ende = len(text) if z_ende == -1 else z_ende
+        allein = not text[z_start:x.start()].strip() and not text[x.end():z_ende].strip()
+        typen.append({"index": len(typen), "start": x.start(), "ende": x.end(), "zeile_start": z_start,
+                      "zeile_ende": min(len(text), z_ende + 1), "allein": allein,
+                      "einzug": text[z_start:x.start()] if allein else "", "name": el.get("name") or "",
+                      "teile": teile, "gesperrt": "; ".join(dict.fromkeys(gruende)) or None, "roh": roh})
+    # Stil der Datei: Einrueckung der Kinder und Schreibweise selbstschliessender Tags (" />" oder "/>")
+    einheit = "\t"
+    for t in typen:
+        mm = re.search(r'\n([ \t]+)<(?:hoarder|tag|damage|attachments|cargo)\b', t["roh"])
+        if mm:
+            basis = t["einzug"] if t["allein"] else ""
+            einheit = mm.group(1)[len(basis):] or "\t"
+            break
+    mit_blank = m.count(" />")
+    return {"typen": typen, "einheit": einheit, "selbst": " />" if mit_blank >= m.count("/>") - mit_blank else "/>"}
+
+
+def _spt_wert_pruefen(wert: Optional[str], was: str, name: str) -> Optional[str]:
+    if wert is None:
+        return None
+    try:
+        v = float(wert)
+    except ValueError:
+        raise ValueError(f"Eintrag „{name}“: {was} „{wert}“ ist keine Zahl.") from None
+    if not math.isfinite(v) or not 0 <= v <= 1:
+        raise ValueError(f"Eintrag „{name}“: {was} „{wert}“ muss zwischen 0 und 1 liegen.")
+    return wert
+
+
+def _spt_teile_pruefen(name: str, teile: Any) -> List[Dict[str, Any]]:
+    """Prueft/bereinigt die Teile EINES Eintrags aus der Oberflaeche. ValueError = Fehler."""
+    if not isinstance(name, str) or not _SPT_NAME_RE.match(name.strip()):
+        raise ValueError(f"Eintragsname „{str(name)[:40]}“ ist ungültig – erlaubt sind 1–128 Zeichen "
+                         "(Buchstaben, Ziffern, _ . -).")
+    name = name.strip()
+    if not isinstance(teile, list):
+        raise ValueError(f"Eintrag „{name}“: ungültige Teile.")
+    sauber: List[Dict[str, Any]] = []
+    zaehl: Dict[str, int] = {}
+    for t in teile:
+        if not isinstance(t, dict):
+            raise ValueError(f"Eintrag „{name}“: ungültiger Teil.")
+        art = t.get("art")
+        zaehl[art] = zaehl.get(art, 0) + 1
+        if art == "hoarder":
+            sauber.append({"art": "hoarder"})
+        elif art == "tag":
+            tag = _spt_zahl(t.get("name")) or ""
+            if not _SPT_PRESET_RE.match(tag):
+                raise ValueError(f"Eintrag „{name}“: Tag „{tag[:30]}“ ist ungültig.")
+            sauber.append({"art": "tag", "name": tag})
+        elif art == "damage":
+            mn = _spt_wert_pruefen(_spt_zahl(t.get("min")), "Damage min", name)
+            mx = _spt_wert_pruefen(_spt_zahl(t.get("max")), "Damage max", name)
+            if mn is None or mx is None:
+                raise ValueError(f"Eintrag „{name}“: Damage braucht min und max.")
+            if float(mn) > float(mx):
+                raise ValueError(f"Eintrag „{name}“: Damage min ({mn}) darf nicht größer als max ({mx}) sein.")
+            sauber.append({"art": "damage", "min": mn, "max": mx})
+        elif art in _SPT_GRUPPEN:
+            chance = _spt_wert_pruefen(_spt_zahl(t.get("chance")), "Chance", name)
+            preset = _spt_zahl(t.get("preset")) or None
+            if preset is not None and not _SPT_PRESET_RE.match(preset):
+                raise ValueError(f"Eintrag „{name}“: Preset „{preset[:30]}“ ist ungültig.")
+            items = []
+            for it in t.get("items") or []:
+                iname = _spt_zahl(it.get("name")) if isinstance(it, dict) else None
+                if not iname or not _SPT_NAME_RE.match(iname):
+                    raise ValueError(f"Eintrag „{name}“: Item-Name „{str(iname or '')[:40]}“ ist leer oder ungültig.")
+                items.append({"name": iname, "chance": _spt_wert_pruefen(_spt_zahl(it.get("chance")), f"Chance von {iname}", name)})
+            sauber.append({"art": art, "chance": chance, "preset": preset, "items": items})
+        else:
+            raise ValueError(f"Eintrag „{name}“: unbekannter Teil „{str(art)[:30]}“.")
+    for art in ("hoarder", "tag", "damage"):
+        if zaehl.get(art, 0) > 1:
+            raise ValueError(f"Eintrag „{name}“: „{art}“ darf nur einmal vorkommen.")
+    return sauber
+
+
+def _spt_block_text(name: str, teile: List[Dict[str, Any]], einzug: str, einheit: str, selbst: str, nl: str) -> str:
+    """Text eines <type>-Blocks im Stil der Datei - ohne die Einrueckung der ersten Zeile."""
+    def attr(k: str, v: Optional[str]) -> str:
+        return f' {k}="{_tool_esc_xml(v)}"' if v is not None else ""
+    if not teile:
+        return f'<type name="{_tool_esc_xml(name)}">{nl}{einzug}</type>'
+    k1, k2 = einzug + einheit, einzug + einheit * 2
+    zeilen = [f'<type name="{_tool_esc_xml(name)}">']
+    for t in teile:
+        art = t["art"]
+        if art == "hoarder":
+            zeilen.append(f"{k1}<hoarder{selbst}")
+        elif art == "tag":
+            zeilen.append(f'{k1}<tag name="{_tool_esc_xml(t["name"])}"{selbst}')
+        elif art == "damage":
+            zeilen.append(f'{k1}<damage min="{_tool_esc_xml(t["min"])}" max="{_tool_esc_xml(t["max"])}"{selbst}')
+        else:
+            kopf = f'{k1}<{art}{attr("chance", t["chance"])}{attr("preset", t["preset"])}'
+            if not t["items"]:
+                zeilen.append(kopf + selbst)
+            else:
+                zeilen.append(kopf + ">")
+                for it in t["items"]:
+                    zeilen.append(f'{k2}<item name="{_tool_esc_xml(it["name"])}"{attr("chance", it["chance"])}{selbst}')
+                zeilen.append(f"{k1}</{art}>")
+    zeilen.append(f"{einzug}</type>")
+    return nl.join(zeilen)
+
+
+def _spt_anwenden(text: Optional[str], geaendert: List[Dict[str, Any]], geloescht: List[int], neu: List[Dict[str, Any]],
+                  praesets: Optional[Dict[str, Set[str]]] = None) -> Dict[str, Any]:
+    """Berechnet die neue Datei. geaendert: [{src, name, teile}], geloescht: [src], neu: [{name, teile}].
+    ValueError = Fehler (nichts schreiben)."""
+    if len(geaendert) + len(geloescht) + len(neu) > _SPT_MAX_AENDERUNGEN:
+        raise ValueError(f"Zu viele Änderungen auf einmal (erlaubt sind {_SPT_MAX_AENDERUNGEN}).")
+    basis = text if text is not None else '<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>\n\n<spawnabletypes>\n</spawnabletypes>\n'
+    scan = _spt_scannen(basis)
+    alt = scan["typen"]
+    nl = _tool_eol(basis)
+    einheit, selbst = scan["einheit"], scan["selbst"]
+    ziele: Set[int] = set()
+    for src in list(geloescht) + [g.get("src") for g in geaendert]:
+        if not isinstance(src, int) or isinstance(src, bool) or not 0 <= src < len(alt):
+            raise ValueError("Die Eintragsliste passt nicht mehr zur Datei auf dem Server – bitte neu laden.")
+        if src in ziele:
+            raise ValueError("Ein Eintrag wurde mehrfach geändert oder gelöscht.")
+        ziele.add(src)
+    edits: List[Tuple[int, int, str]] = []
+    namen_alt: Dict[str, int] = {}
+    for t in alt:
+        namen_alt[t["name"]] = namen_alt.get(t["name"], 0) + 1
+    namen_neu = dict(namen_alt)
+    fehlende_presets: Set[str] = set()
+    for src in geloescht:
+        a = alt[src]
+        namen_neu[a["name"]] = namen_neu.get(a["name"], 0) - 1
+        edits.append((a["zeile_start"], a["zeile_ende"], "") if a["allein"] else (a["start"], a["ende"], ""))
+    n_geaendert = 0
+    bewegt: List[Tuple[str, List[Dict[str, Any]]]] = []
+
+    def presets_pruefen(name: str, teile: List[Dict[str, Any]], alte_teile: List[Dict[str, Any]]) -> None:
+        if praesets is None:
+            return
+        bekannt_alt = {(g["art"], g["preset"]) for g in alte_teile if g.get("preset")}
+        for g in teile:
+            p = g.get("preset")
+            if p and (g["art"], p) not in bekannt_alt and p not in praesets.get(g["art"], set()):
+                raise ValueError(f"Eintrag „{name}“: Das Preset „{p}“ ({g['art']}) gibt es in der cfgrandompresets.xml "
+                                 "dieses Servers nicht.")
+            if p and (g["art"], p) in bekannt_alt and p not in praesets.get(g["art"], set()):
+                fehlende_presets.add(p)
+
+    for g in geaendert:
+        a = alt[g["src"]]
+        if a["gesperrt"]:
+            raise ValueError(f"Eintrag „{a['name']}“ ist schreibgeschützt ({a['gesperrt']}) – er lässt sich nur löschen.")
+        name = str(g.get("name") or "").strip()
+        teile = _spt_teile_pruefen(name, g.get("teile"))
+        if name == a["name"] and teile == a["teile"]:
+            continue
+        presets_pruefen(name, teile, a["teile"])
+        n_geaendert += 1
+        namen_neu[a["name"]] = namen_neu.get(a["name"], 0) - 1
+        namen_neu[name] = namen_neu.get(name, 0) + 1
+        if name != a["name"] and namen_neu[name] > 1:
+            raise ValueError(f"Den Eintrag „{name}“ gibt es schon – Namen sollten eindeutig sein.")
+        edits.append((a["start"], a["ende"], _spt_block_text(name, teile, a["einzug"] if a["allein"] else "", einheit, selbst, nl)))
+    for n in neu:
+        name = str(n.get("name") or "").strip()
+        teile = _spt_teile_pruefen(name, n.get("teile"))
+        presets_pruefen(name, teile, [])
+        namen_neu[name] = namen_neu.get(name, 0) + 1
+        if namen_neu[name] > 1:
+            raise ValueError(f"Den Eintrag „{name}“ gibt es schon – Namen sollten eindeutig sein.")
+        bewegt.append((name, teile))
+    if bewegt:
+        schluss = re.search(r'</spawnabletypes\s*>', _maskiere_xml_kommentare(basis))
+        if not schluss:
+            raise ValueError("Kein schließendes </spawnabletypes> in der Datei gefunden.")
+        zeile = basis.rfind("\n", 0, schluss.start()) + 1
+        allein = not basis[zeile:schluss.start()].strip()
+        einzug = alt[-1]["einzug"] if alt and alt[-1]["allein"] else "\t"
+        text_neu = "".join(einzug + _spt_block_text(nm, tl, einzug, einheit, selbst, nl) + nl for nm, tl in bewegt)
+        edits.append((zeile, zeile, text_neu) if allein else (schluss.start(), schluss.start(), nl + text_neu))
+    ergebnis = basis
+    for start, ende, ersatz in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        ergebnis = ergebnis[:start] + ersatz + ergebnis[ende:]
+    try:
+        ET.fromstring(ergebnis)
+    except ET.ParseError as e:
+        raise ValueError(f"Die berechnete Datei wäre kein gültiges XML ({e}).") from e
+    return {"text": ergebnis, "geaendert": n_geaendert, "geloescht": len(geloescht), "neu": len(neu),
+            "vorher": len(alt), "nachher": len(alt) - len(geloescht) + len(neu),
+            "unveraendert": text is not None and ergebnis == text, "fehlende_presets": sorted(fehlende_presets)}
+
+
+def _spt_praesets_lesen(text: Optional[str]) -> Optional[Dict[str, Set[str]]]:
+    """Preset-Namen aus cfgrandompresets.xml (None = Datei nicht lesbar -> Verweise werden nicht geprueft)."""
+    if not text:
+        return None
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return None
+    return {art: {e.get("name") or "" for e in root.findall(art)} - {""} for art in _SPT_GRUPPEN}
+
+
+def _spt_tags_lesen(text: Optional[str]) -> List[str]:
+    """Bekannte Tags aus cfglimitsdefinition.xml (leer, wenn nicht lesbar)."""
+    if not text:
+        return []
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError:
+        return []
+    return sorted({e.get("name") or "" for e in root.iter("tag")} - {""})
+
+
+def _spt_warnungen(teile_alle: List[Tuple[str, List[Dict[str, Any]]]], tags: List[str], fehlende_presets: List[str]) -> List[str]:
+    out: List[str] = []
+    leer = sum(1 for _n, tl in teile_alle for g in tl if g["art"] in _SPT_GRUPPEN and not g["items"] and not g["preset"])
+    if leer:
+        out.append(f"{leer} Gruppe(n) haben weder Items noch ein Preset.")
+    if tags:
+        unbekannt = sorted({t["name"] for _n, tl in teile_alle for t in tl if t["art"] == "tag" and t["name"] not in tags})
+        if unbekannt:
+            out.append("Unbekannter Tag: " + ", ".join(unbekannt[:5]) + " – laut cfglimitsdefinition.xml gibt es nur: "
+                       + ", ".join(tags) + ".")
+    if fehlende_presets:
+        out.append("Preset(s) ohne Definition in der cfgrandompresets.xml (schon vorher): " + ", ".join(fehlende_presets[:5]))
+    mit_beides = sum(1 for _n, tl in teile_alle for g in tl if g["art"] in _SPT_GRUPPEN and g["preset"] and g["items"])
+    if mit_beides:
+        out.append(f"{mit_beides} Gruppe(n) haben ein Preset UND eigene Items – ob DayZ das so auswertet, ist nicht belegt.")
+    return out
+
+
+async def _spt_dateien_lesen(conn: ServerConnection, loop) -> Tuple[Optional[str], str, Optional[Dict[str, Set[str]]], List[str]]:
+    text, status = await _tools_datei_lesen(conn, _SPT_DATEI, loop)
+    praes_text, praes_status = await _tools_datei_lesen(conn, "cfgrandompresets.xml", loop)
+    tags_text, tags_status = await _tools_datei_lesen(conn, "cfglimitsdefinition.xml", loop)
+    return (text, status, _spt_praesets_lesen(praes_text if praes_status == "ok" else None),
+            _spt_tags_lesen(tags_text if tags_status == "ok" else None))
+
+
+async def api_tools_spawnabletypes_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.spawnabletypes")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.spawnabletypes", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"eintraege": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    try:
+        text, status, praesets, tags = await _spt_dateien_lesen(conn, loop)
+    except Exception as e:  # noqa: BLE001
+        log.exception("[TOOLS] SpawnableTypes: Lesen fehlgeschlagen")
+        return err(f"{_SPT_DATEI} per FTP nicht lesbar ({type(e).__name__}: {e}).", 502)
+    if status == "error":
+        return err(f"{_SPT_DATEI} per FTP nicht lesbar.", 502)
+    out: Dict[str, Any] = {"vorhanden": status == "ok", "hash": _spawn_datei_hash(text if status == "ok" else ""),
+                           "praesets": {k: sorted(v) for k, v in (praesets or {}).items()}, "praesets_gelesen": praesets is not None,
+                           "tags": tags, "eintraege": []}
+    if status == "ok":
+        try:
+            scan = _spt_scannen(text)
+        except ValueError as e:
+            return err(str(e), 422)
+        out["eintraege"] = [{"src": t["index"], "name": t["name"], "teile": t["teile"], "gesperrt": t["gesperrt"]}
+                            for t in scan["typen"]]
+    return ok(out)
+
+
+async def api_tools_spawnabletypes_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.spawnabletypes")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.spawnabletypes", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.spawnabletypes", 10)
+        if fehler is not None:
+            return fehler
+    geaendert, geloescht, neu = data_in.get("geaendert") or [], data_in.get("geloescht") or [], data_in.get("neu") or []
+    if not (isinstance(geaendert, list) and isinstance(geloescht, list) and isinstance(neu, list)) \
+            or any(not isinstance(x, dict) for x in geaendert + neu):
+        return err("Ungültige Änderungsliste.")
+    loop = asyncio.get_running_loop()
+    try:
+        text, status, praesets, tags = await _spt_dateien_lesen(conn, loop)
+    except Exception as e:  # noqa: BLE001
+        log.exception("[TOOLS] SpawnableTypes: Lesen fehlgeschlagen")
+        return err(f"{_SPT_DATEI} per FTP nicht lesbar ({type(e).__name__}: {e}).", 502)
+    if status == "error":
+        return err(f"{_SPT_DATEI} per FTP nicht lesbar.", 502)
+    datei_hash = _spawn_datei_hash(text if status == "ok" else "")
+    if commit and str(data_in.get("erwartet_hash") or "") != datei_hash:
+        return err(f"Die {_SPT_DATEI} auf dem Server hat sich seit der Vorschau geändert (oder die Vorschau fehlt) – "
+                   "bitte „Speichern“ erneut klicken und die neue Vorschau prüfen. Nichts wurde gespeichert.", 409)
+    try:
+        ergebnis = _spt_anwenden(text if status == "ok" else None, geaendert, geloescht, neu, praesets)
+        gesehen = []
+        for g in geaendert + neu:
+            gesehen.append((str(g.get("name") or ""), _spt_teile_pruefen(str(g.get("name") or ""), g.get("teile"))))
+    except ValueError as e:
+        return err(str(e))
+    warnungen = _spt_warnungen(gesehen, tags, ergebnis["fehlende_presets"])
+    try:
+        if commit and not ergebnis["unveraendert"]:
+            geschrieben = await _tool_ce_backup_commit(conn, _SPT_DATEI, text if status == "ok" else None,
+                                                       ergebnis["text"], None, None, loop)
+        else:
+            geschrieben = True
+    except Exception as e:  # noqa: BLE001
+        log.exception("[TOOLS] SpawnableTypes: Schreiben fehlgeschlagen")
+        return err(f"{_SPT_DATEI} konnte nicht gespeichert werden ({type(e).__name__}: {e}).", 502)
+    if not geschrieben:
+        return err(f"Sichern ({_SPT_DATEI}.bak) oder Speichern der {_SPT_DATEI} ist fehlgeschlagen – bitte erneut versuchen.", 502)
+    if commit and not ergebnis["unveraendert"]:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: SpawnableTypes gespeichert",
+                  f"{ergebnis['neu']} neu, {ergebnis['geaendert']} geändert, {ergebnis['geloescht']} gelöscht · {conn.name}")
+    return ok({"generated": [{"filename": _SPT_DATEI, "content": ergebnis["text"]}],
+               "aenderung": {k: ergebnis[k] for k in ("vorher", "nachher", "neu", "geaendert")} | {"entfernt": ergebnis["geloescht"]},
+               "unveraendert": ergebnis["unveraendert"], "datei_hash": datei_hash, "warnungen": warnungen,
+               "backup": f"{_SPT_DATEI}.bak" if commit and status == "ok" and not ergebnis["unveraendert"] else None})
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -46790,6 +47210,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/spawnpoint", api_tools_spawnpoint_post)
     r.add_get("/api/tools/territory", api_tools_territory_get)
     r.add_post("/api/tools/territory", api_tools_territory_post)
+    r.add_get("/api/tools/spawnabletypes", api_tools_spawnabletypes_get)
+    r.add_post("/api/tools/spawnabletypes", api_tools_spawnabletypes_post)
     r.add_get("/api/tools/altaccountfinder", api_tools_altaccountfinder_get)
     r.add_post("/api/tools/altaccountfinder", api_tools_altaccountfinder_post)
     r.add_get("/api/feeds/abandoned-bases/settings", api_abandoned_bases_get)
@@ -47742,6 +48164,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "b93f6c58e2583e72e997d09e5e9287eeeec3d86f94d19cc599894fa24c78b8d7",
         "5a1ee3ac5b096c83fa83aed171e2d34de03a386a748c7eb492f7cf1f777e350d",
         "5f82dbe54e6e37f9ba1840cd35b2212b1578fb13cf6c5c09086a82d7b4ff655f",
+        "5d23bea4f5ff5e7fe0514ef753383395555856619c40201b887321fe009f7e71",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
