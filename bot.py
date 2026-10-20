@@ -1019,6 +1019,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.spawnable":                   {"label": "Rucksack-Builder", "gruppe": "Tools"},
     "tools.event":                       {"label": "Event-Vorlagen", "gruppe": "Tools"},
     "tools.spawnpoint":                  {"label": "Spawn Point Generator", "gruppe": "Tools"},
+    "tools.territory":                   {"label": "Territory Zone Creator", "gruppe": "Tools"},
     "tools.typesbooster":                {"label": "Types Booster", "gruppe": "Tools"},
     "tools.typesreducer":                 {"label": "Types Reducer", "gruppe": "Tools"},
     "tools.typesorganizer":              {"label": "Types Organizer", "gruppe": "Tools"},
@@ -15128,6 +15129,7 @@ _TOOL_LISTE = (
     ("spawnable", "🎒", "Rucksack-Builder"),
     ("event",     "📅", "Event-Vorlagen"),
     ("spawnpoint", "📍", "Spawn Point Generator"),
+    ("territory", "🧭", "Territory Zone Creator"),
     ("typesbooster", "📈", "Types Booster"),
     ("typesreducer", "📉", "Types Reducer"),
     ("typesorganizer", "🗂️", "Types Organizer"),
@@ -23197,6 +23199,424 @@ async def api_tools_spawnpoint_post(request: web.Request) -> web.Response:
                "unveraendert": unveraendert, "auch_hop_travel": auch_hop_travel,
                "datei_hash": datei_hash, "warnungen": _spawn_warnungen(positions, neu, welt),
                "backup": "cfgplayerspawnpoints.xml.bak" if commit and status == "ok" else None})
+
+
+# ── 9. Territory Zone Creator ─────────────────────────────────────────────
+# Zonen in env/*_territories.xml (Zombies und Tiere). Wie beim Spawn Point Generator wird die Datei
+# NICHT neu gebaut: nur geaenderte, geloeschte und neue <zone>-Zeilen werden angefasst, Kommentare,
+# mehrere <territory>-Bloecke samt Farben und alle unberuehrten Zonen bleiben Zeichen fuer Zeichen
+# erhalten (unveraendert gespeichert ergibt die Datei identisch). Quelle der Dateien: cfgenvironment.xml
+# (aktiv eingebunden) und der Ordner env/ des Servers - nicht eine feste Liste.
+_TERR_DATEI_RE = re.compile(r'^([a-z0-9_]{1,40})_territories\.xml$')
+_TERR_NAME_RE = re.compile(r'^[A-Za-z0-9_.\- ]{1,64}$')
+_TERR_LEER = '<?xml version="1.0" encoding="UTF-8"?>\n<territory-type>\n    <territory color="1">\n    </territory>\n</territory-type>\n'
+_TERR_MAX_ZONEN = 20000
+# Anzeigenamen bekannter Dateien (Rest: aus dem Dateinamen abgeleitet) und ein Rueckfall-Zonenname fuer
+# leere Dateien. Bei Dateien mit Zonen nimmt das Tool den haeufigsten Namen/Radius der Datei als Vorgabe.
+_TERR_TYPEN: Dict[str, Tuple[str, str, str]] = {
+    "zombie": ("Zombies", "Zombies", "InfectedVillage"),
+    "wolf": ("Wölfe", "Wolves", "HuntingGround"),
+    "bear": ("Bären", "Bears", "Graze"),
+    "cattle": ("Kühe", "Cattle", "Graze"),
+    "fox": ("Füchse", "Foxes", "Zone_Fox"),
+    "hare": ("Hasen", "Hares", "Zone_Hare"),
+    "hen": ("Hühner", "Hens", "Zone_Hen"),
+    "pig": ("Schweine", "Pigs", "Graze"),
+    "red_deer": ("Rothirsche", "Red deer", "Graze"),
+    "roe_deer": ("Rehe", "Roe deer", "Graze"),
+    "sheep_goat": ("Schafe/Ziegen", "Sheep/goats", "Graze"),
+    "sheep": ("Schafe", "Sheep", "Graze"),
+    "goat": ("Ziegen", "Goats", "Graze"),
+    "wild_boar": ("Wildschweine", "Wild boar", "Graze"),
+    "wildboar": ("Wildschweine", "Wild boar", "Graze"),
+    "reindeer": ("Rentiere", "Reindeer", "Graze"),
+    "mouflon": ("Mufflons", "Mouflon", "Graze"),
+    "monitor": ("Warane", "Monitor lizards", "Graze"),
+    "dobermann_shepherd": ("Hunde", "Dogs", "Graze"),
+}
+
+
+def _terr_zahl(v: float) -> str:
+    """Zahl fuer x/z/r wie in Bohemias Dateien: ganze Zahl oder bis zu 2 Nachkommastellen."""
+    n = round(float(v), 2)
+    return str(int(n)) if n == int(n) else f"{n:.2f}".rstrip("0").rstrip(".")
+
+
+def _terr_dateiname_gueltig(typ: str) -> Optional[str]:
+    typ = str(typ or "").strip().lower()
+    return f"env/{typ}_territories.xml" if re.fullmatch(r'[a-z0-9_]{1,40}', typ) else None
+
+
+def _terr_scannen(text: str) -> Dict[str, Any]:
+    """Zerlegt eine Territory-Datei in <territory>-Bloecke und <zone>-Elemente MIT Textposition
+    (Kommentare zaehlen nicht). ValueError bei allem, was das Tool nicht sicher bearbeiten kann."""
+    try:
+        wurzel = ET.fromstring(text)
+    except ET.ParseError as e:
+        raise ValueError(f"Die Datei ist kein gültiges XML ({e}).") from e
+    if wurzel.tag != "territory-type":
+        raise ValueError("Falsches Wurzelelement – erwartet wird <territory-type>.")
+    m = _maskiere_xml_kommentare(text)
+    ereignisse = []
+    for x in re.finditer(r'<territory(?=[\s/>])(?:[^>/]|/(?!>))*(/?)>', m):
+        ereignisse.append((x.start(), x.end(), "selbst" if x.group(1) else "auf", x.group(0)))
+    for x in re.finditer(r'</territory\s*>', m):
+        ereignisse.append((x.start(), x.end(), "zu", x.group(0)))
+    for x in re.finditer(r'<zone(?=[\s/>])(?:[^>/]|/(?!>))*(/?)>', m):
+        if not x.group(1):
+            raise ValueError("Es gibt eine <zone> ohne Selbstschluss (/>) – diese Schreibweise kann das Tool "
+                             "nicht sicher ändern.")
+        ereignisse.append((x.start(), x.end(), "zone", x.group(0)))
+    ereignisse.sort(key=lambda e: e[0])
+    bloecke: List[Dict[str, Any]] = []
+    zonen: List[Dict[str, Any]] = []
+    offen: Dict[str, Any] = {}      # leer = gerade kein <territory> offen
+    for start, ende, art, roh in ereignisse:
+        if art in ("auf", "selbst"):
+            if offen:
+                raise ValueError("Verschachtelte <territory>-Blöcke – bitte die Datei prüfen.")
+            farbe = re.search(r'\bcolor\s*=\s*(["\'])(.*?)\1', roh)
+            blk = {"index": len(bloecke), "start": start, "auf_ende": ende, "zu_start": None, "zu_ende": None,
+                   "farbe": farbe.group(2) if farbe else "", "zonen": []}
+            bloecke.append(blk)
+            if art == "auf":
+                offen = blk
+        elif art == "zu":
+            if not offen:
+                raise ValueError("Ein </territory> ohne passenden Anfang – bitte die Datei prüfen.")
+            offen["zu_start"], offen["zu_ende"] = start, ende
+            offen = {}
+        else:
+            if not offen:
+                raise ValueError("Eine <zone> steht außerhalb eines <territory>-Blocks – bitte die Datei prüfen.")
+            try:
+                el = ET.fromstring(roh)
+                werte = {k: float(el.get(k)) for k in ("x", "z", "r", "smin", "smax", "dmin", "dmax")}
+                name = el.get("name") or ""
+            except (ET.ParseError, TypeError, ValueError) as e:
+                raise ValueError(f"Eine <zone> hat fehlende oder ungültige Werte: {roh[:120]}") from e
+            z_start = text.rfind("\n", 0, start) + 1
+            z_ende = text.find("\n", ende)
+            z_ende = len(text) if z_ende == -1 else z_ende
+            allein = not text[z_start:start].strip() and not text[ende:z_ende].strip()
+            zone = {"index": len(zonen), "block": offen["index"], "start": start, "ende": ende,
+                    "zeile_start": z_start, "zeile_ende": min(len(text), z_ende + 1), "allein": allein,
+                    "einzug": text[z_start:start] if allein else "", "name": name, "roh": text[start:ende], **werte}
+            zonen.append(zone)
+            offen["zonen"].append(zone["index"])
+    if offen:
+        raise ValueError("Ein <territory> wurde nicht geschlossen – bitte die Datei prüfen.")
+    return {"bloecke": bloecke, "zonen": zonen}
+
+
+_TERR_ZAHLENFELDER = ("x", "z", "r", "smin", "smax", "dmin", "dmax")
+
+
+def _terr_zone_pruefen(z: Dict[str, Any], welt: Optional[int]) -> Dict[str, Any]:
+    """Prueft EINE Zone aus der Oberflaeche und gibt die bereinigten Werte zurueck. ValueError = Fehler."""
+    if not isinstance(z, dict):
+        raise ValueError("Ungültige Zone.")
+    name = str(z.get("name") or "").strip()
+    if not _TERR_NAME_RE.match(name):
+        raise ValueError(f"Zonenname „{name[:40]}“ ist ungültig – erlaubt sind 1–64 Zeichen "
+                         "(Buchstaben, Ziffern, _ . - und Leerzeichen).")
+    werte: Dict[str, Any] = {"name": name}
+    for k in _TERR_ZAHLENFELDER:
+        try:
+            v = float(z[k])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"Zone „{name}“: Wert „{k}“ fehlt oder ist keine Zahl.") from None
+        if not math.isfinite(v):
+            raise ValueError(f"Zone „{name}“: Wert „{k}“ ist keine gültige Zahl.")
+        werte[k] = v
+    for k in ("smin", "smax", "dmin", "dmax"):
+        if werte[k] != int(werte[k]) or not 0 <= werte[k] <= 1000:
+            raise ValueError(f"Zone „{name}“: „{k}“ muss eine ganze Zahl von 0 bis 1000 sein.")
+        werte[k] = int(werte[k])
+    if werte["smin"] > werte["smax"] or werte["dmin"] > werte["dmax"]:
+        raise ValueError(f"Zone „{name}“: das Minimum darf nicht größer als das Maximum sein "
+                         f"(smin {werte['smin']} / smax {werte['smax']}, dmin {werte['dmin']} / dmax {werte['dmax']}).")
+    if werte["r"] <= 0 or werte["r"] > 5000:
+        raise ValueError(f"Zone „{name}“: der Radius muss größer als 0 und höchstens 5000 m sein.")
+    if werte["x"] < 0 or werte["z"] < 0 or (welt and (werte["x"] > welt or werte["z"] > welt)):
+        raise ValueError(f"Zone „{name}“ liegt außerhalb der Karte (x={werte['x']:g}, z={werte['z']:g}) – "
+                         f"erlaubt sind Werte von 0{f' bis {welt}' if welt else ''}.")
+    return werte
+
+
+def _terr_gleich(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    return a["name"] == b["name"] and all(abs(float(a[k]) - float(b[k])) < 0.005 for k in _TERR_ZAHLENFELDER)
+
+
+def _terr_tag_aendern(roh: str, neu: Dict[str, Any], alt: Dict[str, Any]) -> str:
+    """Ersetzt in einem <zone .../>-Text NUR die Werte, die sich geaendert haben - Reihenfolge, Leerraum und
+    unbekannte Attribute bleiben, wie sie waren."""
+    out = roh
+    for k in ("name",) + _TERR_ZAHLENFELDER:
+        if k == "name":
+            if neu["name"] == alt["name"]:
+                continue
+            wert = _tool_esc_xml(neu["name"])
+        else:
+            if abs(float(neu[k]) - float(alt[k])) < 0.005:
+                continue
+            wert = _terr_zahl(neu[k])
+        gefunden = re.search(r'(\b' + k + r'\s*=\s*)(["\'])(.*?)\2', out)
+        if gefunden:
+            out = out[:gefunden.start()] + gefunden.group(1) + '"' + wert + '"' + out[gefunden.end():]
+        else:
+            out = re.sub(r'\s*/>$', f' {k}="{wert}"/>', out)
+    return out
+
+
+def _terr_neue_zone(z: Dict[str, Any]) -> str:
+    return (f'<zone name="{_tool_esc_xml(z["name"])}" smin="{z["smin"]}" smax="{z["smax"]}" dmin="{z["dmin"]}" '
+            f'dmax="{z["dmax"]}" x="{_terr_zahl(z["x"])}" z="{_terr_zahl(z["z"])}" r="{_terr_zahl(z["r"])}"/>')
+
+
+def _terr_anwenden(text: Optional[str], zonen: List[Dict[str, Any]], welt: Optional[int],
+                   neue_farbe: str = "1") -> Dict[str, Any]:
+    """Berechnet die neue Datei. zonen = Wunschliste der Oberflaeche: je Zone `src` (Index der Zone in der
+    Datei, die sie ersetzt) oder None (neu, dann optional `block`). Zonen der Datei, die in der Liste fehlen,
+    werden entfernt. ValueError = Fehler (nichts schreiben)."""
+    if len(zonen) > _TERR_MAX_ZONEN:
+        raise ValueError(f"Zu viele Zonen ({len(zonen)}, erlaubt sind {_TERR_MAX_ZONEN}).")
+    basis = text if text is not None else _TERR_LEER
+    scan = _terr_scannen(basis)
+    alt = scan["zonen"]
+    nl = _tool_eol(basis)
+    behalten: Dict[int, Dict[str, Any]] = {}
+    neu_je_block: Dict[int, List[Dict[str, Any]]] = {}
+    for z in zonen:
+        werte = _terr_zone_pruefen(z, welt)
+        src = z.get("src")
+        if src is None:
+            ziel = z.get("block")
+            if not isinstance(ziel, int) or isinstance(ziel, bool) or not 0 <= ziel < len(scan["bloecke"]):
+                ziel = len(scan["bloecke"]) - 1
+            neu_je_block.setdefault(ziel, []).append(werte)
+            continue
+        if not isinstance(src, int) or isinstance(src, bool) or not 0 <= src < len(alt) or src in behalten:
+            raise ValueError("Die Zonenliste passt nicht mehr zur Datei auf dem Server – bitte neu laden.")
+        behalten[src] = werte
+    edits: List[Tuple[int, int, str]] = []
+    geaendert = entfernt = 0
+    for a in alt:
+        if a["index"] not in behalten:
+            entfernt += 1
+            edits.append((a["zeile_start"], a["zeile_ende"], "") if a["allein"] else (a["start"], a["ende"], ""))
+            continue
+        w = behalten[a["index"]]
+        if not _terr_gleich(w, a):
+            geaendert += 1
+            edits.append((a["start"], a["ende"], _terr_tag_aendern(a["roh"], w, a)))
+    neu_gesamt = sum(len(v) for v in neu_je_block.values())
+    if neu_gesamt and not scan["bloecke"]:
+        raise ValueError("In der Datei gibt es keinen <territory>-Block für neue Zonen.")
+    for blk_index, liste in neu_je_block.items():
+        blk = scan["bloecke"][blk_index]
+        if blk["zu_start"] is None:
+            raise ValueError("Ein leerer <territory/>-Block kann keine neuen Zonen aufnehmen – bitte die Datei prüfen.")
+        letzte = alt[blk["zonen"][-1]] if blk["zonen"] else None
+        zu_zeile = basis.rfind("\n", 0, blk["zu_start"]) + 1
+        zu_einzug = basis[zu_zeile:blk["zu_start"]]
+        allein = not zu_einzug.strip()
+        einzug = letzte["einzug"] if letzte and letzte["allein"] else (zu_einzug + "    " if allein else "        ")
+        zeilen = "".join(einzug + _terr_neue_zone(w) + nl for w in liste)
+        if allein:
+            edits.append((zu_zeile, zu_zeile, zeilen))
+        else:
+            edits.append((blk["zu_start"], blk["zu_start"], nl + zeilen))
+    neu = basis
+    for start, ende, ersatz in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        neu = neu[:start] + ersatz + neu[ende:]
+    try:
+        ET.fromstring(neu)
+    except ET.ParseError as e:
+        raise ValueError(f"Die berechnete Datei wäre kein gültiges XML ({e}).") from e
+    return {"text": neu, "neu": neu_gesamt, "geaendert": geaendert, "entfernt": entfernt,
+            "vorher": len(alt), "nachher": len(alt) - entfernt + neu_gesamt,
+            "unveraendert": neu == (text if text is not None else _TERR_LEER) and text is not None}
+
+
+def _terr_warnungen(zonen: List[Dict[str, Any]], bekannte_namen: Set[str], ereignisnamen: Optional[Set[str]]) -> List[str]:
+    out: List[str] = []
+    namen = {str(z.get("name") or "") for z in zonen}
+    if bekannte_namen:
+        neu = sorted(n for n in namen if n and n not in bekannte_namen)
+        if neu:
+            out.append("Neuer Zonenname, der sonst nirgends in dieser Datei vorkommt: " + ", ".join(neu[:5])
+                       + " – prüfe die Schreibweise (ein Tippfehler im Namen kann dazu führen, dass die Zone wirkungslos ist).")
+    if ereignisnamen:
+        unbekannt = sorted(n for n in namen if n and n not in ereignisnamen)
+        if unbekannt and len(unbekannt) < len(namen):
+            out.append("Kein gleichnamiges Event in der events.xml: " + ", ".join(unbekannt[:5])
+                       + " – bei Zombie-Zonen gehört der Name üblicherweise zu einem Infected-Event.")
+    gross = sum(1 for z in zonen if float(z.get("r") or 0) > 500)
+    if gross:
+        out.append(f"{gross} Zone(n) haben einen Radius über 500 m – das ist ungewöhnlich groß.")
+    punkte = [(float(z["x"]), float(z["z"]), str(z.get("name") or "")) for z in zonen
+              if isinstance(z.get("x"), (int, float)) and isinstance(z.get("z"), (int, float))]
+    doppelt = 0
+    seen: Set[Tuple[int, int, str]] = set()
+    for x, zz, n in punkte:
+        k = (round(x), round(zz), n)
+        if k in seen:
+            doppelt += 1
+        seen.add(k)
+    if doppelt:
+        out.append(f"{doppelt} Zone(n) liegen mit gleichem Namen exakt übereinander (doppelt).")
+    return out
+
+
+def _terr_typen_aus_env(cfgenv: Optional[str], ordner: List[str]) -> List[Dict[str, Any]]:
+    """Welche Territory-Dateien gibt es, und welche bindet die cfgenvironment.xml des Servers ein?"""
+    aktiv: Set[str] = set()
+    if cfgenv:
+        for m in re.finditer(r'<file\s+path\s*=\s*["\']env/([a-z0-9_]+)_territories\.xml["\']', _maskiere_xml_kommentare(cfgenv), re.I):
+            aktiv.add(m.group(1).lower())
+    vorhanden: Set[str] = set()
+    for e in ordner:
+        m = _TERR_DATEI_RE.match(e.split("/")[-1].lower())
+        if m:
+            vorhanden.add(m.group(1))
+    out = []
+    for stem in sorted(aktiv | vorhanden, key=lambda s: (s != "zombie", s)):
+        de, en, vorgabe = _TERR_TYPEN.get(stem, (stem.replace("_", " ").title(), stem.replace("_", " ").title(), "Graze"))
+        out.append({"typ": stem, "datei": f"env/{stem}_territories.xml", "de": de, "en": en,
+                    "vorgabe_name": vorgabe, "aktiv": stem in aktiv if cfgenv else None,
+                    "vorhanden": stem in vorhanden})
+    return out
+
+
+def _terr_zonen_fuer_oberflaeche(scan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [{"src": z["index"], "block": z["block"], "name": z["name"], "x": z["x"], "z": z["z"], "r": z["r"],
+             "smin": int(z["smin"]), "smax": int(z["smax"]), "dmin": int(z["dmin"]), "dmax": int(z["dmax"])}
+            for z in scan["zonen"]]
+
+
+async def api_tools_territory_get(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.territory")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.territory", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"typen": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    karte = _canonical_map_name(str(conn.get("map_name") or "")) or ""
+    welt = DEFAULT_MAP_SIZES.get(karte)
+    typ = str(request.query.get("typ") or "").strip().lower()
+    if not typ:
+        try:
+            cfgenv, status = await _tools_datei_lesen(conn, "cfgenvironment.xml", loop)
+            ordner = await loop.run_in_executor(None, conn.ftp.list_dir, f"{_mission_dir_of(conn).rstrip('/')}/env")
+        except Exception as e:  # noqa: BLE001
+            log.exception("[TOOLS] Territory: Dateiliste fehlgeschlagen")
+            return err(f"Die Territory-Dateien konnten nicht gelesen werden ({type(e).__name__}: {e}).", 502)
+        typen = _terr_typen_aus_env(cfgenv if status == "ok" else None, list(ordner or []))
+        return ok({"typen": typen, "karte": karte, "welt": welt, "cfgenv_gelesen": status == "ok"})
+    dateiname = _terr_dateiname_gueltig(typ)
+    if not dateiname:
+        return err("Ungültiger Dateityp.")
+    try:
+        text, status = await _tools_datei_lesen(conn, dateiname, loop)
+    except Exception as e:  # noqa: BLE001
+        log.exception("[TOOLS] Territory: Lesen fehlgeschlagen")
+        return err(f"{dateiname} per FTP nicht lesbar ({type(e).__name__}: {e}).", 502)
+    if status == "error":
+        return err(f"{dateiname} per FTP nicht lesbar.", 502)
+    out: Dict[str, Any] = {"typ": typ, "datei": dateiname, "vorhanden": status == "ok", "welt": welt, "karte": karte,
+                           "hash": _spawn_datei_hash(text if status == "ok" else "")}
+    if status != "ok":
+        out.update({"zonen": [], "bloecke": []})
+        return ok(out)
+    try:
+        scan = _terr_scannen(text)
+    except ValueError as e:
+        return err(str(e), 422)
+    out["zonen"] = _terr_zonen_fuer_oberflaeche(scan)
+    out["bloecke"] = [{"index": b["index"], "farbe": b["farbe"], "zonen": len(b["zonen"])} for b in scan["bloecke"]]
+    return ok(out)
+
+
+async def api_tools_territory_post(request: web.Request) -> web.Response:
+    conn, fehler = _session_conn(request, "tools.territory")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("tools.territory", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "tools", "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, "tools.territory", 10)
+        if fehler is not None:
+            return fehler
+    dateiname = _terr_dateiname_gueltig(data_in.get("typ"))
+    if not dateiname:
+        return err("Ungültiger Dateityp.")
+    zonen_in = data_in.get("zonen")
+    if not isinstance(zonen_in, list):
+        return err("Keine Zonenliste übergeben.")
+    welt = DEFAULT_MAP_SIZES.get(_canonical_map_name(str(conn.get("map_name") or "")) or "")
+    loop = asyncio.get_running_loop()
+    try:
+        text, status = await _tools_datei_lesen(conn, dateiname, loop)
+    except Exception as e:  # noqa: BLE001
+        log.exception("[TOOLS] Territory: Lesen fehlgeschlagen")
+        return err(f"{dateiname} per FTP nicht lesbar ({type(e).__name__}: {e}).", 502)
+    if status == "error":
+        return err(f"{dateiname} per FTP nicht lesbar.", 502)
+    datei_hash = _spawn_datei_hash(text if status == "ok" else "")
+    if commit and str(data_in.get("erwartet_hash") or "") != datei_hash:
+        return err(f"Die {dateiname} auf dem Server hat sich seit der Vorschau geändert (oder die Vorschau fehlt) – "
+                   "bitte „Speichern“ erneut klicken und die neue Vorschau prüfen. Nichts wurde gespeichert.", 409)
+    try:
+        ergebnis = _terr_anwenden(text if status == "ok" else None, zonen_in, welt)
+    except ValueError as e:
+        return err(str(e))
+    neu = ergebnis["text"]
+    bekannte: Set[str] = set()
+    if status == "ok":
+        try:
+            bekannte = {z["name"] for z in _terr_scannen(text)["zonen"]}
+        except ValueError:
+            bekannte = set()
+    ereignisnamen: Optional[Set[str]] = None
+    if str(data_in.get("typ")).lower() == "zombie":
+        ev_text, ev_status = await _tools_datei_lesen(conn, "db/events.xml", loop)
+        if ev_status == "ok":
+            ereignisnamen = set(re.findall(r'<event\s+name\s*=\s*"([^"]+)"', _maskiere_xml_kommentare(ev_text)))
+    warnungen = _terr_warnungen([z for z in zonen_in if isinstance(z, dict)], bekannte, ereignisnamen)
+    try:
+        if commit and not ergebnis["unveraendert"]:
+            geschrieben = await _tool_ce_backup_commit(conn, dateiname, text if status == "ok" else None, neu,
+                                                       None, None, loop)
+        else:
+            geschrieben = True
+    except Exception as e:  # noqa: BLE001
+        log.exception("[TOOLS] Territory: Schreiben fehlgeschlagen")
+        return err(f"{dateiname} konnte nicht gespeichert werden ({type(e).__name__}: {e}).", 502)
+    if not geschrieben:
+        return err(f"Sichern ({dateiname}.bak) oder Speichern der {dateiname} ist fehlgeschlagen – bitte erneut versuchen.", 502)
+    if commit and not ergebnis["unveraendert"]:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Territory-Zonen gespeichert",
+                  f"{dateiname}: {ergebnis['neu']} neu, {ergebnis['geaendert']} geändert, "
+                  f"{ergebnis['entfernt']} entfernt · {conn.name}")
+    return ok({"generated": [{"filename": dateiname, "content": neu}],
+               "aenderung": {k: ergebnis[k] for k in ("vorher", "nachher", "neu", "geaendert", "entfernt")},
+               "unveraendert": ergebnis["unveraendert"], "datei_hash": datei_hash, "warnungen": warnungen,
+               "backup": f"{dateiname}.bak" if commit and status == "ok" and not ergebnis["unveraendert"] else None})
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -46343,6 +46763,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/randompresets", api_tools_randompresets_post)
     r.add_get("/api/tools/spawnpoint", api_tools_spawnpoint_get)
     r.add_post("/api/tools/spawnpoint", api_tools_spawnpoint_post)
+    r.add_get("/api/tools/territory", api_tools_territory_get)
+    r.add_post("/api/tools/territory", api_tools_territory_post)
     r.add_get("/api/tools/altaccountfinder", api_tools_altaccountfinder_get)
     r.add_post("/api/tools/altaccountfinder", api_tools_altaccountfinder_post)
     r.add_get("/api/feeds/abandoned-bases/settings", api_abandoned_bases_get)
@@ -47292,6 +47714,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "bbc2b131777fdf7125048ab9f16ac2470c414cb01ec776af56bb3651201791c7",
         "5f26d2ea99d9ac256de12b5fd7e5182e7afb5a6704386dded975fd16edd991b8",
         "1db0dc848613bd258b6e2abea6e194aad636a3b04ddc534a755f83a6abb41f97",
+        "b93f6c58e2583e72e997d09e5e9287eeeec3d86f94d19cc599894fa24c78b8d7",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
@@ -47310,6 +47733,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "de91af9ec4192ff38005a4c65d825906f0e28f026c644e7b6aaf788aa9286052",
         "e7f961dab2ab67545e45f774e8139a5c9e5517654cf8766592b210046d82ad5c",
         "4c782db81cb83ec74fa7d113c58ea6f3bfb73f530e10b5763748f3bf29714325",
+        "db8cd2982a6760aea26aab60dfd1293fdeedc30c7e22a7f435d3274ccb47a00b",
     ),
     "vendor/leaflet.css": (
         "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",
