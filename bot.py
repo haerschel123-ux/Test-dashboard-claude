@@ -886,7 +886,15 @@ _CE_EVENT_TYP_ZU_SCHALTER: Dict[str, str] = {
     "StaticContaminatedArea": "contaminated_zone",
     "StaticAirplaneCrate":    "airplane_crate",
     "StaticSantaCrash":       "santa_crash",
+    # Nasdara (DayZ 1.30 Badlands) hat eigene Static-Events laut offizieller events.xml
+    # (BohemiaInteractive/DayZ-Central-Economy, dayzOffline.nasdara): eine groessere Variante des
+    # Heli-Crashs, einen Wassertanker und (wie Sakhal) verschlossene Container.
+    "StaticHeliCrashBig":     "helicopter_crash",
+    "StaticWaterTruck":       "water_truck",
+    "StaticContainerLocked":  "locked_container",
 }
+# Typen, deren konkreter Name in der Meldung stehen soll, weil mehrere Typen unter einem Schalter laufen.
+_CE_EVENT_TYP_NAME_ZEIGEN = frozenset({"StaticHeliCrashBig"})
 _CE_EVENT_SCHALTER_LABEL: Dict[str, Tuple[str, str]] = {
     # schalter_key -> (emoji, Anzeigename)
     "helicopter_crash":  ("🚁", "Helicopter Crash"),
@@ -897,6 +905,16 @@ _CE_EVENT_SCHALTER_LABEL: Dict[str, Tuple[str, str]] = {
     "contaminated_zone": ("☢️", "Contaminated Zone"),
     "airplane_crate":    ("✈️", "Airplane Crate"),
     "santa_crash":       ("🎅", "Santa Crash"),
+    "water_truck":       ("🚛", "Water Truck"),
+    "locked_container":  ("🔒", "Locked Container"),
+}
+# Auf welchen Karten es den Event-Typ in Bohemias events.xml gibt (None = auf allen). Das Dashboard zeigt
+# nur die Schalter, die zur Karte des Servers passen - der Bot meldet unabhaengig davon jeden erkannten Typ.
+_CE_EVENT_KARTEN: Dict[str, Optional[Tuple[str, ...]]] = {
+    "contaminated_zone": ("ChernarusPlus", "Livonia"),
+    "airplane_crate":    ("ChernarusPlus", "Sakhal"),
+    "water_truck":       ("Nasdara",),
+    "locked_container":  ("Sakhal", "Nasdara"),
 }
 # Deutsche Anzeigenamen fuer die Feed-Meldung (die englischen stehen oben; Dashboard nutzt sie unveraendert).
 _CE_EVENT_LABEL_DE: Dict[str, str] = {
@@ -908,6 +926,8 @@ _CE_EVENT_LABEL_DE: Dict[str, str] = {
     "contaminated_zone": "Kontaminierte Zone",
     "airplane_crate": "Flugzeug-Kiste",
     "santa_crash": "Weihnachtsmann-Absturz",
+    "water_truck": "Wasser-LKW",
+    "locked_container": "Verschlossener Container",
 }
 _CE_EVENT_ZEILE_RE = re.compile(
     r"^\s*(?:\d+:\d+:\d+\.\d+\s+)?([A-Za-z_][A-Za-z0-9_ ]*?)\s+\((\d+)\)\s*$")
@@ -7812,7 +7832,7 @@ class DayZBot(discord.Client):
                     f"{delta}× newly appeared ({neuer_stand} active now)") if delta > 1
                 else _ft(conn, f"ist aufgetaucht (jetzt {neuer_stand} aktiv)",
                          f"has appeared ({neuer_stand} active now)"))
-        if schalter == "vehicle_event":
+        if schalter == "vehicle_event" or typ_name in _CE_EVENT_TYP_NAME_ZEIGEN:
             kopf = f"**{typ_name}** {kopf}"
         beschreibung = kopf
         warteschlange = conn.ce_pending_positionen.get(typ_name)
@@ -23743,8 +23763,13 @@ async def api_abandoned_bases_post(request: web.Request) -> web.Response:
 #  Ein/Aus-Schalter-Verwaltung - 1:1 dasselbe Muster wie Verlassene Basen.
 # ──────────────────────────────────────────────────────────────────────────
 def _ce_events_payload(conn: ServerConnection) -> Dict[str, Any]:
-    return {schalter: bool(conn.get(f"ce_events_{schalter}_enabled", True))
-            for schalter in _CE_EVENT_SCHALTER_LABEL}
+    out: Dict[str, Any] = {schalter: bool(conn.get(f"ce_events_{schalter}_enabled", True))
+                           for schalter in _CE_EVENT_SCHALTER_LABEL}
+    # Welche Schalter zur Karte dieses Servers passen (unbekannte Karte: alle).
+    karte = _canonical_map_name(str(conn.get("map_name") or ""))
+    out["_verfuegbar"] = [k for k in _CE_EVENT_SCHALTER_LABEL
+                          if karte is None or _CE_EVENT_KARTEN.get(k) is None or karte in _CE_EVENT_KARTEN[k]]
+    return out
 
 
 async def api_ce_events_get(request: web.Request) -> web.Response:
@@ -47716,6 +47741,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "1db0dc848613bd258b6e2abea6e194aad636a3b04ddc534a755f83a6abb41f97",
         "b93f6c58e2583e72e997d09e5e9287eeeec3d86f94d19cc599894fa24c78b8d7",
         "5a1ee3ac5b096c83fa83aed171e2d34de03a386a748c7eb492f7cf1f777e350d",
+        "5f82dbe54e6e37f9ba1840cd35b2212b1578fb13cf6c5c09086a82d7b4ff655f",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",

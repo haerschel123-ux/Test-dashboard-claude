@@ -274,11 +274,14 @@ def test_ce_events_payload_default_alle_aktiv():
     bot_mod.connections.assign_guild("ceevents-service-1", 5001)
     conn = bot_mod.connections.for_service("ceevents-service-1")
     payload = bot_mod._ce_events_payload(conn)
+    verfuegbar = payload.pop("_verfuegbar")
     assert payload == {
         "helicopter_crash": True, "convoy": True, "checkpoint": True,
         "abandoned_train": True, "vehicle_event": True,
         "contaminated_zone": True, "airplane_crate": True, "santa_crash": True,
+        "water_truck": True, "locked_container": True,
     }
+    assert set(verfuegbar) == set(payload)          # unbekannte Karte: alle Schalter anbieten
 
 
 def test_ce_events_payload_persistiert_deaktivierten_schalter():
@@ -558,3 +561,57 @@ def test_lese_ce_events_deaktivierter_neuer_schalter_postet_nicht(conn_mit_ce_ev
     conn.ftp.inhalte[(pfad, 500)] = _block_text(["StaticSantaCrash (1)"])
     _run(bot_mod.bot._lese_ce_events(conn, "/games/x/config", loop))
     assert gesendet == []
+
+
+# ── Nasdara (DayZ 1.30 Badlands) ─────────────────────────────────────────
+NASDARA_BLOCK = """[CE][DE] DynamicEvent Types (6):
+  StaticHeliCrash (1)
+  StaticHeliCrashBig (0)
+  StaticWaterTruck (0)
+  StaticContainerLocked (2)
+  StaticMilitaryConvoy (1)
+  VehicleMotorbike (3)
+"""
+
+
+def test_nasdara_typen_sind_zugeordnet():
+    z = bot_mod._CE_EVENT_TYP_ZU_SCHALTER
+    assert z["StaticHeliCrashBig"] == "helicopter_crash"
+    assert z["StaticWaterTruck"] == "water_truck"
+    assert z["StaticContainerLocked"] == "locked_container"
+
+
+def test_nasdara_neue_events_werden_im_zaehler_dump_erkannt():
+    counts = {}
+    bot_mod._ce_events_zeilen_auswerten(NASDARA_BLOCK.splitlines(), counts)           # Baseline
+    neu = NASDARA_BLOCK.replace("StaticHeliCrashBig (0)", "StaticHeliCrashBig (1)") \
+                       .replace("StaticWaterTruck (0)", "StaticWaterTruck (1)") \
+                       .replace("StaticContainerLocked (2)", "StaticContainerLocked (3)") \
+                       .replace("VehicleMotorbike (3)", "VehicleMotorbike (4)")
+    erg = bot_mod._ce_events_zeilen_auswerten(neu.splitlines(), counts)
+    assert {(t, s, d) for t, s, d, _ in erg} == {
+        ("StaticHeliCrashBig", "helicopter_crash", 1), ("StaticWaterTruck", "water_truck", 1),
+        ("StaticContainerLocked", "locked_container", 1), ("VehicleMotorbike", "vehicle_event", 1)}
+
+
+def test_schalter_nach_karte_nasdara_zeigt_nur_passende():
+    bot_mod.connections.upsert("ceevents-nasdara")
+    bot_mod.connections.assign_guild("ceevents-nasdara", 5101)
+    conn = bot_mod.connections.for_service("ceevents-nasdara")
+    conn.data["map_name"] = "dayzOffline.nasdara"
+    v = set(bot_mod._ce_events_payload(conn)["_verfuegbar"])
+    assert {"helicopter_crash", "convoy", "checkpoint", "abandoned_train", "vehicle_event", "santa_crash",
+            "water_truck", "locked_container"} <= v
+    assert not ({"contaminated_zone", "airplane_crate"} & v)          # gibt es in Nasdaras events.xml nicht
+    conn.data["map_name"] = "ChernarusPlus"
+    v = set(bot_mod._ce_events_payload(conn)["_verfuegbar"])
+    assert {"contaminated_zone", "airplane_crate"} <= v and not ({"water_truck", "locked_container"} & v)
+
+
+def test_heli_crash_big_nennt_den_typ_und_nasdara_link_geht_zu_izurvive(conn_mit_ce_events):
+    conn, _ = conn_mit_ce_events
+    conn.data["map_name"] = "Nasdara"
+    conn.ce_pending_positionen["StaticHeliCrashBig"] = [(10441.0, 10669.0)]
+    embed = bot_mod.DayZBot._ce_events_embed(bot_mod.bot, conn, "StaticHeliCrashBig", "helicopter_crash", 1, 1)
+    assert "StaticHeliCrashBig" in embed.description and "izurvive.com/nasdaraSat/" in embed.description
+    assert "Dashtabad" in embed.description                              # naechster Ort aus der Nasdara-Liste
