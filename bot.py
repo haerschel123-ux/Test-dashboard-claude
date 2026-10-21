@@ -33200,6 +33200,28 @@ async def _rolle_kauf_ausfuehren(conn: "ServerConnection", guild: Any, gid: int,
         return _RollenErgebnis(True, kauf_id=kauf_id, wallet=wallet, ende=ende, verlaengert=aktiv is not None)
 
 
+async def _rolle_ablauf_nachricht(guild: Any, uid: int, artikel: str) -> None:
+    """Sagt dem Spieler per Direktnachricht, dass seine Shop-Rolle abgelaufen ist. Geschlossene DMs oder ein
+    ausgetretenes Mitglied sind kein Fehler - die Rolle ist in jedem Fall schon entfernt."""
+    member = await _member_von(guild, uid)
+    if member is None:
+        return
+    sprache = _sprache_von({"id": str(uid)})
+    if sprache is None:
+        conn = connections.for_guild(guild.id)
+        sprache = _feed_sprache(conn) if conn is not None else "de"
+    if sprache == "en":
+        text = (f"⏳ Your role **{artikel}** on **{guild.name}** has expired. "
+                "You can buy it again anytime with `/shop buy role` or on the dashboard.")
+    else:
+        text = (f"⏳ Deine Rolle **{artikel}** auf **{guild.name}** ist abgelaufen. "
+                "Du kannst sie jederzeit mit `/shop buy role` oder im Dashboard erneut kaufen.")
+    try:
+        await member.send(text)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
 async def _rollen_ablauf_pruefen() -> int:
     """Entfernt abgelaufene Shop-Rollen. Neustartfest: es zaehlt nur expires_at in der Tabelle - was waehrend einer
     Pause ablief, wird beim naechsten Durchlauf nachgeholt. Rueckgabe: Zahl der beendeten Kaeufe."""
@@ -33213,6 +33235,8 @@ async def _rollen_ablauf_pruefen() -> int:
             db.rollen_kauf_beenden(int(k["id"]), "expired")
             _ROLLEN_ABLAUF_GEMELDET.discard(int(k["id"]))
             n += 1
+            if erg == "ok":                      # nur wenn WIR die Rolle entfernt haben (nicht, wenn sie schon weg war)
+                await _rolle_ablauf_nachricht(guild, int(k["user_id"]), str(k["artikel_name"] or "?"))
         elif int(k["id"]) not in _ROLLEN_ABLAUF_GEMELDET:
             _ROLLEN_ABLAUF_GEMELDET.add(int(k["id"]))
             log.error(f"[ROLLEN-SHOP] Abgelaufene Rolle {k['role_id']} von {k['user_id']} (Guild {k['guild_id']}) "

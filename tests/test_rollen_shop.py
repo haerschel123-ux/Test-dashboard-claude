@@ -44,7 +44,7 @@ class _R:
 class _M:
     def __init__(self, id_, guild, rollen=()):
         self.id, self.display_name, self.roles, self.guild = id_, f"User{id_}", [guild.rollen[r] for r in rollen], guild
-        self.add_log, self.remove_log = [], []
+        self.add_log, self.remove_log, self.dms = [], [], []
 
     async def add_roles(self, role, reason=None):
         await asyncio.sleep(0)                  # wie bei Discord: hier wartet der Bot auf das Netz, andere Aufgaben laufen weiter
@@ -52,6 +52,11 @@ class _M:
             raise discord.Forbidden(_Resp(), "Missing Permissions")
         self.roles.append(role)
         self.add_log.append((role.id, reason))
+
+    async def send(self, text):
+        if self.guild.dm_zu:
+            raise discord.Forbidden(_Resp(), "Cannot send messages to this user")
+        self.dms.append(text)
 
     async def remove_roles(self, role, reason=None):
         if self.guild.verweigern_entfernen:
@@ -68,6 +73,7 @@ class _G:
         self.me = type("Me", (), {"guild_permissions": type("P", (), {"manage_roles": True})(),
                                   "top_role": _R(1, "Bot", 5)})()
         self.mitglieder, self.verweigern, self.verweigern_entfernen = {}, False, False
+        self.dm_zu = False
 
     @property
     def roles(self):
@@ -602,3 +608,35 @@ def test_rollen_endpunkt_meldet_vergebbarkeit(rwelt):
     r = {x["name"]: x for x in d["data"]["roles"]}
     assert st == 200 and r["VIP"]["vergebbar"] and not r["Moderator"]["vergebbar"] and not r["Bot-Rolle"]["vergebbar"]
     assert r["Moderator"]["position"] == 10 and r["Bot-Rolle"]["managed"] is True
+
+
+def test_ablauf_schickt_eine_nachricht_nur_wenn_die_rolle_entfernt_wurde(rwelt, monkeypatch):
+    monkeypatch.setattr(bot.cfg, "sprache", {})
+    guild = rwelt["ga"]
+    rwelt["u"].roles.append(guild.rollen[BOOSTER])
+    bot.db.rollen_kauf_anlegen(G_A, U, None, "Booster-Woche", BOOSTER, 100, 100, None, "t", time.time() - 10)
+    assert _run(bot._rollen_ablauf_pruefen()) == 1
+    assert len(rwelt["u"].dms) == 1 and "Booster-Woche" in rwelt["u"].dms[0] and "abgelaufen" in rwelt["u"].dms[0]
+    # Rolle war schon von Hand entfernt: abgelaufen markieren, aber keine Nachricht
+    bot.db.rollen_kauf_anlegen(G_A, U, None, "Nochmal", BOOSTER, 100, 100, None, "t", time.time() - 10)
+    assert _run(bot._rollen_ablauf_pruefen()) == 1 and len(rwelt["u"].dms) == 1
+    # Sprache des Kontos: Englisch
+    bot.cfg.sprache["555"] = "en"
+    rwelt["u"].roles.append(guild.rollen[BOOSTER])
+    bot.db.rollen_kauf_anlegen(G_A, U, None, "Booster-Week", BOOSTER, 100, 100, None, "t", time.time() - 10)
+    _run(bot._rollen_ablauf_pruefen())
+    assert "has expired" in rwelt["u"].dms[-1]
+
+
+def test_geschlossene_dms_stoeren_den_ablauf_nicht(rwelt):
+    guild = rwelt["ga"]
+    guild.dm_zu = True
+    rwelt["u"].roles.append(guild.rollen[BOOSTER])
+    k = bot.db.rollen_kauf_anlegen(G_A, U, None, "Booster-Woche", BOOSTER, 100, 100, None, "t", time.time() - 10)
+    assert _run(bot._rollen_ablauf_pruefen()) == 1
+    assert not any(r.id == BOOSTER for r in rwelt["u"].roles)
+    assert {x["id"]: x["status"] for x in bot.db.rollen_kaeufe_liste(G_A)}[k] == "expired"
+    # Mitglied ausgetreten: keine Nachricht, kein Fehler
+    del guild.mitglieder[U]
+    bot.db.rollen_kauf_anlegen(G_A, U, None, "X", BOOSTER, 1, 1, None, "t", time.time() - 10)
+    assert _run(bot._rollen_ablauf_pruefen()) == 1
