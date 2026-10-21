@@ -29645,6 +29645,30 @@ async def _notify_link_change(guild_id: Optional[int], embed: discord.Embed):
 #  Server-Neustart (Item spawnt) → Eintrag entfernen (delivered).
 #  WICHTIG: Ohne Entfernen respawnt das Item bei JEDEM Neustart!
 # ══════════════════════════════════════════════════════════════
+def _effect_pfad_zur_mission(effect_pfad: Any, mission_dir: Any) -> str:
+    """Zieht einen gespeicherten cfgEffectArea-Pfad auf den aktuellen Mission-Ordner nach.
+
+    Wechselt der Betreiber bei Nitrado die Karte (z. B. Livonia -> Nasdara), wird
+    ``ftp_mission_dir`` nachgezogen - der einmal gefundene ``cfg_effect_area_path``
+    blieb dagegen auf der alten Karte. Shop-Kaeufe landeten dann in der Datei der
+    alten Mission, die der Server nie liest. Korrigiert wird nur, wenn beide Pfade
+    im selben Verzeichnis liegen und jeweils auf einen ``dayzOffline.<karte>``-
+    Ordner zeigen; eigene Pfade bleiben unangetastet."""
+    effect_pfad = str(effect_pfad or "")
+    mission = str(mission_dir or "").rstrip("/")
+    ordner, _, datei = effect_pfad.rpartition("/")
+    if not mission or not ordner or not datei:
+        return effect_pfad
+    ueber_effect, _, name_effect = ordner.rpartition("/")
+    ueber_mission, _, name_mission = mission.rpartition("/")
+    if not (name_effect.lower().startswith("dayzoffline.")
+            and name_mission.lower().startswith("dayzoffline.")):
+        return effect_pfad
+    if ueber_effect != ueber_mission or name_effect == name_mission:
+        return effect_pfad
+    return f"{mission}/{datei}"
+
+
 class ShopManager:
     AREA_PREFIX = "SHOP_"
 
@@ -29684,9 +29708,15 @@ class ShopManager:
     # ── Pfad zur cfgEffectArea.json ──────────────────────────
     def effect_area_path(self) -> Optional[str]:
         path = self.conn.get("cfg_effect_area_path")
-        if path:
-            return path
         mission = self.conn.get("ftp_mission_dir")
+        if path:
+            richtig = _effect_pfad_zur_mission(path, mission)
+            if richtig != path:
+                log.warning(f"[SHOP] {self.conn.name}: cfgEffectArea-Pfad zeigte auf eine "
+                            f"andere Karte ({path}) – korrigiert auf {richtig}")
+                _conn_store(self.conn, "cfg_effect_area_path", richtig)
+                return richtig
+            return path
         if mission:
             return f"{mission.rstrip('/')}/cfgEffectArea.json"
         return None
@@ -35833,6 +35863,13 @@ def _karte_nachziehen(conn: Optional[ServerConnection], roh_karte: Any) -> bool:
     if neu_dir and neu_dir != alt_dir:
         log.info(f"[KARTE] {conn.name}: Mission-Ordner {alt_dir} → {neu_dir}")
         _conn_store(conn, "ftp_mission_dir", neu_dir)
+    # Der Shop schreibt in cfg_effect_area_path - ohne Nachziehen landeten Kaeufe
+    # nach dem Kartenwechsel in der Datei der alten Mission und spawnten nie.
+    alt_effect = str(conn.get("cfg_effect_area_path") or "")
+    neu_effect = _effect_pfad_zur_mission(alt_effect, conn.get("ftp_mission_dir"))
+    if neu_effect != alt_effect:
+        log.info(f"[KARTE] {conn.name}: cfgEffectArea-Pfad {alt_effect} → {neu_effect}")
+        _conn_store(conn, "cfg_effect_area_path", neu_effect)
     return True
 
 
