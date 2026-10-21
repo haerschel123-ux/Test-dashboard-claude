@@ -1032,6 +1032,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "shop.buy":                          {"label": "Kauf-Befehl (/buy)", "gruppe": "Shop"},
     "shop.catalog_admin":                {"label": "Katalog-Verwaltung", "gruppe": "Shop"},
     "shop.coupons":                      {"label": "Gutscheine & Rabatte", "gruppe": "Shop"},
+    "shop.roleshop":                     {"label": "Rollen-Shop", "gruppe": "Shop"},
     "tools":                             {"label": "Tools (gesamt)", "gruppe": "Tools"},
     "tools.loadout":                     {"label": "Loadout Generator", "gruppe": "Tools"},
     "tools.gaszone":                     {"label": "Gas-Zonen Builder", "gruppe": "Tools"},
@@ -5699,6 +5700,8 @@ class DayZBot(discord.Client):
             self.giveaways_loop.start()
         if not self.temp_unban_loop.is_running():
             self.temp_unban_loop.start()
+        if not self.rollen_ablauf_loop.is_running():
+            self.rollen_ablauf_loop.start()
         if not announcement_scheduler.is_running():
             announcement_scheduler.start()
         if not self.abandoned_bases_digest.is_running():
@@ -7414,6 +7417,18 @@ class DayZBot(discord.Client):
 
     @temp_unban_loop.before_loop
     async def _before_temp_unban_loop(self):
+        await self.wait_until_ready()
+
+    @tasks.loop(minutes=1)
+    async def rollen_ablauf_loop(self):
+        """Zeitlich begrenzte Shop-Rollen entfernen, sobald ``expires_at`` erreicht ist (Tabelle rollen_kaeufe)."""
+        try:
+            await _rollen_ablauf_pruefen()
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stoppen
+            log.error(f"[ROLLEN-SHOP] Ablauf-Pruefung: {e}")
+
+    @rollen_ablauf_loop.before_loop
+    async def _before_rollen_ablauf_loop(self):
         await self.wait_until_ready()
 
     async def _temp_unban_once(self):
@@ -27416,6 +27431,45 @@ class EconomyDB:
                 typ      TEXT    NOT NULL,
                 betrag   INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, role_id))""")
+            # Rollen-Shop (Discord-Rollen gegen Waehrung) – je GUILD. Ein Artikel verkauft genau eine Rolle; der Bestand
+            # wird atomar reserviert. rollen_kaeufe haelt jeden Kauf fest und traegt bei zeitlich begrenzten Rollen
+            # expires_at (NULL = dauerhaft); der Ablauf-Task entfernt die Rolle neustartfest anhand dieser Tabelle.
+            c.execute("""CREATE TABLE IF NOT EXISTS rollen_artikel (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id       INTEGER NOT NULL,
+                role_id        INTEGER NOT NULL,
+                name           TEXT    NOT NULL COLLATE NOCASE,
+                beschreibung   TEXT    NOT NULL DEFAULT '',
+                preis          INTEGER NOT NULL,
+                hidden         INTEGER NOT NULL DEFAULT 0,
+                permanent      INTEGER NOT NULL DEFAULT 1,
+                dauer_tage     INTEGER,
+                bestand        INTEGER,
+                verkauft       INTEGER NOT NULL DEFAULT 0,
+                benoetigt      TEXT    NOT NULL DEFAULT '[]',
+                alle_noetig    INTEGER NOT NULL DEFAULT 0,
+                verfuegbar_ab  REAL,
+                verfuegbar_bis REAL,
+                enabled        INTEGER NOT NULL DEFAULT 1,
+                created_at     REAL    NOT NULL,
+                UNIQUE (guild_id, name))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS rollen_kaeufe (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id      INTEGER NOT NULL,
+                user_id       INTEGER NOT NULL,
+                artikel_id    INTEGER,
+                artikel_name  TEXT,
+                role_id       INTEGER NOT NULL,
+                preis_liste   INTEGER NOT NULL,
+                preis_bezahlt INTEGER NOT NULL,
+                gutschein     TEXT,
+                quelle        TEXT,
+                expires_at    REAL,
+                status        TEXT    NOT NULL DEFAULT 'active',
+                created_at    REAL    NOT NULL,
+                removed_at    REAL)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_rollen_kaeufe ON rollen_kaeufe (guild_id, user_id, role_id, status)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_rollen_kaeufe_ablauf ON rollen_kaeufe (status, expires_at)")
             # Miet-Items (Shop-Rentals): eigener Neustart-Ablauf-Zähler je Kauf.
             # event_name ist die eindeutige Instanz-ID des Events/der Position
             # in db/events.xml + cfgeventspawns.xml (nicht der Katalog-Name der
@@ -28074,6 +28128,123 @@ class EconomyDB:
             return self._conn.execute(
                 "SELECT * FROM letzte_orte WHERE guild_id=? AND service_id=? AND user_id=?",
                 (guild_id, str(service_id or ""), user_id)).fetchone()
+
+    # ── Rollen-Shop (je Guild) ────────────────────────────────
+    def rollen_artikel_liste(self, guild_id: int) -> List[sqlite3.Row]:
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT * FROM rollen_artikel WHERE guild_id=? ORDER BY name COLLATE NOCASE", (guild_id,)).fetchall())
+
+    def rollen_artikel_holen(self, guild_id: int, artikel_id: int) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM rollen_artikel WHERE guild_id=? AND id=?", (guild_id, artikel_id)).fetchone()
+
+    def rollen_artikel_nach_name(self, guild_id: int, name: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM rollen_artikel WHERE guild_id=? AND name=? COLLATE NOCASE", (guild_id, name)).fetchone()
+
+    def rollen_artikel_speichern(self, guild_id: int, artikel_id: Optional[int], f: Dict[str, Any],
+                                 max_artikel: int = 50) -> Tuple[str, Optional[int]]:
+        """Legt einen Artikel an (artikel_id=None) oder aendert ihn. Rueckgabe: ('ok', id), ('name_vorhanden', None),
+        ('limit', None) oder ('nicht_gefunden', None). Der Verkaufszaehler bleibt beim Aendern erhalten."""
+        werte = (f["role_id"], f["name"], f["beschreibung"], f["preis"], 1 if f["hidden"] else 0,
+                 1 if f["permanent"] else 0, f["dauer_tage"], f["bestand"], json.dumps(f["benoetigt"]),
+                 1 if f["alle_noetig"] else 0, f["verfuegbar_ab"], f["verfuegbar_bis"], 1 if f["enabled"] else 0)
+        with self._lock:
+            doppelt = self._conn.execute(
+                "SELECT id FROM rollen_artikel WHERE guild_id=? AND name=? COLLATE NOCASE", (guild_id, f["name"])).fetchone()
+            if artikel_id is None:
+                if doppelt:
+                    return "name_vorhanden", None
+                n = self._conn.execute("SELECT COUNT(*) AS n FROM rollen_artikel WHERE guild_id=?", (guild_id,)).fetchone()["n"]
+                if n >= max_artikel:
+                    return "limit", None
+                cur = self._conn.execute(
+                    "INSERT INTO rollen_artikel (guild_id, role_id, name, beschreibung, preis, hidden, permanent, dauer_tage, "
+                    "bestand, benoetigt, alle_noetig, verfuegbar_ab, verfuegbar_bis, enabled, created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (guild_id,) + werte + (time.time(),))
+                self._conn.commit()
+                return "ok", int(cur.lastrowid)
+            if not self._conn.execute("SELECT 1 FROM rollen_artikel WHERE guild_id=? AND id=?", (guild_id, artikel_id)).fetchone():
+                return "nicht_gefunden", None
+            if doppelt and int(doppelt["id"]) != artikel_id:
+                return "name_vorhanden", None
+            self._conn.execute(
+                "UPDATE rollen_artikel SET role_id=?, name=?, beschreibung=?, preis=?, hidden=?, permanent=?, dauer_tage=?, "
+                "bestand=?, benoetigt=?, alle_noetig=?, verfuegbar_ab=?, verfuegbar_bis=?, enabled=? "
+                "WHERE guild_id=? AND id=?", werte + (guild_id, artikel_id))
+            self._conn.commit()
+            return "ok", artikel_id
+
+    def rollen_artikel_loeschen(self, guild_id: int, artikel_id: int) -> bool:
+        """Loescht den Artikel. Bereits gekaufte (laufende) Rollen bleiben in rollen_kaeufe und laufen normal ab."""
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM rollen_artikel WHERE guild_id=? AND id=?", (guild_id, artikel_id))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def rollen_bestand_reservieren(self, artikel_id: int) -> bool:
+        """Ein Stueck vom Bestand nehmen - atomar. Ohne Bestandsgrenze immer True (und der Zaehler zaehlt trotzdem)."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE rollen_artikel SET verkauft=verkauft+1 WHERE id=? AND (bestand IS NULL OR verkauft<bestand)",
+                (artikel_id,))
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def rollen_bestand_freigeben(self, artikel_id: int) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE rollen_artikel SET verkauft=MAX(0, verkauft-1) WHERE id=?", (artikel_id,))
+            self._conn.commit()
+
+    def rollen_kauf_aktiv(self, guild_id: int, user_id: int, role_id: int) -> Optional[sqlite3.Row]:
+        """Der laufende Shop-Kauf dieser Rolle dieses Users (haeufig hoechstens einer: Verlaengerungen erweitern ihn)."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM rollen_kaeufe WHERE guild_id=? AND user_id=? AND role_id=? AND status='active' "
+                "ORDER BY id DESC LIMIT 1", (guild_id, user_id, role_id)).fetchone()
+
+    def rollen_kauf_anlegen(self, guild_id: int, user_id: int, artikel_id: Optional[int], artikel_name: str,
+                            role_id: int, preis_liste: int, preis_bezahlt: int, gutschein: Optional[str],
+                            quelle: str, expires_at: Optional[float]) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO rollen_kaeufe (guild_id, user_id, artikel_id, artikel_name, role_id, preis_liste, "
+                "preis_bezahlt, gutschein, quelle, expires_at, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,'active',?)",
+                (guild_id, user_id, artikel_id, artikel_name[:100], role_id, preis_liste, preis_bezahlt, gutschein,
+                 quelle, expires_at, time.time()))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def rollen_kauf_verlaengern(self, kauf_id: int, neues_ende: float) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE rollen_kaeufe SET expires_at=? WHERE id=?", (neues_ende, kauf_id))
+            self._conn.commit()
+
+    def rollen_kaeufe_faellig(self, jetzt: float, limit: int = 200) -> List[sqlite3.Row]:
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT * FROM rollen_kaeufe WHERE status='active' AND expires_at IS NOT NULL AND expires_at<=? "
+                "ORDER BY expires_at LIMIT ?", (jetzt, limit)).fetchall())
+
+    def rollen_kauf_beenden(self, kauf_id: int, status: str = "expired") -> None:
+        with self._lock:
+            self._conn.execute("UPDATE rollen_kaeufe SET status=?, removed_at=? WHERE id=?",
+                               (status, time.time(), kauf_id))
+            self._conn.commit()
+
+    def rollen_kaeufe_von(self, guild_id: int, user_id: int, limit: int = 30) -> List[sqlite3.Row]:
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT * FROM rollen_kaeufe WHERE guild_id=? AND user_id=? ORDER BY (status='active') DESC, id DESC LIMIT ?",
+                (guild_id, user_id, limit)).fetchall())
+
+    def rollen_kaeufe_liste(self, guild_id: int, limit: int = 100) -> List[sqlite3.Row]:
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT * FROM rollen_kaeufe WHERE guild_id=? ORDER BY id DESC LIMIT ?", (guild_id, limit)).fetchall())
 
     # ── Gutscheine und Rabatt-Regeln (je Guild) ───────────────
     def gutschein_liste(self, guild_id: int) -> List[sqlite3.Row]:
@@ -32750,6 +32921,368 @@ shop_buy_rental.autocomplete("item")(_rental_buy_autocomplete)
 shop_buy_rental.autocomplete("server")(_server_autocomplete)
 
 
+# ══════════════════════════════════════════════════════════════
+#  ROLLEN-SHOP – Discord-Rollen gegen Waehrung: /shop buy role und Dashboard
+#
+#  Alles je GUILD (das Wallet ist guildweit, Rollen-IDs gelten nur dort). Ein Artikel verkauft genau eine Rolle,
+#  dauerhaft oder fuer N Tage; die Rolle wird SOFORT vergeben. Reihenfolge beim Kauf: Bestand und Gutschein
+#  reservieren, bezahlen, Rolle vergeben - scheitert die Vergabe (Rechte, Hierarchie), wird alles zurueckgegeben.
+#  Zeitlich begrenzte Rollen entfernt ein Hintergrund-Task anhand der Tabelle rollen_kaeufe (neustartfest).
+# ══════════════════════════════════════════════════════════════
+_ROLLEN_ARTIKEL_MAX = 50
+_ROLLEN_DAUER_MAX_TAGE = 3650
+_ROLLEN_BENOETIGT_MAX = 5
+_ROLLEN_KAUF_LOCKS: Dict[Tuple[int, int], asyncio.Lock] = {}
+_ROLLEN_ABLAUF_GEMELDET: Set[int] = set()
+
+
+def _rolle_vergebbar(guild: Any, role: Any) -> Optional[Tuple[str, str]]:
+    """None = der Bot darf diese Rolle vergeben; sonst der Grund als (deutsch, englisch)."""
+    if role is None:
+        return ("Die Rolle gibt es auf dem Discord-Server nicht (mehr).", "The role no longer exists on the Discord server.")
+    if role.is_default():
+        return ("@everyone kann nicht verkauft werden.", "@everyone cannot be sold.")
+    if getattr(role, "managed", False):
+        return ("Diese Rolle wird von einer Integration verwaltet und kann nicht vergeben werden.",
+                "This role is managed by an integration and cannot be assigned.")
+    me = getattr(guild, "me", None)
+    if me is None:
+        return ("Der Bot ist auf dem Discord-Server nicht erreichbar.", "The bot is not reachable on the Discord server.")
+    if not me.guild_permissions.manage_roles:
+        return ("Dem Bot fehlt die Berechtigung „Rollen verwalten“.", "The bot lacks the “Manage Roles” permission.")
+    if role.position >= me.top_role.position:
+        return ("Die Rolle steht über der höchsten Rolle des Bots – schiebe die Bot-Rolle in den Servereinstellungen nach oben.",
+                "The role is above the bot's highest role – move the bot role up in the server settings.")
+    return None
+
+
+async def _member_von(guild: Any, uid: int) -> Optional[Any]:
+    m = guild.get_member(uid)
+    if m is not None:
+        return m
+    try:
+        return await guild.fetch_member(uid)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+
+async def _rolle_geben(guild: Any, uid: int, role_id: int, grund: str) -> Optional[Tuple[str, str]]:
+    """Gibt die Rolle - None = vergeben (oder schon vorhanden), sonst (deutsch, englisch) als Fehlertext."""
+    role = guild.get_role(role_id)
+    problem = _rolle_vergebbar(guild, role)
+    if problem is not None:
+        return problem
+    member = await _member_von(guild, uid)
+    if member is None:
+        return ("Du bist auf dem Discord-Server nicht (mehr) Mitglied.", "You are no longer a member of the Discord server.")
+    if any(r.id == role_id for r in member.roles):
+        return None
+    try:
+        await member.add_roles(role, reason=grund)
+    except discord.Forbidden:
+        return ("Discord hat die Rolle abgelehnt (Berechtigung oder Rollen-Reihenfolge).",
+                "Discord rejected the role (permission or role order).")
+    except discord.HTTPException as e:
+        return (f"Discord hat die Rolle abgelehnt (Fehler {getattr(e, 'status', '?')}).",
+                f"Discord rejected the role (error {getattr(e, 'status', '?')}).")
+    return None
+
+
+async def _rolle_nehmen(guild: Any, uid: int, role_id: int, grund: str) -> str:
+    """Entzieht die Rolle: 'ok', 'weg' (gab es nicht mehr / Mitglied weg / Rolle schon runter) oder 'fehler'."""
+    role = guild.get_role(role_id)
+    if role is None:
+        return "weg"
+    member = await _member_von(guild, uid)
+    if member is None or not any(r.id == role_id for r in member.roles):
+        return "weg"
+    try:
+        await member.remove_roles(role, reason=grund)
+    except (discord.Forbidden, discord.HTTPException) as e:
+        log.warning(f"[ROLLEN-SHOP] Rolle {role_id} von {uid} nicht entfernbar: {e}")
+        return "fehler"
+    return "ok"
+
+
+def _rollen_artikel_dict(row: Any) -> Dict[str, Any]:
+    try:
+        benoetigt = [int(r) for r in json.loads(row["benoetigt"] or "[]")]
+    except (TypeError, ValueError):
+        benoetigt = []
+    return {"id": int(row["id"]), "role_id": int(row["role_id"]), "name": str(row["name"]),
+            "beschreibung": str(row["beschreibung"] or ""), "preis": int(row["preis"]), "hidden": bool(row["hidden"]),
+            "permanent": bool(row["permanent"]), "dauer_tage": row["dauer_tage"], "bestand": row["bestand"],
+            "verkauft": int(row["verkauft"]), "benoetigt": benoetigt, "alle_noetig": bool(row["alle_noetig"]),
+            "verfuegbar_ab": row["verfuegbar_ab"], "verfuegbar_bis": row["verfuegbar_bis"], "enabled": bool(row["enabled"])}
+
+
+def _rollen_artikel_finden(gid: int, ref: Any) -> Optional[Dict[str, Any]]:
+    """Artikel nach Name (ohne Gross/Klein) - sonst, wenn es eine Zahl ist, nach Nummer."""
+    text = str(ref or "").strip()
+    if not text:
+        return None
+    row = db.rollen_artikel_nach_name(gid, text)
+    if row is None and text.isdigit():
+        row = db.rollen_artikel_holen(gid, int(text))
+    return _rollen_artikel_dict(row) if row is not None else None
+
+
+def _rolle_laufzeit_text(a: Dict[str, Any], en: bool) -> str:
+    if a["permanent"] or not a["dauer_tage"]:
+        return "permanent" if en else "dauerhaft"
+    n = int(a["dauer_tage"])
+    return f"{n} day(s)" if en else f"{n} Tag(e)"
+
+
+def _rolle_verfuegbarkeit(guild: Any, gid: int, uid: int, rollen_ids: Optional[Set[int]], a: Dict[str, Any],
+                          en: bool, jetzt: Optional[float] = None) -> Optional["_KaufFehler"]:
+    """Darf dieser Spieler den Artikel JETZT kaufen? None = ja (Preis und Guthaben sind noch nicht geprueft)."""
+    jetzt = jetzt if jetzt is not None else time.time()
+    ids = rollen_ids or set()
+    if not a["enabled"]:
+        return _KaufFehler("nicht_verfuegbar", "❌ Dieser Rollen-Artikel ist nicht verfügbar.", "❌ This role item is not available.")
+    if a["verfuegbar_ab"] is not None and jetzt < float(a["verfuegbar_ab"]):
+        return _KaufFehler("zeitraum", "❌ Dieser Rollen-Artikel ist noch nicht verfügbar.", "❌ This role item is not available yet.")
+    if a["verfuegbar_bis"] is not None and jetzt > float(a["verfuegbar_bis"]):
+        return _KaufFehler("zeitraum", "❌ Dieser Rollen-Artikel wird nicht mehr verkauft.", "❌ This role item is no longer on sale.")
+    noetig = a["benoetigt"]
+    if noetig:
+        erfuellt = all(r in ids for r in noetig) if a["alle_noetig"] else any(r in ids for r in noetig)
+        if not erfuellt:
+            namen = [(guild.get_role(r).name if guild.get_role(r) is not None else str(r)) for r in noetig]
+            wort_de, wort_en = ("alle dieser Rollen", "all of these roles") if a["alle_noetig"] else ("eine dieser Rollen", "one of these roles")
+            return _KaufFehler("rolle_noetig", f"❌ Dafür brauchst du {wort_de}: {', '.join(namen)}",
+                               f"❌ You need {wort_en}: {', '.join(namen)}", daten={"rollen": namen})
+    if a["bestand"] is not None and a["verkauft"] >= int(a["bestand"]):
+        return _KaufFehler("ausverkauft", "❌ Dieser Rollen-Artikel ist ausverkauft.", "❌ This role item is sold out.")
+    problem = _rolle_vergebbar(guild, guild.get_role(a["role_id"]))
+    if problem is not None:
+        return _KaufFehler("nicht_vergebbar", f"❌ Diese Rolle kann gerade nicht vergeben werden: {problem[0]}",
+                           f"❌ This role cannot be assigned right now: {problem[1]}")
+    return _rolle_besitz_status(gid, uid, a, a["role_id"] in ids, en)[0]
+
+
+def _rolle_besitz_status(gid: int, uid: int, a: Dict[str, Any], hat_rolle: bool, en: bool
+                         ) -> Tuple[Optional["_KaufFehler"], Optional[Any]]:
+    """Besitzt der Spieler die Rolle schon? (Fehler, laufender Shop-Kauf). Dauerhafte Rolle: nicht doppelt kaufbar -
+    ausser als Aufwertung einer zeitlich begrenzten. Zeitlich begrenzte: Verlaengerung nur, wenn sie aus dem Shop kommt."""
+    aktiv = db.rollen_kauf_aktiv(gid, uid, a["role_id"])
+    if not hat_rolle:
+        return None, None            # Rolle ist (nicht mehr) da: neu kaufen; ein alter Eintrag wird ersetzt
+    if a["permanent"] or not a["dauer_tage"]:
+        if aktiv is not None and aktiv["expires_at"] is not None:
+            return None, aktiv       # Aufwertung: zeitlich begrenzt -> dauerhaft
+        return _KaufFehler("besitzt", "❌ Du hast diese Rolle schon.", "❌ You already have this role."), aktiv
+    if aktiv is None:
+        return _KaufFehler("besitzt", "❌ Du hast diese Rolle schon (nicht über den Shop).",
+                           "❌ You already have this role (not from the shop)."), None
+    if aktiv["expires_at"] is None:
+        return _KaufFehler("besitzt", "❌ Du hast diese Rolle schon dauerhaft.", "❌ You already have this role permanently."), aktiv
+    return None, aktiv               # Verlaengerung
+
+
+@dataclasses.dataclass
+class _RollenPlan:
+    artikel: Dict[str, Any]
+    preis: _Preis
+    total: int
+    wallet: int
+
+
+@dataclasses.dataclass
+class _RollenErgebnis:
+    ok: bool
+    code: str = ""
+    de: str = ""
+    en: str = ""
+    kauf_id: int = 0
+    wallet: int = 0
+    ende: Optional[float] = None
+    verlaengert: bool = False
+
+    def text(self, en: bool) -> str:
+        return self.en if en else self.de
+
+
+def _rolle_kauf_pruefen(guild: Any, gid: int, uid: int, rollen_ids: Optional[Set[int]], ref: Any,
+                        gutschein: Optional[str], en: bool) -> Union[_RollenPlan, "_KaufFehler"]:
+    """Alle Vorpruefungen eines Rollen-Kaufs, ohne etwas zu veraendern."""
+    a = _rollen_artikel_finden(gid, ref)
+    if a is None:
+        return _KaufFehler("item", f"❌ Rollen-Artikel `{ref}` gibt es nicht. `/shop buy role` zeigt die Auswahl.",
+                           f"❌ Role item `{ref}` does not exist. `/shop buy role` shows the choices.")
+    problem = _rolle_verfuegbarkeit(guild, gid, uid, rollen_ids, a, en)
+    if problem is not None:
+        return problem
+    preis = _preis_berechnen(gid, rollen_ids, a["preis"], gutschein, en, uid)
+    if isinstance(preis, _KaufFehler):
+        return preis
+    wallet, _bank = db.get_balance(gid, uid)
+    if wallet < preis.total:
+        return _KaufFehler("guthaben", "❌ Zu wenig Guthaben.", "❌ Not enough balance.", wallet=wallet, total=preis.total)
+    return _RollenPlan(a, preis, preis.total, wallet)
+
+
+async def _rolle_kauf_ausfuehren(conn: "ServerConnection", guild: Any, gid: int, uid: int, user_name: str,
+                                 plan: _RollenPlan, quelle: str) -> _RollenErgebnis:
+    """Fuehrt den vorgepruefen Kauf aus. Je (Guild, User) nur einer zur Zeit - zwei gleichzeitige Klicks koennten
+    sonst eine dauerhafte Rolle doppelt bezahlen."""
+    a, total = plan.artikel, plan.total
+    lock = _ROLLEN_KAUF_LOCKS.setdefault((gid, uid), asyncio.Lock())
+    async with lock:
+        en = False
+        member = await _member_von(guild, uid)
+        if member is None:
+            return _RollenErgebnis(False, "mitglied", "❌ Du bist auf dem Discord-Server nicht (mehr) Mitglied.",
+                                   "❌ You are no longer a member of the Discord server.")
+        ids = {r.id for r in member.roles}
+        # Zustand unter der Sperre erneut pruefen (Besitz, Bestand, Zeitraum) - zwischen Pruefen und Bezahlen kann viel passieren
+        frisch_row = db.rollen_artikel_holen(gid, a["id"])
+        a = _rollen_artikel_dict(frisch_row) if frisch_row is not None else {**a, "enabled": False}
+        problem = _rolle_verfuegbarkeit(guild, gid, uid, ids, a, en)
+        if problem is not None:
+            return _RollenErgebnis(False, problem.code, problem.de, problem.en)
+        fehler, aktiv = _rolle_besitz_status(gid, uid, a, a["role_id"] in ids, en)
+        if fehler is not None:
+            return _RollenErgebnis(False, fehler.code, fehler.de, fehler.en)
+        # 1. Bestand und Gutschein reservieren, 2. bezahlen
+        if not db.rollen_bestand_reservieren(a["id"]):
+            return _RollenErgebnis(False, "ausverkauft", "❌ Dieser Rollen-Artikel ist ausverkauft.", "❌ This role item is sold out.")
+        code = plan.preis.gutschein
+        gutschein_ok = db.gutschein_einloesen(gid, code, uid, "rolle") if code else True
+
+        def zurueck(gutschein_zurueck: bool = True) -> None:
+            db.rollen_bestand_freigeben(a["id"])
+            if code and gutschein_zurueck and gutschein_ok:
+                db.gutschein_freigeben(gid, code, uid)
+        if not gutschein_ok:
+            zurueck(False)
+            return _RollenErgebnis(False, "gutschein", f"❌ Der Gutschein `{code}` gilt nicht mehr.",
+                                   f"❌ The coupon `{code}` is no longer valid.")
+        if not db.try_spend_wallet(gid, uid, total):
+            zurueck()
+            wallet, _bank = db.get_balance(gid, uid)
+            return _RollenErgebnis(False, "guthaben", "❌ Zu wenig Guthaben.", "❌ Not enough balance.", wallet=wallet)
+        # 3. Rolle vergeben - scheitert das, bekommt der Kaeufer alles zurueck
+        problem_rolle = await _rolle_geben(guild, uid, a["role_id"], f"Rollen-Shop ({quelle})")
+        if problem_rolle is not None:
+            db.add_wallet(gid, uid, total)
+            zurueck()
+            wallet, _bank = db.get_balance(gid, uid)
+            return _RollenErgebnis(False, "rolle", f"❌ {problem_rolle[0]} Dein Geld wurde nicht abgebucht.",
+                                   f"❌ {problem_rolle[1]} You were not charged.", wallet=wallet)
+        # 4. Kauf festhalten; ein laufender Kauf derselben Rolle wird abgeloest (Verlaengerung/Aufwertung)
+        jetzt = time.time()
+        if a["permanent"] or not a["dauer_tage"]:
+            ende: Optional[float] = None
+        else:
+            basis = max(jetzt, float(aktiv["expires_at"])) if aktiv is not None and aktiv["expires_at"] else jetzt
+            ende = basis + int(a["dauer_tage"]) * 86400
+        kauf_id = db.rollen_kauf_anlegen(gid, uid, a["id"], a["name"], a["role_id"], plan.preis.liste, total,
+                                         code, quelle, ende)
+        if aktiv is not None:
+            db.rollen_kauf_beenden(int(aktiv["id"]), "extended")
+        wallet, _bank = db.get_balance(gid, uid)
+        # 5. In den shop_log-Feed
+        rolle = guild.get_role(a["role_id"])
+        feed = discord.Embed(title=_ft(conn, "🎭 ROLLEN-KAUF", "🎭 ROLE PURCHASE"),
+                             description=_ft(conn, f"<@{uid}> hat **{a['name']}** gekauft ({rolle.mention if rolle else a['role_id']})",
+                                             f"<@{uid}> bought **{a['name']}** ({rolle.mention if rolle else a['role_id']})"),
+                             color=0x3498DB)
+        feed.add_field(name=_ft(conn, "Preis", "Price"), value=_fmt_money(total, conn), inline=True)
+        feed.add_field(name=_ft(conn, "Dauer", "Duration"),
+                       value=_rolle_laufzeit_text(a, _feed_sprache(conn) == "en"), inline=True)
+        rabatt_feed = _preis_zeile(plan.preis, conn, _feed_sprache(conn) == "en")
+        if rabatt_feed:
+            feed.add_field(name="🏷️", value=rabatt_feed, inline=False)
+        feed.set_footer(text=f"{_ft(conn, 'Kauf', 'Purchase')} #{kauf_id} · {quelle}")
+        await _post_feed(gid, "shop_log", feed, service_id=conn.service_id)
+        return _RollenErgebnis(True, kauf_id=kauf_id, wallet=wallet, ende=ende, verlaengert=aktiv is not None)
+
+
+async def _rollen_ablauf_pruefen() -> int:
+    """Entfernt abgelaufene Shop-Rollen. Neustartfest: es zaehlt nur expires_at in der Tabelle - was waehrend einer
+    Pause ablief, wird beim naechsten Durchlauf nachgeholt. Rueckgabe: Zahl der beendeten Kaeufe."""
+    n = 0
+    for k in db.rollen_kaeufe_faellig(time.time()):
+        guild = bot.get_guild(int(k["guild_id"])) if bot is not None else None
+        if guild is None:
+            continue                         # Bot (noch) nicht auf dieser Guild - spaeter wieder versuchen
+        erg = await _rolle_nehmen(guild, int(k["user_id"]), int(k["role_id"]), "Rollen-Shop (abgelaufen)")
+        if erg in ("ok", "weg"):
+            db.rollen_kauf_beenden(int(k["id"]), "expired")
+            _ROLLEN_ABLAUF_GEMELDET.discard(int(k["id"]))
+            n += 1
+        elif int(k["id"]) not in _ROLLEN_ABLAUF_GEMELDET:
+            _ROLLEN_ABLAUF_GEMELDET.add(int(k["id"]))
+            log.error(f"[ROLLEN-SHOP] Abgelaufene Rolle {k['role_id']} von {k['user_id']} (Guild {k['guild_id']}) "
+                      "nicht entfernbar – der Bot versucht es weiter.")
+    return n
+
+
+async def _rolle_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    if not interaction.guild_id:
+        return []
+    conn = _conn_of(interaction)
+    such = (current or "").strip().lower()
+    out: List[app_commands.Choice[str]] = []
+    for row in db.rollen_artikel_liste(interaction.guild_id):
+        a = _rollen_artikel_dict(row)
+        if not a["enabled"] or a["hidden"] or (such and such not in a["name"].lower()):
+            continue
+        out.append(app_commands.Choice(name=f"{a['name']} – {_klartext(_fmt_money(a['preis'], conn))}"[:100], value=a["name"][:100]))
+        if len(out) >= 25:
+            break
+    return out
+
+
+@shop_buy_group.command(name="role", description="🎭 Buy a Discord role – you get it immediately")
+@app_commands.describe(
+    role="Role item (pick from the autocomplete list)",
+    coupon="Coupon code for an extra discount (OPTIONAL)")
+async def shop_buy_role(interaction: discord.Interaction, role: str, coupon: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    gid, uid = interaction.guild_id, interaction.user.id
+    conn = _conn_of(interaction)
+    if conn is None or interaction.guild is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    _setze_aktuellen_server(conn)
+    en = _sprache(interaction) == "en"
+    rollen = ({r.id for r in interaction.user.roles} if isinstance(interaction.user, discord.Member) else None)
+    plan = _rolle_kauf_pruefen(interaction.guild, gid, uid, rollen, role, coupon, en)
+    if isinstance(plan, _KaufFehler):
+        if plan.code == "guthaben":
+            return await interaction.response.send_message(embed=_insufficient_embed(plan.total, plan.wallet), ephemeral=True)
+        return await interaction.response.send_message(plan.text(en), ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    res = await _rolle_kauf_ausfuehren(conn, interaction.guild, gid, uid, str(interaction.user), plan, "discord")
+    if not res.ok:
+        if res.code == "guthaben":
+            return await interaction.followup.send(embed=_insufficient_embed(plan.total, res.wallet), ephemeral=True)
+        return await interaction.followup.send(res.text(en), ephemeral=True)
+    a = plan.artikel
+    rolle = interaction.guild.get_role(a["role_id"])
+    embed = discord.Embed(
+        title=_t(interaction, "🎭 Rolle erhalten", "🎭 Role received"),
+        description=_t(interaction,
+                       f"Du hast **{a['name']}** für **{_fmt_money(plan.total, conn)}** gekauft – {rolle.mention if rolle else ''} gehört dir.",
+                       f"You bought **{a['name']}** for **{_fmt_money(plan.total, conn)}** – {rolle.mention if rolle else ''} is yours."),
+        color=0x2ECC71)
+    if res.ende:
+        embed.add_field(name=_t(interaction, "⏳ Läuft ab", "⏳ Expires"), value=f"<t:{int(res.ende)}:R>", inline=True)
+    else:
+        embed.add_field(name=_t(interaction, "⏳ Dauer", "⏳ Duration"), value=_rolle_laufzeit_text(a, en), inline=True)
+    embed.add_field(name="👛 Wallet", value=_fmt_money(res.wallet, conn), inline=True)
+    rabatt_zeile = _preis_zeile(plan.preis, conn, en)
+    if rabatt_zeile:
+        embed.add_field(name="🏷️", value=rabatt_zeile, inline=False)
+    embed.set_footer(text=f"{_t(interaction, 'Kauf', 'Purchase')} #{res.kauf_id}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+shop_buy_role.autocomplete("role")(_rolle_autocomplete)
+
+
 bot.tree.add_command(shop_group)
 
 
@@ -36713,6 +37246,9 @@ def _audit_label(method: str, path: str) -> str:
         return exact
     if path.startswith("/api/shop/items/"):
         return "Shop-Item gelöscht" if method == "DELETE" else "Shop-Item geändert"
+    if path.startswith("/api/roleshop/items"):
+        return {"POST": "Rollen-Artikel angelegt", "PUT": "Rollen-Artikel geändert", "DELETE": "Rollen-Artikel gelöscht"}.get(
+            method, f"{method} {path}")
     if path.startswith("/api/coupons"):
         return {"POST": "Gutschein angelegt", "PUT": "Gutschein geändert", "DELETE": "Gutschein gelöscht"}.get(
             method, f"{method} {path}")
@@ -38100,6 +38636,7 @@ _DASH_PERM_CATS: Tuple[Tuple[str, str, str, Tuple[str, ...]], ...] = (
     ("discord_mgmt", "Discord Management", "Discord Management", ("view", "edit")),
     ("autotasks", "Auto-Aufgaben", "Scheduled Tasks", ("view", "create", "edit", "delete")),
     ("shop", "Shop", "Shop", ("view", "create", "edit", "delete")),
+    ("roleshop", "Rollen-Shop", "Role Shop", ("view", "create", "edit", "delete")),
     ("coupons", "Gutscheine & Rabatte", "Coupons & Discounts", ("view", "create", "edit", "delete")),
     ("tools", "Tools", "Tools", ("view", "edit")),
     ("map", "Karte", "Map", ("view",)),
@@ -44380,7 +44917,8 @@ async def guild_roles(request: web.Request) -> web.Response:
     g = bot.get_guild(gid) if bot else None
     if g is None:
         return ok({"roles": []})
-    roles = [{"id": str(r.id), "name": r.name}
+    roles = [{"id": str(r.id), "name": r.name, "position": getattr(r, "position", 0),
+              "managed": bool(getattr(r, "managed", False)), "vergebbar": _rolle_vergebbar(g, r) is None}
              for r in g.roles if not r.is_default()]
     return ok({"roles": roles})
 
@@ -46672,6 +47210,186 @@ async def api_discounts_put(request: web.Request) -> web.Response:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+#  Rollen-Shop (Dashboard fuer Betreiber): Artikel verwalten und Kaeufe ansehen
+#  Alles gehoert zu EINER Guild (der in der Sitzung gewaehlten, sonst der ersten des Servers).
+# ──────────────────────────────────────────────────────────────────────────
+async def _rollenshop_gate(request: web.Request, aktion: str
+                           ) -> Tuple[Optional["ServerConnection"], int, Any, Optional[web.Response]]:
+    conn, denied = _session_conn(request, "shop.roleshop")
+    if denied is not None:
+        return None, 0, None, denied
+    denied = await _modul_pruefen("shop.roleshop", request, conn)
+    if denied is not None:
+        return None, 0, None, denied
+    denied = await _dash_gate(request, conn, "roleshop", aktion)
+    if denied is not None:
+        return None, 0, None, denied
+    gid = getattr(_mgmt_sicht(request, conn), "guild_id", None)
+    if not gid:
+        return None, 0, None, err("Dem Server ist noch kein Discord-Server zugeordnet.", 409)
+    return conn, int(gid), (bot.get_guild(int(gid)) if bot is not None else None), None
+
+
+def _rollen_artikel_view(a: Dict[str, Any], guild: Any) -> Dict[str, Any]:
+    rolle = guild.get_role(a["role_id"]) if guild is not None else None
+    problem = _rolle_vergebbar(guild, rolle) if guild is not None else ("Der Bot erreicht den Discord-Server nicht.", "")
+    return {"id": a["id"], "role_id": str(a["role_id"]), "role_name": rolle.name if rolle is not None else None,
+            "vergebbar": problem is None, "problem": problem[0] if problem else None,
+            "name": a["name"], "beschreibung": a["beschreibung"], "preis": a["preis"], "hidden": a["hidden"],
+            "permanent": a["permanent"], "dauer_tage": a["dauer_tage"], "bestand": a["bestand"], "verkauft": a["verkauft"],
+            "benoetigt": [str(r) for r in a["benoetigt"]], "alle_noetig": a["alle_noetig"],
+            "verfuegbar_ab": a["verfuegbar_ab"], "verfuegbar_bis": a["verfuegbar_bis"], "enabled": a["enabled"]}
+
+
+def _rollen_artikel_felder(guild: Any, data: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[web.Response]]:
+    if guild is None:
+        return None, err("Der Bot erreicht diesen Discord-Server nicht – ist er dort eingeladen?", 409)
+    try:
+        rid = int(str(data.get("role_id")).strip())
+    except (TypeError, ValueError):
+        return None, err("Bitte eine Rolle wählen.")
+    problem = _rolle_vergebbar(guild, guild.get_role(rid))
+    if problem is not None:
+        return None, err(problem[0])
+    name = str(data.get("name") or "").strip()
+    if not name or len(name) > 60:
+        return None, err("Der Name ist Pflicht (höchstens 60 Zeichen).")
+    beschreibung = str(data.get("beschreibung") or "").strip()
+    if len(beschreibung) > 100:
+        return None, err("Die Beschreibung darf höchstens 100 Zeichen haben.")
+    try:
+        preis = int(data.get("preis"))
+    except (TypeError, ValueError):
+        return None, err("Der Preis muss eine ganze Zahl sein.")
+    if preis < 1 or preis > 10 ** 9:
+        return None, err("Der Preis muss mindestens 1 sein.")
+    permanent = bool(data.get("permanent", True))
+    dauer = None
+    if not permanent:
+        try:
+            dauer = int(data.get("dauer_tage"))
+        except (TypeError, ValueError):
+            return None, err("Die Laufzeit in Tagen muss eine ganze Zahl sein.")
+        if dauer < 1 or dauer > _ROLLEN_DAUER_MAX_TAGE:
+            return None, err(f"Die Laufzeit muss zwischen 1 und {_ROLLEN_DAUER_MAX_TAGE} Tagen liegen.")
+    bestand = data.get("bestand")
+    if bestand in (None, ""):
+        bestand = None
+    else:
+        try:
+            bestand = int(bestand)
+        except (TypeError, ValueError):
+            return None, err("Der Bestand muss eine ganze Zahl sein.")
+        if bestand < 1 or bestand > 10 ** 6:
+            return None, err("Der Bestand muss mindestens 1 sein.")
+    roh = data.get("benoetigt") or []
+    if not isinstance(roh, list) or len(roh) > _ROLLEN_BENOETIGT_MAX:
+        return None, err(f"Höchstens {_ROLLEN_BENOETIGT_MAX} benötigte Rollen.")
+    benoetigt: List[int] = []
+    for r in roh:
+        try:
+            r_id = int(str(r).strip())
+        except (TypeError, ValueError):
+            return None, err("Ungültige benötigte Rolle.")
+        if guild.get_role(r_id) is None:
+            return None, err("Eine benötigte Rolle gibt es auf dem Discord-Server nicht.")
+        if r_id not in benoetigt:
+            benoetigt.append(r_id)
+    von, ok1 = _zeit_oder_none(data.get("verfuegbar_ab"))
+    bis, ok2 = _zeit_oder_none(data.get("verfuegbar_bis"))
+    if not (ok1 and ok2):
+        return None, err("Ungültiger Verkaufszeitraum.")
+    if von is not None and bis is not None and bis <= von:
+        return None, err("„Verfügbar bis“ muss nach „Verfügbar ab“ liegen.")
+    return {"role_id": rid, "name": name, "beschreibung": beschreibung, "preis": preis, "hidden": bool(data.get("hidden", False)),
+            "permanent": permanent, "dauer_tage": dauer, "bestand": bestand, "benoetigt": benoetigt,
+            "alle_noetig": bool(data.get("alle_noetig", False)), "verfuegbar_ab": von, "verfuegbar_bis": bis,
+            "enabled": bool(data.get("enabled", True))}, None
+
+
+async def api_roleshop_list(request: web.Request) -> web.Response:
+    conn, gid, guild, denied = await _rollenshop_gate(request, "view")
+    if denied is not None:
+        return denied
+    return ok({"guild_id": str(gid), "items": [_rollen_artikel_view(_rollen_artikel_dict(r), guild)
+                                               for r in db.rollen_artikel_liste(gid)],
+               "max_artikel": _ROLLEN_ARTIKEL_MAX, "max_benoetigt": _ROLLEN_BENOETIGT_MAX,
+               "waehrung": {"symbol": _cur_symbol(conn), "voran": bool(conn.get("prepend_currency_symbol", False))},
+               "kategorie_stufe": _module_tier("shop.roleshop")})
+
+
+async def api_roleshop_create(request: web.Request) -> web.Response:
+    conn, gid, guild, denied = await _rollenshop_gate(request, "create")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "shop.roleitem", 2)
+    if denied is not None:
+        return denied
+    felder, fehler = _rollen_artikel_felder(guild, await body(request))
+    if felder is None:
+        return fehler
+    erg, aid = await _dash_run(db.rollen_artikel_speichern, gid, None, felder, _ROLLEN_ARTIKEL_MAX)
+    if erg == "name_vorhanden":
+        return err("Einen Rollen-Artikel mit diesem Namen gibt es schon.", 409)
+    if erg == "limit":
+        return err(f"Höchstens {_ROLLEN_ARTIKEL_MAX} Rollen-Artikel pro Discord-Server.", 409)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Rollen-Artikel angelegt", f"{felder['name']} (Guild {gid})")
+    return ok({"id": aid})
+
+
+async def api_roleshop_update(request: web.Request) -> web.Response:
+    conn, gid, guild, denied = await _rollenshop_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "shop.roleitem", 2)
+    if denied is not None:
+        return denied
+    try:
+        aid = int(request.match_info.get("id"))
+    except (TypeError, ValueError):
+        return err("Ungültige Artikel-Nummer.")
+    felder, fehler = _rollen_artikel_felder(guild, await body(request))
+    if felder is None:
+        return fehler
+    erg, _id = await _dash_run(db.rollen_artikel_speichern, gid, aid, felder, _ROLLEN_ARTIKEL_MAX)
+    if erg == "nicht_gefunden":
+        return err("Diesen Rollen-Artikel gibt es nicht.", 404)
+    if erg == "name_vorhanden":
+        return err("Einen Rollen-Artikel mit diesem Namen gibt es schon.", 409)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Rollen-Artikel geändert", f"{felder['name']} (Guild {gid})")
+    return ok({"id": aid})
+
+
+async def api_roleshop_delete(request: web.Request) -> web.Response:
+    conn, gid, guild, denied = await _rollenshop_gate(request, "delete")
+    if denied is not None:
+        return denied
+    try:
+        aid = int(request.match_info.get("id"))
+    except (TypeError, ValueError):
+        return err("Ungültige Artikel-Nummer.")
+    if not await _dash_run(db.rollen_artikel_loeschen, gid, aid):
+        return err("Diesen Rollen-Artikel gibt es nicht.", 404)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Rollen-Artikel gelöscht", f"#{aid} (Guild {gid})")
+    return ok({"id": aid})
+
+
+async def api_roleshop_orders(request: web.Request) -> web.Response:
+    """Die letzten Rollen-Kaeufe dieser Guild (nur Ansehen)."""
+    conn, gid, guild, denied = await _rollenshop_gate(request, "view")
+    if denied is not None:
+        return denied
+    out = []
+    for k in await _dash_run(db.rollen_kaeufe_liste, gid, 100):
+        member = guild.get_member(int(k["user_id"])) if guild is not None else None
+        out.append({"id": int(k["id"]), "user_id": str(k["user_id"]), "user_name": member.display_name if member is not None else None,
+                    "artikel": k["artikel_name"], "preis_liste": int(k["preis_liste"]), "preis_bezahlt": int(k["preis_bezahlt"]),
+                    "gutschein": k["gutschein"], "quelle": k["quelle"], "expires_at": k["expires_at"], "status": k["status"],
+                    "created_at": k["created_at"]})
+    return ok({"orders": out, "waehrung": {"symbol": _cur_symbol(conn), "voran": bool(conn.get("prepend_currency_symbol", False))}})
+
+
+# ──────────────────────────────────────────────────────────────────────────
 #  Spielerbereich: /api/me/*
 #
 #  Ein Spieler ist weder Besitzer noch Admin noch Gast – er hat keine Dashboard-Verbindung (_session_conn
@@ -46782,7 +47500,7 @@ async def post_me_quote(request: web.Request) -> web.Response:
         return denied
     art, name = str(data.get("art") or ""), str(data.get("item") or "")
     try:
-        menge = int(data.get("amount" if art == "shop" else "restarts", 1))
+        menge = int(data.get("amount" if art == "shop" else "restarts", 1)) if art != "role" else 1
     except (TypeError, ValueError):
         return err("Ungültige Menge." if not en else "Invalid amount.", 400)
     if menge < 1:
@@ -46793,6 +47511,9 @@ async def post_me_quote(request: web.Request) -> web.Response:
     elif art == "rental":
         it = conn.rentals_catalog.find(name)
         liste = int(it.get("price_per_restart", 0)) * menge if it and it.get("enabled", True) else None
+    elif art == "role":
+        a = _rollen_artikel_finden(gid, name)
+        liste = a["preis"] if a is not None and a["enabled"] else None
     else:
         return err("Unbekannte Art.", 400)
     if liste is None:
@@ -47087,6 +47808,83 @@ async def post_me_rentals_buy(request: web.Request) -> web.Response:
                "link": loc_url, "near": near, "auto_restart": res.auto_restart,
                "preis_zeile": _klartext(_preis_zeile(plan.preis, conn, en) or ""),
                "ort_gespeichert": gespeichert})
+
+
+def _rollen_view_spieler(ctx: Dict[str, Any], guild: Any, a: Dict[str, Any], jetzt: float) -> Dict[str, Any]:
+    conn, en = ctx["conn"], ctx["en"]
+    rolle = guild.get_role(a["role_id"]) if guild is not None else None
+    problem = _rolle_verfuegbarkeit(guild, ctx["gid"], ctx["uid"], ctx["rollen"], a, en, jetzt) if guild is not None else None
+    aktiv = db.rollen_kauf_aktiv(ctx["gid"], ctx["uid"], a["role_id"])
+    return {"id": a["id"], "name": a["name"], "beschreibung": a["beschreibung"],
+            "role_name": rolle.name if rolle is not None else None, "preis": a["preis"],
+            "price_text": _spieler_geld(conn, a["preis"]), "permanent": a["permanent"] or not a["dauer_tage"],
+            "dauer_tage": a["dauer_tage"], "bestand_frei": (max(0, int(a["bestand"]) - a["verkauft"]) if a["bestand"] is not None else None),
+            "kaufbar": problem is None,
+            "grund": None if problem is None else {"code": problem.code, "text": _klartext(problem.text(en)).replace("❌ ", "")},
+            "besitzt": a["role_id"] in ctx["rollen"],
+            "laeuft_bis": (aktiv["expires_at"] if aktiv is not None else None)}
+
+
+async def api_me_roles(request: web.Request) -> web.Response:
+    """Rollen-Shop: sichtbare Artikel dieser Guild mit Kaufbarkeit und die eigenen laufenden Rollen."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    conn, gid, uid = ctx["conn"], ctx["gid"], ctx["uid"]
+    guild = bot.get_guild(gid)
+    jetzt = time.time()
+    items = []
+    for row in db.rollen_artikel_liste(gid):
+        a = _rollen_artikel_dict(row)
+        if a["enabled"] and not a["hidden"]:
+            items.append(_rollen_view_spieler(ctx, guild, a, jetzt))
+    meine = []
+    for k in db.rollen_kaeufe_von(gid, uid, 30):
+        rolle = guild.get_role(int(k["role_id"])) if guild is not None else None
+        meine.append({"id": int(k["id"]), "artikel": k["artikel_name"], "role_name": rolle.name if rolle is not None else None,
+                      "expires_at": k["expires_at"], "status": k["status"], "created_at": k["created_at"],
+                      "bezahlt_text": _spieler_geld(conn, int(k["preis_bezahlt"]))})
+    wallet, _bank = db.get_balance(gid, uid)
+    return ok({"items": items, "meine": meine, "wallet": wallet, "wallet_text": _spieler_geld(conn, wallet),
+               "rabatte": _spieler_rabatte(ctx),
+               "waehrung": {"symbol": _cur_symbol(conn), "voran": bool(conn.get("prepend_currency_symbol", False))}})
+
+
+async def post_me_roles_buy(request: web.Request) -> web.Response:
+    """Rollen-Kauf aus dem Dashboard – dieselben Regeln wie /shop buy role (_rolle_kauf_pruefen/_ausfuehren)."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    conn, gid, uid, en = ctx["conn"], ctx["gid"], ctx["uid"], _spieler_en(request, ctx["sess"], data)
+    denied = _dash_rate_limited(request, "me.roles.buy", 3)
+    if denied is not None:
+        return denied
+    guild = bot.get_guild(gid) if bot is not None else None
+    if guild is None:
+        return err("Der Bot erreicht diesen Discord-Server nicht." if not en else "The bot cannot reach this Discord server.", 503)
+    gutschein = str(data.get("gutschein") or "").strip() or None
+    plan = _rolle_kauf_pruefen(guild, gid, uid, ctx["rollen"], data.get("item"), gutschein, en)
+    if isinstance(plan, _KaufFehler):
+        if plan.code == "guthaben":
+            text = (f"Du brauchst {_spieler_geld(conn, plan.total)}, hast aber nur {_spieler_geld(conn, plan.wallet)}." if not en else
+                    f"You need {_spieler_geld(conn, plan.total)} but only have {_spieler_geld(conn, plan.wallet)}.")
+            return err(text, 402, code="guthaben")
+        return err(_klartext(plan.text(en)), 404 if plan.code == "item" else 400, code=plan.code)
+    _setze_aktuellen_server(conn)
+    res = await _rolle_kauf_ausfuehren(conn, guild, gid, uid, str(ctx["name"]), plan, "dashboard")
+    if not res.ok:
+        status = 402 if res.code == "guthaben" else (409 if res.code in ("gutschein", "ausverkauft", "besitzt") else 500)
+        if res.code == "guthaben":
+            text = (f"Du brauchst {_spieler_geld(conn, plan.total)}, hast aber nur {_spieler_geld(conn, res.wallet)}." if not en else
+                    f"You need {_spieler_geld(conn, plan.total)} but only have {_spieler_geld(conn, res.wallet)}.")
+            return err(text, 402, code="guthaben")
+        return err(_klartext(res.text(en)), status, code=res.code)
+    a = plan.artikel
+    return ok({"kauf_id": res.kauf_id, "item": a["name"], "total_text": _spieler_geld(conn, plan.total),
+               "wallet_text": _spieler_geld(conn, res.wallet), "ende": res.ende, "verlaengert": res.verlaengert,
+               "role_name": (guild.get_role(a["role_id"]).name if guild.get_role(a["role_id"]) is not None else None),
+               "preis_zeile": _klartext(_preis_zeile(plan.preis, conn, en) or "")})
 
 
 async def api_me_places(request: web.Request) -> web.Response:
@@ -48578,6 +49376,8 @@ def build_app() -> web.Application:
     r.add_get("/api/me/shop", api_me_shop)
     r.add_post("/api/me/shop/buy", post_me_shop_buy)
     r.add_post("/api/me/quote", post_me_quote)
+    r.add_get("/api/me/roles", api_me_roles)
+    r.add_post("/api/me/roles/buy", post_me_roles_buy)
     r.add_get("/api/me/rentals", api_me_rentals)
     r.add_post("/api/me/rentals/buy", post_me_rentals_buy)
     r.add_get("/api/me/places", api_me_places)
@@ -48702,6 +49502,11 @@ def build_app() -> web.Application:
     r.add_post("/api/shop/rentals", api_shop_rentals_create)
     r.add_put("/api/shop/rentals/{name}", api_shop_rentals_update)
     r.add_delete("/api/shop/rentals/{name}", api_shop_rentals_delete)
+    r.add_get("/api/roleshop/items", api_roleshop_list)
+    r.add_post("/api/roleshop/items", api_roleshop_create)
+    r.add_put("/api/roleshop/items/{id}", api_roleshop_update)
+    r.add_delete("/api/roleshop/items/{id}", api_roleshop_delete)
+    r.add_get("/api/roleshop/orders", api_roleshop_orders)
     r.add_get("/api/coupons", api_coupons_list)
     r.add_post("/api/coupons", api_coupons_create)
     r.add_put("/api/coupons/{code}", api_coupons_update)
@@ -49493,6 +50298,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "e2d24b954acac4bd818e15c4c9289791bf7085b2c60141ec123def7a2068d24d",
         "3e13426ebab5e74f309181e8e3967f7e47107c7c591f5b902af63ab82733852f",
         "ab087186d659ce9b2cdecf427fcfb124c5f300d561da09ce84d41216e99a1046",
+        "c6f1f2a97b2185323eefd64119d57d6d6a83bbde6ed5191e4b4cb409bdd846bd",
     ),
     "styles.css": (
         "854cd5c0116ef9230d2534c486b88c6dff38df66194defb0c429309ea4add035",
@@ -49793,6 +50599,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "0fd2761e0aac63310c92b22c5b3efdacc02830be4349dbf7ad2c60546878524d",
         "1db619f03c10fd50eb82d04b42170244fe19d6ea26574bbf85d0ad4f807c9d99",
         "1d0a6b30994cb2a6fd4f07f42eea70c7d626666afc324b91eb72b1afe0684a2b",
+        "3da6c73abea466b00a438a5941682f835670d1588e957aa13eaea9415a527770",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
