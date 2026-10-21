@@ -1031,6 +1031,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "shop":                              {"label": "Shop (gesamt)", "gruppe": "Shop"},
     "shop.buy":                          {"label": "Kauf-Befehl (/buy)", "gruppe": "Shop"},
     "shop.catalog_admin":                {"label": "Katalog-Verwaltung", "gruppe": "Shop"},
+    "shop.coupons":                      {"label": "Gutscheine & Rabatte", "gruppe": "Shop"},
     "tools":                             {"label": "Tools (gesamt)", "gruppe": "Tools"},
     "tools.loadout":                     {"label": "Loadout Generator", "gruppe": "Tools"},
     "tools.gaszone":                     {"label": "Gas-Zonen Builder", "gruppe": "Tools"},
@@ -27386,6 +27387,35 @@ class EconomyDB:
                 z          REAL    NOT NULL,
                 ts         REAL    NOT NULL,
                 PRIMARY KEY (guild_id, service_id, user_id))""")
+            # Gutscheine und dauerhafte Rabatte – je GUILD (das Wallet ist guildweit, Rollen-IDs gelten nur in ihrer
+            # Guild). typ 'fixed' = Betrag in Waehrung, 'percent' = Prozent; max_uses NULL = unbegrenzt. Die
+            # Einloesung ist ein einziges UPDATE mit Bedingungen (atomar), das Protokoll haelt jede Nutzung fest.
+            c.execute("""CREATE TABLE IF NOT EXISTS gutscheine (
+                guild_id    INTEGER NOT NULL,
+                code        TEXT    NOT NULL,
+                typ         TEXT    NOT NULL,
+                betrag      INTEGER NOT NULL,
+                enabled     INTEGER NOT NULL DEFAULT 1,
+                max_uses    INTEGER,
+                uses        INTEGER NOT NULL DEFAULT 0,
+                valid_from  REAL,
+                valid_until REAL,
+                created_at  REAL    NOT NULL,
+                PRIMARY KEY (guild_id, code))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS gutschein_einloesungen (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                code     TEXT    NOT NULL,
+                user_id  INTEGER NOT NULL,
+                kontext  TEXT,
+                ts       REAL    NOT NULL)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_gutschein_einl ON gutschein_einloesungen (guild_id, code, user_id)")
+            c.execute("""CREATE TABLE IF NOT EXISTS rabatt_regeln (
+                guild_id INTEGER NOT NULL,
+                role_id  INTEGER NOT NULL,
+                typ      TEXT    NOT NULL,
+                betrag   INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, role_id))""")
             # Miet-Items (Shop-Rentals): eigener Neustart-Ablauf-Zähler je Kauf.
             # event_name ist die eindeutige Instanz-ID des Events/der Position
             # in db/events.xml + cfgeventspawns.xml (nicht der Katalog-Name der
@@ -28044,6 +28074,92 @@ class EconomyDB:
             return self._conn.execute(
                 "SELECT * FROM letzte_orte WHERE guild_id=? AND service_id=? AND user_id=?",
                 (guild_id, str(service_id or ""), user_id)).fetchone()
+
+    # ── Gutscheine und Rabatt-Regeln (je Guild) ───────────────
+    def gutschein_liste(self, guild_id: int) -> List[sqlite3.Row]:
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT * FROM gutscheine WHERE guild_id=? ORDER BY code", (guild_id,)).fetchall())
+
+    def gutschein_holen(self, guild_id: int, code: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM gutscheine WHERE guild_id=? AND code=?", (guild_id, code)).fetchone()
+
+    def gutschein_speichern(self, guild_id: int, code: str, typ: str, betrag: int, enabled: bool,
+                            max_uses: Optional[int], valid_from: Optional[float], valid_until: Optional[float],
+                            neu: bool) -> str:
+        """Legt einen Gutschein an (neu=True) oder aendert ihn. Rueckgabe: 'ok', 'existiert', 'nicht_gefunden'.
+        Beim Aendern bleibt der Nutzungszaehler erhalten."""
+        with self._lock:
+            vorhanden = self._conn.execute(
+                "SELECT 1 FROM gutscheine WHERE guild_id=? AND code=?", (guild_id, code)).fetchone()
+            if neu:
+                if vorhanden:
+                    return "existiert"
+                self._conn.execute(
+                    "INSERT INTO gutscheine (guild_id, code, typ, betrag, enabled, max_uses, uses, valid_from, "
+                    "valid_until, created_at) VALUES (?,?,?,?,?,?,0,?,?,?)",
+                    (guild_id, code, typ, int(betrag), 1 if enabled else 0, max_uses, valid_from, valid_until,
+                     time.time()))
+            else:
+                if not vorhanden:
+                    return "nicht_gefunden"
+                self._conn.execute(
+                    "UPDATE gutscheine SET typ=?, betrag=?, enabled=?, max_uses=?, valid_from=?, valid_until=? "
+                    "WHERE guild_id=? AND code=?",
+                    (typ, int(betrag), 1 if enabled else 0, max_uses, valid_from, valid_until, guild_id, code))
+            self._conn.commit()
+        return "ok"
+
+    def gutschein_loeschen(self, guild_id: int, code: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM gutscheine WHERE guild_id=? AND code=?", (guild_id, code))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def gutschein_einloesen(self, guild_id: int, code: str, user_id: int, kontext: str = "") -> bool:
+        """Reserviert EINE Nutzung - atomar, mit allen Bedingungen in einem UPDATE (aktiv, im Zeitraum, noch nicht
+        aufgebraucht). False = der Gutschein gilt nicht (mehr); dann wurde nichts veraendert."""
+        jetzt = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE gutscheine SET uses=uses+1 WHERE guild_id=? AND code=? AND enabled=1 "
+                "AND (max_uses IS NULL OR uses<max_uses) AND (valid_from IS NULL OR valid_from<=?) "
+                "AND (valid_until IS NULL OR valid_until>=?)", (guild_id, code, jetzt, jetzt))
+            if cur.rowcount != 1:
+                self._conn.rollback()
+                return False
+            self._conn.execute(
+                "INSERT INTO gutschein_einloesungen (guild_id, code, user_id, kontext, ts) VALUES (?,?,?,?,?)",
+                (guild_id, code, user_id, kontext[:60], jetzt))
+            self._conn.commit()
+            return True
+
+    def gutschein_freigeben(self, guild_id: int, code: str, user_id: int) -> None:
+        """Nimmt eine zuvor reservierte Nutzung zurueck (der Kauf ist doch gescheitert)."""
+        with self._lock:
+            self._conn.execute("UPDATE gutscheine SET uses=MAX(0, uses-1) WHERE guild_id=? AND code=?",
+                               (guild_id, code))
+            self._conn.execute(
+                "DELETE FROM gutschein_einloesungen WHERE id=(SELECT MAX(id) FROM gutschein_einloesungen "
+                "WHERE guild_id=? AND code=? AND user_id=?)", (guild_id, code, user_id))
+            self._conn.commit()
+
+    def rabatt_liste(self, guild_id: int) -> List[sqlite3.Row]:
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT role_id, typ, betrag FROM rabatt_regeln WHERE guild_id=? ORDER BY role_id",
+                (guild_id,)).fetchall())
+
+    def rabatt_ersetzen(self, guild_id: int, regeln: List[Tuple[int, str, int]]) -> None:
+        """Ersetzt ALLE Rabatt-Regeln dieser Guild auf einmal (die Liste im Dashboard wird als Ganzes gespeichert)."""
+        with self._lock:
+            self._conn.execute("DELETE FROM rabatt_regeln WHERE guild_id=?", (guild_id,))
+            self._conn.executemany(
+                "INSERT INTO rabatt_regeln (guild_id, role_id, typ, betrag) VALUES (?,?,?,?)",
+                [(guild_id, int(r), t, int(b)) for r, t, b in regeln])
+            self._conn.commit()
 
     def purchases_of_user(self, service_id: str, guild_id: int, user_id: int, limit: int = 20) -> List[sqlite3.Row]:
         """Die letzten Kaeufe EINES Users auf diesem Server (neueste zuerst) - fuer den Spielerbereich."""
@@ -32179,6 +32295,149 @@ shop_buy_group = app_commands.Group(name="buy", description="Buy something from 
                                     parent=shop_group)
 
 
+# ══════════════════════════════════════════════════════════════
+#  PREISE: Rollen-Rabatt und Gutscheine – gemeinsam fuer Item-Shop, Mieten und Rollen-Shop
+#
+#  Reihenfolge: erst der beste dauerhafte Rabatt aus den Rollen des Kaeufers (eine Regel gewinnt, nie mehrere),
+#  dann der Gutschein auf den schon reduzierten Preis. Ein fester Betrag gilt je KAUF (nicht je Stueck). Der
+#  Endpreis ist nie negativ. Alles pro Guild: das Wallet ist guildweit, Rollen-IDs gelten nur in ihrer Guild.
+# ══════════════════════════════════════════════════════════════
+_GUTSCHEIN_CODE_RE = re.compile(r"^[A-Z0-9\-]{3,32}$")
+_RABATT_TYPEN = ("fixed", "percent")
+_RABATT_MAX_REGELN = 25
+
+
+def _gutschein_code(text: Any) -> Optional[str]:
+    """Normalisierter Gutscheincode (gross) oder None, wenn er nicht dem Format entspricht."""
+    code = str(text or "").strip().upper()
+    return code if _GUTSCHEIN_CODE_RE.match(code) else None
+
+
+def _abzug(typ: str, betrag: int, preis: int) -> int:
+    """Wie viel dieser Rabatt/Gutschein von ``preis`` abzieht (0 … preis)."""
+    if preis <= 0 or int(betrag) <= 0:
+        return 0
+    if typ == "percent":
+        return min(preis, preis * min(100, int(betrag)) // 100)
+    return min(preis, int(betrag))
+
+
+@dataclasses.dataclass
+class _Preis:
+    liste: int
+    rabatt: int = 0
+    rabatt_regel: Optional[Dict[str, Any]] = None
+    gutschein: Optional[str] = None
+    gutschein_abzug: int = 0
+    total: int = 0
+
+
+def _bester_rabatt(gid: int, rollen_ids: Set[int], preis: int) -> Tuple[int, Optional[Dict[str, Any]]]:
+    """Der groesste dauerhafte Rabatt aus den Rollen des Kaeufers: (Abzug, Regel) - (0, None) ohne Rabatt."""
+    beste: Tuple[int, Optional[Dict[str, Any]]] = (0, None)
+    for r in db.rabatt_liste(gid):
+        if int(r["role_id"]) not in rollen_ids:
+            continue
+        a = _abzug(r["typ"], int(r["betrag"]), preis)
+        if a > beste[0]:
+            beste = (a, {"role_id": int(r["role_id"]), "typ": r["typ"], "betrag": int(r["betrag"])})
+    return beste
+
+
+def _gutschein_pruefen(gid: int, code: str, en: bool) -> Union[sqlite3.Row, "_KaufFehler"]:
+    """Gilt der Gutschein JETZT? (Nur Lesen - eingeloest wird erst beim Bezahlen, atomar.)"""
+    row = db.gutschein_holen(gid, code)
+    jetzt = time.time()
+    if row is None:
+        return _KaufFehler("gutschein", f"❌ Den Gutschein `{code}` gibt es nicht.",
+                           f"❌ The coupon `{code}` does not exist.")
+    if not row["enabled"]:
+        return _KaufFehler("gutschein", f"❌ Der Gutschein `{code}` ist nicht aktiv.",
+                           f"❌ The coupon `{code}` is not active.")
+    if row["valid_from"] is not None and jetzt < float(row["valid_from"]):
+        return _KaufFehler("gutschein", f"❌ Der Gutschein `{code}` gilt noch nicht.",
+                           f"❌ The coupon `{code}` is not valid yet.")
+    if row["valid_until"] is not None and jetzt > float(row["valid_until"]):
+        return _KaufFehler("gutschein", f"❌ Der Gutschein `{code}` ist abgelaufen.",
+                           f"❌ The coupon `{code}` has expired.")
+    if row["max_uses"] is not None and int(row["uses"]) >= int(row["max_uses"]):
+        return _KaufFehler("gutschein", f"❌ Der Gutschein `{code}` wurde schon zu oft eingelöst.",
+                           f"❌ The coupon `{code}` has been used up.")
+    return row
+
+
+# Schutz vor dem Durchprobieren von Codes: zu viele ungueltige Codes in kurzer Zeit sperren die Eingabe fuer dieses Konto.
+_GUTSCHEIN_FEHLVERSUCHE: Dict[int, List[float]] = {}
+_GUTSCHEIN_FEHLVERSUCHE_MAX = 8
+_GUTSCHEIN_FEHLVERSUCHE_FENSTER = 600.0
+
+
+def _gutschein_gesperrt(uid: Optional[int]) -> bool:
+    if uid is None:
+        return False
+    grenze = time.time() - _GUTSCHEIN_FEHLVERSUCHE_FENSTER
+    liste = [t for t in _GUTSCHEIN_FEHLVERSUCHE.get(uid, []) if t >= grenze]
+    if liste:
+        _GUTSCHEIN_FEHLVERSUCHE[uid] = liste
+    else:
+        _GUTSCHEIN_FEHLVERSUCHE.pop(uid, None)
+    return len(liste) >= _GUTSCHEIN_FEHLVERSUCHE_MAX
+
+
+def _gutschein_fehlversuch(uid: Optional[int]) -> None:
+    if uid is None:
+        return
+    if len(_GUTSCHEIN_FEHLVERSUCHE) > 5000:                # Speicher begrenzen: abgelaufene Eintraege entfernen
+        grenze = time.time() - _GUTSCHEIN_FEHLVERSUCHE_FENSTER
+        for k in [k for k, v in _GUTSCHEIN_FEHLVERSUCHE.items() if not v or v[-1] < grenze]:
+            _GUTSCHEIN_FEHLVERSUCHE.pop(k, None)
+    _GUTSCHEIN_FEHLVERSUCHE.setdefault(uid, []).append(time.time())
+
+
+def _preis_berechnen(gid: int, rollen_ids: Optional[Set[int]], liste: int, gutschein: Optional[str],
+                     en: bool, uid: Optional[int] = None) -> Union[_Preis, "_KaufFehler"]:
+    """Endpreis fuer einen Listenpreis: Rollen-Rabatt, dann optional ein Gutschein. Ein unbrauchbarer Gutschein
+    ist ein Fehler (der Kaeufer soll nicht stillschweigend ohne Rabatt zahlen). ``uid`` (der Kaeufer) dient nur
+    dem Schutz vor dem Durchprobieren von Codes."""
+    p = _Preis(liste=int(liste))
+    p.rabatt, p.rabatt_regel = _bester_rabatt(gid, rollen_ids or set(), p.liste)
+    rest = p.liste - p.rabatt
+    if gutschein:
+        if _gutschein_gesperrt(uid):
+            return _KaufFehler("gutschein", "❌ Zu viele ungültige Gutscheincodes – bitte versuche es in ein paar Minuten erneut.",
+                               "❌ Too many invalid coupon codes – please try again in a few minutes.")
+        code = _gutschein_code(gutschein)
+        if code is None:
+            _gutschein_fehlversuch(uid)
+            return _KaufFehler("gutschein", "❌ Ungültiger Gutscheincode.", "❌ Invalid coupon code.")
+        row = _gutschein_pruefen(gid, code, en)
+        if isinstance(row, _KaufFehler):
+            if db.gutschein_holen(gid, code) is None:        # nur Codes, die es gar nicht gibt, zaehlen als Fehlversuch
+                _gutschein_fehlversuch(uid)
+            return row
+        p.gutschein = code
+        p.gutschein_abzug = _abzug(row["typ"], int(row["betrag"]), rest)
+        rest -= p.gutschein_abzug
+    p.total = max(0, rest)
+    return p
+
+
+def _preis_zeile(p: Optional[_Preis], conn: "ServerConnection", en: bool) -> Optional[str]:
+    """Einzeiler fuer Bestaetigung und Feed: Listenpreis, Rabatt, Gutschein - None, wenn es nichts abzuziehen gab."""
+    if p is None or (p.rabatt <= 0 and p.gutschein_abzug <= 0):
+        return None
+    teile = [f"{'List price' if en else 'Listenpreis'} {_fmt_money(p.liste, conn)}"]
+    if p.rabatt > 0:
+        teile.append(f"{'Role discount' if en else 'Rollen-Rabatt'} −{_fmt_money(p.rabatt, conn)}")
+    if p.gutschein and p.gutschein_abzug > 0:
+        teile.append(f"{'Coupon' if en else 'Gutschein'} {p.gutschein} −{_fmt_money(p.gutschein_abzug, conn)}")
+    return " · ".join(teile)
+
+
+def _rabatt_beschreibung(typ: str, betrag: int, conn: Optional["ServerConnection"], en: bool) -> str:
+    return f"{int(betrag)} %" if typ == "percent" else _fmt_money(int(betrag), conn)
+
+
 # ── Miete: Pruefen und Ausfuehren – gemeinsam fuer /shop buy rental und das Dashboard ──
 # Wie beim Kauf (_kauf_pruefen/_kauf_ausfuehren): die Regeln stehen EINMAL hier, beide Wege uebersetzen nur das
 # Ergebnis in ihre Antwort.
@@ -32193,6 +32452,7 @@ class _MietePlan:
     ort_label: Optional[str]
     total: int
     wallet: int
+    preis: Optional[_Preis] = None
 
 
 @dataclasses.dataclass
@@ -32213,7 +32473,8 @@ class _MieteErgebnis:
 
 def _miete_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, restarts: int,
                    rollen_ids: Optional[Set[int]], ort: Optional[str], x: Optional[float], z: Optional[float],
-                   y: Optional[float], a: Optional[float], en: bool) -> Union[_MietePlan, "_KaufFehler"]:
+                   y: Optional[float], a: Optional[float], en: bool,
+                   gutschein: Optional[str] = None) -> Union[_MietePlan, "_KaufFehler"]:
     """Alle Vorpruefungen einer Miete, ohne etwas zu veraendern. ``rollen_ids``: Rollen des Mieters auf dieser
     Guild (``None`` = Mitglied unbekannt: Rollen-Items bleiben gesperrt)."""
     it = conn.rentals_catalog.find(item)
@@ -32256,8 +32517,11 @@ def _miete_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, rest
             "`x` (Ost) und `z` (Nord) an, z. B. `x: 4640` `z: 10350`.",
             "❌ Coordinates out of range. Enter the two iZurvive numbers as "
             "`x` (East) and `z` (North), e.g. `x: 4640` `z: 10350`.")
-    # Preis pruefen (Vorpruefung, Abbuchung erst nach FTP-Erfolg)
-    total = int(it.get("price_per_restart", 0)) * int(restarts)
+    # Preis pruefen (Vorpruefung, Abbuchung erst nach FTP-Erfolg): Rollen-Rabatt, dann Gutschein
+    preis = _preis_berechnen(gid, rollen_ids, int(it.get("price_per_restart", 0)) * int(restarts), gutschein, en, uid)
+    if isinstance(preis, _KaufFehler):
+        return preis
+    total = preis.total
     wallet, _bank = db.get_balance(gid, uid)
     if wallet < total:
         return _KaufFehler(
@@ -32265,7 +32529,7 @@ def _miete_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, rest
             f"❌ Du brauchst **{_fmt_money(total, conn)}**, dein Wallet hat nur **{_fmt_money(wallet, conn)}**.",
             f"❌ You need **{_fmt_money(total, conn)}** but your wallet only has **{_fmt_money(wallet, conn)}**.",
             wallet=wallet, total=total)
-    return _MietePlan(it, int(restarts), float(x), y, float(z), a, ort_label, total, wallet)
+    return _MietePlan(it, int(restarts), float(x), y, float(z), a, ort_label, total, wallet, preis)
 
 
 async def _miete_ausfuehren(conn: "ServerConnection", gid: int, uid: int, user_name: str,
@@ -32330,8 +32594,12 @@ async def _miete_ausfuehren(conn: "ServerConnection", gid: int, uid: int, user_n
                 "❌ cfgeventspawns.xml konnte nicht gespeichert werden – nichts wurde abgebucht.",
                 "❌ cfgeventspawns.xml could not be saved – nothing was charged.")
 
-    # 2. ... dann Geld abbuchen (atomar). Bei Fehlschlag: Rollback
-    if not db.try_spend_wallet(gid, uid, total):
+    # 2. ... dann den Gutschein reservieren und Geld abbuchen (beides atomar). Bei Fehlschlag: Rollback
+    code = plan.preis.gutschein if plan.preis else None
+    gutschein_ok = db.gutschein_einloesen(gid, code, uid, "miete") if code else True
+    if not gutschein_ok or not db.try_spend_wallet(gid, uid, total):
+        if code and gutschein_ok:
+            db.gutschein_freigeben(gid, code, uid)
         rollback_ok = False
         async with conn.events_lock:
             ev2, ev2_status = await loop.run_in_executor(
@@ -32360,6 +32628,9 @@ async def _miete_ausfuehren(conn: "ServerConnection", gid: int, uid: int, user_n
                 color=0xE67E22)
             await _post_feed(gid, "shop_log", warn, service_id=conn.service_id)
         wallet, _bank = db.get_balance(gid, uid)
+        if not gutschein_ok:
+            return _MieteErgebnis(False, "gutschein", f"❌ Der Gutschein `{code}` gilt nicht mehr.",
+                                  f"❌ The coupon `{code}` is no longer valid.", wallet=wallet)
         return _MieteErgebnis(False, "guthaben", wallet=wallet)
 
     # 3. Miete als aktiv speichern
@@ -32389,6 +32660,9 @@ async def _miete_ausfuehren(conn: "ServerConnection", gid: int, uid: int, user_n
         color=0x3498DB)
     feed.add_field(name=_ft(conn, "Preis", "Price"), value=_fmt_money(total, conn), inline=True)
     feed.add_field(name=_ft(conn, "Ort", "Location"), value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_feed}", inline=True)
+    rabatt_feed = _preis_zeile(plan.preis, conn, _feed_sprache(conn) == "en")
+    if rabatt_feed:
+        feed.add_field(name="🏷️", value=rabatt_feed, inline=False)
     feed.set_footer(text=(f"{_ft(conn, 'Miete', 'Rental')} #{rental_id} · {event_name}")[:100])
     await _post_feed(gid, "shop_log", feed, service_id=conn.service_id)
     return _MieteErgebnis(True, rental_id=rental_id, event_name=event_name, wallet=wallet,
@@ -32404,11 +32678,12 @@ async def _miete_ausfuehren(conn: "ServerConnection", gid: int, uid: int, user_n
     z="iZurvive Y coordinate (North – the SECOND number on iZurvive)",
     y="Height / altitude (OPTIONAL)",
     a="Rotation in degrees (OPTIONAL)",
+    coupon="Coupon code for an extra discount (OPTIONAL)",
     server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def shop_buy_rental(interaction: discord.Interaction, item: str,
                           restarts: app_commands.Range[int, 1], x: float, z: float,
                           y: Optional[float] = None, a: Optional[float] = None,
-                          server: Optional[str] = None):
+                          coupon: Optional[str] = None, server: Optional[str] = None):
     if not await _require_guild(interaction):
         return
     gid, uid = interaction.guild_id, interaction.user.id
@@ -32422,7 +32697,7 @@ async def shop_buy_rental(interaction: discord.Interaction, item: str,
     en = _sprache(interaction) == "en"
     rollen = ({r.id for r in interaction.user.roles}
               if isinstance(interaction.user, discord.Member) else None)
-    plan = _miete_pruefen(_conn, gid, uid, item, int(restarts), rollen, None, x, z, y, a, en)
+    plan = _miete_pruefen(_conn, gid, uid, item, int(restarts), rollen, None, x, z, y, a, en, coupon)
     if isinstance(plan, _KaufFehler):
         if plan.code == "guthaben":
             return await interaction.response.send_message(
@@ -32465,6 +32740,9 @@ async def shop_buy_rental(interaction: discord.Interaction, item: str,
                     value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=False)
     embed.add_field(name=_t(interaction, "🚚 Lieferung", "🚚 Delivery"), value=delivery_info, inline=False)
     embed.add_field(name="👛 Wallet", value=_fmt_money(res.wallet, _conn), inline=True)
+    rabatt_zeile = _preis_zeile(plan.preis, _conn, en)
+    if rabatt_zeile:
+        embed.add_field(name="🏷️", value=rabatt_zeile, inline=False)
     embed.set_footer(text=f"Miete #{res.rental_id}")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -34289,6 +34567,7 @@ class _KaufPlan:
     ort_label: Optional[str]
     total: int
     wallet: int
+    preis: Optional[_Preis] = None
 
 
 @dataclasses.dataclass
@@ -34308,7 +34587,8 @@ class _KaufErgebnis:
 
 def _kauf_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, amount: int,
                   rollen_ids: Optional[Set[int]], ort: Optional[str], x: Optional[float],
-                  z: Optional[float], y: Optional[float], en: bool) -> Union[_KaufPlan, _KaufFehler]:
+                  z: Optional[float], y: Optional[float], en: bool,
+                  gutschein: Optional[str] = None) -> Union[_KaufPlan, _KaufFehler]:
     """Alle Vorpruefungen eines Kaufs, ohne etwas zu veraendern. ``rollen_ids`` sind die Discord-Rollen des
     Kaeufers auf dieser Guild (``None`` = Mitglied unbekannt: Rollen-Items bleiben dann gesperrt)."""
     katalog = conn.catalog
@@ -34376,8 +34656,11 @@ def _kauf_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, amoun
         return _KaufFehler("hoehe", "❌ Höhe `y` außerhalb des Bereichs (−100 … 1000). Leer lassen für Bodenhöhe.",
                            "❌ Height `y` out of range (−100 … 1000). Leave it empty for ground level.")
 
-    # Preis pruefen (Vorpruefung, Abbuchung erst nach FTP-Erfolg)
-    total = int(it.get("price", 0)) * int(amount)
+    # Preis pruefen (Vorpruefung, Abbuchung erst nach FTP-Erfolg): Rollen-Rabatt, dann Gutschein
+    preis = _preis_berechnen(gid, rollen_ids, int(it.get("price", 0)) * int(amount), gutschein, en, uid)
+    if isinstance(preis, _KaufFehler):
+        return preis
+    total = preis.total
     wallet, _bank = db.get_balance(gid, uid)
     if wallet < total:
         return _KaufFehler(
@@ -34385,7 +34668,7 @@ def _kauf_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, amoun
             f"❌ Du brauchst **{_fmt_money(total, conn)}**, dein Wallet hat nur **{_fmt_money(wallet, conn)}**.",
             f"❌ You need **{_fmt_money(total, conn)}** but your wallet only has **{_fmt_money(wallet, conn)}**.",
             wallet=wallet, total=total)
-    return _KaufPlan(it, cls_list, int(amount), float(x), y_val, float(z), ort_label, total, wallet)
+    return _KaufPlan(it, cls_list, int(amount), float(x), y_val, float(z), ort_label, total, wallet, preis)
 
 
 def _kauf_ort_info(conn: "ServerConnection", x: float, z: float) -> Tuple[str, Optional[str]]:
@@ -34418,8 +34701,12 @@ async def _kauf_ausfuehren(conn: "ServerConnection", gid: int, uid: int, user_na
     if not ok:
         return _KaufErgebnis(False, "lieferung", err, err)
 
-    # 2. ... dann Geld abbuchen (atomar). Bei Fehlschlag: Rollback
-    if not db.try_spend_wallet(gid, uid, total):
+    # 2. ... dann den Gutschein reservieren und Geld abbuchen (beides atomar). Bei Fehlschlag: Rollback
+    code = plan.preis.gutschein if plan.preis else None
+    gutschein_ok = db.gutschein_einloesen(gid, code, uid, "shop") if code else True
+    if not gutschein_ok or not db.try_spend_wallet(gid, uid, total):
+        if code and gutschein_ok:
+            db.gutschein_freigeben(gid, code, uid)
         rollback_ok = await conn.shop.remove_area_entries(area_names)   # Einträge zurückrollen
         if not rollback_ok:
             # Verwaiste Einträge würden bei jedem Neustart gratis spawnen → Admins warnen
@@ -34436,6 +34723,9 @@ async def _kauf_ausfuehren(conn: "ServerConnection", gid: int, uid: int, user_na
                 color=0xE67E22)
             await _post_feed(gid, "shop_log", warn, service_id=conn.service_id)
         wallet, _bank = db.get_balance(gid, uid)
+        if not gutschein_ok:
+            return _KaufErgebnis(False, "gutschein", f"❌ Der Gutschein `{code}` gilt nicht mehr.",
+                                 f"❌ The coupon `{code}` is no longer valid.", wallet=wallet)
         return _KaufErgebnis(False, "guthaben", wallet=wallet)
 
     # 3. Kauf als pending speichern
@@ -34461,6 +34751,9 @@ async def _kauf_ausfuehren(conn: "ServerConnection", gid: int, uid: int, user_na
         color=0x3498DB)
     feed.add_field(name=_ft(conn, "Preis", "Price"), value=_fmt_money(total, conn), inline=True)
     feed.add_field(name=_ft(conn, "Ort", "Location"), value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_feed}", inline=True)
+    rabatt_feed = _preis_zeile(plan.preis, conn, _feed_sprache(conn) == "en")
+    if rabatt_feed:
+        feed.add_field(name="🏷️", value=rabatt_feed, inline=False)
     feed.add_field(name="Status", value=_ft(conn, "⏳ ausstehend (spawnt nach dem Neustart)",
                                             "⏳ pending (spawns after restart)"), inline=False)
     feed.set_footer(text=(f"{_ft(conn, 'Kauf', 'Purchase')} #{purchase_id} · " + "+".join(cls_list))[:100])
@@ -34478,11 +34771,13 @@ async def _kauf_ausfuehren(conn: "ServerConnection", gid: int, uid: int, user_na
     x="iZurvive X coordinate (East – the FIRST number on iZurvive) – not needed with `ort`",
     z="iZurvive Y coordinate (North – the SECOND number on iZurvive) – not needed with `ort`",
     y="Height / altitude (OPTIONAL – leave empty for default ground level)",
+    coupon="Coupon code for an extra discount (OPTIONAL)",
     server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_buy(interaction: discord.Interaction, item: str,
                   amount: app_commands.Range[int, 1], ort: Optional[str] = None,
                   x: Optional[float] = None, z: Optional[float] = None,
-                  y: Optional[float] = None, server: Optional[str] = None):
+                  y: Optional[float] = None, coupon: Optional[str] = None,
+                  server: Optional[str] = None):
     if not await _require_guild(interaction):
         return
     gid, uid = interaction.guild_id, interaction.user.id
@@ -34497,7 +34792,7 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
     en = _sprache(interaction) == "en"
     rollen = ({r.id for r in interaction.user.roles}
               if isinstance(interaction.user, discord.Member) else None)
-    plan = _kauf_pruefen(_conn, gid, uid, item, int(amount), rollen, ort, x, z, y, en)
+    plan = _kauf_pruefen(_conn, gid, uid, item, int(amount), rollen, ort, x, z, y, en, coupon)
     if isinstance(plan, _KaufFehler):
         if plan.code == "kein_katalog":
             return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
@@ -34546,6 +34841,9 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
                     value=f"{ort_zeile}[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=False)
     embed.add_field(name=_t(interaction, "🚚 Lieferung", "🚚 Delivery"), value=delivery_info, inline=False)
     embed.add_field(name="👛 Wallet", value=_fmt_money(res.wallet, _conn), inline=True)
+    rabatt_zeile = _preis_zeile(plan.preis, _conn, en)
+    if rabatt_zeile:
+        embed.add_field(name="🏷️", value=rabatt_zeile, inline=False)
     embed.set_footer(text=_t(interaction, f"Kauf #{res.purchase_id}", f"Purchase #{res.purchase_id}"))
     await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -36415,6 +36713,11 @@ def _audit_label(method: str, path: str) -> str:
         return exact
     if path.startswith("/api/shop/items/"):
         return "Shop-Item gelöscht" if method == "DELETE" else "Shop-Item geändert"
+    if path.startswith("/api/coupons"):
+        return {"POST": "Gutschein angelegt", "PUT": "Gutschein geändert", "DELETE": "Gutschein gelöscht"}.get(
+            method, f"{method} {path}")
+    if path == "/api/discounts":
+        return "Rabatt-Regeln geändert"
     if path.startswith("/api/zones/"):
         if "/allowlist" in path:
             return "Zonen-Allowlist geändert"
@@ -37797,6 +38100,7 @@ _DASH_PERM_CATS: Tuple[Tuple[str, str, str, Tuple[str, ...]], ...] = (
     ("discord_mgmt", "Discord Management", "Discord Management", ("view", "edit")),
     ("autotasks", "Auto-Aufgaben", "Scheduled Tasks", ("view", "create", "edit", "delete")),
     ("shop", "Shop", "Shop", ("view", "create", "edit", "delete")),
+    ("coupons", "Gutscheine & Rabatte", "Coupons & Discounts", ("view", "create", "edit", "delete")),
     ("tools", "Tools", "Tools", ("view", "edit")),
     ("map", "Karte", "Map", ("view",)),
     ("bans", "Bans", "Bans", ("view", "create", "delete")),
@@ -46169,6 +46473,205 @@ async def api_heatmap_reset(request: web.Request) -> web.Response:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+#  Gutscheine und dauerhafte Rabatte (Dashboard fuer Betreiber)
+#
+#  Alles gehoert zu EINER Guild (der in der Sitzung gewaehlten, sonst der ersten des Servers): das Wallet ist
+#  guildweit. Gate wie bei den anderen Shop-Seiten: _session_conn, _modul_pruefen, _dash_gate.
+# ──────────────────────────────────────────────────────────────────────────
+async def _gutschein_gate(request: web.Request, aktion: str
+                          ) -> Tuple[Optional["ServerConnection"], int, Optional[web.Response]]:
+    conn, denied = _session_conn(request, "shop.coupons")
+    if denied is not None:
+        return None, 0, denied
+    denied = await _modul_pruefen("shop.coupons", request, conn)
+    if denied is not None:
+        return None, 0, denied
+    denied = await _dash_gate(request, conn, "coupons", aktion)
+    if denied is not None:
+        return None, 0, denied
+    gid = getattr(_mgmt_sicht(request, conn), "guild_id", None)
+    if not gid:
+        return None, 0, err("Dem Server ist noch kein Discord-Server zugeordnet.", 409)
+    return conn, int(gid), None
+
+
+def _gutschein_status(row: Any, jetzt: float) -> str:
+    if not row["enabled"]:
+        return "disabled"
+    if row["valid_until"] is not None and jetzt > float(row["valid_until"]):
+        return "expired"
+    if row["valid_from"] is not None and jetzt < float(row["valid_from"]):
+        return "scheduled"
+    if row["max_uses"] is not None and int(row["uses"]) >= int(row["max_uses"]):
+        return "used_up"
+    return "active"
+
+
+def _gutschein_view(row: Any, jetzt: float) -> Dict[str, Any]:
+    return {"code": row["code"], "typ": row["typ"], "betrag": int(row["betrag"]), "enabled": bool(row["enabled"]),
+            "max_uses": row["max_uses"], "uses": int(row["uses"]), "valid_from": row["valid_from"],
+            "valid_until": row["valid_until"], "status": _gutschein_status(row, jetzt)}
+
+
+def _rabatt_wert_pruefen(data: Dict[str, Any]) -> Tuple[Optional[Tuple[str, int]], Optional[str]]:
+    """(typ, betrag) aus dem Body oder (None, Fehlertext)."""
+    typ = str(data.get("typ") or "")
+    if typ not in _RABATT_TYPEN:
+        return None, "Typ muss „fixed“ (fester Betrag) oder „percent“ (Prozent) sein."
+    try:
+        betrag = int(data.get("betrag"))
+    except (TypeError, ValueError):
+        return None, "Der Betrag muss eine ganze Zahl sein."
+    if betrag < 1 or (typ == "percent" and betrag > 100) or betrag > 10 ** 9:
+        return None, "Prozent: 1 bis 100. Fester Betrag: mindestens 1."
+    return (typ, betrag), None
+
+
+def _zeit_oder_none(v: Any) -> Tuple[Optional[float], bool]:
+    """(Zeitpunkt als Epoche oder None, gueltig). Leer = None."""
+    if v is None or v == "":
+        return None, True
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None, False
+    return (f, True) if math.isfinite(f) and 0 < f < 4_102_444_800 else (None, False)
+
+
+def _gutschein_felder(data: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    wert, fehler = _rabatt_wert_pruefen(data)
+    if wert is None:
+        return None, fehler
+    max_uses = data.get("max_uses")
+    if max_uses in (None, ""):
+        max_uses = None
+    else:
+        try:
+            max_uses = int(max_uses)
+        except (TypeError, ValueError):
+            return None, "Die Anzahl der Nutzungen muss eine ganze Zahl sein."
+        if max_uses < 1 or max_uses > 10 ** 9:
+            return None, "Die Anzahl der Nutzungen muss mindestens 1 sein."
+    von, ok1 = _zeit_oder_none(data.get("valid_from"))
+    bis, ok2 = _zeit_oder_none(data.get("valid_until"))
+    if not (ok1 and ok2):
+        return None, "Ungültiger Zeitraum."
+    if von is not None and bis is not None and bis <= von:
+        return None, "„Gültig bis“ muss nach „Gültig ab“ liegen."
+    return {"typ": wert[0], "betrag": wert[1], "enabled": bool(data.get("enabled", True)), "max_uses": max_uses,
+            "valid_from": von, "valid_until": bis}, None
+
+
+async def api_coupons_list(request: web.Request) -> web.Response:
+    conn, gid, denied = await _gutschein_gate(request, "view")
+    if denied is not None:
+        return denied
+    jetzt = time.time()
+    guild = bot.get_guild(gid) if bot is not None else None
+    regeln = []
+    for r in db.rabatt_liste(gid):
+        rolle = guild.get_role(int(r["role_id"])) if guild is not None else None
+        regeln.append({"role_id": str(r["role_id"]), "role_name": rolle.name if rolle is not None else None,
+                       "typ": r["typ"], "betrag": int(r["betrag"])})
+    return ok({"guild_id": str(gid), "coupons": [_gutschein_view(r, jetzt) for r in db.gutschein_liste(gid)],
+               "rabatte": regeln, "max_rabatte": _RABATT_MAX_REGELN,
+               "waehrung": {"symbol": _cur_symbol(conn), "voran": bool(conn.get("prepend_currency_symbol", False))},
+               "kategorie_stufe": _module_tier("shop.coupons")})
+
+
+async def api_coupons_create(request: web.Request) -> web.Response:
+    conn, gid, denied = await _gutschein_gate(request, "create")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "shop.coupon", 3)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    code = _gutschein_code(data.get("code"))
+    if code is None:
+        return err("Der Code braucht 3 bis 32 Zeichen: Buchstaben, Ziffern oder Bindestrich.")
+    felder, fehler = _gutschein_felder(data)
+    if felder is None:
+        return err(fehler or "Ungültige Eingabe.")
+    erg = await _dash_run(db.gutschein_speichern, gid, code, felder["typ"], felder["betrag"], felder["enabled"],
+                          felder["max_uses"], felder["valid_from"], felder["valid_until"], True)
+    if erg == "existiert":
+        return err("Diesen Gutscheincode gibt es schon.", 409)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Gutschein angelegt", f"{code} (Guild {gid})")
+    return ok({"code": code})
+
+
+async def api_coupons_update(request: web.Request) -> web.Response:
+    conn, gid, denied = await _gutschein_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "shop.coupon", 3)
+    if denied is not None:
+        return denied
+    code = _gutschein_code(request.match_info.get("code"))
+    if code is None:
+        return err("Ungültiger Code.")
+    data = await body(request)
+    felder, fehler = _gutschein_felder(data)
+    if felder is None:
+        return err(fehler or "Ungültige Eingabe.")
+    erg = await _dash_run(db.gutschein_speichern, gid, code, felder["typ"], felder["betrag"], felder["enabled"],
+                          felder["max_uses"], felder["valid_from"], felder["valid_until"], False)
+    if erg == "nicht_gefunden":
+        return err("Diesen Gutschein gibt es nicht.", 404)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Gutschein geändert", f"{code} (Guild {gid})")
+    return ok({"code": code})
+
+
+async def api_coupons_delete(request: web.Request) -> web.Response:
+    conn, gid, denied = await _gutschein_gate(request, "delete")
+    if denied is not None:
+        return denied
+    code = _gutschein_code(request.match_info.get("code"))
+    if code is None or not await _dash_run(db.gutschein_loeschen, gid, code):
+        return err("Diesen Gutschein gibt es nicht.", 404)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Gutschein gelöscht", f"{code} (Guild {gid})")
+    return ok({"code": code})
+
+
+async def api_discounts_put(request: web.Request) -> web.Response:
+    """Ersetzt die Rabatt-Regeln dieser Guild als Ganzes: [{role_id, typ, betrag}] - je Rolle hoechstens eine."""
+    conn, gid, denied = await _gutschein_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "shop.discounts", 3)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    roh = data.get("rules")
+    if not isinstance(roh, list) or len(roh) > _RABATT_MAX_REGELN:
+        return err(f"Höchstens {_RABATT_MAX_REGELN} Rabatt-Regeln.")
+    regeln: List[Tuple[int, str, int]] = []
+    gesehen: Set[int] = set()
+    for r in roh:
+        if not isinstance(r, dict):
+            return err("Ungültige Regel.")
+        try:
+            rid = int(str(r.get("role_id")).strip())
+        except (TypeError, ValueError):
+            return err("Jede Regel braucht eine Rolle.")
+        if rid in gesehen:
+            return err("Jede Rolle darf nur eine Regel haben.")
+        gesehen.add(rid)
+        denied = _rolle_gehoert_guild(gid, rid)
+        if denied is not None:
+            return denied
+        wert, fehler = _rabatt_wert_pruefen(r)
+        if wert is None:
+            return err(fehler or "Ungültige Regel.")
+        regeln.append((rid, wert[0], wert[1]))
+    await _dash_run(db.rabatt_ersetzen, gid, regeln)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Rabatt-Regeln geändert",
+               f"{len(regeln)} Regel(n) (Guild {gid})")
+    return ok({"anzahl": len(regeln)})
+
+
+# ──────────────────────────────────────────────────────────────────────────
 #  Spielerbereich: /api/me/*
 #
 #  Ein Spieler ist weder Besitzer noch Admin noch Gast – er hat keine Dashboard-Verbindung (_session_conn
@@ -46254,6 +46757,59 @@ async def _spieler_ctx(request: web.Request) -> Tuple[Optional[Dict[str, Any]], 
 
 def _spieler_geld(conn: ServerConnection, n: int) -> str:
     return _klartext(_fmt_money(int(n), conn))
+
+
+def _spieler_rabatte(ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Die dauerhaften Rabatte, die dem Spieler aus seinen Rollen zustehen (zur Anzeige; gerechnet wird beim Kauf)."""
+    conn = ctx["conn"]
+    out = []
+    for r in db.rabatt_liste(ctx["gid"]):
+        if int(r["role_id"]) in ctx["rollen"]:
+            out.append({"typ": r["typ"], "betrag": int(r["betrag"]),
+                        "text": _klartext(_rabatt_beschreibung(r["typ"], int(r["betrag"]), conn, ctx["en"]))})
+    return out
+
+
+async def post_me_quote(request: web.Request) -> web.Response:
+    """Endpreis VORAB (mit Rollen-Rabatt und optionalem Gutschein) fuer den Kauf-Dialog - veraendert nichts."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    conn, gid, en = ctx["conn"], ctx["gid"], _spieler_en(request, ctx["sess"], data)
+    denied = _dash_rate_limited(request, "me.quote", 1)
+    if denied is not None:
+        return denied
+    art, name = str(data.get("art") or ""), str(data.get("item") or "")
+    try:
+        menge = int(data.get("amount" if art == "shop" else "restarts", 1))
+    except (TypeError, ValueError):
+        return err("Ungültige Menge." if not en else "Invalid amount.", 400)
+    if menge < 1:
+        return err("Ungültige Menge." if not en else "Invalid amount.", 400)
+    if art == "shop":
+        it = conn.catalog.find(name) if conn.catalog is not None else None
+        liste = int(it.get("price", 0)) * menge if it and it.get("enabled", True) else None
+    elif art == "rental":
+        it = conn.rentals_catalog.find(name)
+        liste = int(it.get("price_per_restart", 0)) * menge if it and it.get("enabled", True) else None
+    else:
+        return err("Unbekannte Art.", 400)
+    if liste is None:
+        return err("Dieses Item gibt es nicht." if not en else "This item does not exist.", 404)
+    gutschein = str(data.get("gutschein") or "").strip() or None
+    preis = _preis_berechnen(gid, ctx["rollen"], liste, gutschein, en, ctx["uid"])
+    if isinstance(preis, _KaufFehler):
+        return err(_klartext(preis.text(en)), 400, code=preis.code)
+    return ok(_preis_view(preis, conn, en))
+
+
+def _preis_view(preis: "_Preis", conn: ServerConnection, en: bool) -> Dict[str, Any]:
+    return {"liste_text": _spieler_geld(conn, preis.liste), "total_text": _spieler_geld(conn, preis.total),
+            "rabatt": preis.rabatt, "rabatt_text": _spieler_geld(conn, preis.rabatt),
+            "gutschein": preis.gutschein, "gutschein_abzug": preis.gutschein_abzug,
+            "gutschein_text": _spieler_geld(conn, preis.gutschein_abzug),
+            "zeile": _klartext(_preis_zeile(preis, conn, en) or "")}
 
 
 def _ort_dict(r: Any, conn: ServerConnection) -> Dict[str, Any]:
@@ -46370,6 +46926,7 @@ async def api_me_shop(request: web.Request) -> web.Response:
                       "kaufbar": kaufbar, "rollen": rollen_namen})
     wallet, _bank = db.get_balance(ctx["gid"], ctx["uid"])
     return ok({"items": items, "wallet": wallet, "wallet_text": _spieler_geld(conn, wallet),
+               "rabatte": _spieler_rabatte(ctx),
                "waehrung": {"symbol": _cur_symbol(conn),
                             "voran": bool(conn.get("prepend_currency_symbol", False))}})
 
@@ -46399,7 +46956,8 @@ async def post_me_shop_buy(request: web.Request) -> web.Response:
     if speichern_als and not _ORTE_NAME_RE.match(speichern_als):
         return err("Ungültiger Ortsname." if not en else "Invalid location name.", 400)
 
-    plan = _kauf_pruefen(conn, gid, uid, str(data.get("item") or ""), amount, ctx["rollen"], ort, x, z, y, en)
+    gutschein = str(data.get("gutschein") or "").strip() or None
+    plan = _kauf_pruefen(conn, gid, uid, str(data.get("item") or ""), amount, ctx["rollen"], ort, x, z, y, en, gutschein)
     if isinstance(plan, _KaufFehler):
         text = _klartext(plan.text(en))
         if plan.code == "rolle":
@@ -46418,7 +46976,7 @@ async def post_me_shop_buy(request: web.Request) -> web.Response:
                     if not en else
                     f"You need {_spieler_geld(conn, plan.total)} but only have {_spieler_geld(conn, res.wallet)}.")
             return err(text, 402, code=res.code)
-        status = 503 if res.code in ("kein_ftp", "shop_start") else 500
+        status = 503 if res.code in ("kein_ftp", "shop_start") else (409 if res.code == "gutschein" else 500)
         return err(_klartext(res.text(en)), status, code=res.code)
     gespeichert = None
     if speichern_als:
@@ -46429,6 +46987,7 @@ async def post_me_shop_buy(request: web.Request) -> web.Response:
                "total_text": _spieler_geld(conn, plan.total), "wallet_text": _spieler_geld(conn, res.wallet),
                "x": round(plan.x, 1), "z": round(plan.z, 1), "ort_label": _klartext(plan.ort_label or ""),
                "link": loc_url, "near": near, "auto_restart": res.auto_restart,
+               "preis_zeile": _klartext(_preis_zeile(plan.preis, conn, en) or ""),
                "ort_gespeichert": gespeichert})
 
 
@@ -46469,6 +47028,7 @@ async def api_me_rentals(request: web.Request) -> web.Response:
               for r in await _dash_run(db.rentals_of_user, conn.service_id, gid, uid, 30)]
     wallet, _bank = db.get_balance(gid, uid)
     return ok({"items": items, "mieten": mieten, "wallet": wallet, "wallet_text": _spieler_geld(conn, wallet),
+               "rabatte": _spieler_rabatte(ctx),
                "waehrung": {"symbol": _cur_symbol(conn), "voran": bool(conn.get("prepend_currency_symbol", False))}})
 
 
@@ -46493,7 +47053,9 @@ async def post_me_rentals_buy(request: web.Request) -> web.Response:
     speichern_als = str(data.get("speichern_als") or "").strip()
     if speichern_als and not _ORTE_NAME_RE.match(speichern_als):
         return err("Ungültiger Ortsname." if not en else "Invalid location name.", 400)
-    plan = _miete_pruefen(conn, gid, uid, str(data.get("item") or ""), restarts, ctx["rollen"], ort, x, z, y, a, en)
+    gutschein = str(data.get("gutschein") or "").strip() or None
+    plan = _miete_pruefen(conn, gid, uid, str(data.get("item") or ""), restarts, ctx["rollen"], ort, x, z, y, a, en,
+                          gutschein)
     if isinstance(plan, _KaufFehler):
         text = _klartext(plan.text(en))
         if plan.code == "rolle":
@@ -46512,7 +47074,7 @@ async def post_me_rentals_buy(request: web.Request) -> web.Response:
                     if not en else
                     f"You need {_spieler_geld(conn, plan.total)} but only have {_spieler_geld(conn, res.wallet)}.")
             return err(text, 402, code=res.code)
-        status = 503 if res.code in ("kein_ftp", "shop_start") else 500
+        status = 503 if res.code in ("kein_ftp", "shop_start") else (409 if res.code == "gutschein" else 500)
         return err(_klartext(res.text(en)), status, code=res.code)
     gespeichert = None
     if speichern_als:
@@ -46523,6 +47085,7 @@ async def post_me_rentals_buy(request: web.Request) -> web.Response:
                "total_text": _spieler_geld(conn, plan.total), "wallet_text": _spieler_geld(conn, res.wallet),
                "x": round(plan.x, 1), "z": round(plan.z, 1), "ort_label": _klartext(plan.ort_label or ""),
                "link": loc_url, "near": near, "auto_restart": res.auto_restart,
+               "preis_zeile": _klartext(_preis_zeile(plan.preis, conn, en) or ""),
                "ort_gespeichert": gespeichert})
 
 
@@ -48014,6 +48577,7 @@ def build_app() -> web.Application:
     r.add_get("/api/me/orders", api_me_orders)
     r.add_get("/api/me/shop", api_me_shop)
     r.add_post("/api/me/shop/buy", post_me_shop_buy)
+    r.add_post("/api/me/quote", post_me_quote)
     r.add_get("/api/me/rentals", api_me_rentals)
     r.add_post("/api/me/rentals/buy", post_me_rentals_buy)
     r.add_get("/api/me/places", api_me_places)
@@ -48138,6 +48702,11 @@ def build_app() -> web.Application:
     r.add_post("/api/shop/rentals", api_shop_rentals_create)
     r.add_put("/api/shop/rentals/{name}", api_shop_rentals_update)
     r.add_delete("/api/shop/rentals/{name}", api_shop_rentals_delete)
+    r.add_get("/api/coupons", api_coupons_list)
+    r.add_post("/api/coupons", api_coupons_create)
+    r.add_put("/api/coupons/{code}", api_coupons_update)
+    r.add_delete("/api/coupons/{code}", api_coupons_delete)
+    r.add_put("/api/discounts", api_discounts_put)
     r.add_get("/api/events/templates", api_event_templates_list)
     r.add_post("/api/events/templates", api_event_templates_create)
     r.add_put("/api/events/templates/{name}", api_event_templates_update)
@@ -48923,6 +49492,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "6b28d12e1c945fa02f90b360c2bc97a78077e2d8849668a7143c5c886ba4fd90",
         "e2d24b954acac4bd818e15c4c9289791bf7085b2c60141ec123def7a2068d24d",
         "3e13426ebab5e74f309181e8e3967f7e47107c7c591f5b902af63ab82733852f",
+        "ab087186d659ce9b2cdecf427fcfb124c5f300d561da09ce84d41216e99a1046",
     ),
     "styles.css": (
         "854cd5c0116ef9230d2534c486b88c6dff38df66194defb0c429309ea4add035",
@@ -48971,6 +49541,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "08fca07211f88d28baea2e711898d50887c17e8afc4f0d8889f3cbc558d68a8f",
         "92bac71a41b90fb4b2970fc337c5fbd762ae22a84b6d950162f7f8278a85ff72",
         "0559404f19f1db0e1a5438512ae802a5af1ecce82379ea8e588e5454b85353b0",
+        "b532e93d2b9b046fc8f8c4e9b0026a0293fea64c79048ae8ee8add00ed42aac8",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -49221,6 +49792,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "5d23bea4f5ff5e7fe0514ef753383395555856619c40201b887321fe009f7e71",
         "0fd2761e0aac63310c92b22c5b3efdacc02830be4349dbf7ad2c60546878524d",
         "1db619f03c10fd50eb82d04b42170244fe19d6ea26574bbf85d0ad4f807c9d99",
+        "1d0a6b30994cb2a6fd4f07f42eea70c7d626666afc324b91eb72b1afe0684a2b",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",

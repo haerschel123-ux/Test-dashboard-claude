@@ -298,6 +298,9 @@ class _FakeDB:
     def get_balance(self, guild_id, user_id):
         return self.wallet, 0
 
+    def rabatt_liste(self, guild_id):          # keine Rabatt-Regeln (die Preisberechnung fragt sie ab)
+        return []
+
     def try_spend_wallet(self, guild_id, user_id, amount):
         if amount > self.wallet:
             return False
