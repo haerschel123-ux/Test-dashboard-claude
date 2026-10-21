@@ -386,3 +386,123 @@ def test_spieler_kann_die_sprache_wechseln(welt):
     assert api("POST", "/api/sprache", s, {"lang": "de"})[0] == 200
     assert bot.cfg.sprache.get("555") == "de"
     assert api("POST", "/api/sprache", None, {"lang": "de"})[0] == 401
+
+
+# ── Mieten (/api/me/rentals) ─────────────────────────────────────────────
+import xml.etree.ElementTree as ET  # noqa: E402
+from test_shop_rentals import MISSION, _EVENTS_XML, _RENTAL_EVENT_XML, _FakeFTP  # noqa: E402
+
+
+class _SchreibFehlerFTP(_FakeFTP):
+    def write_file(self, pfad, inhalt):
+        return False
+
+
+@pytest.fixture
+def miete(welt):
+    a = welt["a"]
+    a.ftp, a.rentals = _FakeFTP(), True
+    a.data["ftp_mission_dir"] = MISSION
+    kat = bot.RentalCatalog()
+    for name, preis, rollen, an in (("Olga", 100, [], True), ("Vip-Olga", 50, [ROLLE_VIP], True), ("Aus", 1, [], False)):
+        kat.items.append({"name": name, "price_per_restart": preis, "event_xml": _RENTAL_EVENT_XML, "event_zone": "",
+                          "category": "Vehicle", "event_group": "", "enabled": an, "min_restarts": 1,
+                          "max_restarts": 5, "role_ids": rollen})
+    kat.rebuild_index()
+    a._rentals_catalog = kat
+    return a
+
+
+def _miet_events(conn):
+    root = ET.fromstring(conn.ftp.files[f"{MISSION}/db/events.xml"])
+    return [e.get("name") for e in root.findall("event") if (e.get("name") or "").startswith(bot._RENTAL_EVENT_PREFIX)]
+
+
+def _mieten(s, **kw):
+    return api("POST", "/api/me/rentals/buy", s, dict({"item": "Olga", "restarts": 2}, **kw))
+
+
+def test_miet_katalog_und_rollen(welt, miete):
+    st, d = api("GET", "/api/me/rentals", _session(gid=G_A, sid_="1000"))
+    items = {i["name"]: i for i in d["data"]["items"]}
+    assert st == 200 and set(items) == {"Olga", "Vip-Olga"} and items["Olga"]["kaufbar"] and not items["Vip-Olga"]["kaufbar"]
+    assert d["data"]["mieten"] == []
+    st, d = api("GET", "/api/me/rentals", _session(uid=ANDERER, gid=G_A, sid_="1000"))
+    assert {i["name"]: i for i in d["data"]["items"]}["Vip-Olga"]["kaufbar"]
+
+
+def test_miete_per_koordinaten(welt, miete):
+    bot.db.add_wallet(G_A, U, 1000)
+    vor = bot.db.get_balance(G_A, U)[0]
+    st, d = _mieten(_session(gid=G_A, sid_="1000"), x=4640, z=10350)
+    assert st == 200, d
+    assert len(_miet_events(miete)) == 1 and bot.db.get_balance(G_A, U)[0] == vor - 200
+    assert welt["feeds"][-1] == (G_A, "shop_log", "1000")
+    st, d = api("GET", "/api/me/rentals", _session(gid=G_A, sid_="1000"))
+    m = d["data"]["mieten"]
+    assert len(m) == 1 and (m[0]["item"], m[0]["total"], m[0]["remaining"], m[0]["status"]) == ("Olga", 2, 2, "active")
+
+
+def test_miete_mit_gespeichertem_ort_und_ort_speichern(welt, miete):
+    bot.db.add_wallet(G_A, U, 1000)
+    s = _session(gid=G_A, sid_="1000")
+    api("POST", "/api/me/places", s, {"name": "Basis", "x": 4640, "z": 10350})
+    st, d = _mieten(s, ort="Basis")
+    assert st == 200 and "Basis" in d["data"]["ort_label"], d
+    bot._DASH_RATE_LIMIT_LAST.clear()
+    st, d = _mieten(s, x=1000, z=2000, speichern_als="Garage")
+    assert st == 200 and d["data"]["ort_gespeichert"] == "ok"
+    assert {o["name"] for o in api("GET", "/api/me/places", s)[1]["data"]["gespeichert"]} == {"Basis", "Garage"}
+
+
+def test_miete_ablehnungen_veraendern_nichts(welt, miete):
+    bot.db.add_wallet(G_A, U, 1000)
+    vor = bot.db.get_balance(G_A, U)[0]
+    s = _session(gid=G_A, sid_="1000")
+    for kw in (dict(item="Gibt es nicht", x=1, z=1), dict(item="Aus", x=1, z=1), dict(restarts=99, x=1, z=1),
+               dict(restarts=0, x=1, z=1), dict(restarts="abc", x=1, z=1), dict(x=1, z=1, ort="last"), dict(),
+               dict(x=99999, z=1), dict(x="abc", z=1), dict(x=1, z=1, speichern_als="a<b>"),
+               dict(item="Vip-Olga", x=1, z=1), dict(ort="last")):
+        st, d = _mieten(s, **kw)
+        assert st in (400, 402) and not d["ok"], kw
+    assert bot.db.get_balance(G_A, U)[0] == vor and _miet_events(miete) == []
+    assert bot.db.rentals_of_user("1000", G_A, U, 5) == []
+
+
+def test_miete_zu_wenig_guthaben_402(welt, miete):
+    s = _session(gid=G_A, sid_="1000")
+    bot.db.try_spend_wallet(G_A, U, bot.db.get_balance(G_A, U)[0])
+    st, d = _mieten(s, x=1, z=1)
+    assert st == 402 and d["code"] == "guthaben" and _miet_events(miete) == []
+
+
+def test_miete_ftp_schreibfehler_nichts_abgebucht(welt, miete):
+    miete.ftp = _SchreibFehlerFTP()
+    bot.db.add_wallet(G_A, U, 1000)
+    vor = bot.db.get_balance(G_A, U)[0]
+    st, d = _mieten(_session(gid=G_A, sid_="1000"), x=1, z=1)
+    assert st == 500 and bot.db.get_balance(G_A, U)[0] == vor and bot.db.rentals_of_user("1000", G_A, U, 5) == []
+
+
+def test_miete_rollen_item_mit_rolle(welt, miete):
+    bot.db.add_wallet(G_A, ANDERER, 1000)
+    st, d = _mieten(_session(uid=ANDERER, gid=G_A, sid_="1000"), item="Vip-Olga", x=1, z=1)
+    assert st == 200, d
+
+
+def test_miete_fremder_ort_und_fremde_mieten(welt, miete):
+    bot.db.add_wallet(G_A, U, 1000)
+    bot.db.add_wallet(G_A, ANDERER, 1000)
+    api("POST", "/api/me/places", _session(uid=ANDERER, gid=G_A, sid_="1000"), {"name": "Fremd", "x": 5, "z": 5})
+    s = _session(gid=G_A, sid_="1000")
+    assert _mieten(s, ort="Fremd")[0] == 400
+    assert _mieten(_session(uid=ANDERER, gid=G_A, sid_="1000"), x=1, z=1)[0] == 200
+    assert api("GET", "/api/me/rentals", s)[1]["data"]["mieten"] == []        # die Miete des anderen sieht er nicht
+    assert len(api("GET", "/api/me/rentals", _session(uid=ANDERER, gid=G_A, sid_="1000"))[1]["data"]["mieten"]) == 1
+
+
+def test_miete_nur_auf_dem_gewaehlten_server_und_nur_fuer_mitglieder(welt, miete):
+    bot.db.add_wallet(G_A, U, 1000)
+    assert _mieten(_session(mitglied=(G_B,), gid=G_A, sid_="1000"), x=1, z=1)[0] == 403       # Mitgliedschaft fehlt
+    assert api("GET", "/api/me/rentals", _session())[0] == 409                                # kein Server gewaehlt
+    assert _miet_events(miete) == []

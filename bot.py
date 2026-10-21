@@ -28124,6 +28124,16 @@ class EconomyDB:
                 "AND guild_id=? AND service_id=? ORDER BY id",
                 (int(guild_id), str(service_id or ""))).fetchall())
 
+    def rentals_of_user(self, service_id: str, guild_id: int, user_id: int, limit: int = 30) -> List[sqlite3.Row]:
+        """Mieten EINES Users auf diesem Server (aktive und ablaufende zuerst, dann die juengsten) - fuer den
+        Spielerbereich. Wie active_rentals immer nach guild_id UND service_id gefiltert."""
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT id, item_name, x, z, restarts_total, restarts_remaining, status, created_at FROM rentals "
+                "WHERE service_id=? AND guild_id=? AND user_id=? "
+                "ORDER BY (status IN ('active','expiring')) DESC, created_at DESC, id DESC LIMIT ?",
+                (str(service_id or ""), guild_id, user_id, max(1, int(limit)))).fetchall())
+
     def rental_decrement(self, rental_id: int, restarts_remaining: int):
         with self._lock:
             self._conn.execute(
@@ -32169,6 +32179,222 @@ shop_buy_group = app_commands.Group(name="buy", description="Buy something from 
                                     parent=shop_group)
 
 
+# ── Miete: Pruefen und Ausfuehren – gemeinsam fuer /shop buy rental und das Dashboard ──
+# Wie beim Kauf (_kauf_pruefen/_kauf_ausfuehren): die Regeln stehen EINMAL hier, beide Wege uebersetzen nur das
+# Ergebnis in ihre Antwort.
+@dataclasses.dataclass
+class _MietePlan:
+    item: Dict[str, Any]
+    restarts: int
+    x: float
+    y: Optional[float]
+    z: float
+    a: Optional[float]
+    ort_label: Optional[str]
+    total: int
+    wallet: int
+
+
+@dataclasses.dataclass
+class _MieteErgebnis:
+    ok: bool
+    code: str = ""
+    de: str = ""
+    en: str = ""
+    rental_id: int = 0
+    event_name: str = ""
+    wallet: int = 0
+    auto_restart: bool = False
+    cooldown: int = 0
+
+    def text(self, en: bool) -> str:
+        return self.en if en else self.de
+
+
+def _miete_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, restarts: int,
+                   rollen_ids: Optional[Set[int]], ort: Optional[str], x: Optional[float], z: Optional[float],
+                   y: Optional[float], a: Optional[float], en: bool) -> Union[_MietePlan, "_KaufFehler"]:
+    """Alle Vorpruefungen einer Miete, ohne etwas zu veraendern. ``rollen_ids``: Rollen des Mieters auf dieser
+    Guild (``None`` = Mitglied unbekannt: Rollen-Items bleiben gesperrt)."""
+    it = conn.rentals_catalog.find(item)
+    if not it or not it.get("enabled", True):
+        return _KaufFehler(
+            "item", f"❌ Miet-Item `{item}` ist nicht verfügbar. `/shop rentals` zeigt den Katalog.",
+            f"❌ Rental item `{item}` is not available. Use `/shop rentals` to see the catalog.")
+    # Rollen-Beschraenkung zuerst (leer = alle duerfen)
+    noetig = _rollen_aus_daten(it.get("role_ids"))
+    if noetig and not (rollen_ids is not None and any(r in rollen_ids for r in noetig)):
+        return _KaufFehler(
+            "rolle",
+            f"❌ Du hast nicht die erforderliche Rolle, um **{it['name']}** zu mieten.\n"
+            "Benötigt wird: " + ", ".join(f"<@&{r}>" for r in noetig),
+            f"❌ You don't have the required role to rent **{it['name']}**.\n"
+            "Required: " + ", ".join(f"<@&{r}>" for r in noetig),
+            daten={"role_ids": [str(r) for r in noetig]})
+    min_r, max_r = int(it.get("min_restarts", 1)), int(it.get("max_restarts", 1))
+    if not (min_r <= restarts <= max_r):
+        return _KaufFehler("menge", f"❌ **{it['name']}** kann für {min_r}–{max_r} Neustarts gemietet werden.",
+                           f"❌ **{it['name']}** can be rented for {min_r}-{max_r} restarts.")
+    # Ort: eine Auswahl (letzter Ort, Platzierung, gespeicherter Ort) ODER x/z - nur eigene Orte auf diesem Server
+    ort_label: Optional[str] = None
+    if ort and (x is not None or z is not None):
+        return _KaufFehler("ort_doppelt", "❌ Entweder `ort` wählen ODER `x` und `z` angeben – nicht beides.",
+                           "❌ Pick `ort` OR enter `x` and `z` – not both.")
+    if ort:
+        aufgeloest, ort_fehler = _ort_aufloesen(conn, gid, uid, ort, en)
+        if aufgeloest is None:
+            return _KaufFehler("ort", ort_fehler, ort_fehler)
+        x, z, ort_label = aufgeloest
+    elif x is None or z is None:
+        return _KaufFehler("ort_fehlt", "❌ Bitte `x` und `z` oder einen gespeicherten Ort angeben.",
+                           "❌ Please enter `x` and `z` or pick a saved location.")
+    # Koordinaten validieren (iZurvive: x=Ost, z=Nord)
+    if not (0.0 <= x <= 20000.0 and 0.0 <= z <= 20000.0):
+        return _KaufFehler(
+            "koordinaten",
+            "❌ Koordinaten außerhalb der Map. Gib die beiden iZurvive-Zahlen als "
+            "`x` (Ost) und `z` (Nord) an, z. B. `x: 4640` `z: 10350`.",
+            "❌ Coordinates out of range. Enter the two iZurvive numbers as "
+            "`x` (East) and `z` (North), e.g. `x: 4640` `z: 10350`.")
+    # Preis pruefen (Vorpruefung, Abbuchung erst nach FTP-Erfolg)
+    total = int(it.get("price_per_restart", 0)) * int(restarts)
+    wallet, _bank = db.get_balance(gid, uid)
+    if wallet < total:
+        return _KaufFehler(
+            "guthaben",
+            f"❌ Du brauchst **{_fmt_money(total, conn)}**, dein Wallet hat nur **{_fmt_money(wallet, conn)}**.",
+            f"❌ You need **{_fmt_money(total, conn)}** but your wallet only has **{_fmt_money(wallet, conn)}**.",
+            wallet=wallet, total=total)
+    return _MietePlan(it, int(restarts), float(x), y, float(z), a, ort_label, total, wallet)
+
+
+async def _miete_ausfuehren(conn: "ServerConnection", gid: int, uid: int, user_name: str,
+                            plan: _MietePlan) -> _MieteErgebnis:
+    """Liefert die vorgepruefte Miete aus: Event + Position schreiben (unter dem Event-Lock), dann abbuchen
+    (atomar, bei Fehlschlag Rollback), dann als aktiv speichern und im shop_log-Feed melden."""
+    if conn.api is None or conn.ftp is None:
+        return _MieteErgebnis(
+            False, "kein_ftp",
+            "❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn kann nichts "
+            "ausgeliefert werden.\nBitte wende dich an den Bot-Betreiber.",
+            "❌ This server is missing FTP access – without it nothing "
+            "can be delivered.\nPlease contact the bot operator.")
+    if not conn.rentals or not _mission_dir_of(conn):
+        return _MieteErgebnis(
+            False, "shop_start",
+            "❌ Rental-System startet noch oder es ist kein Mission-Ordner bekannt – "
+            "bitte gleich noch einmal versuchen.",
+            "❌ Rental system is still starting up or no mission folder is known – "
+            "try again in a moment.")
+    it, restarts, total = plan.item, plan.restarts, plan.total
+    x, y, z, a = plan.x, plan.y, plan.z, plan.a
+
+    # 1. Event + Position schreiben (unter dem Rentals-Lock)
+    event_name = _tool_rental_event_name()
+    loop = asyncio.get_running_loop()
+    async with conn.events_lock:
+        ev_text, ev_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, conn, "db/events.xml")
+        sp_text, sp_status = await loop.run_in_executor(
+            None, _tool_datei_lesen_sync, conn, "cfgeventspawns.xml")
+        if ev_status != "ok" or sp_status != "ok":
+            return _MieteErgebnis(
+                False, "ftp_lesen", "❌ db/events.xml oder cfgeventspawns.xml sind per FTP nicht lesbar.",
+                "❌ db/events.xml or cfgeventspawns.xml could not be read via FTP.")
+        try:
+            renamed = _tool_rental_event_umbenennen(str(it.get("event_xml") or ""), event_name)
+            neu_ev = _tool_rental_event_einfuegen(ev_text, event_name, renamed)
+        except ValueError as e:
+            return _MieteErgebnis(False, "event", f"❌ {e}", f"❌ {e}")
+        pos_group = str(it.get("event_group") or "").strip() or None
+        neu_sp = _tool_rental_pos_schreiben(
+            sp_text, event_name, x, z, y=y, a=a, gruppe=pos_group,
+            zone_xml=(str(it.get("event_zone") or "") or None))
+
+        ok_ev = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, conn, "db/events.xml", neu_ev)
+        if not ok_ev:
+            return _MieteErgebnis(
+                False, "ftp_schreiben", "❌ db/events.xml konnte nicht gespeichert werden – nichts wurde abgebucht.",
+                "❌ db/events.xml could not be saved – nothing was charged.")
+        ok_sp = await loop.run_in_executor(
+            None, _tool_datei_schreiben_sync, conn, "cfgeventspawns.xml", neu_sp)
+        if not ok_sp:
+            # Event wurde geschrieben, Position nicht – Event zurückrollen,
+            # sonst bleibt ein Event ohne Position übrig.
+            neu_ev_rollback, _ = _tool_delete_event(neu_ev, event_name)
+            await loop.run_in_executor(
+                None, _tool_datei_schreiben_sync, conn, "db/events.xml", neu_ev_rollback)
+            return _MieteErgebnis(
+                False, "ftp_schreiben",
+                "❌ cfgeventspawns.xml konnte nicht gespeichert werden – nichts wurde abgebucht.",
+                "❌ cfgeventspawns.xml could not be saved – nothing was charged.")
+
+    # 2. ... dann Geld abbuchen (atomar). Bei Fehlschlag: Rollback
+    if not db.try_spend_wallet(gid, uid, total):
+        rollback_ok = False
+        async with conn.events_lock:
+            ev2, ev2_status = await loop.run_in_executor(
+                None, _tool_datei_lesen_sync, conn, "db/events.xml")
+            sp2, sp2_status = await loop.run_in_executor(
+                None, _tool_datei_lesen_sync, conn, "cfgeventspawns.xml")
+            if ev2_status == "ok" and sp2_status == "ok":
+                ev3, _ = _tool_delete_event(ev2, event_name)
+                sp3, _ = _tool_delete_eventspawns(sp2, event_name)
+                rollback_ok = (
+                    await loop.run_in_executor(
+                        None, _tool_datei_schreiben_sync, conn, "db/events.xml", ev3)
+                    and await loop.run_in_executor(
+                        None, _tool_datei_schreiben_sync, conn, "cfgeventspawns.xml", sp3))
+        if not rollback_ok:
+            log.error(f"[RENTAL] Rollback fehlgeschlagen – verwaistes Event: {event_name}")
+            warn = discord.Embed(
+                title=_ft(conn, "⚠️ Verwaistes Miet-Event", "⚠️ Orphaned rental event"),
+                description=_ft(conn,
+                                f"Ein abgebrochener Miet-Kauf konnte nicht zurückgerollt werden "
+                                f"(`{event_name}`). Es muss manuell über das Event-Vorlagen-Tool "
+                                f"entfernt werden – `/shop check` markiert es ebenfalls.",
+                                f"A cancelled rental purchase could not be rolled back "
+                                f"(`{event_name}`). It needs manual removal via the "
+                                f"Event templates tool - `/shop check` also flags it."),
+                color=0xE67E22)
+            await _post_feed(gid, "shop_log", warn, service_id=conn.service_id)
+        wallet, _bank = db.get_balance(gid, uid)
+        return _MieteErgebnis(False, "guthaben", wallet=wallet)
+
+    # 3. Miete als aktiv speichern
+    # expires_at ist nur eine grobe Rückfall-Sicherung (siehe
+    # RentalManager.on_restart_detected) - falls der Server sehr lange ohne
+    # erkannten Neustart durchläuft, verhindert sie einen unbegrenzten Ablauf.
+    expires_at = time.time() + max(1, int(restarts)) * 6 * 3600
+    rental_id = db.create_rental(
+        conn.service_id, gid, uid, user_name, it["name"], event_name,
+        x, y, z, a, pos_group, int(restarts), expires_at)
+
+    # 4. Auto-Restart oder Hinweis auf nächsten Neustart
+    auto_restart = bool(conn.get("auto_restart_after_purchase", False) and conn.shop)
+    cooldown = 0
+    if auto_restart:
+        conn.shop.schedule_auto_restart()
+        cooldown = int(conn.get("restart_cooldown_seconds", 300) or 300)
+    wallet, _bank = db.get_balance(gid, uid)
+
+    # 5. In den shop_log-Feed posten
+    loc_url, near = _kauf_ort_info(conn, x, z)
+    near_feed = (f"\n*({_ft(conn, 'Nahe', 'Near')} {near})*") if near else ""
+    feed = discord.Embed(
+        title=_ft(conn, "🚗 MIET-KAUF", "🚗 RENTAL PURCHASE"),
+        description=_ft(conn, f"<@{uid}> hat **{it['name']}** für **{restarts} Neustart(s)** gemietet",
+                        f"<@{uid}> rented **{it['name']}** for **{restarts} restart(s)**"),
+        color=0x3498DB)
+    feed.add_field(name=_ft(conn, "Preis", "Price"), value=_fmt_money(total, conn), inline=True)
+    feed.add_field(name=_ft(conn, "Ort", "Location"), value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_feed}", inline=True)
+    feed.set_footer(text=(f"{_ft(conn, 'Miete', 'Rental')} #{rental_id} · {event_name}")[:100])
+    await _post_feed(gid, "shop_log", feed, service_id=conn.service_id)
+    return _MieteErgebnis(True, rental_id=rental_id, event_name=event_name, wallet=wallet,
+                          auto_restart=auto_restart, cooldown=cooldown)
+
+
 @shop_buy_group.command(name="rental",
                         description="🚗 Rent a vehicle/object – spawns at your coordinates for N restarts")
 @app_commands.describe(
@@ -32187,206 +32413,60 @@ async def shop_buy_rental(interaction: discord.Interaction, item: str,
         return
     gid, uid = interaction.guild_id, interaction.user.id
 
-    # ── 1. Server EINMAL auflösen – Katalog, Lieferung und Ablauf müssen
-    #       zwingend derselbe Server sein (gleicher Grund wie bei /buy).
+    # ── Server EINMAL auflösen – Katalog, Lieferung und Ablauf müssen zwingend derselbe Server sein
+    #    (gleicher Grund wie bei /buy).
     _conn, _fehler = _conn_waehlen(interaction, server)
     if _conn is None:
         return await interaction.response.send_message(
             _fehler or _premium_missing_text(interaction), ephemeral=True)
-    katalog = _conn.rentals_catalog
-    it = katalog.find(item)
-    if not it or not it.get("enabled", True):
-        return await interaction.response.send_message(_t(
-            interaction, f"❌ Miet-Item `{item}` ist nicht verfügbar. `/shop rentals` zeigt den Katalog.",
-            f"❌ Rental item `{item}` is not available. Use `/shop rentals` to see the catalog."),
-            ephemeral=True)
-
-    # ── 1b. Rollen-Beschränkung zuerst (leer = alle dürfen) ───
-    noetig = _rollen_aus_daten(it.get("role_ids"))
-    if noetig and not (isinstance(interaction.user, discord.Member)
-                       and _member_has_role_ids(interaction.user, noetig)):
-        return await interaction.response.send_message(_t(
-            interaction,
-            f"❌ Du hast nicht die erforderliche Rolle, um **{it['name']}** zu mieten.\n"
-            "Benötigt wird: " + ", ".join(f"<@&{r}>" for r in noetig),
-            f"❌ You don't have the required role to rent **{it['name']}**.\n"
-            "Required: " + ", ".join(f"<@&{r}>" for r in noetig)),
-            ephemeral=True)
-
-    min_r, max_r = int(it.get("min_restarts", 1)), int(it.get("max_restarts", 1))
-    if not (min_r <= restarts <= max_r):
-        return await interaction.response.send_message(_t(
-            interaction, f"❌ **{it['name']}** kann für {min_r}–{max_r} Neustarts gemietet werden.",
-            f"❌ **{it['name']}** can be rented for {min_r}-{max_r} restarts."), ephemeral=True)
-
-    # ── 2. Koordinaten validieren (iZurvive: x=Ost, z=Nord) ───
-    if not (0.0 <= x <= 20000.0 and 0.0 <= z <= 20000.0):
-        return await interaction.response.send_message(_t(
-            interaction,
-            "❌ Koordinaten außerhalb der Map. Gib die beiden iZurvive-Zahlen als "
-            "`x` (Ost) und `z` (Nord) an, z. B. `x: 4640` `z: 10350`.",
-            "❌ Coordinates out of range. Enter the two iZurvive numbers as "
-            "`x` (East) and `z` (North), e.g. `x: 4640` `z: 10350`."), ephemeral=True)
-
-    # ── 3. Preis prüfen (Vorprüfung, Abbuchung erst nach FTP-Erfolg) ──
-    total = int(it.get("price_per_restart", 0)) * int(restarts)
-    wallet, _bank = db.get_balance(gid, uid)
-    if wallet < total:
-        return await interaction.response.send_message(
-            embed=_insufficient_embed(total, wallet), ephemeral=True)
+    en = _sprache(interaction) == "en"
+    rollen = ({r.id for r in interaction.user.roles}
+              if isinstance(interaction.user, discord.Member) else None)
+    plan = _miete_pruefen(_conn, gid, uid, item, int(restarts), rollen, None, x, z, y, a, en)
+    if isinstance(plan, _KaufFehler):
+        if plan.code == "guthaben":
+            return await interaction.response.send_message(
+                embed=_insufficient_embed(plan.total, plan.wallet), ephemeral=True)
+        return await interaction.response.send_message(plan.text(en), ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
+    res = await _miete_ausfuehren(_conn, gid, uid, str(interaction.user), plan)
+    if not res.ok:
+        if res.code == "guthaben":
+            return await interaction.followup.send(
+                embed=_insufficient_embed(plan.total, res.wallet), ephemeral=True)
+        return await interaction.followup.send(res.text(en), ephemeral=True)
 
-    if _conn.api is None or _conn.ftp is None:
-        return await interaction.followup.send(_t(
-            interaction,
-            "❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn kann nichts "
-            "ausgeliefert werden.\nBitte wende dich an den Bot-Betreiber.",
-            "❌ This server is missing FTP access – without it nothing "
-            "can be delivered.\nPlease contact the bot operator."), ephemeral=True)
-    if not _conn.rentals or not _mission_dir_of(_conn):
-        return await interaction.followup.send(_t(
-            interaction,
-            "❌ Rental-System startet noch oder es ist kein Mission-Ordner bekannt – "
-            "bitte gleich noch einmal versuchen.",
-            "❌ Rental system is still starting up or no mission folder is known – "
-            "try again in a moment."), ephemeral=True)
-
-    # ── 4. Event + Position schreiben (unter dem Rentals-Lock) ───────
-    event_name = _tool_rental_event_name()
-    loop = asyncio.get_running_loop()
-    async with _conn.events_lock:
-        ev_text, ev_status = await loop.run_in_executor(
-            None, _tool_datei_lesen_sync, _conn, "db/events.xml")
-        sp_text, sp_status = await loop.run_in_executor(
-            None, _tool_datei_lesen_sync, _conn, "cfgeventspawns.xml")
-        if ev_status != "ok" or sp_status != "ok":
-            return await interaction.followup.send(_t(
-                interaction, "❌ db/events.xml oder cfgeventspawns.xml sind per FTP nicht lesbar.",
-                "❌ db/events.xml or cfgeventspawns.xml could not be read via FTP."),
-                ephemeral=True)
-        try:
-            renamed = _tool_rental_event_umbenennen(str(it.get("event_xml") or ""), event_name)
-            neu_ev = _tool_rental_event_einfuegen(ev_text, event_name, renamed)
-        except ValueError as e:
-            return await interaction.followup.send(f"❌ {e}", ephemeral=True)
-        pos_group = str(it.get("event_group") or "").strip() or None
-        neu_sp = _tool_rental_pos_schreiben(
-            sp_text, event_name, x, z, y=y, a=a, gruppe=pos_group,
-            zone_xml=(str(it.get("event_zone") or "") or None))
-
-        ok_ev = await loop.run_in_executor(
-            None, _tool_datei_schreiben_sync, _conn, "db/events.xml", neu_ev)
-        if not ok_ev:
-            return await interaction.followup.send(_t(
-                interaction, "❌ db/events.xml konnte nicht gespeichert werden – "
-                "nichts wurde abgebucht.",
-                "❌ db/events.xml could not be saved – nothing was charged."), ephemeral=True)
-        ok_sp = await loop.run_in_executor(
-            None, _tool_datei_schreiben_sync, _conn, "cfgeventspawns.xml", neu_sp)
-        if not ok_sp:
-            # Event wurde geschrieben, Position nicht – Event zurückrollen,
-            # sonst bleibt ein Event ohne Position übrig.
-            neu_ev_rollback, _ = _tool_delete_event(neu_ev, event_name)
-            await loop.run_in_executor(
-                None, _tool_datei_schreiben_sync, _conn, "db/events.xml", neu_ev_rollback)
-            return await interaction.followup.send(_t(
-                interaction, "❌ cfgeventspawns.xml konnte nicht gespeichert werden – "
-                "nichts wurde abgebucht.",
-                "❌ cfgeventspawns.xml could not be saved – nothing was charged."),
-                ephemeral=True)
-
-    # ── 5. ... dann Geld abbuchen (atomar). Bei Fehlschlag: Rollback ──
-    if not db.try_spend_wallet(gid, uid, total):
-        rollback_ok = False
-        async with _conn.events_lock:
-            ev2, ev2_status = await loop.run_in_executor(
-                None, _tool_datei_lesen_sync, _conn, "db/events.xml")
-            sp2, sp2_status = await loop.run_in_executor(
-                None, _tool_datei_lesen_sync, _conn, "cfgeventspawns.xml")
-            if ev2_status == "ok" and sp2_status == "ok":
-                ev3, _ = _tool_delete_event(ev2, event_name)
-                sp3, _ = _tool_delete_eventspawns(sp2, event_name)
-                rollback_ok = (
-                    await loop.run_in_executor(
-                        None, _tool_datei_schreiben_sync, _conn, "db/events.xml", ev3)
-                    and await loop.run_in_executor(
-                        None, _tool_datei_schreiben_sync, _conn, "cfgeventspawns.xml", sp3))
-        if not rollback_ok:
-            log.error(f"[RENTAL] Rollback fehlgeschlagen – verwaistes Event: {event_name}")
-            warn = discord.Embed(
-                title=_ft(_conn, "⚠️ Verwaistes Miet-Event", "⚠️ Orphaned rental event"),
-                description=_ft(_conn,
-                                f"Ein abgebrochener Miet-Kauf konnte nicht zurückgerollt werden "
-                                f"(`{event_name}`). Es muss manuell über das Event-Vorlagen-Tool "
-                                f"entfernt werden – `/shop check` markiert es ebenfalls.",
-                                f"A cancelled rental purchase could not be rolled back "
-                                f"(`{event_name}`). It needs manual removal via the "
-                                f"Event templates tool - `/shop check` also flags it."),
-                color=0xE67E22)
-            await _post_feed(gid, "shop_log", warn, service_id=_conn.service_id)
-        wallet, _bank = db.get_balance(gid, uid)
-        return await interaction.followup.send(
-            embed=_insufficient_embed(total, wallet), ephemeral=True)
-
-    # ── 6. Miete als aktiv speichern ───────────────────────────
-    # expires_at ist nur eine grobe Rückfall-Sicherung (siehe
-    # RentalManager.on_restart_detected) - falls der Server sehr lange ohne
-    # erkannten Neustart durchläuft, verhindert sie einen unbegrenzten Ablauf.
-    expires_at = time.time() + max(1, int(restarts)) * 6 * 3600
-    rental_id = db.create_rental(
-        _conn.service_id, gid, uid, str(interaction.user), it["name"], event_name,
-        x, y, z, a, pos_group, int(restarts), expires_at)
-
-    # ── 7. Auto-Restart oder Hinweis auf nächsten Neustart ────
-    if _conn.get("auto_restart_after_purchase", False) and _conn.shop:
-        _conn.shop.schedule_auto_restart()
-        cooldown = int(_conn.get("restart_cooldown_seconds", 300) or 300)
+    # ── Bestätigung an den Käufer ───────────────────────────
+    x, z, it, restarts, total = plan.x, plan.z, plan.item, plan.restarts, plan.total
+    if res.auto_restart:
         delivery_info = _t(
             interaction,
             f"🔄 Ein Server-Neustart wurde geplant – deine Miete spawnt in "
-            f"etwa **{max(5, cooldown)} Sekunden** (plus Startzeit).",
+            f"etwa **{max(5, res.cooldown)} Sekunden** (plus Startzeit).",
             f"🔄 A server restart has been scheduled – your rental will spawn "
-            f"in about **{max(5, cooldown)} seconds** (plus boot time).")
+            f"in about **{max(5, res.cooldown)} seconds** (plus boot time).")
     else:
         delivery_info = _t(interaction,
                            "⏳ Deine Miete spawnt beim **nächsten geplanten Server-Neustart**.",
                            "⏳ Your rental will spawn at the **next scheduled server restart**.")
-
-    # ── 8. Bestätigung an den Käufer ───────────────────────────
-    map_name = _conn.get("map_name", "ChernarusPlus")
-    loc_url  = _izurvive_url(x, z, map_name)
-    near     = _nearest_location(x, z, map_name)
+    loc_url, near = _kauf_ort_info(_conn, x, z)
     near_txt = _t(interaction, f"\n*(Nahe {near})*", f"\n*(Near {near})*") if near else ""
-    wallet, _bank = db.get_balance(gid, uid)
-
     embed = discord.Embed(
         title=_t(interaction, "🚗 Miete erfolgreich", "🚗 Rental successful"),
         description=_t(
             interaction,
             f"Du hast **{it['name']}** für **{restarts} Neustart(s)** für "
-            f"**{_fmt_money(total)}** gemietet.",
+            f"**{_fmt_money(total, _conn)}** gemietet.",
             f"You rented **{it['name']}** for **{restarts} restart(s)** for "
-            f"**{_fmt_money(total)}**."),
+            f"**{_fmt_money(total, _conn)}**."),
         color=0x2ECC71)
     embed.add_field(name=_t(interaction, "📍 Spawn-Ort", "📍 Spawn location"),
                     value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=False)
     embed.add_field(name=_t(interaction, "🚚 Lieferung", "🚚 Delivery"), value=delivery_info, inline=False)
-    embed.add_field(name="👛 Wallet", value=_fmt_money(wallet), inline=True)
-    embed.set_footer(text=f"Miete #{rental_id}")
+    embed.add_field(name="👛 Wallet", value=_fmt_money(res.wallet, _conn), inline=True)
+    embed.set_footer(text=f"Miete #{res.rental_id}")
     await interaction.followup.send(embed=embed, ephemeral=True)
-
-    # ── 9. In den shop_log-Feed posten ─────────────────────────
-    near_feed = (f"\n*({_ft(_conn, 'Nahe', 'Near')} {near})*") if near else ""
-    feed = discord.Embed(
-        title=_ft(_conn, "🚗 MIET-KAUF", "🚗 RENTAL PURCHASE"),
-        description=_ft(_conn, f"{interaction.user.mention} hat **{it['name']}** für **{restarts} Neustart(s)** gemietet",
-                        f"{interaction.user.mention} rented **{it['name']}** for **{restarts} restart(s)**"),
-        color=0x3498DB)
-    feed.add_field(name=_ft(_conn, "Preis", "Price"), value=_fmt_money(total), inline=True)
-    feed.add_field(name=_ft(_conn, "Ort", "Location"), value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_feed}", inline=True)
-    feed.set_footer(text=(f"{_ft(_conn, 'Miete', 'Rental')} #{rental_id} · {event_name}")[:100])
-    await _post_feed(gid, "shop_log", feed, service_id=_conn.service_id)
 
 shop_buy_rental.autocomplete("item")(_rental_buy_autocomplete)
 shop_buy_rental.autocomplete("server")(_server_autocomplete)
@@ -46311,15 +46391,8 @@ async def post_me_shop_buy(request: web.Request) -> web.Response:
     if amount < 1:
         return err("Ungültige Menge." if not en else "Invalid amount.", 400)
 
-    def zahl(v: Any) -> Optional[float]:
-        if v is None or v == "":
-            return None
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return float("nan")
     ort = str(data.get("ort") or "").strip() or None
-    x, z, y = zahl(data.get("x")), zahl(data.get("z")), zahl(data.get("y"))
+    x, z, y = _anzahl_oder_none(data.get("x")), _anzahl_oder_none(data.get("z")), _anzahl_oder_none(data.get("y"))
     if any(v is not None and not math.isfinite(v) for v in (x, z, y)):
         return err("Ungültige Koordinaten." if not en else "Invalid coordinates.", 400)
     speichern_als = str(data.get("speichern_als") or "").strip()
@@ -46353,6 +46426,100 @@ async def post_me_shop_buy(request: web.Request) -> web.Response:
                                       plan.x, plan.z, "dashboard", _ORTE_SPEICHER_MAX)
     loc_url, near = _kauf_ort_info(conn, plan.x, plan.z)
     return ok({"purchase_id": res.purchase_id, "item": plan.item["name"], "amount": plan.amount,
+               "total_text": _spieler_geld(conn, plan.total), "wallet_text": _spieler_geld(conn, res.wallet),
+               "x": round(plan.x, 1), "z": round(plan.z, 1), "ort_label": _klartext(plan.ort_label or ""),
+               "link": loc_url, "near": near, "auto_restart": res.auto_restart,
+               "ort_gespeichert": gespeichert})
+
+
+def _anzahl_oder_none(v: Any) -> Optional[float]:
+    """Zahl aus dem JSON-Body: None = nicht angegeben, NaN = unbrauchbar (der Aufrufer lehnt NaN/inf ab)."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+async def api_me_rentals(request: web.Request) -> web.Response:
+    """Miet-Katalog dieses Servers (wie der Spieler ihn mieten darf) und die eigenen Mieten."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    conn, gid, uid = ctx["conn"], ctx["gid"], ctx["uid"]
+    guild = bot.get_guild(gid)
+    items = []
+    for it in conn.rentals_catalog.items:
+        if not it.get("enabled", True):
+            continue
+        noetig = _rollen_aus_daten(it.get("role_ids"))
+        rollen_namen = []
+        for r in noetig:
+            rolle = guild.get_role(r) if guild is not None else None
+            rollen_namen.append(rolle.name if rolle is not None else str(r))
+        preis = int(it.get("price_per_restart", 0))
+        items.append({"name": str(it.get("name") or "?"), "category": str(it.get("category", "Vehicle")),
+                      "price_per_restart": preis, "price_text": _spieler_geld(conn, preis),
+                      "min_restarts": int(it.get("min_restarts", 1)), "max_restarts": int(it.get("max_restarts", 1)),
+                      "kaufbar": (not noetig) or any(r in ctx["rollen"] for r in noetig), "rollen": rollen_namen})
+    mieten = [{"id": int(r["id"]), "item": r["item_name"], "x": r["x"], "z": r["z"], "total": int(r["restarts_total"]),
+               "remaining": int(r["restarts_remaining"]), "status": r["status"], "created_at": r["created_at"],
+               "link": _izurvive_url(float(r["x"] or 0), float(r["z"] or 0), conn.get("map_name", "ChernarusPlus"))}
+              for r in await _dash_run(db.rentals_of_user, conn.service_id, gid, uid, 30)]
+    wallet, _bank = db.get_balance(gid, uid)
+    return ok({"items": items, "mieten": mieten, "wallet": wallet, "wallet_text": _spieler_geld(conn, wallet),
+               "waehrung": {"symbol": _cur_symbol(conn), "voran": bool(conn.get("prepend_currency_symbol", False))}})
+
+
+async def post_me_rentals_buy(request: web.Request) -> web.Response:
+    """Miete aus dem Dashboard – dieselben Regeln wie /shop buy rental (_miete_pruefen/_miete_ausfuehren)."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    conn, gid, uid, en = ctx["conn"], ctx["gid"], ctx["uid"], _spieler_en(request, ctx["sess"], data)
+    denied = _dash_rate_limited(request, "me.rentals.buy", 3)
+    if denied is not None:
+        return denied
+    try:
+        restarts = int(data.get("restarts", 1))
+    except (TypeError, ValueError):
+        return err("Ungültige Neustart-Anzahl." if not en else "Invalid number of restarts.", 400)
+    ort = str(data.get("ort") or "").strip() or None
+    x, z, y, a = (_anzahl_oder_none(data.get(k)) for k in ("x", "z", "y", "a"))
+    if any(v is not None and not math.isfinite(v) for v in (x, z, y, a)):
+        return err("Ungültige Koordinaten." if not en else "Invalid coordinates.", 400)
+    speichern_als = str(data.get("speichern_als") or "").strip()
+    if speichern_als and not _ORTE_NAME_RE.match(speichern_als):
+        return err("Ungültiger Ortsname." if not en else "Invalid location name.", 400)
+    plan = _miete_pruefen(conn, gid, uid, str(data.get("item") or ""), restarts, ctx["rollen"], ort, x, z, y, a, en)
+    if isinstance(plan, _KaufFehler):
+        text = _klartext(plan.text(en))
+        if plan.code == "rolle":
+            guild = bot.get_guild(gid)
+            namen = []
+            for r in plan.daten.get("role_ids", []):
+                rolle = guild.get_role(int(r)) if guild is not None else None
+                namen.append(rolle.name if rolle is not None else r)
+            text = (f"Dafür brauchst du eine dieser Rollen: {', '.join(namen)}" if not en
+                    else f"You need one of these roles: {', '.join(namen)}")
+        return err(text, 402 if plan.code == "guthaben" else 400, code=plan.code)
+    res = await _miete_ausfuehren(conn, gid, uid, str(ctx["name"]), plan)
+    if not res.ok:
+        if res.code == "guthaben":
+            text = (f"Du brauchst {_spieler_geld(conn, plan.total)}, hast aber nur {_spieler_geld(conn, res.wallet)}."
+                    if not en else
+                    f"You need {_spieler_geld(conn, plan.total)} but only have {_spieler_geld(conn, res.wallet)}.")
+            return err(text, 402, code=res.code)
+        status = 503 if res.code in ("kein_ftp", "shop_start") else 500
+        return err(_klartext(res.text(en)), status, code=res.code)
+    gespeichert = None
+    if speichern_als:
+        gespeichert = await _dash_run(db.ort_speichern, gid, conn.service_id, uid, speichern_als,
+                                      plan.x, plan.z, "dashboard", _ORTE_SPEICHER_MAX)
+    loc_url, near = _kauf_ort_info(conn, plan.x, plan.z)
+    return ok({"rental_id": res.rental_id, "item": plan.item["name"], "restarts": plan.restarts,
                "total_text": _spieler_geld(conn, plan.total), "wallet_text": _spieler_geld(conn, res.wallet),
                "x": round(plan.x, 1), "z": round(plan.z, 1), "ort_label": _klartext(plan.ort_label or ""),
                "link": loc_url, "near": near, "auto_restart": res.auto_restart,
@@ -47847,6 +48014,8 @@ def build_app() -> web.Application:
     r.add_get("/api/me/orders", api_me_orders)
     r.add_get("/api/me/shop", api_me_shop)
     r.add_post("/api/me/shop/buy", post_me_shop_buy)
+    r.add_get("/api/me/rentals", api_me_rentals)
+    r.add_post("/api/me/rentals/buy", post_me_rentals_buy)
     r.add_get("/api/me/places", api_me_places)
     r.add_post("/api/me/places", post_me_places)
     r.add_delete("/api/me/places", delete_me_places)
@@ -48753,6 +48922,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "ed353c1afacead0c5c54291a1665ec5078ab0dfc09b2bbe0e1977784f100a214",
         "6b28d12e1c945fa02f90b360c2bc97a78077e2d8849668a7143c5c886ba4fd90",
         "e2d24b954acac4bd818e15c4c9289791bf7085b2c60141ec123def7a2068d24d",
+        "3e13426ebab5e74f309181e8e3967f7e47107c7c591f5b902af63ab82733852f",
     ),
     "styles.css": (
         "854cd5c0116ef9230d2534c486b88c6dff38df66194defb0c429309ea4add035",
@@ -49050,6 +49220,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "5f82dbe54e6e37f9ba1840cd35b2212b1578fb13cf6c5c09086a82d7b4ff655f",
         "5d23bea4f5ff5e7fe0514ef753383395555856619c40201b887321fe009f7e71",
         "0fd2761e0aac63310c92b22c5b3efdacc02830be4349dbf7ad2c60546878524d",
+        "1db619f03c10fd50eb82d04b42170244fe19d6ea26574bbf85d0ad4f807c9d99",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
