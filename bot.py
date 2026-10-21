@@ -8112,6 +8112,20 @@ class DayZBot(discord.Client):
                     db.abandoned_bases_record_build(
                         conn.service_id, xz[0], xz[1], ev.get("player_id"),
                         ev.get("player"), aktion, radius_m=radius)
+        # Kauf-Orte: letzter bekannter Ort und - bei Platzieren - automatischer Vorschlag fuer /buy. Nur fuer
+        # verlinkte Spieler, nur im normalen Event-Pfad und nur mit bekanntem Server (Schluessel ist die service_id).
+        if nebenwirkungen and conn is not None:
+            try:
+                pkey = _PRIMARY_PLAYER_KEYS.get(str(ev.get("type", "")))
+                pname = ev.get(pkey) if pkey else None
+                xz_ort = _ev_position_xz(ev, None) if pname else None
+                if pname and xz_ort is not None:
+                    platziert = (str(ev.get("item") or "platziert") if ev.get("type") == "basebuild"
+                                 and str(ev.get("aktion") or "").lower() in _ORTE_AKTIONEN else None)
+                    await asyncio.get_running_loop().run_in_executor(
+                        None, _orte_aus_ereignis, conn, str(pname), xz_ort, platziert)
+            except Exception as e:  # noqa: BLE001 - ein Fehler hier darf das Posten der Feeds nie stoeren
+                log.debug(f"[KAUF-ORTE] {e}")
         # Alt Account Finder: NUR im normalen Event-Pfad (nebenwirkungen=True)
         # und NUR mit bekanntem Server - service_id ist Pflichtteil des
         # DB-Schluessels, ohne conn gaebe es keine sichere Zuordnung. Erkennt
@@ -27345,6 +27359,32 @@ class EconomyDB:
                 status       TEXT DEFAULT 'pending',
                 created_at   REAL,
                 delivered_at REAL)""")
+            # Kauf-Orte: Orte, die /buy vorschlaegt. art='auto' = die letzten Platzier-Orte (rollierend, ein neuer
+            # verdraengt den aeltesten), art='gespeichert' = per /places save mit Namen abgelegt. Immer je Guild UND
+            # Server (Koordinaten gelten nur auf der Karte dieses Servers) und je Discord-User - niemand sieht oder
+            # nutzt die Orte eines anderen.
+            c.execute("""CREATE TABLE IF NOT EXISTS kauf_orte (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id   INTEGER NOT NULL,
+                service_id TEXT    NOT NULL DEFAULT '',
+                user_id    INTEGER NOT NULL,
+                art        TEXT    NOT NULL,
+                name       TEXT    COLLATE NOCASE,
+                x          REAL    NOT NULL,
+                z          REAL    NOT NULL,
+                grund      TEXT,
+                created_at REAL    NOT NULL)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_kauf_orte ON kauf_orte (guild_id, service_id, user_id, art)")
+            # Letzter bekannter Ort eines verlinkten Spielers (aus beliebigen Ereignissen mit Position), damit er
+            # auch nach dem Verlassen des Servers noch verfuegbar ist.
+            c.execute("""CREATE TABLE IF NOT EXISTS letzte_orte (
+                guild_id   INTEGER NOT NULL,
+                service_id TEXT    NOT NULL,
+                user_id    INTEGER NOT NULL,
+                x          REAL    NOT NULL,
+                z          REAL    NOT NULL,
+                ts         REAL    NOT NULL,
+                PRIMARY KEY (guild_id, service_id, user_id))""")
             # Miet-Items (Shop-Rentals): eigener Neustart-Ablauf-Zähler je Kauf.
             # event_name ist die eindeutige Instanz-ID des Events/der Position
             # in db/events.xml + cfgeventspawns.xml (nicht der Katalog-Name der
@@ -27915,6 +27955,94 @@ class EconomyDB:
                  total_price, x, y, z, json.dumps(area_names), time.time()))
             self._conn.commit()
             return int(cur.lastrowid)
+
+    # ── Kauf-Orte (Vorschlaege fuer /buy) ─────────────────────
+    def orte_auto_merken(self, guild_id: int, service_id: str, user_id: int, x: float, z: float,
+                         grund: str = "", max_auto: int = 5, nah_m: float = 30.0) -> None:
+        """Merkt einen Platzier-Ort als automatischen Vorschlag. Liegt er nahe an einem schon gemerkten (mehrere
+        Gegenstaende an derselben Basis), wird dieser nur aktualisiert statt die Liste zu fluten; sonst wird er
+        neu angelegt und der aelteste verdraengt, sobald mehr als ``max_auto`` da sind."""
+        sid = str(service_id or "")
+        with self._lock:
+            for r in self._conn.execute(
+                    "SELECT id, x, z FROM kauf_orte WHERE guild_id=? AND service_id=? AND user_id=? AND art='auto'",
+                    (guild_id, sid, user_id)).fetchall():
+                if math.hypot(float(r["x"]) - x, float(r["z"]) - z) <= nah_m:
+                    self._conn.execute("UPDATE kauf_orte SET x=?, z=?, grund=?, created_at=? WHERE id=?",
+                                       (x, z, grund[:80], time.time(), r["id"]))
+                    self._conn.commit()
+                    return
+            self._conn.execute(
+                "INSERT INTO kauf_orte (guild_id, service_id, user_id, art, name, x, z, grund, created_at) "
+                "VALUES (?,?,?,'auto',NULL,?,?,?,?)", (guild_id, sid, user_id, x, z, grund[:80], time.time()))
+            self._conn.execute(
+                "DELETE FROM kauf_orte WHERE art='auto' AND guild_id=? AND service_id=? AND user_id=? AND id NOT IN ("
+                "SELECT id FROM kauf_orte WHERE art='auto' AND guild_id=? AND service_id=? AND user_id=? "
+                "ORDER BY created_at DESC, id DESC LIMIT ?)",
+                (guild_id, sid, user_id, guild_id, sid, user_id, max(1, int(max_auto))))
+            self._conn.commit()
+
+    def orte_liste(self, guild_id: int, service_id: str, user_id: int, art: str) -> List[sqlite3.Row]:
+        """Orte eines Users auf diesem Server: 'auto' neueste zuerst, 'gespeichert' alphabetisch."""
+        order = "created_at DESC, id DESC" if art == "auto" else "name COLLATE NOCASE ASC"
+        with self._lock:
+            return list(self._conn.execute(
+                f"SELECT * FROM kauf_orte WHERE guild_id=? AND service_id=? AND user_id=? AND art=? ORDER BY {order}",
+                (guild_id, str(service_id or ""), user_id, art)).fetchall())
+
+    def ort_holen(self, guild_id: int, service_id: str, user_id: int, ort_id: int, art: str) -> Optional[sqlite3.Row]:
+        """Genau EINEN Ort - nur, wenn er diesem User auf diesem Server gehoert."""
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM kauf_orte WHERE id=? AND guild_id=? AND service_id=? AND user_id=? AND art=?",
+                (ort_id, guild_id, str(service_id or ""), user_id, art)).fetchone()
+
+    def ort_nach_name(self, guild_id: int, service_id: str, user_id: int, name: str) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM kauf_orte WHERE guild_id=? AND service_id=? AND user_id=? AND art='gespeichert' "
+                "AND name=? COLLATE NOCASE", (guild_id, str(service_id or ""), user_id, name)).fetchone()
+
+    def ort_speichern(self, guild_id: int, service_id: str, user_id: int, name: str, x: float, z: float,
+                      grund: str = "", max_gespeichert: int = 15) -> str:
+        """Legt einen Ort dauerhaft unter einem Namen ab. Rueckgabe: 'ok', 'limit' oder 'name_vorhanden'."""
+        sid = str(service_id or "")
+        with self._lock:
+            if self._conn.execute(
+                    "SELECT 1 FROM kauf_orte WHERE guild_id=? AND service_id=? AND user_id=? AND art='gespeichert' "
+                    "AND name=? COLLATE NOCASE", (guild_id, sid, user_id, name)).fetchone():
+                return "name_vorhanden"
+            n = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM kauf_orte WHERE guild_id=? AND service_id=? AND user_id=? AND art='gespeichert'",
+                (guild_id, sid, user_id)).fetchone()["n"]
+            if n >= max_gespeichert:
+                return "limit"
+            self._conn.execute(
+                "INSERT INTO kauf_orte (guild_id, service_id, user_id, art, name, x, z, grund, created_at) "
+                "VALUES (?,?,?,'gespeichert',?,?,?,?,?)", (guild_id, sid, user_id, name, x, z, grund[:80], time.time()))
+            self._conn.commit()
+        return "ok"
+
+    def ort_loeschen(self, guild_id: int, service_id: str, user_id: int, name: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM kauf_orte WHERE guild_id=? AND service_id=? AND user_id=? AND art='gespeichert' "
+                "AND name=? COLLATE NOCASE", (guild_id, str(service_id or ""), user_id, name))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def letzter_ort_setzen(self, guild_id: int, service_id: str, user_id: int, x: float, z: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO letzte_orte (guild_id, service_id, user_id, x, z, ts) VALUES (?,?,?,?,?,?)",
+                (guild_id, str(service_id or ""), user_id, x, z, time.time()))
+            self._conn.commit()
+
+    def letzter_ort(self, guild_id: int, service_id: str, user_id: int) -> Optional[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM letzte_orte WHERE guild_id=? AND service_id=? AND user_id=?",
+                (guild_id, str(service_id or ""), user_id)).fetchone()
 
     def pending_purchases(self, created_before: Optional[float] = None,
                           guild_id: Optional[int] = None,
@@ -33906,18 +34034,159 @@ bot.tree.add_command(edit_group)
 
 
 
+# ══════════════════════════════════════════════════════════════
+#  KAUF-ORTE – Orte, die /buy vorschlaegt
+#  * automatisch: die letzten 5 Orte, an denen ein verlinkter Spieler etwas PLATZIERT hat (Feed "place")
+#  * gespeichert: bis zu 15, per /places save mit Namen
+#  * letzter bekannter Ort: aus dem Positions-Cache und dem letzten Ereignis mit Position
+#  Alles je Guild, Server und Discord-User - ein Spieler sieht und nutzt nur seine eigenen Orte.
+# ══════════════════════════════════════════════════════════════
+_ORTE_AUTO_MAX = 5
+_ORTE_SPEICHER_MAX = 15
+_ORTE_NAH_M = 30.0                         # naeher beieinander = derselbe Ort (eine Basis, viele Gegenstaende)
+_ORTE_AKTIONEN = ("placed", "deployed")    # Platzieren (Feed "place" ohne "attached")
+_ORTE_NAME_RE = re.compile(r"^[\w .\-]{1,32}$")
+
+
+def _orte_aus_ereignis(conn: "ServerConnection", spieler: str, xz: Tuple[float, float],
+                       platziert_item: Optional[str]) -> None:
+    """Haelt fuer die Discord-Accounts, die diesen Ingame-Namen verlinkt haben, den letzten Ort fest und - bei einem
+    Platzier-Ereignis - den automatischen Vorschlag. Nur Verlinkte in den Guilds DIESES Servers."""
+    x, z = xz
+    if not (0.0 <= x <= 40000.0 and 0.0 <= z <= 40000.0) or (x == 0.0 and z == 0.0):
+        return
+    for gid in conn.guild_ids:
+        for link in db.links_for_name(spieler, int(gid)):
+            uid = int(link["user_id"])
+            db.letzter_ort_setzen(int(gid), conn.service_id, uid, x, z)
+            if platziert_item is not None:
+                db.orte_auto_merken(int(gid), conn.service_id, uid, x, z, platziert_item,
+                                    max_auto=_ORTE_AUTO_MAX, nah_m=_ORTE_NAH_M)
+
+
+def _ort_letzter_bekannter(conn: "ServerConnection", gid: int, uid: int) -> Optional[Dict[str, Any]]:
+    """Letzter bekannter Ort des Spielers: die neuere der beiden Quellen - laufende Position aus dem Log-Cache
+    (nur solange er online ist) oder das zuletzt gespeicherte Ereignis (auch nach dem Verlassen des Servers)."""
+    kandidaten: List[Tuple[float, float, float]] = []      # (Zeitstempel, x, z)
+    teile = {str(r["ingame_name"]).lower() for r in db.get_links_by_user(gid, uid)}
+    positionen = getattr(conn.parser, "player_positions", None) or {}
+    for name, eintrag in list(positionen.items()):
+        if str(name).lower() not in teile or not isinstance(eintrag, dict):
+            continue
+        xz = _ev_parse_pos(eintrag.get("position"))
+        if xz is None:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(eintrag.get("last_seen"))).timestamp()
+        except (TypeError, ValueError):
+            ts = time.time()
+        kandidaten.append((ts, xz[0], xz[1]))
+    row = db.letzter_ort(gid, conn.service_id, uid)
+    if row is not None:
+        kandidaten.append((float(row["ts"]), float(row["x"]), float(row["z"])))
+    if not kandidaten:
+        return None
+    ts, x, z = max(kandidaten)
+    return {"x": x, "z": z, "ts": ts}
+
+
+def _ort_alter(sekunden: float, en: bool) -> str:
+    m = int(max(0, sekunden) // 60)
+    if m < 1:
+        return "just now" if en else "gerade eben"
+    if m < 60:
+        return f"{m} min ago" if en else f"vor {m} Min"
+    h = m // 60
+    if h < 48:
+        return f"{h} h ago" if en else f"vor {h} Std"
+    return f"{h // 24} d ago" if en else f"vor {h // 24} Tagen"
+
+
+def _ort_text(conn: "ServerConnection", x: float, z: float) -> str:
+    near = _nearest_location(x, z, conn.get("map_name", "ChernarusPlus"))
+    return f"{x:.0f} / {z:.0f}" + (f" · {near}" if near else "")
+
+
+def _ort_vorschlaege(conn: "ServerConnection", gid: int, uid: int, en: bool) -> List[Tuple[str, str]]:
+    """[(Beschriftung, Wert)] fuer die Auswahl in /buy und /places save: letzter bekannter Ort, die automatischen
+    Orte (neueste zuerst), dann die gespeicherten (alphabetisch)."""
+    jetzt = time.time()
+    out: List[Tuple[str, str]] = []
+    letzter = _ort_letzter_bekannter(conn, gid, uid)
+    if letzter is not None:
+        out.append((("📍 Last known location · " if en else "📍 Letzter bekannter Ort · ")
+                    + _ort_alter(jetzt - letzter["ts"], en) + " · " + _ort_text(conn, letzter["x"], letzter["z"]), "last"))
+    for r in db.orte_liste(gid, conn.service_id, uid, "auto"):
+        out.append((("🏗️ Placed " if en else "🏗️ Platziert ") + _ort_alter(jetzt - float(r["created_at"]), en)
+                    + " · " + _ort_text(conn, float(r["x"]), float(r["z"])), f"a:{int(r['id'])}"))
+    for r in db.orte_liste(gid, conn.service_id, uid, "gespeichert"):
+        out.append((f"⭐ {r['name']} · " + _ort_text(conn, float(r["x"]), float(r["z"])), f"s:{int(r['id'])}"))
+    return out
+
+
+def _ort_aufloesen(conn: "ServerConnection", gid: int, uid: int, wert: str,
+                   en: bool) -> Tuple[Optional[Tuple[float, float, str]], str]:
+    """Wandelt die Auswahl in (x, z, Beschriftung) um. Rueckgabe: (Ort, Fehlertext) - genau eines ist gesetzt.
+    Es zaehlen NUR Orte dieses Users auf diesem Server."""
+    wert = (wert or "").strip()
+    if wert == "last":
+        o = _ort_letzter_bekannter(conn, gid, uid)
+        if o is None:
+            return None, ("❌ No last known location yet – link with `/link` and play on the server, or enter x and z."
+                          if en else "❌ Noch kein letzter bekannter Ort – verknüpfe dich mit `/link` und spiele auf dem Server, oder gib x und z an.")
+        return (o["x"], o["z"], "📍 " + ("Last known location" if en else "Letzter bekannter Ort")), ""
+    m = re.fullmatch(r"([as]):(\d+)", wert)
+    if m:
+        r = db.ort_holen(gid, conn.service_id, uid, int(m.group(2)), "auto" if m.group(1) == "a" else "gespeichert")
+    else:
+        r = db.ort_nach_name(gid, conn.service_id, uid, wert)       # frei getippter Name eines gespeicherten Ortes
+    if r is None:
+        return None, ("❌ Location not found – pick one from the list or check `/places list`."
+                      if en else "❌ Ort nicht gefunden – wähle einen aus der Liste oder prüfe `/places list`.")
+    if r["art"] == "gespeichert":
+        return (float(r["x"]), float(r["z"]), f"⭐ {r['name']}"), ""
+    return (float(r["x"]), float(r["z"]), "🏗️ " + ("Placed location" if en else "Platzierter Ort")), ""
+
+
+async def _ort_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    if not interaction.guild_id:
+        return []
+    conn, _f = _conn_waehlen(interaction, getattr(interaction.namespace, "server", None))
+    if conn is None:
+        return []
+    en = _sprache(interaction) == "en"
+    such = (current or "").strip().lower()
+    return [app_commands.Choice(name=label[:100], value=wert)
+            for label, wert in _ort_vorschlaege(conn, interaction.guild_id, interaction.user.id, en)
+            if not such or such in label.lower()][:25]
+
+
+async def _gespeicherte_orte_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    if not interaction.guild_id:
+        return []
+    conn, _f = _conn_waehlen(interaction, getattr(interaction.namespace, "server", None))
+    if conn is None:
+        return []
+    such = (current or "").strip().lower()
+    return [app_commands.Choice(name=str(r["name"])[:100], value=str(r["name"])[:100])
+            for r in db.orte_liste(interaction.guild_id, conn.service_id, interaction.user.id, "gespeichert")
+            if not such or such in str(r["name"]).lower()][:25]
+
+
 @bot.tree.command(
     name="buy",
-    description="🛒 Buy an item – it spawns at your coordinates after the next server restart")
+    description="🛒 Buy an item – it spawns at a saved location or your coordinates after the next server restart")
 @app_commands.describe(
     item="Item name (pick from the autocomplete list)",
     amount="How many to buy",
-    x="iZurvive X coordinate (East – the FIRST number on iZurvive)",
-    z="iZurvive Y coordinate (North – the SECOND number on iZurvive)",
+    ort="Where it spawns: last known location, your last placements or a saved location (instead of x/z)",
+    x="iZurvive X coordinate (East – the FIRST number on iZurvive) – not needed with `ort`",
+    z="iZurvive Y coordinate (North – the SECOND number on iZurvive) – not needed with `ort`",
     y="Height / altitude (OPTIONAL – leave empty for default ground level)",
     server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
 async def cmd_buy(interaction: discord.Interaction, item: str,
-                  amount: app_commands.Range[int, 1], x: float, z: float,
+                  amount: app_commands.Range[int, 1], ort: Optional[str] = None,
+                  x: Optional[float] = None, z: Optional[float] = None,
                   y: Optional[float] = None, server: Optional[str] = None):
     if not await _require_guild(interaction):
         return
@@ -33970,6 +34239,26 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
             f"ein Admin muss den Katalog-Eintrag korrigieren.",
             f"❌ Item `{it.get('name', item)}` has no classnames configured – "
             f"ask an admin to fix the catalog entry."), ephemeral=True)
+
+    # ── 1c. Ort: entweder eine Auswahl (letzter bekannter Ort, automatisch gemerkter oder gespeicherter Ort)
+    #        ODER x/z. Beides zugleich waere mehrdeutig. Es zaehlen nur Orte dieses Users auf diesem Server.
+    ort_label: Optional[str] = None
+    if ort and (x is not None or z is not None):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Entweder `ort` wählen ODER `x` und `z` angeben – nicht beides.",
+            "❌ Pick `ort` OR enter `x` and `z` – not both."), ephemeral=True)
+    if ort:
+        aufgeloest, ort_fehler = _ort_aufloesen(_conn, gid, uid, ort, _sprache(interaction) == "en")
+        if aufgeloest is None:
+            return await interaction.response.send_message(ort_fehler, ephemeral=True)
+        x, z, ort_label = aufgeloest
+    elif x is None or z is None:
+        return await interaction.response.send_message(_t(
+            interaction,
+            "❌ Wähle einen `ort` (letzter bekannter Ort, deine letzten Platzierungen oder ein gespeicherter Ort) "
+            "oder gib `x` und `z` an. Mit `/places save` speicherst du Orte unter einem Namen.",
+            "❌ Pick an `ort` (last known location, your last placements or a saved location) or enter `x` and `z`. "
+            "Use `/places save` to save locations under a name."), ephemeral=True)
 
     # ── 2. Koordinaten validieren (iZurvive: x=Ost, z=Nord) ───
     if not (0.0 <= x <= 20000.0 and 0.0 <= z <= 20000.0):
@@ -34076,8 +34365,9 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
             interaction, f"Du hast **{amount}× {it['name']}** für **{_fmt_money(total)}** gekauft.",
             f"You bought **{amount}× {it['name']}** for **{_fmt_money(total)}**."),
         color=0x2ECC71)
+    ort_zeile = f"**{ort_label}**\n" if ort_label else ""
     embed.add_field(name=_t(interaction, "📍 Spawn-Ort", "📍 Spawn location"),
-                    value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=False)
+                    value=f"{ort_zeile}[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=False)
     embed.add_field(name=_t(interaction, "🚚 Lieferung", "🚚 Delivery"), value=delivery_info, inline=False)
     embed.add_field(name="👛 Wallet",   value=_fmt_money(wallet), inline=True)
     embed.set_footer(text=_t(interaction, f"Kauf #{purchase_id}", f"Purchase #{purchase_id}"))
@@ -34098,7 +34388,148 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
     await _post_feed(gid, "shop_log", feed, service_id=_conn.service_id)
 
 cmd_buy.autocomplete("item")(_shop_buy_autocomplete)
+cmd_buy.autocomplete("ort")(_ort_autocomplete)
 cmd_buy.autocomplete("server")(_server_autocomplete)
+
+
+# ── /places: gespeicherte Orte fuer /buy ────────────────────
+places_group = app_commands.Group(
+    name="places", description="📍 Your saved locations for /buy (up to 15 named, plus your last placements)")
+
+
+@places_group.command(name="save", description="💾 Save a location under a name (up to 15) – default: your newest location")
+@app_commands.describe(
+    name="Name for the location, e.g. Base",
+    ort="Which suggestion to save (default: the newest – last placement or last known location)",
+    x="Or: iZurvive X coordinate (East)",
+    z="Or: iZurvive Y coordinate (North)",
+    server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def places_save(interaction: discord.Interaction, name: str, ort: Optional[str] = None,
+                        x: Optional[float] = None, z: Optional[float] = None, server: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler or _premium_missing_text(interaction), ephemeral=True)
+    en = _sprache(interaction) == "en"
+    gid, uid = interaction.guild_id, interaction.user.id
+    name = (name or "").strip()
+    if not _ORTE_NAME_RE.match(name):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Ungültiger Name – 1 bis 32 Zeichen: Buchstaben, Ziffern, Leerzeichen, `_`, `.`, `-`.",
+            "❌ Invalid name – 1 to 32 characters: letters, digits, spaces, `_`, `.`, `-`."), ephemeral=True)
+    if ort and (x is not None or z is not None):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Entweder `ort` wählen ODER `x` und `z` angeben – nicht beides.",
+            "❌ Pick `ort` OR enter `x` and `z` – not both."), ephemeral=True)
+    if (x is None) != (z is None):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Bitte `x` UND `z` angeben.", "❌ Please enter both `x` and `z`."), ephemeral=True)
+    if x is not None and z is not None:
+        welt = DEFAULT_MAP_SIZES.get(_canonical_map_name(str(conn.get("map_name") or "")) or "") or 20000
+        if not (math.isfinite(x) and math.isfinite(z) and 0.0 <= x <= welt and 0.0 <= z <= welt):
+            return await interaction.response.send_message(_t(
+                interaction, f"❌ Koordinaten außerhalb der Karte (0 bis {welt}).",
+                f"❌ Coordinates outside the map (0 to {welt})."), ephemeral=True)
+        punkt, grund = (float(x), float(z)), "x/z"
+    elif ort:
+        aufgeloest, ort_fehler = _ort_aufloesen(conn, gid, uid, ort, en)
+        if aufgeloest is None:
+            return await interaction.response.send_message(ort_fehler, ephemeral=True)
+        punkt, grund = (aufgeloest[0], aufgeloest[1]), aufgeloest[2]
+    else:
+        # Ohne Angabe: der neueste Ort - letzte Platzierung oder letzter bekannter Ort, je nachdem was juenger ist
+        kandidaten: List[Tuple[float, float, float, str]] = []
+        auto = db.orte_liste(gid, conn.service_id, uid, "auto")
+        if auto:
+            kandidaten.append((float(auto[0]["created_at"]), float(auto[0]["x"]), float(auto[0]["z"]), "🏗️"))
+        letzter = _ort_letzter_bekannter(conn, gid, uid)
+        if letzter is not None:
+            kandidaten.append((letzter["ts"], letzter["x"], letzter["z"], "📍"))
+        if not kandidaten:
+            return await interaction.response.send_message(_t(
+                interaction,
+                "❌ Noch kein Ort bekannt. Verknüpfe dich mit `/link` und platziere etwas auf dem Server – "
+                "oder gib `x` und `z` an.",
+                "❌ No location known yet. Link with `/link` and place something on the server – "
+                "or enter `x` and `z`."), ephemeral=True)
+        _ts, px, pz, grund = max(kandidaten)
+        punkt = (px, pz)
+    erg = db.ort_speichern(gid, conn.service_id, uid, name, punkt[0], punkt[1], grund, _ORTE_SPEICHER_MAX)
+    if erg == "name_vorhanden":
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Du hast schon einen Ort namens **{name}**. Wähle einen anderen Namen oder lösche ihn mit `/places delete`.",
+            f"❌ You already have a location named **{name}**. Pick another name or delete it with `/places delete`."),
+            ephemeral=True)
+    if erg == "limit":
+        return await interaction.response.send_message(_t(
+            interaction, f"❌ Du hast schon {_ORTE_SPEICHER_MAX} gespeicherte Orte. Lösche einen mit `/places delete`.",
+            f"❌ You already have {_ORTE_SPEICHER_MAX} saved locations. Delete one with `/places delete`."), ephemeral=True)
+    map_name = conn.get("map_name", "ChernarusPlus")
+    await interaction.response.send_message(_t(
+        interaction,
+        f"⭐ **{name}** gespeichert: [{punkt[0]:.0f} / {punkt[1]:.0f}]({_izurvive_url(punkt[0], punkt[1], map_name)}). "
+        f"Bei `/buy` wählst du ihn unter `ort`.",
+        f"⭐ **{name}** saved: [{punkt[0]:.0f} / {punkt[1]:.0f}]({_izurvive_url(punkt[0], punkt[1], map_name)}). "
+        f"Pick it under `ort` in `/buy`."), ephemeral=True)
+
+
+@places_group.command(name="list", description="📋 Show your last known location, last placements and saved locations")
+@app_commands.describe(server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def places_list(interaction: discord.Interaction, server: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler or _premium_missing_text(interaction), ephemeral=True)
+    en = _sprache(interaction) == "en"
+    gid, uid = interaction.guild_id, interaction.user.id
+    map_name = conn.get("map_name", "ChernarusPlus")
+    jetzt = time.time()
+
+    def zeile(x: float, z: float, vorn: str) -> str:
+        return f"{vorn} [{_ort_text(conn, x, z)}]({_izurvive_url(x, z, map_name)})"
+    letzter = _ort_letzter_bekannter(conn, gid, uid)
+    auto = db.orte_liste(gid, conn.service_id, uid, "auto")
+    gesp = db.orte_liste(gid, conn.service_id, uid, "gespeichert")
+    e = discord.Embed(title=_t(interaction, "📍 Deine Orte", "📍 Your locations"), color=0x3498DB)
+    e.add_field(name=_t(interaction, "Letzter bekannter Ort", "Last known location"),
+                value=(zeile(letzter["x"], letzter["z"], _ort_alter(jetzt - letzter["ts"], en) + " ·") if letzter
+                       else _t(interaction, "– noch keiner (`/link` und auf dem Server spielen)", "– none yet (`/link` and play on the server)")),
+                inline=False)
+    e.add_field(name=_t(interaction, f"Letzte Platzierungen ({len(auto)}/{_ORTE_AUTO_MAX})", f"Last placements ({len(auto)}/{_ORTE_AUTO_MAX})"),
+                value="\n".join(zeile(float(r["x"]), float(r["z"]), _ort_alter(jetzt - float(r["created_at"]), en) + " ·") for r in auto)
+                or _t(interaction, "– noch keine (werden automatisch gemerkt, wenn du etwas platzierst)", "– none yet (remembered automatically when you place something)"),
+                inline=False)
+    e.add_field(name=_t(interaction, f"Gespeichert ({len(gesp)}/{_ORTE_SPEICHER_MAX})", f"Saved ({len(gesp)}/{_ORTE_SPEICHER_MAX})"),
+                value="\n".join(zeile(float(r["x"]), float(r["z"]), f"⭐ **{r['name']}** ·") for r in gesp)[:1000]
+                or _t(interaction, "– noch keine (`/places save`)", "– none yet (`/places save`)"),
+                inline=False)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@places_group.command(name="delete", description="🗑️ Delete one of your saved locations")
+@app_commands.describe(name="Name of the saved location", server="Welcher Nitrado-Server? (nur nötig, wenn mehrere verbunden sind)")
+async def places_delete(interaction: discord.Interaction, name: str, server: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    conn, fehler = _conn_waehlen(interaction, server)
+    if conn is None:
+        return await interaction.response.send_message(fehler or _premium_missing_text(interaction), ephemeral=True)
+    if db.ort_loeschen(interaction.guild_id, conn.service_id, interaction.user.id, (name or "").strip()):
+        return await interaction.response.send_message(_t(
+            interaction, f"🗑️ **{name}** gelöscht.", f"🗑️ **{name}** deleted."), ephemeral=True)
+    await interaction.response.send_message(_t(
+        interaction, f"❌ Du hast keinen gespeicherten Ort namens **{name}**.",
+        f"❌ You have no saved location named **{name}**."), ephemeral=True)
+
+
+places_save.autocomplete("ort")(_ort_autocomplete)
+places_save.autocomplete("server")(_server_autocomplete)
+places_list.autocomplete("server")(_server_autocomplete)
+places_delete.autocomplete("name")(_gespeicherte_orte_autocomplete)
+places_delete.autocomplete("server")(_server_autocomplete)
+bot.tree.add_command(places_group)
 
 
 # ══════════════════════════════════════════════════════════════
