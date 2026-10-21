@@ -37,6 +37,7 @@ import xml.etree.ElementTree as ET
 import threading
 import functools
 import contextvars
+import dataclasses
 import copy
 import glob
 import zipfile
@@ -28044,6 +28045,14 @@ class EconomyDB:
                 "SELECT * FROM letzte_orte WHERE guild_id=? AND service_id=? AND user_id=?",
                 (guild_id, str(service_id or ""), user_id)).fetchone()
 
+    def purchases_of_user(self, service_id: str, guild_id: int, user_id: int, limit: int = 20) -> List[sqlite3.Row]:
+        """Die letzten Kaeufe EINES Users auf diesem Server (neueste zuerst) - fuer den Spielerbereich."""
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT id, item_name, amount, total_price, x, z, status, created_at, delivered_at FROM purchases "
+                "WHERE service_id=? AND guild_id=? AND user_id=? ORDER BY created_at DESC, id DESC LIMIT ?",
+                (str(service_id or ""), guild_id, user_id, max(1, int(limit)))).fetchall())
+
     def pending_purchases(self, created_before: Optional[float] = None,
                           guild_id: Optional[int] = None,
                           service_id: Optional[str] = None) -> List[sqlite3.Row]:
@@ -34173,6 +34182,212 @@ async def _gespeicherte_orte_autocomplete(interaction: discord.Interaction, curr
             if not such or such in str(r["name"]).lower()][:25]
 
 
+# ── Kauf: Pruefen und Ausfuehren – gemeinsam fuer /buy und das Dashboard ──
+# Beide Wege muessen dieselben Regeln durchsetzen (Rolle, Hoechstmenge, Ort, Guthaben, Rollback). Deshalb
+# steht die Logik EINMAL hier; /buy und /api/me/shop/buy uebersetzen nur das Ergebnis in ihre Antwort.
+@dataclasses.dataclass
+class _KaufFehler:
+    code: str
+    de: str = ""
+    en: str = ""
+    wallet: int = 0
+    total: int = 0
+    daten: Dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    def text(self, en: bool) -> str:
+        return self.en if en else self.de
+
+
+@dataclasses.dataclass
+class _KaufPlan:
+    item: Dict[str, Any]
+    cls_list: List[str]
+    amount: int
+    x: float
+    y: float
+    z: float
+    ort_label: Optional[str]
+    total: int
+    wallet: int
+
+
+@dataclasses.dataclass
+class _KaufErgebnis:
+    ok: bool
+    code: str = ""
+    de: str = ""
+    en: str = ""
+    purchase_id: int = 0
+    wallet: int = 0
+    auto_restart: bool = False
+    cooldown: int = 0
+
+    def text(self, en: bool) -> str:
+        return self.en if en else self.de
+
+
+def _kauf_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, amount: int,
+                  rollen_ids: Optional[Set[int]], ort: Optional[str], x: Optional[float],
+                  z: Optional[float], y: Optional[float], en: bool) -> Union[_KaufPlan, _KaufFehler]:
+    """Alle Vorpruefungen eines Kaufs, ohne etwas zu veraendern. ``rollen_ids`` sind die Discord-Rollen des
+    Kaeufers auf dieser Guild (``None`` = Mitglied unbekannt: Rollen-Items bleiben dann gesperrt)."""
+    katalog = conn.catalog
+    if katalog is None:
+        return _KaufFehler("kein_katalog")
+    it = katalog.find(item)
+    if not it or not it.get("enabled", True):
+        return _KaufFehler("item", f"❌ Item `{item}` ist nicht verfügbar. `/shop list` zeigt den Katalog.",
+                           f"❌ Item `{item}` is not available. Use `/shop list` to see the catalog.")
+    # Rollen-Beschraenkung: leer heisst, alle duerfen kaufen. Vor allen weiteren Pruefungen, damit niemand ueber
+    # die Fehlermeldungen erfaehrt, was er ohnehin nicht kaufen darf.
+    noetig = _item_role_ids(it)
+    if noetig and not (rollen_ids is not None and any(r in rollen_ids for r in noetig)):
+        return _KaufFehler(
+            "rolle",
+            f"❌ Du hast nicht die erforderliche Rolle, um **{it['name']}** zu kaufen.\n"
+            "Benötigt wird: " + ", ".join(f"<@&{r}>" for r in noetig),
+            f"❌ You don't have the required role to buy **{it['name']}**.\n"
+            "Required: " + ", ".join(f"<@&{r}>" for r in noetig),
+            daten={"role_ids": [str(r) for r in noetig]})
+    max_amount = int(it.get("max_amount_per_buy", 1))
+    if amount > max_amount:
+        return _KaufFehler("menge", f"❌ Du kannst höchstens **{max_amount}× {it['name']}** pro Kauf erwerben.",
+                           f"❌ You can buy at most **{max_amount}× {it['name']}** per purchase.")
+    cls_list = _item_classnames(it)
+    if not cls_list:
+        return _KaufFehler(
+            "classnames",
+            f"❌ Item `{it.get('name', item)}` hat keine Classnames konfiguriert – "
+            f"ein Admin muss den Katalog-Eintrag korrigieren.",
+            f"❌ Item `{it.get('name', item)}` has no classnames configured – "
+            f"ask an admin to fix the catalog entry.")
+
+    # Ort: entweder eine Auswahl (letzter bekannter Ort, automatisch gemerkter oder gespeicherter Ort) ODER x/z.
+    # Beides zugleich waere mehrdeutig. Es zaehlen nur Orte dieses Users auf diesem Server.
+    ort_label: Optional[str] = None
+    if ort and (x is not None or z is not None):
+        return _KaufFehler("ort_doppelt", "❌ Entweder `ort` wählen ODER `x` und `z` angeben – nicht beides.",
+                           "❌ Pick `ort` OR enter `x` and `z` – not both.")
+    if ort:
+        aufgeloest, ort_fehler = _ort_aufloesen(conn, gid, uid, ort, en)
+        if aufgeloest is None:
+            return _KaufFehler("ort", ort_fehler, ort_fehler)
+        x, z, ort_label = aufgeloest
+    elif x is None or z is None:
+        return _KaufFehler(
+            "ort_fehlt",
+            "❌ Wähle einen `ort` (letzter bekannter Ort, deine letzten Platzierungen oder ein gespeicherter Ort) "
+            "oder gib `x` und `z` an. Mit `/places save` speicherst du Orte unter einem Namen.",
+            "❌ Pick an `ort` (last known location, your last placements or a saved location) or enter `x` and `z`. "
+            "Use `/places save` to save locations under a name.")
+
+    # Koordinaten validieren (iZurvive: x=Ost, z=Nord)
+    if not (0.0 <= x <= 20000.0 and 0.0 <= z <= 20000.0):
+        return _KaufFehler(
+            "koordinaten",
+            "❌ Koordinaten außerhalb der Map. Gib die beiden iZurvive-Zahlen als "
+            "`x` (Ost) und `z` (Nord) an, z. B. `x: 4640` `z: 10350`.",
+            "❌ Coordinates out of range. Enter the two iZurvive numbers as "
+            "`x` (East) and `z` (North), e.g. `x: 4640` `z: 10350`.")
+    # ACHTUNG Achsen-Mapping: cfgEffectArea Pos = [X, HÖHE, NORD]
+    # → iZurvive-X → Pos[0], Höhe (y-Parameter) → Pos[1], iZurvive-Y → Pos[2]
+    y_val = float(conn.get("default_pos_y", 0.0) or 0.0) if y is None else float(y)
+    if not (-100.0 <= y_val <= 1000.0):
+        return _KaufFehler("hoehe", "❌ Höhe `y` außerhalb des Bereichs (−100 … 1000). Leer lassen für Bodenhöhe.",
+                           "❌ Height `y` out of range (−100 … 1000). Leave it empty for ground level.")
+
+    # Preis pruefen (Vorpruefung, Abbuchung erst nach FTP-Erfolg)
+    total = int(it.get("price", 0)) * int(amount)
+    wallet, _bank = db.get_balance(gid, uid)
+    if wallet < total:
+        return _KaufFehler(
+            "guthaben",
+            f"❌ Du brauchst **{_fmt_money(total, conn)}**, dein Wallet hat nur **{_fmt_money(wallet, conn)}**.",
+            f"❌ You need **{_fmt_money(total, conn)}** but your wallet only has **{_fmt_money(wallet, conn)}**.",
+            wallet=wallet, total=total)
+    return _KaufPlan(it, cls_list, int(amount), float(x), y_val, float(z), ort_label, total, wallet)
+
+
+def _kauf_ort_info(conn: "ServerConnection", x: float, z: float) -> Tuple[str, Optional[str]]:
+    """(Karten-Link, naechster Ortsname oder None) fuer die Bestaetigung."""
+    map_name = conn.get("map_name", "ChernarusPlus")
+    return _izurvive_url(x, z, map_name), _nearest_location(x, z, map_name)
+
+
+async def _kauf_ausfuehren(conn: "ServerConnection", gid: int, uid: int, user_name: str,
+                           plan: _KaufPlan) -> _KaufErgebnis:
+    """Liefert den vorgeprueften Kauf aus: erst in cfgEffectArea.json schreiben, dann abbuchen (atomar, bei
+    Fehlschlag Rollback), dann als ausstehend vormerken und im shop_log-Feed melden."""
+    # Auslieferung auf genau dem gewaehlten Server – hier wird nur noch geprueft, ob er einsatzbereit ist.
+    if conn.api is None or conn.ftp is None:
+        return _KaufErgebnis(
+            False, "kein_ftp",
+            "❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn kann nichts "
+            "ausgeliefert werden.\nBitte wende dich an den Bot-Betreiber.",
+            "❌ This server is missing FTP access – without it nothing "
+            "can be delivered.\nPlease contact the bot operator.")
+    if not conn.shop:
+        return _KaufErgebnis(False, "shop_start",
+                             "❌ Shop-System startet noch – bitte gleich noch einmal versuchen.",
+                             "❌ Shop system is still starting up – try again in a moment.")
+    it, cls_list, amount, total = plan.item, plan.cls_list, plan.amount, plan.total
+    x, y_val, z = plan.x, plan.y, plan.z
+
+    # 1. Erst in cfgEffectArea.json schreiben ...
+    ok, err, area_names = await conn.shop.add_purchase_entries(cls_list, amount, x, y_val, z)
+    if not ok:
+        return _KaufErgebnis(False, "lieferung", err, err)
+
+    # 2. ... dann Geld abbuchen (atomar). Bei Fehlschlag: Rollback
+    if not db.try_spend_wallet(gid, uid, total):
+        rollback_ok = await conn.shop.remove_area_entries(area_names)   # Einträge zurückrollen
+        if not rollback_ok:
+            # Verwaiste Einträge würden bei jedem Neustart gratis spawnen → Admins warnen
+            log.error(f"[SHOP] Rollback fehlgeschlagen – verwaiste Areas: {area_names}")
+            warn = discord.Embed(
+                title=_ft(conn, "⚠️ Verwaiste Shop-Einträge", "⚠️ Orphaned shop entries"),
+                description=_ft(conn,
+                                "Ein abgebrochener Kauf konnte in der `cfgEffectArea.json` nicht "
+                                "zurückgerollt werden. Führe `/shop cleanup` aus, um die verwaisten "
+                                "Einträge zu entfernen, sonst spawnen die Items bei jedem Neustart erneut.",
+                                "A cancelled purchase could not be rolled back in "
+                                "`cfgEffectArea.json`. Run `/shop cleanup` to remove the "
+                                "orphaned entries, otherwise the items respawn on every restart."),
+                color=0xE67E22)
+            await _post_feed(gid, "shop_log", warn, service_id=conn.service_id)
+        wallet, _bank = db.get_balance(gid, uid)
+        return _KaufErgebnis(False, "guthaben", wallet=wallet)
+
+    # 3. Kauf als pending speichern
+    purchase_id = db.create_purchase(
+        conn.service_id, gid, uid, user_name, it["name"], "+".join(cls_list),
+        amount, total, x, y_val, z, area_names)
+
+    # 4. Auto-Restart oder Hinweis auf nächsten Neustart
+    auto_restart = bool(conn.get("auto_restart_after_purchase", False))
+    cooldown = 0
+    if auto_restart:
+        conn.shop.schedule_auto_restart()
+        cooldown = int(conn.get("restart_cooldown_seconds", 300) or 300)
+    wallet, _bank = db.get_balance(gid, uid)
+
+    # 5. Kauf in den shop_log-Feed posten
+    loc_url, near = _kauf_ort_info(conn, x, z)
+    near_feed = (f"\n*({_ft(conn, 'Nahe', 'Near')} {near})*") if near else ""
+    feed = discord.Embed(
+        title=_ft(conn, "🛒 SHOP-KAUF", "🛒 SHOP PURCHASE"),
+        description=_ft(conn, f"<@{uid}> hat **{amount}× {it['name']}** gekauft",
+                        f"<@{uid}> bought **{amount}× {it['name']}**"),
+        color=0x3498DB)
+    feed.add_field(name=_ft(conn, "Preis", "Price"), value=_fmt_money(total, conn), inline=True)
+    feed.add_field(name=_ft(conn, "Ort", "Location"), value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_feed}", inline=True)
+    feed.add_field(name="Status", value=_ft(conn, "⏳ ausstehend (spawnt nach dem Neustart)",
+                                            "⏳ pending (spawns after restart)"), inline=False)
+    feed.set_footer(text=(f"{_ft(conn, 'Kauf', 'Purchase')} #{purchase_id} · " + "+".join(cls_list))[:100])
+    await _post_feed(gid, "shop_log", feed, service_id=conn.service_id)
+    return _KaufErgebnis(True, purchase_id=purchase_id, wallet=wallet, auto_restart=auto_restart, cooldown=cooldown)
+
+
 @bot.tree.command(
     name="buy",
     description="🛒 Buy an item – it spawns at a saved location or your coordinates after the next server restart")
@@ -34192,200 +34407,67 @@ async def cmd_buy(interaction: discord.Interaction, item: str,
         return
     gid, uid = interaction.guild_id, interaction.user.id
 
-    # ── 1. Server EINMAL aufloesen – Katalog, Lieferung, Neustart und
-    #       Karte muessen zwingend derselbe Server sein. Frueher wurde hier
-    #       viermal unabhaengig aufgeloest: der Katalog kam von A, das Item
-    #       spawnte auf B und neu gestartet wurde ein dritter Server.
+    # ── Server EINMAL aufloesen – Katalog, Lieferung, Neustart und Karte muessen zwingend derselbe Server sein.
+    #    Frueher wurde hier viermal unabhaengig aufgeloest: der Katalog kam von A, das Item spawnte auf B und
+    #    neu gestartet wurde ein dritter Server.
     _conn, _fehler = _conn_waehlen(interaction, server)
     if _conn is None:
         return await interaction.response.send_message(
             _fehler or _premium_missing_text(interaction), ephemeral=True)
-    katalog_conn = _conn
-    katalog = _conn.catalog
-    if katalog is None:
-        return await interaction.response.send_message(
-            _premium_missing_text(interaction), ephemeral=True)
-    it = katalog.find(item)
-    if not it or not it.get("enabled", True):
-        return await interaction.response.send_message(_t(
-            interaction, f"❌ Item `{item}` ist nicht verfügbar. `/shop list` zeigt den Katalog.",
-            f"❌ Item `{item}` is not available. Use `/shop list` to see the catalog."),
-            ephemeral=True)
-    # ── 1b. Rollen-Beschraenkung: leer heisst, alle duerfen kaufen ──
-    #        Vor allen weiteren Pruefungen, damit niemand ueber die
-    #        Fehlermeldungen erfaehrt, was er ohnehin nicht kaufen darf.
-    noetig = _item_role_ids(it)
-    if noetig and not (isinstance(interaction.user, discord.Member)
-                       and _member_has_role_ids(interaction.user, noetig)):
-        return await interaction.response.send_message(_t(
-            interaction,
-            f"❌ Du hast nicht die erforderliche Rolle, um **{it['name']}** zu kaufen.\n"
-            "Benötigt wird: " + ", ".join(f"<@&{r}>" for r in noetig),
-            f"❌ You don't have the required role to buy **{it['name']}**.\n"
-            "Required: " + ", ".join(f"<@&{r}>" for r in noetig)),
-            ephemeral=True)
-
-    max_amount = int(it.get("max_amount_per_buy", 1))
-    if amount > max_amount:
-        return await interaction.response.send_message(_t(
-            interaction, f"❌ Du kannst höchstens **{max_amount}× {it['name']}** pro Kauf erwerben.",
-            f"❌ You can buy at most **{max_amount}× {it['name']}** per purchase."),
-            ephemeral=True)
-    cls_list = _item_classnames(it)
-    if not cls_list:
-        return await interaction.response.send_message(_t(
-            interaction,
-            f"❌ Item `{it.get('name', item)}` hat keine Classnames konfiguriert – "
-            f"ein Admin muss den Katalog-Eintrag korrigieren.",
-            f"❌ Item `{it.get('name', item)}` has no classnames configured – "
-            f"ask an admin to fix the catalog entry."), ephemeral=True)
-
-    # ── 1c. Ort: entweder eine Auswahl (letzter bekannter Ort, automatisch gemerkter oder gespeicherter Ort)
-    #        ODER x/z. Beides zugleich waere mehrdeutig. Es zaehlen nur Orte dieses Users auf diesem Server.
-    ort_label: Optional[str] = None
-    if ort and (x is not None or z is not None):
-        return await interaction.response.send_message(_t(
-            interaction, "❌ Entweder `ort` wählen ODER `x` und `z` angeben – nicht beides.",
-            "❌ Pick `ort` OR enter `x` and `z` – not both."), ephemeral=True)
-    if ort:
-        aufgeloest, ort_fehler = _ort_aufloesen(_conn, gid, uid, ort, _sprache(interaction) == "en")
-        if aufgeloest is None:
-            return await interaction.response.send_message(ort_fehler, ephemeral=True)
-        x, z, ort_label = aufgeloest
-    elif x is None or z is None:
-        return await interaction.response.send_message(_t(
-            interaction,
-            "❌ Wähle einen `ort` (letzter bekannter Ort, deine letzten Platzierungen oder ein gespeicherter Ort) "
-            "oder gib `x` und `z` an. Mit `/places save` speicherst du Orte unter einem Namen.",
-            "❌ Pick an `ort` (last known location, your last placements or a saved location) or enter `x` and `z`. "
-            "Use `/places save` to save locations under a name."), ephemeral=True)
-
-    # ── 2. Koordinaten validieren (iZurvive: x=Ost, z=Nord) ───
-    if not (0.0 <= x <= 20000.0 and 0.0 <= z <= 20000.0):
-        return await interaction.response.send_message(_t(
-            interaction,
-            "❌ Koordinaten außerhalb der Map. Gib die beiden iZurvive-Zahlen als "
-            "`x` (Ost) und `z` (Nord) an, z. B. `x: 4640` `z: 10350`.",
-            "❌ Coordinates out of range. Enter the two iZurvive numbers as "
-            "`x` (East) and `z` (North), e.g. `x: 4640` `z: 10350`."), ephemeral=True)
-    # ACHTUNG Achsen-Mapping: cfgEffectArea Pos = [X, HÖHE, NORD]
-    # → iZurvive-X → Pos[0], Höhe (y-Parameter) → Pos[1], iZurvive-Y → Pos[2]
-    y_val = float(katalog_conn.get("default_pos_y", 0.0) or 0.0) if y is None else float(y)
-    if not (-100.0 <= y_val <= 1000.0):
-        return await interaction.response.send_message(_t(
-            interaction,
-            "❌ Höhe `y` außerhalb des Bereichs (−100 … 1000). Leer lassen für Bodenhöhe.",
-            "❌ Height `y` out of range (−100 … 1000). Leave it empty for ground level."),
-            ephemeral=True)
-
-    # ── 3. Preis prüfen (Vorprüfung, Abbuchung erst nach FTP-Erfolg) ──
-    total = int(it.get("price", 0)) * int(amount)
-    wallet, _bank = db.get_balance(gid, uid)
-    if wallet < total:
-        return await interaction.response.send_message(
-            embed=_insufficient_embed(total, wallet), ephemeral=True)
+    en = _sprache(interaction) == "en"
+    rollen = ({r.id for r in interaction.user.roles}
+              if isinstance(interaction.user, discord.Member) else None)
+    plan = _kauf_pruefen(_conn, gid, uid, item, int(amount), rollen, ort, x, z, y, en)
+    if isinstance(plan, _KaufFehler):
+        if plan.code == "kein_katalog":
+            return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+        if plan.code == "guthaben":
+            return await interaction.response.send_message(
+                embed=_insufficient_embed(plan.total, plan.wallet), ephemeral=True)
+        return await interaction.response.send_message(plan.text(en), ephemeral=True)
 
     await interaction.response.defer(ephemeral=True)
-    # Auslieferung auf genau dem oben gewaehlten Server – hier wird nur noch
-    # geprueft, ob er einsatzbereit ist, nicht neu aufgeloest.
-    if _conn.api is None or _conn.ftp is None:
-        return await interaction.followup.send(_t(
-            interaction,
-            "❌ Für diesen Server fehlt der FTP-Zugang – ohne ihn kann nichts "
-            "ausgeliefert werden.\nBitte wende dich an den Bot-Betreiber.",
-            "❌ This server is missing FTP access – without it nothing "
-            "can be delivered.\nPlease contact the bot operator."),
-            ephemeral=True)
-    if not _conn.shop:
-        return await interaction.followup.send(_t(
-            interaction, "❌ Shop-System startet noch – bitte gleich noch einmal versuchen.",
-            "❌ Shop system is still starting up – try again in a moment."), ephemeral=True)
+    res = await _kauf_ausfuehren(_conn, gid, uid, str(interaction.user), plan)
+    if not res.ok:
+        if res.code == "lieferung":
+            return await interaction.followup.send(
+                embed=discord.Embed(title=_t(interaction, "❌ Kauf fehlgeschlagen", "❌ Purchase failed"),
+                                    description=res.de, color=0xE74C3C),
+                ephemeral=True)
+        if res.code == "guthaben":
+            return await interaction.followup.send(
+                embed=_insufficient_embed(plan.total, res.wallet), ephemeral=True)
+        return await interaction.followup.send(res.text(en), ephemeral=True)
 
-    # ── 4. Erst in cfgEffectArea.json schreiben ... ───────────
-    ok, err, area_names = await _conn.shop.add_purchase_entries(
-        cls_list, int(amount), x, y_val, z)
-    if not ok:
-        return await interaction.followup.send(
-            embed=discord.Embed(title=_t(interaction, "❌ Kauf fehlgeschlagen", "❌ Purchase failed"),
-                               description=err, color=0xE74C3C),
-            ephemeral=True)
-
-    # ── 5. ... dann Geld abbuchen (atomar). Bei Fehlschlag: Rollback ──
-    if not db.try_spend_wallet(gid, uid, total):
-        rollback_ok = await _conn.shop.remove_area_entries(area_names)   # Einträge zurückrollen
-        if not rollback_ok:
-            # Verwaiste Einträge würden bei jedem Neustart gratis spawnen → Admins warnen
-            log.error(f"[SHOP] Rollback fehlgeschlagen – verwaiste Areas: {area_names}")
-            warn = discord.Embed(
-                title=_ft(_conn, "⚠️ Verwaiste Shop-Einträge", "⚠️ Orphaned shop entries"),
-                description=_ft(_conn,
-                                "Ein abgebrochener Kauf konnte in der `cfgEffectArea.json` nicht "
-                                "zurückgerollt werden. Führe `/shop cleanup` aus, um die verwaisten "
-                                "Einträge zu entfernen, sonst spawnen die Items bei jedem Neustart erneut.",
-                                "A cancelled purchase could not be rolled back in "
-                                "`cfgEffectArea.json`. Run `/shop cleanup` to remove the "
-                                "orphaned entries, otherwise the items respawn on every restart."),
-                color=0xE67E22)
-            await _post_feed(gid, "shop_log", warn, service_id=_conn.service_id)
-        wallet, _bank = db.get_balance(gid, uid)
-        return await interaction.followup.send(
-            embed=_insufficient_embed(total, wallet), ephemeral=True)
-
-    # ── 6. Kauf als pending speichern ─────────────────────────
-    purchase_id = db.create_purchase(
-        _conn.service_id, gid, uid, str(interaction.user), it["name"],
-        "+".join(cls_list),
-        int(amount), total, x, y_val, z, area_names)
-
-    # ── 7. Auto-Restart oder Hinweis auf nächsten Neustart ────
-    if _conn.get("auto_restart_after_purchase", False):
-        _conn.shop.schedule_auto_restart()
-        cooldown = int(_conn.get("restart_cooldown_seconds", 300) or 300)
+    # ── Bestätigung an den Käufer (Ort + iZurvive-Link) ────
+    x, z = plan.x, plan.z
+    it, amount, total = plan.item, plan.amount, plan.total
+    if res.auto_restart:
         delivery_info = _t(
             interaction,
             f"🔄 Ein Server-Neustart wurde geplant – deine Items spawnen in "
-            f"etwa **{max(5, cooldown)} Sekunden** (plus Startzeit).",
+            f"etwa **{max(5, res.cooldown)} Sekunden** (plus Startzeit).",
             f"🔄 A server restart has been scheduled – your items will spawn "
-            f"in about **{max(5, cooldown)} seconds** (plus boot time).")
+            f"in about **{max(5, res.cooldown)} seconds** (plus boot time).")
     else:
         delivery_info = _t(interaction,
                            "⏳ Deine Items spawnen beim **nächsten geplanten Server-Neustart**.",
                            "⏳ Your items will spawn at the **next scheduled server restart**.")
-
-    # ── 8. Bestätigung an den Käufer (Ort + iZurvive-Link) ────
-    map_name = _conn.get("map_name", "ChernarusPlus")
-    loc_url  = _izurvive_url(x, z, map_name)
-    near     = _nearest_location(x, z, map_name)
+    loc_url, near = _kauf_ort_info(_conn, x, z)
     near_txt = _t(interaction, f"\n*(Nahe {near})*", f"\n*(Near {near})*") if near else ""
-    wallet, _bank = db.get_balance(gid, uid)
-
     embed = discord.Embed(
         title=_t(interaction, "🛒 Kauf erfolgreich", "🛒 Purchase successful"),
         description=_t(
-            interaction, f"Du hast **{amount}× {it['name']}** für **{_fmt_money(total)}** gekauft.",
-            f"You bought **{amount}× {it['name']}** for **{_fmt_money(total)}**."),
+            interaction, f"Du hast **{amount}× {it['name']}** für **{_fmt_money(total, _conn)}** gekauft.",
+            f"You bought **{amount}× {it['name']}** for **{_fmt_money(total, _conn)}**."),
         color=0x2ECC71)
-    ort_zeile = f"**{ort_label}**\n" if ort_label else ""
+    ort_zeile = f"**{plan.ort_label}**\n" if plan.ort_label else ""
     embed.add_field(name=_t(interaction, "📍 Spawn-Ort", "📍 Spawn location"),
                     value=f"{ort_zeile}[{x:.1f} / {z:.1f}]({loc_url}){near_txt}", inline=False)
     embed.add_field(name=_t(interaction, "🚚 Lieferung", "🚚 Delivery"), value=delivery_info, inline=False)
-    embed.add_field(name="👛 Wallet",   value=_fmt_money(wallet), inline=True)
-    embed.set_footer(text=_t(interaction, f"Kauf #{purchase_id}", f"Purchase #{purchase_id}"))
+    embed.add_field(name="👛 Wallet", value=_fmt_money(res.wallet, _conn), inline=True)
+    embed.set_footer(text=_t(interaction, f"Kauf #{res.purchase_id}", f"Purchase #{res.purchase_id}"))
     await interaction.followup.send(embed=embed, ephemeral=True)
-
-    # ── 9. Kauf in den shop_log-Feed posten ───────────────────
-    near_feed = (f"\n*({_ft(_conn, 'Nahe', 'Near')} {near})*") if near else ""
-    feed = discord.Embed(
-        title=_ft(_conn, "🛒 SHOP-KAUF", "🛒 SHOP PURCHASE"),
-        description=_ft(_conn, f"{interaction.user.mention} hat **{amount}× {it['name']}** gekauft",
-                        f"{interaction.user.mention} bought **{amount}× {it['name']}**"),
-        color=0x3498DB)
-    feed.add_field(name=_ft(_conn, "Preis", "Price"),    value=_fmt_money(total), inline=True)
-    feed.add_field(name=_ft(_conn, "Ort", "Location"), value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_feed}", inline=True)
-    feed.add_field(name="Status",   value=_ft(_conn, "⏳ ausstehend (spawnt nach dem Neustart)",
-                                              "⏳ pending (spawns after restart)"), inline=False)
-    feed.set_footer(text=(f"{_ft(_conn, 'Kauf', 'Purchase')} #{purchase_id} · " + "+".join(cls_list))[:100])
-    await _post_feed(gid, "shop_log", feed, service_id=_conn.service_id)
 
 cmd_buy.autocomplete("item")(_shop_buy_autocomplete)
 cmd_buy.autocomplete("ort")(_ort_autocomplete)
@@ -35442,7 +35524,12 @@ _SESS_PUBLIC_EXACT = ("/", "/index.html", "/api/session", "/favicon.ico", "/api/
 # hinter dem Token. Die Mandantentrennung haengt davon nicht ab, die macht
 # _session_conn.
 _SESS_OHNE_TOKEN = ("/api/my-guilds", "/api/my-guilds/select", "/api/options",
-                     "/api/consent", "/api/bugreport", "/api/bugreport/status")
+                     "/api/consent", "/api/bugreport", "/api/bugreport/status",
+                     # Spracheinstellung des Kontos: ein Spieler hat nie einen Token, soll die Sprache aber wechseln koennen
+                     "/api/sprache")
+# Der Spielerbereich: ebenfalls nur mit Discord-Anmeldung, aber ganz ohne Nitrado-Token - ein Spieler hat nie
+# einen. Die Absicherung macht jeder Handler selbst ueber _spieler_ctx (Mitgliedschaft, Server, Rollen).
+_SESS_SPIELER_PREFIX = "/api/me/"
 
 
 def _sess_prune() -> None:
@@ -35458,7 +35545,8 @@ def _sess_create(token: str, gameservers: list,
                  token_invalid: bool = False,
                  owned_guilds: Optional[list] = None,
                  guild_id: Optional[str] = None,
-                 is_guest: bool = False) -> str:
+                 is_guest: bool = False,
+                 member_guilds: Optional[list] = None) -> str:
     """Neue Session anlegen.
 
     Sie entsteht jetzt schon beim Discord-Login – also bevor ein Nitrado-Token
@@ -35486,6 +35574,12 @@ def _sess_create(token: str, gameservers: list,
         # dafuer, welche Guild diese Anmeldung waehlen darf – niemals die
         # guild_id aus dem Anfrage-Body.
         "owned_guilds": list(owned_guilds or []),
+        # ALLE Discord-Server, auf denen das Konto Mitglied ist (ebenfalls vom Login) - Grundlage des
+        # Spielerbereichs (/api/me/*). Die dort gewaehlte Guild/der Server stehen getrennt von guild_id,
+        # damit die Besitzer-Auswahl unberuehrt bleibt.
+        "member_guilds": list(member_guilds or []),
+        "player_guild_id": None,
+        "player_service_id": None,
         "guild_id": guild_id,
         # Der zuletzt besuchte Server, der diesem Konto WIRKLICH gehoert – fuer
         # den "Zurueck zu meinem Server"-Knopf im Gast-Zugang (siehe
@@ -35577,7 +35671,7 @@ async def _dash_auth_middleware(request: web.Request, handler):
         # hinter diesem Tor fuer sie dicht, egal was Dashboard Permissions
         # erlaubt.
         if not sess.get("token") and not _conn_for_session(sess) and not (
-                path in _SESS_OHNE_TOKEN and sess.get("discord")):
+                (path in _SESS_OHNE_TOKEN or path.startswith(_SESS_SPIELER_PREFIX)) and sess.get("discord")):
             # Ohne ``session_weg``: die Anmeldung ist in Ordnung, es fehlt nur
             # der Nitrado-Server. Das Dashboard bleibt deshalb stehen.
             return web.json_response(
@@ -36072,6 +36166,7 @@ async def api_discord_callback(request: web.Request) -> web.Response:
                        token_invalid=token_invalid,
                        owned_guilds=eigene,
                        is_guest=is_guest,
+                       member_guilds=_mitglied_guilds(guild_roh),
                        guild_id=_login_guild_vorauswahl(view["id"], eigene, conn,
                                                         is_guest))
     if conn is not None:
@@ -36231,7 +36326,7 @@ _AUDIT_LABELS = {
     ("POST", "/api/announcements"): "Ankündigung angelegt",
     ("POST", "/api/auto-restart"): "Auto-Neustart geändert",
 }
-_AUDIT_SKIP_PREFIXES = ("/api/auth/discord/", "/api/bugreport")
+_AUDIT_SKIP_PREFIXES = ("/api/auth/discord/", "/api/bugreport", "/api/me/")
 
 
 def _audit_label(method: str, path: str) -> str:
@@ -45993,16 +46088,343 @@ async def api_heatmap_reset(request: web.Request) -> web.Response:
     return ok({"heatmap_counts": await _dash_run(db.heatmap_counts, conn.service_id)})
 
 
-async def api_map_meta(request: web.Request) -> web.Response:
-    _c, denied = _session_conn(request)
+# ──────────────────────────────────────────────────────────────────────────
+#  Spielerbereich: /api/me/*
+#
+#  Ein Spieler ist weder Besitzer noch Admin noch Gast – er hat keine Dashboard-Verbindung (_session_conn
+#  lehnt ihn zu Recht ab). Alles hier laeuft deshalb ueber _spieler_ctx: Guild und Server kommen aus der
+#  SESSION (beim Login von Discord geholt bzw. vom Spieler gewaehlt und dagegen geprueft), die Mitgliedschaft und
+#  die Rollen werden bei jeder Anfrage live abgefragt. Aus dem Anfrage-Body kommt nie eine Guild- oder User-ID.
+# ──────────────────────────────────────────────────────────────────────────
+def _mitglied_guilds(roh: Any) -> List[Dict[str, Any]]:
+    """Alle Discord-Server, auf denen das Konto Mitglied ist (aus Discords Guild-Liste beim Login)."""
+    if not isinstance(roh, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for g in roh:
+        if not isinstance(g, dict):
+            continue
+        gid = str(g.get("id") or "").strip()
+        if not gid.isdigit():
+            continue
+        icon = g.get("icon")
+        out.append({
+            "id": gid,
+            "name": str(g.get("name") or f"Discord {gid}"),
+            "icon_url": (f"https://cdn.discordapp.com/icons/{gid}/{icon}.png?size=128" if icon else None),
+            "owner": g.get("owner") is True,
+        })
+    return out
+
+
+def _spieler_en(request: web.Request, sess: Dict[str, Any], data: Optional[Dict[str, Any]] = None) -> bool:
+    """Antwortsprache: ?lang=/lang aus dem Frontend, sonst die am Konto gespeicherte, sonst Englisch."""
+    wahl = str(request.query.get("lang") or (data or {}).get("lang") or "").lower()
+    if wahl not in ("de", "en"):
+        wahl = _sprache_von(sess.get("discord")) or "en"
+    return wahl == "en"
+
+
+def _klartext(s: str) -> str:
+    """Markdown aus den Discord-Texten entfernen – im Dashboard stehen sie als einfacher Text."""
+    return str(s).replace("**", "").replace("`", "")
+
+
+async def _spieler_member(gid: int, uid: int) -> Optional[Any]:
+    """Das Discord-Mitglied live holen (Cache, sonst Discord). None = kein Mitglied oder Bot nicht auf der Guild."""
+    guild = bot.get_guild(gid) if bot is not None else None
+    if guild is None:
+        return None
+    m = guild.get_member(uid)
+    if m is not None:
+        return m
+    try:
+        return await guild.fetch_member(uid)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+
+async def _spieler_ctx(request: web.Request) -> Tuple[Optional[Dict[str, Any]], Optional[web.Response]]:
+    """Der Spielerkontext dieser Anmeldung: ``({conn, gid, uid, rollen, sess, name, en}, None)`` oder ``(None, Fehler)``.
+
+    Die Guild muss in der beim Login geholten Mitgliederliste stehen, der Server zu dieser Guild gehoeren und
+    freigeschaltet sein, und die Person muss JETZT noch Mitglied sein."""
+    sess = _sess_get(request)
+    if not sess or not sess.get("discord"):
+        return None, err("Session abgelaufen – bitte neu anmelden.", 401)
+    gid_s, sid_s = str(sess.get("player_guild_id") or ""), str(sess.get("player_service_id") or "")
+    if not gid_s or not sid_s:
+        return None, err("Kein Server gewählt.", 409, code="kein_server")
+    if not any(str(g.get("id")) == gid_s for g in (sess.get("member_guilds") or [])):
+        return None, err("Du bist auf diesem Discord-Server kein Mitglied.", 403)
+    conn = next((c for c in connections.all_for_guild(gid_s) if c.service_id == sid_s), None)
+    if conn is None or not conn.guild_id:
+        return None, err("Dieser Server ist nicht freigeschaltet.", 403)
+    try:
+        uid = int(sess["discord"]["id"])
+    except (TypeError, ValueError, KeyError):
+        return None, err("Session abgelaufen – bitte neu anmelden.", 401)
+    member = await _spieler_member(int(gid_s), uid)
+    if member is None:
+        return None, err("Du bist auf diesem Discord-Server kein Mitglied.", 403)
+    return {"conn": conn, "gid": int(gid_s), "uid": uid, "rollen": {r.id for r in member.roles},
+            "sess": sess, "name": str(sess["discord"].get("name") or member.display_name),
+            "en": _spieler_en(request, sess)}, None
+
+
+def _spieler_geld(conn: ServerConnection, n: int) -> str:
+    return _klartext(_fmt_money(int(n), conn))
+
+
+def _ort_dict(r: Any, conn: ServerConnection) -> Dict[str, Any]:
+    x, z = float(r["x"]), float(r["z"])
+    return {"id": int(r["id"]), "name": r["name"], "x": round(x, 1), "z": round(z, 1),
+            "text": _ort_text(conn, x, z), "ts": float(r["created_at"]),
+            "link": _izurvive_url(x, z, conn.get("map_name", "ChernarusPlus"))}
+
+
+async def api_me_servers(request: web.Request) -> web.Response:
+    """Alle Server, die dieses Konto als Spieler betreten darf: Mitglied der Guild, Bot dort, Server freigeschaltet."""
+    sess = _sess_get(request)
+    if not sess or not sess.get("discord"):
+        return err("Session abgelaufen – bitte neu anmelden.", 401)
+    out = []
+    for g in (sess.get("member_guilds") or []):
+        gid = str(g["id"])
+        if bot is None or bot.get_guild(int(gid)) is None:
+            continue
+        for c in connections.all_for_guild(gid):
+            if not c.guild_id:
+                continue
+            out.append({"guild_id": gid, "guild_name": g["name"], "icon_url": g["icon_url"],
+                        "owner": bool(g["owner"]), "service_id": c.service_id, "server_name": c.name,
+                        "map_name": c.get("map_name")})
+    out.sort(key=lambda e: (not e["owner"], str(e["guild_name"]).lower(), str(e["server_name"]).lower()))
+    return ok({"servers": out[:100],
+               "gewaehlt": ({"guild_id": sess.get("player_guild_id"), "service_id": sess.get("player_service_id")}
+                            if sess.get("player_guild_id") else None)})
+
+
+async def post_me_servers_select(request: web.Request) -> web.Response:
+    sess = _sess_get(request)
+    if not sess or not sess.get("discord"):
+        return err("Session abgelaufen – bitte neu anmelden.", 401)
+    data = await body(request)
+    gid_s, sid_s = str(data.get("guild_id") or "").strip(), str(data.get("service_id") or "").strip()
+    if not any(str(g.get("id")) == gid_s for g in (sess.get("member_guilds") or [])):
+        return err("Du bist auf diesem Discord-Server kein Mitglied.", 403)
+    conn = next((c for c in connections.all_for_guild(gid_s) if c.service_id == sid_s), None)
+    if conn is None or not conn.guild_id:
+        return err("Dieser Server ist nicht freigeschaltet.", 403)
+    if await _spieler_member(int(gid_s), int(sess["discord"]["id"])) is None:
+        return err("Du bist auf diesem Discord-Server kein Mitglied.", 403)
+    sess["player_guild_id"], sess["player_service_id"] = gid_s, conn.service_id
+    return ok({"guild_id": gid_s, "service_id": conn.service_id, "server_name": conn.name})
+
+
+def _bestellung_dict(r: Any, conn: ServerConnection) -> Dict[str, Any]:
+    return {"id": int(r["id"]), "item": r["item_name"], "amount": int(r["amount"] or 0),
+            "total": int(r["total_price"] or 0), "total_text": _spieler_geld(conn, r["total_price"] or 0),
+            "status": r["status"], "created_at": r["created_at"], "delivered_at": r["delivered_at"]}
+
+
+async def api_me_overview(request: web.Request) -> web.Response:
+    ctx, denied = await _spieler_ctx(request)
     if denied is not None:
         return denied
-    denied = await _dash_gate(request, _c, "map", "view")
-    if denied is not None:
-        return denied
-    map_name = _c.get("map_name", "ChernarusPlus")
-    stil = _karten_einstellung("map_image_style", "sat", _MAP_IMAGE_STYLES, _c)
+    conn, gid, uid = ctx["conn"], ctx["gid"], ctx["uid"]
+    wallet, bank = db.get_balance(gid, uid)
+    bestellungen = db.purchases_of_user(conn.service_id, gid, uid, 5)
+    guild = bot.get_guild(gid)
     return ok({
+        "name": ctx["name"], "guild_name": guild.name if guild is not None else str(gid),
+        "server_name": conn.name, "map_name": conn.get("map_name"),
+        "wallet": wallet, "bank": bank, "wallet_text": _spieler_geld(conn, wallet),
+        "bank_text": _spieler_geld(conn, bank), "gesamt_text": _spieler_geld(conn, wallet + bank),
+        "bestellungen": [_bestellung_dict(r, conn) for r in bestellungen],
+        "orte": {"gespeichert": len(db.orte_liste(gid, conn.service_id, uid, "gespeichert")),
+                 "max": _ORTE_SPEICHER_MAX},
+    })
+
+
+async def api_me_orders(request: web.Request) -> web.Response:
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    conn = ctx["conn"]
+    try:
+        limit = min(200, max(1, int(request.query.get("limit", 50))))
+    except ValueError:
+        limit = 50
+    wallet, bank = db.get_balance(ctx["gid"], ctx["uid"])
+    return ok({"bestellungen": [_bestellung_dict(r, conn)
+                                for r in db.purchases_of_user(conn.service_id, ctx["gid"], ctx["uid"], limit)],
+               "wallet_text": _spieler_geld(conn, wallet), "bank_text": _spieler_geld(conn, bank)})
+
+
+async def api_me_shop(request: web.Request) -> web.Response:
+    """Der Katalog dieses Servers, wie ihn der Spieler kaufen darf (Rollen-Items nur mit Rolle als kaufbar markiert)."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    conn = ctx["conn"]
+    katalog = conn.catalog
+    if katalog is None:
+        return err("Für diesen Server gibt es keinen Shop.", 404)
+    guild = bot.get_guild(ctx["gid"])
+    items = []
+    for it in katalog.items:
+        if not it.get("enabled", True):
+            continue
+        noetig = _item_role_ids(it)
+        kaufbar = (not noetig) or any(r in ctx["rollen"] for r in noetig)
+        rollen_namen = []
+        for r in noetig:
+            rolle = guild.get_role(r) if guild is not None else None
+            rollen_namen.append(rolle.name if rolle is not None else str(r))
+        items.append({"name": str(it.get("name") or "?"), "price": int(it.get("price", 0)),
+                      "price_text": _spieler_geld(conn, int(it.get("price", 0))),
+                      "category": str(it.get("category", "Misc")),
+                      "max_amount": int(it.get("max_amount_per_buy", 1)),
+                      "bundle": len(_item_classnames(it)) > 1,
+                      "kaufbar": kaufbar, "rollen": rollen_namen})
+    wallet, _bank = db.get_balance(ctx["gid"], ctx["uid"])
+    return ok({"items": items, "wallet": wallet, "wallet_text": _spieler_geld(conn, wallet),
+               "waehrung": {"symbol": _cur_symbol(conn),
+                            "voran": bool(conn.get("prepend_currency_symbol", False))}})
+
+
+async def post_me_shop_buy(request: web.Request) -> web.Response:
+    """Kauf aus dem Dashboard – dieselben Regeln wie /buy (_kauf_pruefen/_kauf_ausfuehren)."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    conn, gid, uid, en = ctx["conn"], ctx["gid"], ctx["uid"], _spieler_en(request, ctx["sess"], data)
+    denied = _dash_rate_limited(request, "me.shop.buy", 3)
+    if denied is not None:
+        return denied
+    try:
+        amount = int(data.get("amount", 1))
+    except (TypeError, ValueError):
+        return err("Ungültige Menge." if not en else "Invalid amount.", 400)
+    if amount < 1:
+        return err("Ungültige Menge." if not en else "Invalid amount.", 400)
+
+    def zahl(v: Any) -> Optional[float]:
+        if v is None or v == "":
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return float("nan")
+    ort = str(data.get("ort") or "").strip() or None
+    x, z, y = zahl(data.get("x")), zahl(data.get("z")), zahl(data.get("y"))
+    if any(v is not None and not math.isfinite(v) for v in (x, z, y)):
+        return err("Ungültige Koordinaten." if not en else "Invalid coordinates.", 400)
+    speichern_als = str(data.get("speichern_als") or "").strip()
+    if speichern_als and not _ORTE_NAME_RE.match(speichern_als):
+        return err("Ungültiger Ortsname." if not en else "Invalid location name.", 400)
+
+    plan = _kauf_pruefen(conn, gid, uid, str(data.get("item") or ""), amount, ctx["rollen"], ort, x, z, y, en)
+    if isinstance(plan, _KaufFehler):
+        text = _klartext(plan.text(en))
+        if plan.code == "rolle":
+            guild = bot.get_guild(gid)
+            namen = []
+            for r in plan.daten.get("role_ids", []):
+                rolle = guild.get_role(int(r)) if guild is not None else None
+                namen.append(rolle.name if rolle is not None else r)
+            text = (f"Dafür brauchst du eine dieser Rollen: {', '.join(namen)}" if not en
+                    else f"You need one of these roles: {', '.join(namen)}")
+        return err(text, 402 if plan.code == "guthaben" else 400, code=plan.code)
+    res = await _kauf_ausfuehren(conn, gid, uid, str(ctx["name"]), plan)
+    if not res.ok:
+        if res.code == "guthaben":
+            text = (f"Du brauchst {_spieler_geld(conn, plan.total)}, hast aber nur {_spieler_geld(conn, res.wallet)}."
+                    if not en else
+                    f"You need {_spieler_geld(conn, plan.total)} but only have {_spieler_geld(conn, res.wallet)}.")
+            return err(text, 402, code=res.code)
+        status = 503 if res.code in ("kein_ftp", "shop_start") else 500
+        return err(_klartext(res.text(en)), status, code=res.code)
+    gespeichert = None
+    if speichern_als:
+        gespeichert = await _dash_run(db.ort_speichern, gid, conn.service_id, uid, speichern_als,
+                                      plan.x, plan.z, "dashboard", _ORTE_SPEICHER_MAX)
+    loc_url, near = _kauf_ort_info(conn, plan.x, plan.z)
+    return ok({"purchase_id": res.purchase_id, "item": plan.item["name"], "amount": plan.amount,
+               "total_text": _spieler_geld(conn, plan.total), "wallet_text": _spieler_geld(conn, res.wallet),
+               "x": round(plan.x, 1), "z": round(plan.z, 1), "ort_label": _klartext(plan.ort_label or ""),
+               "link": loc_url, "near": near, "auto_restart": res.auto_restart,
+               "ort_gespeichert": gespeichert})
+
+
+async def api_me_places(request: web.Request) -> web.Response:
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    conn, gid, uid = ctx["conn"], ctx["gid"], ctx["uid"]
+    letzter = await _dash_run(_ort_letzter_bekannter, conn, gid, uid)
+    auto = db.orte_liste(gid, conn.service_id, uid, "auto")
+    gesp = db.orte_liste(gid, conn.service_id, uid, "gespeichert")
+    return ok({
+        "letzter": ({"x": round(letzter["x"], 1), "z": round(letzter["z"], 1), "ts": letzter["ts"],
+                     "text": _ort_text(conn, letzter["x"], letzter["z"]),
+                     "link": _izurvive_url(letzter["x"], letzter["z"], conn.get("map_name", "ChernarusPlus"))}
+                    if letzter else None),
+        "auto": [_ort_dict(r, conn) for r in auto], "gespeichert": [_ort_dict(r, conn) for r in gesp],
+        "max_auto": _ORTE_AUTO_MAX, "max_gespeichert": _ORTE_SPEICHER_MAX,
+        "verlinkt": bool(db.get_links_by_user(gid, uid)),
+    })
+
+
+async def post_me_places(request: web.Request) -> web.Response:
+    """Einen Ort unter einem Namen speichern (x/z, meist per Kartentipp)."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    conn, gid, uid, en = ctx["conn"], ctx["gid"], ctx["uid"], _spieler_en(request, ctx["sess"], data)
+    denied = _dash_rate_limited(request, "me.places.save", 1)
+    if denied is not None:
+        return denied
+    name = str(data.get("name") or "").strip()
+    if not _ORTE_NAME_RE.match(name):
+        return err("Ungültiger Name – 1 bis 32 Zeichen: Buchstaben, Ziffern, Leerzeichen, _ . -" if not en else
+                   "Invalid name – 1 to 32 characters: letters, digits, spaces, _ . -", 400, code="name")
+    try:
+        x, z = float(data.get("x")), float(data.get("z"))
+    except (TypeError, ValueError):
+        return err("Ungültige Koordinaten." if not en else "Invalid coordinates.", 400, code="koordinaten")
+    welt = _world_size(conn.get("map_name", "ChernarusPlus"))
+    if not (math.isfinite(x) and math.isfinite(z) and 0.0 <= x <= welt and 0.0 <= z <= welt):
+        return err(f"Koordinaten außerhalb der Karte (0 bis {welt})." if not en
+                   else f"Coordinates outside the map (0 to {welt}).", 400, code="koordinaten")
+    erg = await _dash_run(db.ort_speichern, gid, conn.service_id, uid, name, x, z, "dashboard", _ORTE_SPEICHER_MAX)
+    if erg == "name_vorhanden":
+        return err("Du hast schon einen Ort mit diesem Namen." if not en
+                   else "You already have a location with this name.", 409, code="name_vorhanden")
+    if erg == "limit":
+        return err(f"Du hast schon {_ORTE_SPEICHER_MAX} gespeicherte Orte – lösche zuerst einen." if not en
+                   else f"You already have {_ORTE_SPEICHER_MAX} saved locations – delete one first.", 409, code="limit")
+    return ok({"name": name})
+
+
+async def delete_me_places(request: web.Request) -> web.Response:
+    """Einen gespeicherten Ort loeschen: ?name=… – nur eigene Orte auf diesem Server."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    name = str(request.query.get("name") or "").strip()
+    if not name or not await _dash_run(db.ort_loeschen, ctx["gid"], ctx["conn"].service_id, ctx["uid"], name):
+        return err("No such saved location." if ctx["en"] else "Diesen gespeicherten Ort gibt es nicht.", 404)
+    return ok({"name": name})
+
+
+def _map_meta_daten(conn: ServerConnection) -> Dict[str, Any]:
+    map_name = conn.get("map_name", "ChernarusPlus")
+    stil = _karten_einstellung("map_image_style", "sat", _MAP_IMAGE_STYLES, conn)
+    return {
         "map_name": map_name,
         "world_size": _world_size(map_name),
         "tile_url": _tile_url(map_name, stil),      # XYZ-Template ({z}/{x}/{y}), Browser lädt es
@@ -46014,7 +46436,25 @@ async def api_map_meta(request: web.Request) -> web.Response:
                      else f"https://www.izurvive.com/?m={map_name}"),
         "heatmap_typen": [{"key": k, "label_de": de, "label_en": en, "emoji": em}
                           for k, de, en, em in HEATMAP_TYPEN],
-    })
+    }
+
+
+async def api_me_map_meta(request: web.Request) -> web.Response:
+    """Dieselbe Karte wie /api/map/meta, aber fuer den Spieler-Server – ohne Admin-Gate, ohne Spieler-Positionen."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    return ok(_map_meta_daten(ctx["conn"]))
+
+
+async def api_map_meta(request: web.Request) -> web.Response:
+    _c, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, _c, "map", "view")
+    if denied is not None:
+        return denied
+    return ok(_map_meta_daten(_c))
 
 
 async def api_map_players(request: web.Request) -> web.Response:
@@ -47400,6 +47840,17 @@ def build_app() -> web.Application:
     r.add_post("/api/servers/select", post_servers_select)
     r.add_get("/api/my-guilds", api_my_guilds)
     r.add_post("/api/my-guilds/select", post_my_guilds_select)
+    # Spielerbereich (nur mit Discord-Login; jeder Handler prueft Mitgliedschaft/Server/Rollen selbst)
+    r.add_get("/api/me/servers", api_me_servers)
+    r.add_post("/api/me/servers/select", post_me_servers_select)
+    r.add_get("/api/me/overview", api_me_overview)
+    r.add_get("/api/me/orders", api_me_orders)
+    r.add_get("/api/me/shop", api_me_shop)
+    r.add_post("/api/me/shop/buy", post_me_shop_buy)
+    r.add_get("/api/me/places", api_me_places)
+    r.add_post("/api/me/places", post_me_places)
+    r.add_delete("/api/me/places", delete_me_places)
+    r.add_get("/api/me/map/meta", api_me_map_meta)
     r.add_post("/api/auth/guild", post_setup_guild)
     r.add_get("/api/auth/discord/start", api_discord_start)
     r.add_get("/api/auth/discord/callback", api_discord_callback)
@@ -48301,6 +48752,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "11a47d40ec27a3ad0e50ffac10130e3c10cb774cc3287979f6a1c89efee6728a",
         "ed353c1afacead0c5c54291a1665ec5078ab0dfc09b2bbe0e1977784f100a214",
         "6b28d12e1c945fa02f90b360c2bc97a78077e2d8849668a7143c5c886ba4fd90",
+        "e2d24b954acac4bd818e15c4c9289791bf7085b2c60141ec123def7a2068d24d",
     ),
     "styles.css": (
         "854cd5c0116ef9230d2534c486b88c6dff38df66194defb0c429309ea4add035",
@@ -48348,6 +48800,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c4cb9c118a6577d73e65f502dab32434eed4ca126a0bf6ce5e6ae8c5e16ec6a2",
         "08fca07211f88d28baea2e711898d50887c17e8afc4f0d8889f3cbc558d68a8f",
         "92bac71a41b90fb4b2970fc337c5fbd762ae22a84b6d950162f7f8278a85ff72",
+        "0559404f19f1db0e1a5438512ae802a5af1ecce82379ea8e588e5454b85353b0",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -48596,6 +49049,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "5a1ee3ac5b096c83fa83aed171e2d34de03a386a748c7eb492f7cf1f777e350d",
         "5f82dbe54e6e37f9ba1840cd35b2212b1578fb13cf6c5c09086a82d7b4ff655f",
         "5d23bea4f5ff5e7fe0514ef753383395555856619c40201b887321fe009f7e71",
+        "0fd2761e0aac63310c92b22c5b3efdacc02830be4349dbf7ad2c60546878524d",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
