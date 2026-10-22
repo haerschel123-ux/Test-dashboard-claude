@@ -1045,6 +1045,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.territory":                   {"label": "Territory Zone Creator", "gruppe": "Tools"},
     "tools.spawnabletypes":              {"label": "Visual SpawnableTypes Configurator", "gruppe": "Tools"},
     "tools.bunkerbroadcast":             {"label": "Bunker Broadcast Builder", "gruppe": "Tools"},
+    "tools.territoryexclusion":          {"label": "Territory Exclusion", "gruppe": "Tools"},
     "tools.typesbooster":                {"label": "Types Booster", "gruppe": "Tools"},
     "tools.typesreducer":                 {"label": "Types Reducer", "gruppe": "Tools"},
     "tools.typesorganizer":              {"label": "Types Organizer", "gruppe": "Tools"},
@@ -15185,6 +15186,7 @@ _TOOL_LISTE = (
     ("territory", "🧭", "Territory Zone Creator"),
     ("spawnabletypes", "🗃️", "Visual SpawnableTypes Configurator"),
     ("bunkerbroadcast", "📻", "Bunker Broadcast Builder"),
+    ("territoryexclusion", "✂️", "Territory Exclusion"),
     ("typesbooster", "📈", "Types Booster"),
     ("typesreducer", "📉", "Types Reducer"),
     ("typesorganizer", "🗂️", "Types Organizer"),
@@ -25278,6 +25280,212 @@ async def api_tools_bunkerbroadcast_post(request: web.Request) -> web.Response:
                                  "schalter_nachher": zustand if zustand in (True, False) else None},
                    "backup": ([f"{_BB_DATEI}.bak"] if commit and bb_aenderung is not None and bb_vorher is not None else [])
                              + ([f"{_BB_GAMEPLAY_DATEI}.bak"] if commit and gp_neu is not None else [])})
+
+
+# ── 12. Territory Exclusion ───────────────────────────────────────────────
+# Wie der Territory Zone Creator, aber zum ENTFERNEN: Auf der Karte werden Kreise und Rechtecke gezeichnet; alle Zonen
+# der gewaehlten env/*_territories.xml, deren MITTELPUNKT in einer Flaeche liegt, fallen beim Speichern weg (einzelne
+# lassen sich vorher behalten). Geschrieben wird chirurgisch wie dort: nur die Zeilen der entfernten Zonen werden
+# gestrichen, Kommentare, Bloecke, Farben und alle uebrigen Zonen bleiben Zeichen fuer Zeichen. Die uebrigen Zonen
+# werden dabei nicht neu bewertet - ein ungewoehnlicher Wert in einer unberuehrten Zone blockiert nichts. Die Flaechen
+# selbst werden nicht gespeichert; die Datei ist der einzige Stand.
+_TEX_MODUL = "tools.territoryexclusion"
+_TEX_MAX_BEREICHE = 200
+
+
+def _tex_zahl(b: Dict[str, Any], schluessel: str) -> float:
+    v = b.get(schluessel)
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        raise ValueError(schluessel)
+    return float(v)
+
+
+def _tex_bereiche(roh: Any, welt: Optional[int]) -> List[Dict[str, Any]]:
+    """Prueft und normalisiert die gezeichneten Flaechen (Kreis: x, z, r - Rechteck: x1, z1, x2, z2 in beliebiger
+    Eckenreihenfolge). ValueError = Fehler, nichts wird geschrieben."""
+    if not isinstance(roh, list):
+        raise ValueError("Keine Flächenliste übergeben.")
+    if not roh:
+        raise ValueError("Bitte mindestens eine Fläche zeichnen.")
+    if len(roh) > _TEX_MAX_BEREICHE:
+        raise ValueError(f"Zu viele Flächen ({len(roh)}, erlaubt sind {_TEX_MAX_BEREICHE}).")
+    grenze = float(welt) if welt else None
+    out: List[Dict[str, Any]] = []
+    for i, b in enumerate(roh, start=1):
+        art = b.get("art") if isinstance(b, dict) else None
+        try:
+            if art == "kreis":
+                x, z, r = _tex_zahl(b, "x"), _tex_zahl(b, "z"), _tex_zahl(b, "r")
+                if r <= 0 or (grenze and r > grenze):
+                    raise ValueError("r")
+                punkte = [(x, z)]
+                form = {"art": "kreis", "x": x, "z": z, "r": r}
+            elif art == "rechteck":
+                xa, za, xb, zb = (_tex_zahl(b, k) for k in ("x1", "z1", "x2", "z2"))
+                if xa == xb or za == zb:
+                    raise ValueError("flaeche")
+                punkte = [(xa, za), (xb, zb)]
+                form = {"art": "rechteck", "x1": min(xa, xb), "z1": min(za, zb), "x2": max(xa, xb), "z2": max(za, zb)}
+            else:
+                raise ValueError("form")
+        except ValueError as e:
+            grund = str(e)
+            if grund == "form":
+                raise ValueError(f"Fläche {i}: Unbekannte Form.") from None
+            if grund == "flaeche":
+                raise ValueError(f"Fläche {i}: Ein Rechteck braucht eine Breite und eine Höhe größer als 0.") from None
+            if art == "kreis":
+                raise ValueError(f"Fläche {i}: Ein Kreis braucht X, Z und einen Radius größer als 0.") from None
+            raise ValueError(f"Fläche {i}: Ein Rechteck braucht vier Eckwerte (X1, Z1, X2, Z2).") from None
+        for px, pz in punkte:
+            if px < 0 or pz < 0 or (grenze and (px > grenze or pz > grenze)):
+                raise ValueError(f"Fläche {i}: Liegt außerhalb der Karte (erlaubt sind Werte von 0 bis {int(grenze)})."
+                                 if grenze else f"Fläche {i}: Werte dürfen nicht negativ sein.")
+        out.append(form)
+    return out
+
+
+def _tex_trifft(b: Dict[str, Any], x: float, z: float) -> bool:
+    """Liegt der Punkt (Zonenmittelpunkt) in der Flaeche? Rand zaehlt dazu."""
+    if b["art"] == "kreis":
+        return (x - b["x"]) ** 2 + (z - b["z"]) ** 2 <= b["r"] ** 2
+    return b["x1"] <= x <= b["x2"] and b["z1"] <= z <= b["z2"]
+
+
+def _tex_entfernen(text: str, scan: Dict[str, Any], weg: Set[int]) -> str:
+    """Streicht die Zonen mit diesen Indizes aus dem Text: steht die Zone allein in ihrer Zeile, faellt die ganze
+    Zeile weg, sonst nur das Tag. Alles andere bleibt unveraendert."""
+    edits: List[Tuple[int, int, str]] = []
+    for a in scan["zonen"]:
+        if a["index"] in weg:
+            edits.append((a["zeile_start"], a["zeile_ende"], "") if a["allein"] else (a["start"], a["ende"], ""))
+    neu = text
+    for start, ende, ersatz in sorted(edits, key=lambda e: (e[0], e[1]), reverse=True):
+        neu = neu[:start] + ersatz + neu[ende:]
+    try:
+        ET.fromstring(neu)
+    except ET.ParseError as e:
+        raise ValueError(f"Die berechnete Datei wäre kein gültiges XML ({e}).") from e
+    return neu
+
+
+async def api_tools_territoryexclusion_get(request: web.Request) -> web.Response:
+    conn, fehler = await _brlc_prepare(request, _TEX_MODUL, "view")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return ok({"typen": [], "kein_mission_ordner": True})
+    loop = asyncio.get_running_loop()
+    karte, welt = _bb_karte(conn)
+    typ = str(request.query.get("typ") or "").strip().lower()
+    if not typ:
+        try:
+            cfgenv, status = await _tools_datei_lesen(conn, "cfgenvironment.xml", loop)
+            ordner = await loop.run_in_executor(None, conn.ftp.list_dir, f"{_mission_dir_of(conn).rstrip('/')}/env")
+        except Exception as e:  # noqa: BLE001
+            log.exception("[TOOLS] Territory Exclusion: Dateiliste fehlgeschlagen")
+            return err(f"Die Territory-Dateien konnten nicht gelesen werden ({type(e).__name__}: {e}).", 502)
+        typen = _terr_typen_aus_env(cfgenv if status == "ok" else None, list(ordner or []))
+        return ok({"typen": typen, "karte": karte, "welt": welt, "cfgenv_gelesen": status == "ok"})
+    dateiname = _terr_dateiname_gueltig(typ)
+    if not dateiname:
+        return err("Ungültiger Dateityp.")
+    try:
+        text, status = await _tools_datei_lesen(conn, dateiname, loop)
+    except Exception as e:  # noqa: BLE001
+        log.exception("[TOOLS] Territory Exclusion: Lesen fehlgeschlagen")
+        return err(f"{dateiname} per FTP nicht lesbar ({type(e).__name__}: {e}).", 502)
+    if status == "error":
+        return err(f"{dateiname} per FTP nicht lesbar.", 502)
+    out: Dict[str, Any] = {"typ": typ, "datei": dateiname, "vorhanden": status == "ok", "welt": welt, "karte": karte,
+                           "hash": _spawn_datei_hash(text if status == "ok" else ""), "zonen": [], "bloecke": []}
+    if status != "ok":
+        return ok(out)
+    try:
+        scan = _terr_scannen(text)
+    except ValueError as e:
+        return err(str(e), 422)
+    out["zonen"] = _terr_zonen_fuer_oberflaeche(scan)
+    out["bloecke"] = [{"index": b["index"], "farbe": b["farbe"], "zonen": len(b["zonen"])} for b in scan["bloecke"]]
+    return ok(out)
+
+
+async def api_tools_territoryexclusion_post(request: web.Request) -> web.Response:
+    conn, fehler = await _brlc_prepare(request, _TEX_MODUL, "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, _TEX_MODUL, 10)
+        if fehler is not None:
+            return fehler
+    dateiname = _terr_dateiname_gueltig(data_in.get("typ"))
+    if not dateiname:
+        return err("Ungültiger Dateityp.")
+    _karte, welt = _bb_karte(conn)
+    try:
+        bereiche = _tex_bereiche(data_in.get("bereiche"), welt)
+    except ValueError as e:
+        return err(str(e))
+    behalten_roh = data_in.get("behalten")
+    if behalten_roh is None:
+        behalten_roh = []
+    if (not isinstance(behalten_roh, list) or len(behalten_roh) > _TERR_MAX_ZONEN
+            or any(isinstance(v, bool) or not isinstance(v, int) for v in behalten_roh)):
+        return err("Ungültige Eingabe: behalten")
+    behalten = set(behalten_roh)
+    loop = asyncio.get_running_loop()
+    try:
+        text, status = await _tools_datei_lesen(conn, dateiname, loop)
+    except Exception as e:  # noqa: BLE001
+        log.exception("[TOOLS] Territory Exclusion: Lesen fehlgeschlagen")
+        return err(f"{dateiname} per FTP nicht lesbar ({type(e).__name__}: {e}).", 502)
+    if status == "error":
+        return err(f"{dateiname} per FTP nicht lesbar.", 502)
+    if status != "ok":
+        return err(f"Die {dateiname} gibt es auf dem Server nicht – es gibt nichts zu entfernen.", 404)
+    datei_hash = _spawn_datei_hash(text)
+    if commit and str(data_in.get("erwartet_hash") or "") != datei_hash:
+        return err(f"Die {dateiname} auf dem Server hat sich seit der Vorschau geändert (oder die Vorschau fehlt) – "
+                   "bitte „Speichern“ erneut klicken und die neue Vorschau prüfen. Nichts wurde gespeichert.", 409)
+    try:
+        scan = _terr_scannen(text)
+        treffer = [z for z in scan["zonen"] if any(_tex_trifft(b, z["x"], z["z"]) for b in bereiche)]
+        weg = {z["index"] for z in treffer if z["index"] not in behalten}
+        neu = _tex_entfernen(text, scan, weg)
+    except ValueError as e:
+        return err(str(e), 422)
+    unveraendert = not weg
+    warnungen: List[str] = []
+    if not treffer:
+        warnungen.append("Keine Zone liegt mit ihrem Mittelpunkt in den gezeichneten Flächen.")
+    if weg and len(weg) == len(scan["zonen"]):
+        warnungen.append("Damit würden ALLE Zonen dieser Datei entfernt – sie wäre danach leer.")
+    namen: Dict[str, int] = {}
+    for z in scan["zonen"]:
+        if z["index"] in weg:
+            namen[z["name"]] = namen.get(z["name"], 0) + 1
+    try:
+        geschrieben = True
+        if commit and not unveraendert:
+            geschrieben = await _tool_ce_backup_commit(conn, dateiname, text, neu, None, None, loop)
+    except Exception as e:  # noqa: BLE001
+        log.exception("[TOOLS] Territory Exclusion: Schreiben fehlgeschlagen")
+        return err(f"{dateiname} konnte nicht gespeichert werden ({type(e).__name__}: {e}).", 502)
+    if not geschrieben:
+        return err(f"Sichern ({dateiname}.bak) oder Speichern der {dateiname} ist fehlgeschlagen – bitte erneut versuchen.", 502)
+    if commit and not unveraendert:
+        _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Territory Exclusion gespeichert",
+                   f"{dateiname}: {len(weg)} Zone(n) entfernt, {len(bereiche)} Fläche(n) · {conn.name}")
+    return ok({"generated": [{"filename": dateiname, "content": neu}],
+               "aenderung": {"vorher": len(scan["zonen"]), "nachher": len(scan["zonen"]) - len(weg), "entfernt": len(weg),
+                             "treffer": len(treffer), "behalten": len(treffer) - len(weg), "flaechen": len(bereiche)},
+               "namen": dict(sorted(namen.items(), key=lambda kv: -kv[1])[:20]),
+               "unveraendert": unveraendert, "datei_hash": datei_hash, "warnungen": warnungen,
+               "backup": f"{dateiname}.bak" if commit and not unveraendert else None})
 
 
 # ── 9. Types Booster ──────────────────────────────────────────────────────
@@ -50720,6 +50928,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/territory", api_tools_territory_post)
     r.add_get("/api/tools/bunkerbroadcast", api_tools_bunkerbroadcast_get)
     r.add_post("/api/tools/bunkerbroadcast", api_tools_bunkerbroadcast_post)
+    r.add_get("/api/tools/territoryexclusion", api_tools_territoryexclusion_get)
+    r.add_post("/api/tools/territoryexclusion", api_tools_territoryexclusion_post)
     r.add_get("/api/tools/spawnabletypes", api_tools_spawnabletypes_get)
     r.add_post("/api/tools/spawnabletypes", api_tools_spawnabletypes_post)
     r.add_get("/api/tools/altaccountfinder", api_tools_altaccountfinder_get)
@@ -51686,6 +51896,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "1d0a6b30994cb2a6fd4f07f42eea70c7d626666afc324b91eb72b1afe0684a2b",
         "3da6c73abea466b00a438a5941682f835670d1588e957aa13eaea9415a527770",
         "aa25fac275d6a4e01b3b7f4caf59b8972f759fa508638694ad86b37a36c6937d",
+        "d389792d900dff31ac0812c12d0a0f057ac9af489cc6646f24dbdc45ca0b759c",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
@@ -51706,6 +51917,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "4c782db81cb83ec74fa7d113c58ea6f3bfb73f530e10b5763748f3bf29714325",
         "db8cd2982a6760aea26aab60dfd1293fdeedc30c7e22a7f435d3274ccb47a00b",
         "9d83e6b99cb7b5e3aff72b59c7a8c535157ac3e7f0727af2a797831c3fc9ad3e",
+        "348ef6ec03933c640b7a2c90543530e9a0881c17e807fdc066c7ea9436c7f1a2",
     ),
     "vendor/leaflet.css": (
         "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",
