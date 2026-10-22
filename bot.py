@@ -30348,6 +30348,12 @@ class EconomyDB:
                 (guild_id, sid, like, limit, offset)).fetchall()
         return [dict(r) for r in rows], int(gesamt)
 
+    def roster_spieler_gesamt(self) -> int:
+        """Wie viele verschiedene Ingame-Namen der Bot je gesehen hat - alle Server und Guilds zusammen, derselbe Name
+        (ohne Gross-/Kleinschreibung) nur einmal. Nur die Zahl, fuer die Startseite."""
+        with self._lock:
+            return int(self._conn.execute("SELECT COUNT(DISTINCT ingame_name) AS n FROM player_roster").fetchone()["n"])
+
     def roster_delete(self, guild_id: int, service_id: str, ingame_name: str) -> bool:
         """Loescht eine Spieler-Zeile und entlinkt NUR DIESEN Namen, falls
         verknuepft - andere Accounts (Haupt/Alt) desselben Discord-Users
@@ -37716,7 +37722,7 @@ _SESS_STORE: Dict[str, Dict[str, Any]] = {}
 
 # Pfade, die ohne Session erreichbar sind
 _SESS_PUBLIC_PREFIXES = ("/api/auth/", "/static/", "/vendor/", "/maps/")
-_SESS_PUBLIC_EXACT = ("/", "/index.html", "/api/session", "/favicon.ico", "/api/health",
+_SESS_PUBLIC_EXACT = ("/", "/index.html", "/api/session", "/favicon.ico", "/api/health", "/api/public/stats",
                       # Stripe ruft das ohne Session-Cookie auf - die eigentliche
                       # Absicherung ist die Signaturpruefung im Handler selbst.
                       "/api/payment/stripe/webhook")
@@ -37846,6 +37852,36 @@ def _sess_is_public(path: str) -> bool:
     if path in _SESS_PUBLIC_EXACT:
         return True
     return any(path.startswith(p) for p in _SESS_PUBLIC_PREFIXES)
+
+
+# ── Zahlen fuer die Startseite ───────────────────────────────────────────
+# Drei Gesamtsummen, auch ohne Anmeldung sichtbar: Discord-Communities (Server, auf denen der Bot installiert ist), verbundene
+# Spielserver (Verbindungen mit Token) und erfasste Spieler (verschiedene Ingame-Namen). Nie etwas Einzelnes eines Kunden.
+_START_ZAHLEN_TTL = 300.0
+_START_ZAHLEN: Dict[str, Any] = {"ts": 0.0, "daten": None}
+
+
+async def _start_zahlen() -> Optional[Dict[str, int]]:
+    """Fuenf Minuten zwischengespeichert, damit die oeffentliche Seite die Datenbank nicht belastet. Solange der
+    Discord-Bot noch nicht bereit ist, gibt es keine verlaessliche Zahl der Communities: dann None, nichts wird gemerkt."""
+    jetzt = time.time()
+    if _START_ZAHLEN["daten"] is not None and jetzt - _START_ZAHLEN["ts"] < _START_ZAHLEN_TTL:
+        return _START_ZAHLEN["daten"]
+    if bot is None or not bot.is_ready():
+        return None
+    spieler = await asyncio.get_running_loop().run_in_executor(None, db.roster_spieler_gesamt)
+    daten = {"communities": len(bot.guilds),
+             "servers": sum(1 for c in connections.all() if str(c.data.get("nitrado_token") or "").strip()),
+             "players": spieler}
+    _START_ZAHLEN.update({"ts": jetzt, "daten": daten})
+    return daten
+
+
+async def api_public_stats(request: web.Request) -> web.Response:
+    daten = await _start_zahlen()
+    if daten is None:
+        return err("Die Zahlen sind noch nicht verfügbar.", 503)
+    return web.json_response({"ok": True, "data": daten}, headers={"Cache-Control": "public, max-age=300"})
 
 
 @web.middleware
@@ -50707,6 +50743,7 @@ def build_app() -> web.Application:
     r.add_post("/api/payment/stripe/webhook", stripe_webhook)
     r.add_post("/api/auth/logout", post_logout)
     r.add_get("/api/session", api_get_session)
+    r.add_get("/api/public/stats", api_public_stats)
     r.add_post("/api/consent", post_consent)
     r.add_post("/api/dashboard/rate-limit-abort", api_dash_rate_limit_abort)
     r.add_get("/api/dashboard/rate-limit-status", api_dash_rate_limit_status)
@@ -51594,6 +51631,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "3e13426ebab5e74f309181e8e3967f7e47107c7c591f5b902af63ab82733852f",
         "ab087186d659ce9b2cdecf427fcfb124c5f300d561da09ce84d41216e99a1046",
         "c6f1f2a97b2185323eefd64119d57d6d6a83bbde6ed5191e4b4cb409bdd846bd",
+        "574533c53b9f4971092e57c7fcea6dab414c24de9d59d24a6b173933777824ce",
     ),
     "styles.css": (
         "854cd5c0116ef9230d2534c486b88c6dff38df66194defb0c429309ea4add035",
@@ -51643,6 +51681,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "92bac71a41b90fb4b2970fc337c5fbd762ae22a84b6d950162f7f8278a85ff72",
         "0559404f19f1db0e1a5438512ae802a5af1ecce82379ea8e588e5454b85353b0",
         "b532e93d2b9b046fc8f8c4e9b0026a0293fea64c79048ae8ee8add00ed42aac8",
+        "ce79c3176d9c957cbbbc861bf18996aaa271e095bdb5ca321ccf7aaa52692cd1",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -51897,6 +51936,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "3da6c73abea466b00a438a5941682f835670d1588e957aa13eaea9415a527770",
         "aa25fac275d6a4e01b3b7f4caf59b8972f759fa508638694ad86b37a36c6937d",
         "d389792d900dff31ac0812c12d0a0f057ac9af489cc6646f24dbdc45ca0b759c",
+        "cda2739ed6a1aeaed6ffb472602be5099422c18b5c7006021b2d66aceb7560a4",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
