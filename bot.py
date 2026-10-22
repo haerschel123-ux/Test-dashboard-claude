@@ -1044,6 +1044,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.spawnpoint":                  {"label": "Spawn Point Generator", "gruppe": "Tools"},
     "tools.territory":                   {"label": "Territory Zone Creator", "gruppe": "Tools"},
     "tools.spawnabletypes":              {"label": "Visual SpawnableTypes Configurator", "gruppe": "Tools"},
+    "tools.bunkerbroadcast":             {"label": "Bunker Broadcast Builder", "gruppe": "Tools"},
     "tools.typesbooster":                {"label": "Types Booster", "gruppe": "Tools"},
     "tools.typesreducer":                 {"label": "Types Reducer", "gruppe": "Tools"},
     "tools.typesorganizer":              {"label": "Types Organizer", "gruppe": "Tools"},
@@ -15183,6 +15184,7 @@ _TOOL_LISTE = (
     ("spawnpoint", "📍", "Spawn Point Generator"),
     ("territory", "🧭", "Territory Zone Creator"),
     ("spawnabletypes", "🗃️", "Visual SpawnableTypes Configurator"),
+    ("bunkerbroadcast", "📻", "Bunker Broadcast Builder"),
     ("typesbooster", "📈", "Types Booster"),
     ("typesreducer", "📉", "Types Reducer"),
     ("typesorganizer", "🗂️", "Types Organizer"),
@@ -21777,6 +21779,12 @@ def _fv_validate_one(name: str, text: str, map_name: str) -> Dict[str, Any]:
                 issues.append(_fv_issue("error", "Die JSON-Wurzel muss ein Objekt sein.", 1))
             if base == "cfgeffectarea.json" and not (isinstance(parsed, dict) and isinstance(parsed.get("Areas"), list)):
                 issues.append(_fv_issue("error", "Erwartet wird ein Objekt mit Areas-Liste.", 1))
+            if base == "cfgbunkerbroadcast.json":
+                # dieselben Regeln wie im Bunker Broadcast Builder (Spannen des Spiels, HHMM, Positionen)
+                karte = _canonical_map_name(map_name) or None
+                fehler, hinweise = _bb_pruefen(parsed, karte, DEFAULT_MAP_SIZES.get(karte or ""))
+                issues.extend(_fv_issue("error", t) for t in fehler)
+                issues.extend(_fv_issue("warning", t) for t in hinweise)
     elif base.endswith(".c"):
         plain = re.sub(r"//.*$|/\*[\s\S]*?\*/|\"(?:\\.|[^\"])*\"", "", text, flags=re.M)
         braces = plain.count("{") - plain.count("}")
@@ -24256,6 +24264,1020 @@ async def api_ce_events_post(request: web.Request) -> web.Response:
     _audit_add("dashboard", _audit_actor(_sess_get(request)), "CE-Events-Einstellungen geändert",
               conn.name)
     return ok(_ce_events_payload(conn))
+
+
+# ── 11. Bunker Broadcast Builder ──────────────────────────────────────────
+# Editor fuer cfgbunkerbroadcast.json (DayZ 1.30 / Badlands) samt Schalter WorldsData.bunkerBroadcastEnabled in der
+# cfggameplay.json. Beide Dateien werden NICHT neu geschrieben: ein JSON-Parser liefert zu jedem Wert die Textposition,
+# geaendert werden nur die Zeichen der Werte, die sich wirklich geaendert haben. Unbekannte Schluessel, Reihenfolge,
+# Einrueckung, Zeilenenden und Zahlenschreibweise (6.0 bleibt 6.0) bleiben erhalten; eine unveraenderte Datei kommt
+# Byte fuer Byte zurueck. Regeln und Spannen stammen aus der veroeffentlichten Spielpruefung (Build 1.30.164200).
+_JT_LEER = " \t\n\r"
+_JT_ZAHL_RE = re.compile(r'-?(?:0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?')
+_JT_MAX_BYTES = 2 * 1024 * 1024
+_JT_MAX_TIEFE = 64
+
+
+class _JtKnoten:
+    """Ein Wert im JSON-Text mit seiner Position (start inklusive, ende exklusive)."""
+    __slots__ = ("art", "start", "ende", "wert", "glieder", "eintraege", "ganz")
+
+    def __init__(self, art: str, start: int, ende: int = 0) -> None:
+        self.art, self.start, self.ende = art, start, ende       # "objekt" | "array" | "text" | "zahl" | "bool" | "null"
+        self.wert: Any = None
+        self.glieder: List[Tuple[str, int, int, "_JtKnoten"]] = []   # objekt: (Schluessel, Schluessel-Start, -Ende, Wert)
+        self.eintraege: List["_JtKnoten"] = []                       # array
+        self.ganz = False                                            # zahl: ohne Bruch und Exponent geschrieben
+
+    def hole(self, schluessel: str) -> Optional["_JtKnoten"]:
+        for name, _a, _b, knoten in self.glieder:
+            if name == schluessel:
+                return knoten
+        return None
+
+    def py(self) -> Any:
+        if self.art == "objekt":
+            return {name: knoten.py() for name, _a, _b, knoten in self.glieder}
+        if self.art == "array":
+            return [knoten.py() for knoten in self.eintraege]
+        return self.wert
+
+
+def _jt_parse(text: str) -> Tuple[_JtKnoten, List[Tuple[str, int]]]:
+    """Streng nach RFC 8259 (keine Kommentare, keine Endkommas, kein NaN). Rueckgabe: Wurzel und die Liste der
+    doppelten Schluessel (Name, Zeile). Fehler als ValueError mit Zeile und Spalte."""
+    n = len(text)
+    doppelt: List[Tuple[str, int]] = []
+
+    def fehler(pos: int, meldung: str):
+        zeile = text.count("\n", 0, pos) + 1
+        spalte = pos - (text.rfind("\n", 0, pos) + 1) + 1
+        raise ValueError(f"Zeile {zeile}, Spalte {spalte}: {meldung}")
+
+    def leer(i: int) -> int:
+        while i < n and text[i] in _JT_LEER:
+            i += 1
+        return i
+
+    def zeichenkette(i: int) -> Tuple[str, int]:
+        j = i + 1
+        while j < n:
+            c = text[j]
+            if c == '"':
+                try:
+                    return json.loads(text[i:j + 1]), j + 1
+                except ValueError:
+                    fehler(i, "Ungültiger Text")
+            if c == "\\":
+                j += 2
+                continue
+            if c < " ":
+                fehler(j, "Ungültiges Zeichen in einem Text")
+            j += 1
+        fehler(i, "Ein Text ist nicht abgeschlossen")
+        return "", n
+
+    def wert(i: int, tiefe: int) -> Tuple[_JtKnoten, int]:
+        if tiefe > _JT_MAX_TIEFE:
+            fehler(i, "Zu tief verschachtelt")
+        i = leer(i)
+        if i >= n:
+            fehler(i, "Die Datei endet unerwartet")
+        c = text[i]
+        if c == "{":
+            obj = _JtKnoten("objekt", i)
+            i = leer(i + 1)
+            if i < n and text[i] == "}":
+                obj.ende = i + 1
+                return obj, i + 1
+            gesehen = set()
+            while True:
+                i = leer(i)
+                if i >= n or text[i] != '"':
+                    fehler(i, "Ein Schlüssel in Anführungszeichen wird erwartet")
+                name, j = zeichenkette(i)
+                k_start, k_ende = i, j
+                j = leer(j)
+                if j >= n or text[j] != ":":
+                    fehler(j, "Ein Doppelpunkt wird erwartet")
+                inhalt, j = wert(j + 1, tiefe + 1)
+                if name in gesehen:
+                    doppelt.append((name, text.count("\n", 0, k_start) + 1))
+                gesehen.add(name)
+                obj.glieder.append((name, k_start, k_ende, inhalt))
+                j = leer(j)
+                if j < n and text[j] == ",":
+                    i = j + 1
+                    continue
+                if j < n and text[j] == "}":
+                    obj.ende = j + 1
+                    return obj, j + 1
+                fehler(j, "Ein Komma oder } wird erwartet")
+        if c == "[":
+            arr = _JtKnoten("array", i)
+            i = leer(i + 1)
+            if i < n and text[i] == "]":
+                arr.ende = i + 1
+                return arr, i + 1
+            while True:
+                inhalt, j = wert(i, tiefe + 1)
+                arr.eintraege.append(inhalt)
+                j = leer(j)
+                if j < n and text[j] == ",":
+                    i = j + 1
+                    continue
+                if j < n and text[j] == "]":
+                    arr.ende = j + 1
+                    return arr, j + 1
+                fehler(j, "Ein Komma oder ] wird erwartet")
+        if c == '"':
+            s, j = zeichenkette(i)
+            k = _JtKnoten("text", i, j)
+            k.wert = s
+            return k, j
+        for wort, w in (("true", True), ("false", False), ("null", None)):
+            if text.startswith(wort, i):
+                j = i + len(wort)
+                if j < n and (text[j].isalnum() or text[j] == "_"):
+                    fehler(i, "Unerwartetes Zeichen")
+                k = _JtKnoten("null" if wort == "null" else "bool", i, j)
+                k.wert = w
+                return k, j
+        if c in "-0123456789":
+            m = _JT_ZAHL_RE.match(text, i)
+            if not m:
+                fehler(i, "Ungültige Zahl")
+            j = m.end()
+            if j < n and (text[j] in ".eE+-_" or text[j].isalnum()):
+                fehler(i, "Ungültige Zahl")
+            k = _JtKnoten("zahl", i, j)
+            k.ganz = m.group(1) is None and m.group(2) is None
+            try:
+                k.wert = int(m.group(0)) if k.ganz else float(m.group(0))
+            except ValueError:
+                fehler(i, "Ungültige Zahl")
+            return k, j
+        fehler(i, "Unerwartetes Zeichen")
+        raise AssertionError  # pragma: no cover
+
+    if not text.strip("﻿ \t\r\n"):
+        raise ValueError("Die Datei ist leer.")
+    start = 1 if text.startswith("﻿") else 0
+    wurzel, ende = wert(start, 0)
+    ende = leer(ende)
+    if ende < n:
+        fehler(ende, "Nach dem Ende der Datei steht weiterer Inhalt")
+    return wurzel, doppelt
+
+
+def _jt_zahl_text(wert: Any, ganz: bool = False) -> str:
+    """Zahl als JSON-Text. Gleitkommazahlen immer mit Dezimalpunkt oder Exponent (6.0, nie 6)."""
+    if isinstance(wert, bool) or not isinstance(wert, (int, float)):
+        raise ValueError("Keine Zahl")
+    if isinstance(wert, float):
+        if not math.isfinite(wert):
+            raise ValueError("Keine endliche Zahl")
+        if ganz and wert.is_integer():
+            return str(int(wert))
+        return repr(wert)
+    return str(wert)
+
+
+class _JtBearbeiter:
+    """Sammelt Textaenderungen (start, ende, Ersatz) gegen den Originaltext und wendet sie am Ende an."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.wurzel, self.doppelt = _jt_parse(text)
+        self.aenderungen: List[Tuple[int, int, str]] = []
+        self.zeilenende = "\r\n" if "\r\n" in text else "\n"
+        self.einheit = self._einheit()
+
+    def _einheit(self) -> str:
+        w = self.wurzel
+        if w.art == "objekt" and w.glieder:
+            pos = w.glieder[0][1]
+            davor = self.text[self.text.rfind("\n", 0, pos) + 1:pos]
+            if davor and not davor.strip():
+                return davor
+        return "  "
+
+    def einzug_von(self, pos: int) -> str:
+        zeile = self.text.rfind("\n", 0, pos) + 1
+        return re.match(r"[ \t]*", self.text[zeile:]).group(0)
+
+    def literal(self, wert: Any, ind: str, ganz: bool = False) -> str:
+        """Fertiger JSON-Text fuer einen neuen Wert; ``ind`` = Einzug der Zeile, in der er beginnt."""
+        if isinstance(wert, bool):
+            return "true" if wert else "false"
+        if wert is None:
+            return "null"
+        if isinstance(wert, (int, float)):
+            return _jt_zahl_text(wert, ganz)
+        if isinstance(wert, str):
+            return json.dumps(wert, ensure_ascii=False)
+        kind = ind + self.einheit
+        if isinstance(wert, list):
+            if not wert:
+                return "[]"
+            if not any(isinstance(x, (list, dict)) for x in wert):
+                return "[" + ", ".join(self.literal(x, ind) for x in wert) + "]"
+            return ("[" + self.zeilenende + ("," + self.zeilenende).join(kind + self.literal(x, kind) for x in wert)
+                    + self.zeilenende + ind + "]")
+        if isinstance(wert, dict):
+            if not wert:
+                return "{}"
+            return ("{" + self.zeilenende
+                    + ("," + self.zeilenende).join(kind + json.dumps(k, ensure_ascii=False) + ": " + self.literal(v, kind)
+                                                    for k, v in wert.items())
+                    + self.zeilenende + ind + "}")
+        raise ValueError("Nicht darstellbarer Wert")
+
+    def ersetze(self, knoten: _JtKnoten, literal: str) -> None:
+        self.aenderungen.append((knoten.start, knoten.ende, literal))
+
+    def fuege_glieder_ein(self, obj: _JtKnoten, paare: List[Tuple[str, str]]) -> None:
+        """Haengt neue Schluessel (Name, fertiger Werttext) ans Ende eines Objekts - im Stil der vorhandenen Eintraege."""
+        if not paare:
+            return
+        t = self.text
+        if obj.glieder:
+            letztes = obj.glieder[-1]
+            if len(obj.glieder) >= 2:
+                trenn = t[obj.glieder[-2][3].ende:letztes[1]]
+            elif "\n" in t[obj.start:letztes[1]]:
+                trenn = "," + self.zeilenende + self.einzug_von(letztes[1])
+            else:
+                trenn = ", "
+            kv = t[letztes[2]:letztes[3].start]
+            neu = "".join(trenn + json.dumps(k, ensure_ascii=False) + kv + w for k, w in paare)
+            self.aenderungen.append((letztes[3].ende, letztes[3].ende, neu))
+            return
+        ind = self.einzug_von(obj.start)
+        kind = ind + self.einheit
+        zeilen = [kind + json.dumps(k, ensure_ascii=False) + ": " + w for k, w in paare]
+        innen = self.zeilenende + ("," + self.zeilenende).join(zeilen) + self.zeilenende + ind
+        self.aenderungen.append((obj.start + 1, obj.ende - 1, innen))
+
+    def array_neu(self, arr: _JtKnoten, eintraege: List[Tuple[Optional[int], Optional[str]]]) -> None:
+        """Baut ein Array neu zusammen. ``eintraege``: (alter Index, None) = vorhandenen Eintrag samt seiner eigenen
+        Aenderungen uebernehmen, (None, Text) = neuer Eintrag. Anfang, Ende und Trenner kommen aus der Originaldatei."""
+        t = self.text
+        lo, hi = arr.start + 1, arr.ende - 1
+        intern = [a for a in self.aenderungen if a[0] >= lo and a[1] <= hi]
+        self.aenderungen = [a for a in self.aenderungen if a not in intern]
+        texte: List[str] = []
+        for alt, neu in eintraege:
+            if neu is not None:
+                texte.append(neu)
+                continue
+            it = arr.eintraege[alt]
+            innen = sorted((a for a in intern if a[0] >= it.start and a[1] <= it.ende), key=lambda a: (a[0], a[1]))
+            teil, pos = [], it.start
+            for s, e, ersatz in innen:
+                teil.append(t[pos:s])
+                teil.append(ersatz)
+                pos = e
+            teil.append(t[pos:it.ende])
+            texte.append("".join(teil))
+        if not texte:
+            self.aenderungen.append((lo, hi, ""))
+            return
+        if arr.eintraege:
+            davor = t[lo:arr.eintraege[0].start]
+            danach = t[arr.eintraege[-1].ende:hi]
+            if len(arr.eintraege) >= 2:
+                trenn = t[arr.eintraege[0].ende:arr.eintraege[1].start]
+            elif "\n" in davor:
+                trenn = "," + self.zeilenende + self.einzug_von(arr.eintraege[0].start)
+            else:
+                trenn = ", "
+        else:
+            ind = self.einzug_von(arr.start)
+            kind = ind + self.einheit
+            davor = self.zeilenende + kind
+            danach = self.zeilenende + ind
+            trenn = "," + self.zeilenende + kind
+        if len(texte) == len(arr.eintraege) and all(alt == i and neu is None for i, (alt, neu) in enumerate(eintraege)):
+            self.aenderungen.extend(intern)              # nichts hinzugekommen oder weggefallen: nur die Werte aendern
+            return
+        self.aenderungen.append((lo, hi, davor + trenn.join(texte) + danach))
+
+    def ergebnis(self) -> str:
+        t = self.text
+        teile, pos = [], 0
+        for s, e, ersatz in sorted(self.aenderungen, key=lambda a: (a[0], a[1])):
+            if s < pos:
+                raise ValueError("Interner Fehler: sich überlappende Änderungen")
+            teile.append(t[pos:s])
+            teile.append(ersatz)
+            pos = e
+        teile.append(t[pos:])
+        return "".join(teile)
+
+
+_BB_DATEI = "cfgbunkerbroadcast.json"
+_BB_GAMEPLAY_DATEI = "cfggameplay.json"
+_BB_STAND = {"spielbuild": "1.30.164200", "regeln": "2026-10-22"}
+_BB_ABSCHNITTE = ("bunkerSettings", "schedulerSettings", "playbackSettings")
+_BB_HHMM_RE = re.compile(r'^(?:[01][0-9]|2[0-3])[0-5][0-9]$')
+_BB_MAX_EINTRAEGE = 500
+# (Abschnitt, Schluessel, Typ, Minimum, Maximum, Klassenvorgabe, Wert der Nasdara-Mission, Einheit) - Spannen inklusive
+_BB_FELDER = (
+    ("bunkerSettings", "numberOfActive", "integer", 1, 30, 2, 3, ""),
+    ("bunkerSettings", "lockCodeLength", "integer", 3, 6, 4, 4, "Zeichen"),
+    ("bunkerSettings", "lockCodeMode", "integer", 0, 1, 0, 0, ""),
+    ("schedulerSettings", "batchLifetimeLength", "integer", 1, 1000, 1, 720, "Spielminuten"),
+    ("schedulerSettings", "reportInterval", "integer", 1, 120, 1, 10, "Spielminuten"),
+    ("playbackSettings", "dotDuration", "number", 0.1, 5, 0.3, 0.5, "s"),
+    ("playbackSettings", "dashDuration", "number", 0.1, 5, 0.4, 1.5, "s"),
+    ("playbackSettings", "symbolGapDuration", "number", 0.1, 5, 0.1, 0.4, "s"),
+    ("playbackSettings", "wordGapDuration", "number", 0.1, 5, 0.3, 2.2, "s"),
+    ("playbackSettings", "pauseBetweenBunkers", "number", 0.5, 10, 2, 6.0, "s"),
+    ("playbackSettings", "bunkerRepetitions", "integer", 0, 3, 0, 0, ""),
+    ("playbackSettings", "messageRepetitions", "integer", 0, 5, 0, 1, ""),
+)
+_BB_FELD_NAME = {
+    "numberOfActive": "Aktive Bunker", "lockCodeLength": "Code-Länge", "lockCodeMode": "Code-Modus",
+    "batchLifetimeLength": "Lebensdauer eines Satzes", "reportInterval": "Berichtsabstand",
+    "dotDuration": "Punktdauer", "dashDuration": "Strichdauer", "symbolGapDuration": "Symbolpause",
+    "wordGapDuration": "Wortpause", "pauseBetweenBunkers": "Pause zwischen Bunkern",
+    "bunkerRepetitions": "Wiederholungen je Bunker", "messageRepetitions": "Wiederholungen der Nachricht",
+}
+_BB_NASDARA_PERIODEN = (("1745", "0600"),)
+# Die 23 Broadcast-Bunker der offiziellen Nasdara-Mission (DayZ-Central-Economy, dayzOffline.nasdara/
+# cfgbunkerbroadcast.json, Commit f220b29) in voller Genauigkeit - mit der Objekthoehe (Y). Die Zuordnung sucht das
+# Bunkerobjekt dreidimensional im Radius 1 m; die Hoehe darf deshalb weder weggelassen noch durch Terrainhoehe ersetzt werden.
+_BB_KATALOG: Dict[str, Tuple[Tuple[float, float, float], ...]] = {
+    "Nasdara": (
+        (7216.415039000014, 185.243851, 5706.95459),
+        (9167.879882999987, 211.157135, 11945.569336),
+        (11203.510742000013, 176.846359, 9662.226563),
+        (6797.303710999986, 244.669296, 10515.37793),
+        (10742.790039000014, 150.632004, 4027.940186),
+        (7630.182617000013, 248.902024, 8752.492188),
+        (11494.507813000004, 165.301834, 11022.930664),
+        (10419.642577999999, 168.087982, 8056.37793),
+        (4584.328125, 265.411163, 10884.116211),
+        (10087.624023000011, 152.086868, 4239.237305),
+        (10959.40625, 165.977493, 7783.450195),
+        (7381.81005900001, 263.272827, 7383.055664),
+        (10555.939452999999, 163.533524, 6135.306641),
+        (8830.352539000014, 159.339523, 5132.939453),
+        (8541.851563000004, 166.770554, 4795.474609),
+        (8741.5625, 181.255325, 7560.641113),
+        (13323.453125, 241.828705, 14238.014648),
+        (3861.5620120000094, 333.834839, 9775.362305),
+        (6559.7690430000075, 246.380325, 7361.540039),
+        (9633.549804999988, 166.527985, 5440.727539),
+        (2863.215820000012, 436.36615, 6381.550781),
+        (5719.367188000004, 298.773956, 8969.555664),
+        (6713.5434569999925, 252.133988, 3980.503418),
+    ),
+}
+_BB_ZUORDNUNG_METER = 1.0
+
+
+def _bb_num(v: Any) -> str:
+    """Zahl fuer Meldungen: ganze Zahlen ohne Nachkommastellen."""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
+def _bb_katalog_nr(karte: Optional[str], x: float, y: float, z: float) -> Optional[int]:
+    """Nummer (ab 1) des bekannten Bunkers, dessen Objekt in 3D innerhalb von 1 m liegt - sonst None."""
+    beste: Optional[int] = None
+    kleinster = _BB_ZUORDNUNG_METER
+    for i, (kx, ky, kz) in enumerate(_BB_KATALOG.get(karte or "", ()), start=1):
+        d = math.sqrt((kx - x) ** 2 + (ky - y) ** 2 + (kz - z) ** 2)
+        if d <= kleinster:
+            beste, kleinster = i, d
+    return beste
+
+
+def _bb_ist_zahl(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _bb_position(knoten: _JtKnoten) -> Optional[Tuple[float, float, float]]:
+    """(x, y, z) eines Proxy-Eintrags, sonst None (kein Objekt, keine ``position`` aus genau drei endlichen Zahlen)."""
+    if knoten.art != "objekt":
+        return None
+    pos = knoten.hole("position")
+    if pos is None or pos.art != "array" or len(pos.eintraege) != 3:
+        return None
+    if not all(e.art == "zahl" and math.isfinite(e.wert) for e in pos.eintraege):
+        return None
+    return float(pos.eintraege[0].wert), float(pos.eintraege[1].wert), float(pos.eintraege[2].wert)
+
+
+def _bb_modell(text: Optional[str], karte: Optional[str]) -> Dict[str, Any]:
+    """Zerlegt die Datei fuer die Oberflaeche. ``text`` None = Datei fehlt. ValueError bei ungueltigem JSON."""
+    felder: Dict[str, Any] = {}
+    modell: Dict[str, Any] = {"felder": felder, "perioden": [], "perioden_da": False, "proxies": [],
+                              "proxies_da": False, "unbekannt": [], "doppelt": []}
+    if text is None:
+        return modell
+    ed = _JtBearbeiter(text)
+    modell["doppelt"] = [{"name": n, "zeile": z} for n, z in ed.doppelt]
+    wurzel = ed.wurzel
+    if wurzel.art != "objekt":
+        raise ValueError("Die Wurzel der Datei ist kein JSON-Objekt.")
+    bekannt = {"bunkerSettings": {f[1] for f in _BB_FELDER if f[0] == "bunkerSettings"},
+               "schedulerSettings": {f[1] for f in _BB_FELDER if f[0] == "schedulerSettings"} | {"periods"},
+               "playbackSettings": {f[1] for f in _BB_FELDER if f[0] == "playbackSettings"}}
+    unbekannt: List[str] = []
+    for name, _a, _b, kn in wurzel.glieder:
+        if name not in bekannt and name != "proxies":
+            unbekannt.append(name)
+    for abschnitt in _BB_ABSCHNITTE:
+        sec = wurzel.hole(abschnitt)
+        for _a1, schluessel, typ, *_rest in (f for f in _BB_FELDER if f[0] == abschnitt):
+            kn = sec.hole(schluessel) if sec is not None and sec.art == "objekt" else None
+            eintrag: Dict[str, Any] = {"da": kn is not None, "wert": None, "text": None, "art": None}
+            if kn is not None:
+                eintrag["art"] = kn.art
+                eintrag["text"] = text[kn.start:kn.ende] if kn.art != "objekt" and kn.art != "array" else kn.art
+                if kn.art == "zahl":
+                    eintrag["wert"] = kn.wert
+            felder[f"{abschnitt}.{schluessel}"] = eintrag
+        if sec is not None and sec.art == "objekt":
+            unbekannt.extend(f"{abschnitt}.{n}" for n, _a, _b, _k in sec.glieder if n not in bekannt[abschnitt])
+        elif sec is not None:
+            unbekannt.append(f"{abschnitt} (kein Objekt)")
+    sched = wurzel.hole("schedulerSettings")
+    per = sched.hole("periods") if sched is not None and sched.art == "objekt" else None
+    if per is not None:
+        modell["perioden_da"] = True
+        if per.art == "array":
+            for i, it in enumerate(per.eintraege):
+                e: Dict[str, Any] = {"src": i, "start": None, "ende": None, "kaputt": False}
+                if it.art == "objekt":
+                    s, en = it.hole("startTime"), it.hole("endTime")
+                    e["start"] = s.wert if s is not None and s.art == "text" else (text[s.start:s.ende] if s is not None else None)
+                    e["ende"] = en.wert if en is not None and en.art == "text" else (text[en.start:en.ende] if en is not None else None)
+                    e["kaputt"] = not (s is not None and s.art == "text" and en is not None and en.art == "text")
+                    unbekannt.extend(f"schedulerSettings.periods[{i}].{n}" for n, _a, _b, _k in it.glieder
+                                     if n not in ("startTime", "endTime"))
+                else:
+                    e["kaputt"] = True
+                modell["perioden"].append(e)
+        else:
+            modell["perioden_kaputt"] = True
+    prox = wurzel.hole("proxies")
+    if prox is not None:
+        modell["proxies_da"] = True
+        if prox.art == "array":
+            for i, it in enumerate(prox.eintraege):
+                p = _bb_position(it)
+                e = {"src": i, "x": None, "y": None, "z": None, "kaputt": p is None, "weitere": False, "nr": None}
+                if p is not None:
+                    e["x"], e["y"], e["z"] = p
+                    e["nr"] = _bb_katalog_nr(karte, *p)
+                if it.art == "objekt":
+                    weitere = [n for n, _a, _b, _k in it.glieder if n != "position"]
+                    e["weitere"] = bool(weitere)
+                    unbekannt.extend(f"proxies[{i}].{n}" for n in weitere)
+                modell["proxies"].append(e)
+        else:
+            modell["proxies_kaputt"] = True
+    modell["unbekannt"] = unbekannt[:60]
+    modell["unbekannt_gesamt"] = len(unbekannt)
+    return modell
+
+
+def _bb_pruefen(daten: Any, karte: Optional[str], welt: Optional[int]) -> Tuple[List[str], List[str]]:
+    """Strenge Pruefung des Ergebnisses gegen die Regeln des Spiels (Fehler = nicht speichern) plus Hinweise.
+    Das Spiel verwirft eine Datei mit Wert ausserhalb der Spanne ganz (kein Begrenzen) - deshalb gibt es hier
+    nichts zu korrigieren, nur zu melden."""
+    fehler: List[str] = []
+    warn: List[str] = []
+    if not isinstance(daten, dict):
+        return ["Die Wurzel der Datei ist kein JSON-Objekt."], []
+    for abschnitt in _BB_ABSCHNITTE:
+        if abschnitt in daten and not isinstance(daten[abschnitt], dict):
+            fehler.append(f"„{abschnitt}“ ist kein Objekt.")
+    for abschnitt, schluessel, typ, mn, mx, _v, _n, _e in _BB_FELDER:
+        sec = daten.get(abschnitt)
+        if not isinstance(sec, dict) or schluessel not in sec:
+            continue
+        wert, name = sec[schluessel], _BB_FELD_NAME[schluessel]
+        if not _bb_ist_zahl(wert) or (isinstance(wert, float) and not math.isfinite(wert)):
+            fehler.append(f"{name}: Der Wert ist keine Zahl.")
+            continue
+        if typ == "integer" and isinstance(wert, float):
+            if not wert.is_integer():
+                fehler.append(f"{name}: {_bb_num(wert)} ist keine ganze Zahl.")
+                continue
+            warn.append(f"{name}: Der Wert ist als {wert} geschrieben – ob das Spiel ihn als ganze Zahl liest, ist nicht belegt.")
+        if not (mn <= wert <= mx):
+            fehler.append(f"{name}: {_bb_num(wert)} liegt außerhalb von {_bb_num(mn)}–{_bb_num(mx)}.")
+    sched = daten.get("schedulerSettings") if isinstance(daten.get("schedulerSettings"), dict) else {}
+    per = sched.get("periods")
+    if per is None:
+        warn.append("Kein Zeitfenster: Es startet keine reguläre Durchsage.")
+    elif not isinstance(per, list):
+        fehler.append("„schedulerSettings.periods“ ist kein Array.")
+    else:
+        if not per:
+            warn.append("Kein Zeitfenster: Es startet keine reguläre Durchsage.")
+        for i, p in enumerate(per, start=1):
+            ok_p = (isinstance(p, dict) and isinstance(p.get("startTime"), str) and isinstance(p.get("endTime"), str))
+            if not ok_p:
+                fehler.append(f"Zeitfenster {i}: Beginn und Ende müssen als Text (HHMM) angegeben sein.")
+            elif not (_BB_HHMM_RE.match(p["startTime"]) and _BB_HHMM_RE.match(p["endTime"])):
+                fehler.append(f"Zeitfenster {i}: Bitte vier Ziffern als HHMM angeben (z. B. 1745, Stunden 00–23, Minuten 00–59).")
+    prox = daten.get("proxies")
+    punkte: List[Tuple[float, float, float]] = []
+    if prox is None:
+        warn.append("Es gibt keine Standorte (proxies).")
+    elif not isinstance(prox, list):
+        fehler.append("„proxies“ ist kein Array.")
+    else:
+        for i, p in enumerate(prox, start=1):
+            pos = p.get("position") if isinstance(p, dict) else None
+            if (not isinstance(pos, list) or len(pos) != 3 or not all(_bb_ist_zahl(c) and math.isfinite(c) for c in pos)):
+                fehler.append(f"Bunker {i}: Die Position braucht genau drei endliche Zahlen [x, y, z].")
+            else:
+                punkte.append((float(pos[0]), float(pos[1]), float(pos[2])))
+    if not fehler:
+        aktiv = (daten.get("bunkerSettings") or {}).get("numberOfActive")
+        if _bb_ist_zahl(aktiv) and punkte and aktiv > len(punkte):
+            warn.append(f"Aktive Bunker ({_bb_num(aktiv)}) sind mehr als vorhandene Standorte ({len(punkte)}). Das Spiel kann weniger auswählen.")
+        mehrfach = len(punkte) - len(set(punkte))
+        if mehrfach:
+            warn.append(f"{mehrfach} Standort(e) kommen mehrfach vor. Bitte die Zuordnung prüfen.")
+        if punkte and karte in _BB_KATALOG:
+            unbekannt = sum(1 for p in punkte if _bb_katalog_nr(karte, *p) is None)
+            if unbekannt:
+                warn.append(f"{unbekannt} von {len(punkte)} Standorten gehören zu keinem bekannten Bunker dieser Karte.")
+        elif punkte:
+            warn.append("Für diese Karte gibt es keinen belegten Bunkerkatalog: Standorte müssen vorhandenen Bunkerobjekten entsprechen.")
+        if welt:
+            draussen = sum(1 for p in punkte if not (0 <= p[0] <= welt and 0 <= p[2] <= welt))
+            if draussen:
+                warn.append(f"{draussen} Standort(e) liegen außerhalb der Karte.")
+        null_y = sum(1 for p in punkte if p[1] == 0)
+        if null_y:
+            warn.append(f"{null_y} Standort(e) haben die Höhe 0 – nicht verifiziert (Terrainhöhe ist nicht automatisch der Bunkerursprung).")
+    return fehler, warn
+
+
+def _bb_zahl_eingabe(wert: Any, typ: str, name: str) -> Any:
+    if not _bb_ist_zahl(wert) or (isinstance(wert, float) and not math.isfinite(wert)):
+        raise ValueError(f"{name}: Der Wert ist keine Zahl.")
+    if typ == "integer":
+        if isinstance(wert, float) and not wert.is_integer():
+            raise ValueError(f"{name}: {_bb_num(wert)} ist keine ganze Zahl.")
+        return int(wert)
+    return float(wert)
+
+
+def _bb_klon(ed: _JtBearbeiter, vorlage: _JtKnoten, ersetzungen: List[Tuple[_JtKnoten, str]]) -> str:
+    teile, pos = [], vorlage.start
+    for knoten, ersatz in sorted(ersetzungen, key=lambda e: e[0].start):
+        teile.append(ed.text[pos:knoten.start])
+        teile.append(ersatz)
+        pos = knoten.ende
+    teile.append(ed.text[pos:vorlage.ende])
+    return "".join(teile)
+
+
+def _bb_glied_einzug(ed: _JtBearbeiter, obj: _JtKnoten) -> str:
+    """Einzug, mit dem ein neuer Schluessel in ``obj`` beginnt."""
+    if obj.glieder:
+        return ed.einzug_von(obj.glieder[-1][1])
+    return ed.einzug_von(obj.start) + ed.einheit
+
+
+def _bb_eintraege_anwenden(ed: _JtBearbeiter, arr: _JtKnoten, final: List[Dict[str, Any]], pruefe_eintrag, vorlage_ok,
+                           klone, neu_literal) -> None:
+    """Gemeinsamer Ablauf fuer ``periods`` und ``proxies``: vorhandene Eintraege (``src``) werden nur an den
+    geaenderten Werten angefasst, neue aus einer Vorlage geklont, nicht mehr genannte entfernt."""
+    benutzt: set = set()
+    liste: List[Tuple[Optional[int], Optional[str]]] = []
+    vorlage = next((it for it in arr.eintraege if vorlage_ok(it)), None)
+    ind = ed.einzug_von(arr.eintraege[0].start) if arr.eintraege else ed.einzug_von(arr.start) + ed.einheit
+    for e in final:
+        src = e.get("src")
+        if (isinstance(src, int) and not isinstance(src, bool) and 0 <= src < len(arr.eintraege) and src not in benutzt):
+            benutzt.add(src)
+            if not e.get("behalten"):
+                pruefe_eintrag(arr.eintraege[src], e, src)
+            liste.append((src, None))
+        elif vorlage is not None:
+            liste.append((None, klone(vorlage, e)))
+        else:
+            liste.append((None, neu_literal(e, ind)))
+    ed.array_neu(arr, liste)
+
+
+def _bb_anwenden(text: Optional[str], eingabe: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Wendet die Eingaben der Oberflaeche auf den Dateitext an. ``text`` None = Datei gibt es noch nicht.
+    Rueckgabe: neuer Text und Hinweise zu bewusst korrigierten Typen. ValueError bei ungueltigen Eingaben."""
+    ed = _JtBearbeiter(text if text is not None else "{}\n")
+    if ed.doppelt:
+        name, zeile = ed.doppelt[0]
+        raise ValueError(f"Der Schlüssel „{name}“ steht in Zeile {zeile} mehrfach – die Datei ist mehrdeutig und wird nicht automatisch geändert.")
+    wurzel = ed.wurzel
+    if wurzel.art != "objekt":
+        raise ValueError("Die Wurzel der Datei ist kein JSON-Objekt.")
+    for abschnitt in _BB_ABSCHNITTE:
+        kn = wurzel.hole(abschnitt)
+        if kn is not None and kn.art != "objekt":
+            raise ValueError(f"„{abschnitt}“ ist kein Objekt.")
+    hinweise: List[str] = []
+    neu_in: Dict[str, List[Tuple[str, Any]]] = {a: [] for a in _BB_ABSCHNITTE}   # fehlende Schluessel je Abschnitt
+    felder = eingabe.get("felder")
+    if felder is not None and not isinstance(felder, dict):
+        raise ValueError("Ungültige Eingabe: felder")
+    for abschnitt, schluessel, typ, _mn, _mx, _v, _n, _e in _BB_FELDER:
+        pfad = f"{abschnitt}.{schluessel}"
+        if not felder or felder.get(pfad) is None:
+            continue
+        ziel = _bb_zahl_eingabe(felder[pfad], typ, _BB_FELD_NAME[schluessel])
+        sec = wurzel.hole(abschnitt)
+        kn = sec.hole(schluessel) if sec is not None else None
+        if kn is None:
+            neu_in[abschnitt].append((schluessel, ziel))
+            continue
+        if kn.art == "zahl" and kn.wert == ziel and (typ == "number" or kn.ganz):
+            continue                                   # unveraendert: Originaltext (z. B. 6.0) bleibt
+        if kn.art != "zahl":
+            hinweise.append(f"{_BB_FELD_NAME[schluessel]}: stand nicht als Zahl in der Datei und wird als Zahl gespeichert.")
+        ed.ersetze(kn, _jt_zahl_text(ziel))
+
+    perioden = eingabe.get("perioden")
+    if perioden is not None:
+        if not isinstance(perioden, list) or len(perioden) > _BB_MAX_EINTRAEGE:
+            raise ValueError("Ungültige Eingabe: perioden")
+        for p in perioden:
+            if not isinstance(p, dict):
+                raise ValueError("Ungültige Eingabe: perioden")
+            if p.get("behalten") and isinstance(p.get("src"), int):
+                continue                                   # defekter Eintrag, den der Nutzer nicht angefasst hat
+            if not isinstance(p.get("start"), str) or not isinstance(p.get("ende"), str):
+                raise ValueError("Ungültige Eingabe: perioden")
+        sched = wurzel.hole("schedulerSettings")
+        arr = sched.hole("periods") if sched is not None else None
+        if arr is not None and arr.art != "array":
+            raise ValueError("„schedulerSettings.periods“ ist kein Array.")
+        if arr is None:
+            if any(p.get("behalten") for p in perioden):
+                raise ValueError("Ungültige Eingabe: perioden")
+            if perioden:
+                neu_in["schedulerSettings"].append(
+                    ("periods", [{"startTime": p["start"], "endTime": p["ende"]} for p in perioden]))
+        else:
+            def per_pruefen(it: _JtKnoten, e: Dict[str, Any], i: int) -> None:
+                if it.art != "objekt":
+                    raise ValueError(f"Zeitfenster {i + 1} ist kein Objekt – bitte löschen und neu anlegen.")
+                fehlt: List[Tuple[str, str]] = []
+                for schl, wert in (("startTime", e["start"]), ("endTime", e["ende"])):
+                    k = it.hole(schl)
+                    if k is not None and k.art == "text" and k.wert == wert:
+                        continue
+                    if k is None:
+                        fehlt.append((schl, json.dumps(wert, ensure_ascii=False)))
+                        continue
+                    if k.art != "text":
+                        hinweise.append(f"Zeitfenster {i + 1}: {schl} stand nicht als Text und wird als Text gespeichert.")
+                    ed.ersetze(k, json.dumps(wert, ensure_ascii=False))
+                ed.fuege_glieder_ein(it, fehlt)
+
+            def per_vorlage(it: _JtKnoten) -> bool:
+                return (it.art == "objekt" and [g[0] for g in it.glieder] in (["startTime", "endTime"], ["endTime", "startTime"])
+                        and all(g[3].art == "text" for g in it.glieder))
+
+            def per_klon(vorlage: _JtKnoten, e: Dict[str, Any]) -> str:
+                return _bb_klon(ed, vorlage, [(vorlage.hole("startTime"), json.dumps(e["start"], ensure_ascii=False)),
+                                              (vorlage.hole("endTime"), json.dumps(e["ende"], ensure_ascii=False))])
+
+            def per_neu(e: Dict[str, Any], ind: str) -> str:
+                return ed.literal({"startTime": e["start"], "endTime": e["ende"]}, ind)
+
+            _bb_eintraege_anwenden(ed, arr, perioden, per_pruefen, per_vorlage, per_klon, per_neu)
+
+    proxies = eingabe.get("proxies")
+    if proxies is not None:
+        if not isinstance(proxies, list) or len(proxies) > _BB_MAX_EINTRAEGE:
+            raise ValueError("Ungültige Eingabe: proxies")
+        for i, p in enumerate(proxies, start=1):
+            if not isinstance(p, dict):
+                raise ValueError("Ungültige Eingabe: proxies")
+            if p.get("behalten"):
+                continue
+            if not all(_bb_ist_zahl(p.get(k)) and math.isfinite(p[k]) for k in ("x", "y", "z")):
+                raise ValueError(f"Bunker {i}: Die Position braucht genau drei endliche Zahlen [x, y, z].")
+        arr = wurzel.hole("proxies")
+        if arr is not None and arr.art != "array":
+            raise ValueError("„proxies“ ist kein Array.")
+        if arr is not None:
+            def prox_pruefen(it: _JtKnoten, e: Dict[str, Any], i: int) -> None:
+                if it.art != "objekt":
+                    raise ValueError(f"Bunker {i + 1} ist kein Objekt – bitte löschen und neu anlegen.")
+                xyz = [float(e["x"]), float(e["y"]), float(e["z"])]
+                pos = it.hole("position")
+                if (pos is not None and pos.art == "array" and len(pos.eintraege) == 3
+                        and all(k.art == "zahl" for k in pos.eintraege)):
+                    for k, w in zip(pos.eintraege, xyz):
+                        if float(k.wert) != w:
+                            ed.ersetze(k, _jt_zahl_text(w))
+                    return
+                lit = ed.literal(xyz, "")
+                if pos is not None:
+                    ed.ersetze(pos, lit)
+                else:
+                    ed.fuege_glieder_ein(it, [("position", lit)])
+
+            def prox_vorlage(it: _JtKnoten) -> bool:
+                return (it.art == "objekt" and [g[0] for g in it.glieder] == ["position"]
+                        and _bb_position(it) is not None)
+
+            def prox_klon(vorlage: _JtKnoten, e: Dict[str, Any]) -> str:
+                zahlen = vorlage.hole("position").eintraege
+                return _bb_klon(ed, vorlage, [(k, _jt_zahl_text(float(e[c]))) for k, c in zip(zahlen, ("x", "y", "z"))])
+
+            def prox_neu(e: Dict[str, Any], ind: str) -> str:
+                return ed.literal({"position": [float(e["x"]), float(e["y"]), float(e["z"])]}, ind)
+
+            _bb_eintraege_anwenden(ed, arr, proxies, prox_pruefen, prox_vorlage, prox_klon, prox_neu)
+        elif any(p.get("behalten") for p in proxies):
+            raise ValueError("Ungültige Eingabe: proxies")
+
+    # fehlende Schluessel und Abschnitte am Ende einfuegen
+    fehlende_abschnitte: List[Tuple[str, Dict[str, Any]]] = []
+    for abschnitt in _BB_ABSCHNITTE:
+        paare = neu_in[abschnitt]
+        if not paare:
+            continue
+        sec = wurzel.hole(abschnitt)
+        if sec is None:
+            fehlende_abschnitte.append((abschnitt, dict(paare)))
+        else:
+            ind = _bb_glied_einzug(ed, sec)
+            ed.fuege_glieder_ein(sec, [(k, ed.literal(v, ind)) for k, v in paare])
+    wurzel_neu: List[Tuple[str, Any]] = list(fehlende_abschnitte)
+    if proxies is not None and wurzel.hole("proxies") is None and proxies:
+        wurzel_neu.append(("proxies", [{"position": [float(p["x"]), float(p["y"]), float(p["z"])]} for p in proxies]))
+    if wurzel_neu:
+        ind = _bb_glied_einzug(ed, wurzel)
+        ed.fuege_glieder_ein(wurzel, [(k, ed.literal(v, ind)) for k, v in wurzel_neu])
+    return ed.ergebnis(), hinweise
+
+
+# ── Schalter in der cfggameplay.json ─────────────────────────────────────
+def _bb_schalter_lesen(text: Optional[str]) -> Dict[str, Any]:
+    """Stand von ``WorldsData.bunkerBroadcastEnabled``: wert True/False, None = Schluessel fehlt."""
+    out: Dict[str, Any] = {"vorhanden": text is not None, "lesbar": True, "wert": None, "ungueltig": False,
+                           "abschnitt": False, "fehler": None}
+    if text is None:
+        return out
+    try:
+        ed = _JtBearbeiter(text)
+    except ValueError as e:
+        out.update({"lesbar": False, "fehler": str(e)})
+        return out
+    w = ed.wurzel.hole("WorldsData") if ed.wurzel.art == "objekt" else None
+    if ed.wurzel.art != "objekt":
+        out.update({"lesbar": False, "fehler": "Die Wurzel der Datei ist kein JSON-Objekt."})
+        return out
+    out["abschnitt"] = w is not None and w.art == "objekt"
+    if w is not None and w.art == "objekt":
+        k = w.hole("bunkerBroadcastEnabled")
+        if k is not None:
+            if k.art == "bool":
+                out["wert"] = k.wert
+            else:
+                out["ungueltig"] = True
+    if any(n in ("WorldsData", "bunkerBroadcastEnabled") for n, _z in ed.doppelt):
+        out["mehrdeutig"] = True
+    return out
+
+
+def _bb_schalter_setzen(text: str, an: bool) -> str:
+    """Setzt ``WorldsData.bunkerBroadcastEnabled`` - nur dieser Wert wird angefasst, der Rest der Datei bleibt."""
+    ed = _JtBearbeiter(text)
+    if ed.wurzel.art != "objekt":
+        raise ValueError("Die Wurzel der Datei ist kein JSON-Objekt.")
+    if any(n in ("WorldsData", "bunkerBroadcastEnabled") for n, _z in ed.doppelt):
+        raise ValueError("In der cfggameplay.json kommt „WorldsData“ oder „bunkerBroadcastEnabled“ mehrfach vor – "
+                         "der Schalter wird nicht automatisch geändert.")
+    lit = "true" if an else "false"
+    w = ed.wurzel.hole("WorldsData")
+    if w is None:
+        ed.fuege_glieder_ein(ed.wurzel, [("WorldsData", ed.literal({"bunkerBroadcastEnabled": an}, _bb_glied_einzug(ed, ed.wurzel)))])
+    elif w.art != "objekt":
+        raise ValueError("„WorldsData“ in der cfggameplay.json ist kein Objekt.")
+    else:
+        k = w.hole("bunkerBroadcastEnabled")
+        if k is None:
+            ed.fuege_glieder_ein(w, [("bunkerBroadcastEnabled", lit)])
+        elif not (k.art == "bool" and k.wert is an):
+            ed.ersetze(k, lit)
+    return ed.ergebnis()
+
+
+# ── Routen ───────────────────────────────────────────────────────────────
+_BB_MODUL = "tools.bunkerbroadcast"
+_BB_GAMEPLAY_FEHLT = ("Die cfggameplay.json gibt es auf dem Server nicht oder sie ist nicht lesbar – "
+                      "der Schalter kann nicht gesetzt werden.")
+
+
+def _bb_karte(conn: ServerConnection) -> Tuple[Optional[str], Optional[int]]:
+    karte = _canonical_map_name(str(conn.get("map_name") or "")) or None
+    return karte, DEFAULT_MAP_SIZES.get(karte or "")
+
+
+def _bb_regeln() -> List[Dict[str, Any]]:
+    return [{"pfad": f"{a}.{s}", "abschnitt": a, "schluessel": s, "typ": typ, "min": mn, "max": mx,
+             "vorgabe": v, "nasdara": n, "einheit": e, "name": _BB_FELD_NAME[s]}
+            for a, s, typ, mn, mx, v, n, e in _BB_FELDER]
+
+
+def _bb_vorlage(karte: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Offizielle Werte der Mission der Karte (nur wo es sie gibt) - zum Laden in den Editor, nie automatisch."""
+    if karte not in _BB_KATALOG:
+        return None
+    return {"felder": {f"{a}.{s}": n for a, s, _t, _mn, _mx, _v, n, _e in _BB_FELDER},
+            "perioden": [{"start": s, "ende": e} for s, e in _BB_NASDARA_PERIODEN],
+            "proxies": [{"x": x, "y": y, "z": z} for x, y, z in _BB_KATALOG[karte]]}
+
+
+async def api_tools_bunkerbroadcast_get(request: web.Request) -> web.Response:
+    conn, fehler = await _brlc_prepare(request, _BB_MODUL, "view")
+    if fehler is not None:
+        return fehler
+    karte, welt = _bb_karte(conn)
+    out: Dict[str, Any] = {
+        "karte": karte, "welt": welt, "datei": _BB_DATEI, "stand": _BB_STAND, "regeln": _bb_regeln(),
+        "katalog": [{"nr": i, "x": x, "y": y, "z": z} for i, (x, y, z) in enumerate(_BB_KATALOG.get(karte or "", ()), start=1)],
+        "vorlage": _bb_vorlage(karte), "kein_mission_ordner": not bool(_mission_dir_of(conn)),
+        "vorhanden": False, "hash": _spawn_datei_hash(""), "modell": None, "kaputt": None,
+        "fehler": [], "warnungen": [], "schalter": _bb_schalter_lesen(None), "gameplay_hash": _spawn_datei_hash("")}
+    if out["kein_mission_ordner"]:
+        return ok(out)
+    loop = asyncio.get_running_loop()
+    try:
+        text, status = await _tools_datei_lesen(conn, _BB_DATEI, loop)
+        gp_text, gp_status = await _tools_datei_lesen(conn, _BB_GAMEPLAY_DATEI, loop)
+    except Exception as e:  # noqa: BLE001
+        log.exception("[TOOLS] Bunker Broadcast: Lesen fehlgeschlagen")
+        return err(f"Die Dateien konnten nicht gelesen werden ({type(e).__name__}: {e}).", 502)
+    if status == "error":
+        return err(f"{_BB_DATEI} per FTP nicht lesbar.", 502)
+    if gp_status == "error":
+        return err(f"{_BB_GAMEPLAY_DATEI} per FTP nicht lesbar.", 502)
+    out["gameplay_hash"] = _spawn_datei_hash(gp_text if gp_status == "ok" else "")
+    out["schalter"] = _bb_schalter_lesen(gp_text if gp_status == "ok" else None)
+    out["vorhanden"] = status == "ok"
+    if status != "ok":
+        out["modell"] = _bb_modell(None, karte)
+        return ok(out)
+    if len(text.encode("utf-8")) > _JT_MAX_BYTES:
+        return err(f"{_BB_DATEI} ist größer als 2 MB und wird nicht geladen.", 413)
+    out["hash"] = _spawn_datei_hash(text)
+    try:
+        out["modell"] = _bb_modell(text, karte)
+        fehler_liste, warn = _bb_pruefen(_jt_parse(text)[0].py(), karte, welt)
+    except ValueError as e:
+        out["kaputt"] = str(e)
+        return ok(out)
+    out["fehler"], out["warnungen"] = fehler_liste, warn
+    return ok(out)
+
+
+async def _bb_schreiben(conn: ServerConnection, bb_vorher: Optional[str], bb_neu: Optional[str],
+                        gp_vorher: Optional[str], gp_neu: Optional[str], loop) -> Tuple[Dict[str, str], Optional[str]]:
+    """Schreibt die geaenderten Dateien: erst die Sicherungen (.bak), dann die Bunker-Datei, dann den Schalter. Schlaegt
+    der Schalter fehl, wird die Bunker-Datei zurueckgenommen. Rueckgabe: Status je Datei und ggf. eine Fehlermeldung.
+    Zwei Dateien beim Hoster sind kein atomarer Vorgang - deshalb wird jeder Teilstatus einzeln gemeldet."""
+    ergebnis = {"bunker": "unveraendert" if bb_neu is None else "offen",
+                "schalter": "unveraendert" if gp_neu is None else "offen"}
+    if bb_neu is not None and bb_vorher is not None:
+        if not await _tools_datei_schreiben(conn, _BB_DATEI + ".bak", bb_vorher, loop):
+            return ergebnis, f"Sichern der {_BB_DATEI}.bak ist fehlgeschlagen – nichts wurde geändert."
+    if gp_neu is not None and gp_vorher is not None:
+        if not await _tools_datei_schreiben(conn, _BB_GAMEPLAY_DATEI + ".bak", gp_vorher, loop):
+            return ergebnis, f"Sichern der {_BB_GAMEPLAY_DATEI}.bak ist fehlgeschlagen – nichts wurde geändert."
+    if bb_neu is not None:
+        if not await _tools_datei_schreiben(conn, _BB_DATEI, bb_neu, loop):
+            ergebnis["bunker"] = "fehlgeschlagen"
+            return ergebnis, f"Die {_BB_DATEI} konnte nicht gespeichert werden – bitte erneut versuchen."
+        ergebnis["bunker"] = "geschrieben"
+    if gp_neu is not None:
+        if await _tools_datei_schreiben(conn, _BB_GAMEPLAY_DATEI, gp_neu, loop):
+            ergebnis["schalter"] = "geschrieben"
+        else:
+            ergebnis["schalter"] = "fehlgeschlagen"
+            if bb_neu is None:
+                return ergebnis, f"Der Schalter in der {_BB_GAMEPLAY_DATEI} konnte nicht gespeichert werden."
+            zurueck = (await _tools_datei_schreiben(conn, _BB_DATEI, bb_vorher, loop) if bb_vorher is not None
+                       else await _tools_datei_loeschen(conn, _BB_DATEI, loop))
+            ergebnis["bunker"] = "zurueckgenommen" if zurueck else "nicht_zurueckgenommen"
+            if zurueck:
+                return ergebnis, ("Der Schalter in der cfggameplay.json konnte nicht gespeichert werden – die Bunker-Datei "
+                                  "wurde zurückgenommen. Es ist nichts geändert.")
+            return ergebnis, ("Der Schalter in der cfggameplay.json konnte nicht gespeichert werden und die Bunker-Datei "
+                              "ließ sich nicht zurücknehmen – bitte beide Dateien prüfen (Sicherungen: .bak).")
+    return ergebnis, None
+
+
+async def api_tools_bunkerbroadcast_post(request: web.Request) -> web.Response:
+    conn, fehler = await _brlc_prepare(request, _BB_MODUL, "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, _BB_MODUL, 10)
+        if fehler is not None:
+            return fehler
+    schalter = data_in.get("schalter")
+    if schalter not in (True, False, None):
+        return err("Ungültige Eingabe: schalter")
+    karte, welt = _bb_karte(conn)
+    loop = asyncio.get_running_loop()
+    async with _schaden_lock(conn.service_id):          # derselbe Lock wie die Schaden-Schalter: gleiche cfggameplay.json
+        try:
+            text, status = await _tools_datei_lesen(conn, _BB_DATEI, loop)
+            gp_text, gp_status = await _tools_datei_lesen(conn, _BB_GAMEPLAY_DATEI, loop)
+        except Exception as e:  # noqa: BLE001
+            log.exception("[TOOLS] Bunker Broadcast: Lesen fehlgeschlagen")
+            return err(f"Die Dateien konnten nicht gelesen werden ({type(e).__name__}: {e}).", 502)
+        if status == "error":
+            return err(f"{_BB_DATEI} per FTP nicht lesbar.", 502)
+        if gp_status == "error":
+            return err(f"{_BB_GAMEPLAY_DATEI} per FTP nicht lesbar.", 502)
+        bb_vorher = text if status == "ok" else None
+        gp_vorher = gp_text if gp_status == "ok" else None
+        bb_hash, gp_hash = _spawn_datei_hash(bb_vorher), _spawn_datei_hash(gp_vorher)
+        if commit and (str(data_in.get("erwartet_hash") or "") != bb_hash
+                       or (schalter is not None and str(data_in.get("erwartet_hash_gameplay") or "") != gp_hash)):
+            return err("Eine der Dateien auf dem Server hat sich seit der Vorschau geändert (oder die Vorschau fehlt) – "
+                       "bitte „Speichern“ erneut klicken und die neue Vorschau prüfen. Nichts wurde gespeichert.", 409)
+        if bb_vorher is not None and len(bb_vorher.encode("utf-8")) > _JT_MAX_BYTES:
+            return err(f"{_BB_DATEI} ist größer als 2 MB und wird nicht bearbeitet.", 413)
+        try:
+            bb_neu, hinweise = _bb_anwenden(bb_vorher, data_in)
+            neu_py = _jt_parse(bb_neu)[0].py()
+            alt_py = _jt_parse(bb_vorher)[0].py() if bb_vorher is not None else {}
+        except ValueError as e:
+            return err(str(e))
+        fehler_liste, warn = _bb_pruefen(neu_py, karte, welt)
+        if fehler_liste:
+            return err(fehler_liste[0], 422, fehler=fehler_liste)
+        gp_neu: Optional[str] = None
+        if schalter is not None:
+            if gp_vorher is None:
+                return err(_BB_GAMEPLAY_FEHLT, 409)
+            try:
+                gp_geaendert = _bb_schalter_setzen(gp_vorher, schalter)
+            except ValueError as e:
+                return err(str(e))
+            gp_neu = gp_geaendert if gp_geaendert != gp_vorher else None
+        zustand = schalter if schalter is not None else _bb_schalter_lesen(gp_vorher)["wert"]
+        if zustand is not True:
+            warn.append("Bunker-Funk ist in der cfggameplay.json nicht aktiviert (WorldsData.bunkerBroadcastEnabled). "
+                        "Die Konfiguration wird so nicht aktiv.")
+        bb_aenderung = bb_neu if bb_neu != bb_vorher else None
+        unveraendert = bb_aenderung is None and gp_neu is None
+        ergebnis: Dict[str, str] = {}
+        if commit and not unveraendert:
+            try:
+                ergebnis, schreibfehler = await _bb_schreiben(conn, bb_vorher, bb_aenderung, gp_vorher, gp_neu, loop)
+            except Exception as e:  # noqa: BLE001
+                log.exception("[TOOLS] Bunker Broadcast: Schreiben fehlgeschlagen")
+                return err(f"Die Dateien konnten nicht gespeichert werden ({type(e).__name__}: {e}).", 502)
+            if schreibfehler:
+                return err(schreibfehler, 502, ergebnis=ergebnis)
+            _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: Bunker Broadcast gespeichert",
+                       f"{ergebnis['bunker']}/{ergebnis['schalter']} · {conn.name}")
+        a_prox = alt_py.get("proxies") if isinstance(alt_py.get("proxies"), list) else []
+        n_prox = neu_py.get("proxies") if isinstance(neu_py.get("proxies"), list) else []
+        a_per = (alt_py.get("schedulerSettings") or {}).get("periods") if isinstance(alt_py.get("schedulerSettings"), dict) else None
+        n_per = (neu_py.get("schedulerSettings") or {}).get("periods") if isinstance(neu_py.get("schedulerSettings"), dict) else None
+        geaendert = 0
+        for a, s, *_r in _BB_FELDER:
+            av = (alt_py.get(a) or {}).get(s) if isinstance(alt_py.get(a), dict) else None
+            nv = (neu_py.get(a) or {}).get(s) if isinstance(neu_py.get(a), dict) else None
+            if av != nv:
+                geaendert += 1
+        generated: List[Dict[str, str]] = [{"filename": _BB_DATEI, "content": bb_neu}]
+        if gp_neu is not None:
+            generated.append({"filename": _BB_GAMEPLAY_DATEI, "content": gp_neu})
+        return ok({"generated": generated, "unveraendert": unveraendert, "datei_hash": bb_hash, "gameplay_hash": gp_hash,
+                   "warnungen": warn, "hinweise": hinweise, "ergebnis": ergebnis,
+                   "aenderung": {"felder": geaendert, "perioden_vorher": len(a_per) if isinstance(a_per, list) else 0,
+                                 "perioden_nachher": len(n_per) if isinstance(n_per, list) else 0,
+                                 "proxies_vorher": len(a_prox), "proxies_nachher": len(n_prox),
+                                 "schalter_vorher": _bb_schalter_lesen(gp_vorher)["wert"],
+                                 "schalter_nachher": zustand if zustand in (True, False) else None},
+                   "backup": ([f"{_BB_DATEI}.bak"] if commit and bb_aenderung is not None and bb_vorher is not None else [])
+                             + ([f"{_BB_GAMEPLAY_DATEI}.bak"] if commit and gp_neu is not None else [])})
 
 
 # ── 9. Types Booster ──────────────────────────────────────────────────────
@@ -49696,6 +50718,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/spawnpoint", api_tools_spawnpoint_post)
     r.add_get("/api/tools/territory", api_tools_territory_get)
     r.add_post("/api/tools/territory", api_tools_territory_post)
+    r.add_get("/api/tools/bunkerbroadcast", api_tools_bunkerbroadcast_get)
+    r.add_post("/api/tools/bunkerbroadcast", api_tools_bunkerbroadcast_post)
     r.add_get("/api/tools/spawnabletypes", api_tools_spawnabletypes_get)
     r.add_post("/api/tools/spawnabletypes", api_tools_spawnabletypes_post)
     r.add_get("/api/tools/altaccountfinder", api_tools_altaccountfinder_get)
@@ -50661,6 +51685,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "1db619f03c10fd50eb82d04b42170244fe19d6ea26574bbf85d0ad4f807c9d99",
         "1d0a6b30994cb2a6fd4f07f42eea70c7d626666afc324b91eb72b1afe0684a2b",
         "3da6c73abea466b00a438a5941682f835670d1588e957aa13eaea9415a527770",
+        "aa25fac275d6a4e01b3b7f4caf59b8972f759fa508638694ad86b37a36c6937d",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
@@ -50680,6 +51705,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "e7f961dab2ab67545e45f774e8139a5c9e5517654cf8766592b210046d82ad5c",
         "4c782db81cb83ec74fa7d113c58ea6f3bfb73f530e10b5763748f3bf29714325",
         "db8cd2982a6760aea26aab60dfd1293fdeedc30c7e22a7f435d3274ccb47a00b",
+        "9d83e6b99cb7b5e3aff72b59c7a8c535157ac3e7f0727af2a797831c3fc9ad3e",
     ),
     "vendor/leaflet.css": (
         "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",

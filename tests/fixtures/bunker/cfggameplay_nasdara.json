@@ -1,0 +1,12 @@
+{
+    "version": 123,
+    "GeneralData": {
+        "disableBaseDamage": false,
+        "disableContainerDamage": false
+    },
+    "WorldsData": {
+        "lightingConfig": 1,
+        "objectSpawnersArr": [],
+        "bunkerBroadcastEnabled": false
+    }
+}
