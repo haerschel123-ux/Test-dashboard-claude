@@ -51938,6 +51938,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "d389792d900dff31ac0812c12d0a0f057ac9af489cc6646f24dbdc45ca0b759c",
         "cda2739ed6a1aeaed6ffb472602be5099422c18b5c7006021b2d66aceb7560a4",
         "399c6c489a59e5b9fd552061490fe01a0f0e9f1b90c7135344a5b83550dd605b",
+        "0abd441c5d36335854ba59e697f5ff77541bc06bc111c7b39bc9964ada982e66",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
@@ -51959,6 +51960,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "db8cd2982a6760aea26aab60dfd1293fdeedc30c7e22a7f435d3274ccb47a00b",
         "9d83e6b99cb7b5e3aff72b59c7a8c535157ac3e7f0727af2a797831c3fc9ad3e",
         "348ef6ec03933c640b7a2c90543530e9a0881c17e807fdc066c7ea9436c7f1a2",
+        "014c591a3cd6aa6862e1583939b437c8b2c2b2d23c009d10f61107a470f84e99",
     ),
     "vendor/leaflet.css": (
         "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",
