@@ -5067,6 +5067,10 @@ async def _premium_check(interaction: discord.Interaction) -> bool:
                 if role_id and interaction.user is not None:
                     gid = int(str(cfg.config.get("premium_role_guild_id") or "0") or 0)
                     erlaubt = await _user_hat_rolle(gid, interaction.user.id, role_id)
+                if not erlaubt and interaction.guild_id is not None:
+                    # Beta haengt am Server: gehoert dieser Guild ein Beta-Server, gilt es fuer alle, die den Befehl
+                    # dort ausfuehren duerfen (siehe _server_hat_beta)
+                    erlaubt = await _guild_hat_beta_server(interaction.guild_id)
                 if erlaubt:
                     return True
                 gesperrt = True
@@ -39874,13 +39878,73 @@ async def _sitzung_hat_beta_zugriff(sess: Optional[Dict[str, Any]]) -> bool:
     return await _user_hat_rolle(gid, int(uid), BETA_ROLLE_ID)
 
 
+# Beta haengt - wie Premium - am SERVER und nicht nur an der einzelnen Person: Ein Server gilt als Beta-Server, wenn er
+# freigeschaltet ist (Guild zugeordnet) UND entweder die Kunden-Stufe "beta"/"premium_beta" hat ODER sein Eigentuemer die
+# Beta-Rolle im Betreiber-Discord traegt. Dann duerfen auch dessen Admins (Eigentuemer, Gaeste mit Dashboard Permissions,
+# Discord-Befehle auf der Guild des Servers) die Beta-Module nutzen - ohne selbst die Rolle zu haben, aber nur auf diesem Server.
+_BETA_BESITZER_TTL = 60.0
+_BETA_BESITZER_CACHE: Dict[str, Tuple[float, bool]] = {}
+
+
+async def _besitzer_hat_beta_rolle(owner_id: str) -> bool:
+    """Traegt der Eigentuemer die Beta-Rolle im Betreiber-Discord? Eine Minute gemerkt: Eine Seite fragt mehrere Module ab,
+    und jede Abfrage ginge sonst einzeln zu Discord."""
+    jetzt = time.time()
+    alt = _BETA_BESITZER_CACHE.get(owner_id)
+    if alt is not None and jetzt - alt[0] < _BETA_BESITZER_TTL:
+        return alt[1]
+    try:
+        gid = int(str(cfg.config.get("premium_role_guild_id") or "0") or 0)
+        hat = bool(gid) and await _user_hat_rolle(gid, int(owner_id), BETA_ROLLE_ID)
+    except (TypeError, ValueError):
+        hat = False
+    _BETA_BESITZER_CACHE[owner_id] = (jetzt, hat)
+    return hat
+
+
+async def _server_hat_beta(conn: Optional[ServerConnection]) -> bool:
+    """Gilt dieser Server als Beta-Server? Ohne Guild-Zuordnung (= nicht freigeschaltet) nie."""
+    if conn is None or not conn.guild_ids:
+        return False
+    if _kunden_stufe(conn) in ("beta", "premium_beta"):
+        return True
+    besitzer = str(conn.data.get("owner_discord_id") or "").strip()
+    return besitzer.isdigit() and await _besitzer_hat_beta_rolle(besitzer)
+
+
+async def _guild_hat_beta_server(guild_id: Any) -> bool:
+    """Gehoert dieser Discord-Guild mindestens ein Beta-Server? (Wie bei Premium zaehlt jeder ihrer Server.)"""
+    try:
+        for c in connections.all_for_guild(int(guild_id)):
+            if await _server_hat_beta(c):
+                return True
+    except Exception:  # noqa: BLE001 – im Zweifel nicht freigeben
+        pass
+    return False
+
+
+def _sitzung_gehoert_zum_server(sess: Optional[Dict[str, Any]], conn: Optional[ServerConnection]) -> bool:
+    """Ist diese Anmeldung Betreiber, Eigentuemer oder Gast mit Dashboard Permission DIESES Servers? Nur dann darf der
+    Beta-Status des Servers fuer sie gelten."""
+    if not sess or conn is None:
+        return False
+    if sess.get("is_admin"):
+        return True
+    uid = str(((sess.get("discord") or {}).get("id")) or "").strip()
+    if not uid:
+        return False
+    if uid == str(conn.data.get("owner_discord_id") or "").strip():
+        return True
+    return bool(_dash_guest_actions(uid, conn))
+
+
 async def _module_erlaubt(key: str, sess: Optional[Dict[str, Any]],
                           conn: Optional[ServerConnection]) -> bool:
     """Darf diese Sitzung dieses Feed-Modul nutzen? Der Betreiber (Admin-Rolle)
     kommt immer durch, sonst entscheidet die im Modul Manager gesetzte Stufe:
-    public = jeder, premium = wie bisher (_sitzung_hat_premium), beta = nur
-    mit der dafuer hinterlegten Rolle im Haupt-Discord, under_review = nur
-    der Betreiber selbst."""
+    public = jeder, premium = wie bisher (_sitzung_hat_premium), beta = mit der
+    dafuer hinterlegten Rolle im Haupt-Discord ODER auf einem Beta-Server (siehe
+    _server_hat_beta), under_review = nur der Betreiber selbst."""
     if (sess or {}).get("is_admin"):
         return True
     tier = _module_tier(key)
@@ -39897,9 +39961,11 @@ async def _module_erlaubt(key: str, sess: Optional[Dict[str, Any]],
             return False
         try:
             gid = int(str(cfg.config.get("premium_role_guild_id") or "0") or 0)
-            return await _user_hat_rolle(gid, int(uid), role_id)
+            if await _user_hat_rolle(gid, int(uid), role_id):
+                return True
         except (TypeError, ValueError):
-            return False
+            pass
+        return _sitzung_gehoert_zum_server(sess, conn) and await _server_hat_beta(conn)
     return False
 
 
@@ -41816,7 +41882,8 @@ async def api_get_session(request: web.Request) -> web.Response:
         "premium_text": DASHBOARD_PREMIUM_TEXT,
         # Fuer das Status-Abzeichen unter dem Discord-Namen: unabhaengig von
         # Premium, siehe _sitzung_hat_beta_zugriff.
-        "beta": await _sitzung_hat_beta_zugriff(sess),
+        "beta": (await _sitzung_hat_beta_zugriff(sess)
+                 or (_sitzung_gehoert_zum_server(sess, _conn) and await _server_hat_beta(_conn))),
         "guild_id_requested": (str(_conn.guild_ids_requested[0])
                                if _conn is not None and _conn.guild_ids_requested else None),
         "discord_login": login_required,
