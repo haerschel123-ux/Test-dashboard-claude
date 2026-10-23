@@ -302,13 +302,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "auto_restart_schedule: Wird über /auto restart im Discord gesetzt (Startzeit +",
         "  Intervall in Stunden). Ankündigungen 60/30/15/10/5/3 Min vorher im /setup feeds restart Channel.",
         "economy_backup_keep: So viele tägliche economy.db-Backups werden aufbewahrt.",
-        "delivery_cleanup_delay_seconds: FALLBACK-Delay. Nach einem Server-Neustart wartet",
-        "  der Bot, bis der Server wieder ONLINE ist (A2S-Antwort), und entfernt die",
-        "  SHOP_-Einträge dann SOFORT aus der cfgEffectArea.json. Nur wenn der Online-",
-        "  Status nicht prüfbar ist (server_ip/query_port fehlt oder A2S-Timeout),",
-        "  wartet er stattdessen diesen festen Delay, bevor er sie entfernt.",
-        "delivery_online_wait_max_seconds: Maximal so lange auf die A2S-Antwort warten;",
-        "  danach (oder ohne server_ip/query_port) greift der feste Delay als Fallback.",
+        "Shop-Lieferung: Nach einem erkannten Server-Neustart (egal, wodurch er ausgelöst wurde)",
+        "  entfernt der Bot die gelieferten SHOP_-Einträge genau 2 Minuten später aus der",
+        "  cfgEffectArea.json. Dieser Wert ist fest und nicht einstellbar.",
+        "delivery_online_wait_max_seconds: Maximal so lange auf die A2S-Antwort warten (Mieten,",
+        "  Airdrop-/Gameplay-Rotation); ohne server_ip/query_port wird nicht gewartet.",
         "zones: Überwachte Zonen (im Dashboard unter „Zonen\" verwalten).",
         "  Pro Zone: name, x/z (iZurvive: x=Ost, z=Nord), radius (Meter), role_id",
         "  (optional, Ping-@), channel_id (optional, eigener Warn-Channel), allowlist",
@@ -318,7 +316,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "zone_ping_cooldown_seconds: Wiederhol-Intervall zwischen zwei Pings für",
         "  denselben Spieler in derselben Zone (Default 300 = 5 Minuten)."
     ],
-    "delivery_cleanup_delay_seconds": 600,
     "delivery_online_wait_max_seconds": 2700,
     "zones": [],
     "zone_ping_cooldown_seconds": 300,
@@ -4049,7 +4046,7 @@ class ServerConnection:
         "kill_reward", "action_economy", "max_linked_accounts",
         "shop_default_price", "shop_category_prices", "shop_categories_custom",
         "default_radius", "default_pos_y",
-        "delivery_grace_seconds", "delivery_cleanup_delay_seconds",
+        "delivery_grace_seconds",
         "delivery_online_wait_max_seconds",
         "restart_cooldown_seconds", "zone_ping_cooldown_seconds",
         "log_poll_interval_seconds", "ftp_fail_warn_cycles",
@@ -6085,6 +6082,12 @@ class DayZBot(discord.Client):
                 # zwischen letztem Poll und Rotation keine Events verloren gehen.
                 restart_detected = bool(state.get("file"))
                 old_file = state.get("file")
+                if restart_detected and conn.shop:
+                    # Sofort melden, NOCH VOR dem Lesen des Rests der alten Datei: Ist der nicht lesbar (z. B. FTP 550),
+                    # bricht dieser Zyklus unten ab und die Rotation wird wiederholt - der Neustart waere sonst nie
+                    # beim Shop angekommen und die gelieferten Items blieben in der Datei. Die Kennung entprellt die
+                    # Wiederholungen.
+                    conn.shop.neustart_erkannt(latest)
                 if old_file and old_file in adm_files and not skip_backlog:
                     old_tail, _ = await _log_lesen_ab_offset(
                         conn, old_file, state.get("offset", 0))
@@ -6131,6 +6134,8 @@ class DayZBot(discord.Client):
                 # Gleiche Datei, aber geschrumpft: Server hat die ADM beim Neustart geleert
                 log.info(f"[POLL] Offset {state.get('offset', 0)} > Dateigröße {current_size} – Neustart (Truncation) erkannt")
                 restart_detected = True
+                if conn.shop:
+                    conn.shop.neustart_erkannt()
                 state = {"file": latest, "offset": 0}
                 # Die geleerte Datei enthaelt den alten Block nicht mehr – der
                 # bisherige Roster ist damit hinfaellig. Neu hydrieren lassen,
@@ -6139,12 +6144,10 @@ class DayZBot(discord.Client):
                 conn.online_zustand_zuruecksetzen(
                     "ADM-Datei wurde geleert (Truncation/Neustart)")
 
-            if conn.shop and (restart_detected or conn.shop.cleanup_retry_needed):
-                # Offene Käufe ausliefern; nach FTP-Fehler automatisch erneut versuchen.
-                # Bei frisch erkanntem Neustart bleiben die Einträge in der Datei,
-                # bis der Server per A2S wieder online ist (Mission-Load fertig),
-                # und werden dann sofort entfernt
-                conn.shop.spawn_cleanup(delayed=restart_detected)
+            if conn.shop and conn.shop.cleanup_retry_needed:
+                # Entfernen der gelieferten Einträge nach FTP-Fehler automatisch erneut versuchen.
+                # (Ein frisch erkannter Neustart startet seine Frist schon oben über conn.shop.neustart_erkannt.)
+                conn.shop.spawn_cleanup()
 
             if conn.rentals and (restart_detected or conn.rentals.cleanup_retry_needed):
                 # Miet-Ablauf-Zaehler weiterschalten / abgelaufene Mieten entfernen -
@@ -30907,6 +30910,9 @@ def _effect_pfad_zur_mission(effect_pfad: Any, mission_dir: Any) -> str:
 
 class ShopManager:
     AREA_PREFIX = "SHOP_"
+    # So lange nach einem erkannten Neustart bleiben die gelieferten SHOP_-Eintraege in der Datei (der Server liest sie beim
+    # Hochfahren und spawnt die Items), danach werden sie entfernt. Fest und unabhaengig davon, wodurch der Neustart kam.
+    CLEANUP_NACH_NEUSTART_SEKUNDEN = 120
 
     def __init__(self, bot_ref: "DayZBot", conn: "ServerConnection"):
         self.bot  = bot_ref
@@ -30919,17 +30925,28 @@ class ShopManager:
         self._cleanup_task: Optional[asyncio.Task] = None
         self.cleanup_retry_needed = False   # FTP-Fehler beim Cleanup → Retry im Poll-Zyklus
         self._last_restart_at = 0.0         # Zeitpunkt des zuletzt ERKANNTEN Server-Neustarts
+        self._gemeldete_kennung = ""        # Datei, deren Neustart schon gemeldet wurde (siehe neustart_erkannt)
+
+    # ── Neustart erkannt: Aufraeum-Frist starten ──────────────
+    def neustart_erkannt(self, kennung: str = "") -> None:
+        """Der Log-Poller hat einen Server-Neustart bemerkt - gleich, ob der Bot, der Neustart-Plan, Nitrado oder ein Absturz
+        ihn ausgeloest hat; erkannt wird er nur an den Logdateien. Startet die Frist von CLEANUP_NACH_NEUSTART_SEKUNDEN, nach
+        der die SHOP_-Eintraege entfernt werden.
+        kennung (z. B. der Name der neuen ADM-Datei) entprellt: solange die Rotation nicht abgeschlossen ist, sieht der Poller
+        denselben Neustart in jedem Zyklus wieder - das darf die Frist nicht jedes Mal neu starten."""
+        if kennung:
+            if kennung == self._gemeldete_kennung:
+                return
+            self._gemeldete_kennung = kennung
+        self._last_restart_at = time.time()
+        self.spawn_cleanup(delayed=True)
 
     # ── Cleanup als Task starten (Referenz halten, Fehler loggen) ─
     def spawn_cleanup(self, delayed: bool = False):
         """Startet on_restart_detected als Task – nie fire-and-forget.
-        delayed=True bei frisch erkanntem Neustart: die SHOP_-Einträge bleiben
-        in der Datei, bis der Server per A2S wieder online ist (= Boot fertig,
-        cfgEffectArea.json sicher eingelesen), und werden dann sofort entfernt.
-        Ist der Online-Status nicht prüfbar, greift stattdessen der feste
-        delivery_cleanup_delay_seconds-Fallback."""
-        if delayed:
-            self._last_restart_at = time.time()
+        delayed=True bei frisch erkanntem Neustart (siehe neustart_erkannt): die SHOP_-Einträge bleiben noch
+        CLEANUP_NACH_NEUSTART_SEKUNDEN in der Datei, dann werden sie entfernt. Läuft schon ein Task, wartet der mit der
+        neuen Erkennungszeit einfach länger - ein zweiter wird nicht gestartet."""
         if self._cleanup_task and not self._cleanup_task.done():
             return
         self._cleanup_task = asyncio.create_task(self._cleanup_safe(delayed))
@@ -31199,40 +31216,13 @@ class ShopManager:
         except Exception as e:
             log.error(f"[SHOP] Auto-Restart fehlgeschlagen: {e}")
 
-    # ── Warten bis der Server wieder online ist (A2S) ─────────
-    async def _wait_for_server_online(self) -> bool:
-        """Pollt den Spielserver per A2S, bis er antwortet (= wirklich online).
-        True = online gesehen. False = server_ip/query_port fehlt oder Timeout
-        (delivery_online_wait_max_seconds) – dann greift der feste Delay als
-        Fallback, sonst würden Items bei falschem Query-Port ewig respawnen."""
-        ip = str(self.conn.get("server_ip") or "").split(":")[0].strip()
-        qport = int(self.conn.get("query_port", 0) or 0)
-        if not ip or not qport:
-            log.warning("[SHOP] server_ip/query_port nicht gesetzt – kann Server-online "
-                        "nicht prüfen, nutze festen Delivery-Delay als Fallback.")
-            return False
-        max_wait = max(60, int(self.conn.get("delivery_online_wait_max_seconds", 2700) or 2700))
-        deadline = time.time() + max_wait
-        loop = asyncio.get_running_loop()
-        while time.time() < deadline:
-            info = await loop.run_in_executor(None, a2s_query, ip, qport)
-            if info:
-                return True
-            await asyncio.sleep(20)
-        log.warning(f"[SHOP] Server nach {max_wait // 60} Min nicht per A2S erreichbar – "
-                    "nutze festen Delivery-Delay als Fallback.")
-        return False
-
     # ── Neustart erkannt (neue ADM-Datei) → ausliefern ────────
     async def on_restart_detected(self, delayed: bool = False):
-        """Wird vom Log-Poller nach einem erkannten Server-Neustart aufgerufen.
-        Wartet bei delayed, bis der Server per A2S wieder online ist – die neue ADM
-        erscheint früh im Boot, der Server muss die cfgEffectArea.json aber erst
-        vollständig einlesen (zu frühes Entfernen = Items spawnen nie). Antwortet
-        der Server per A2S, ist die Mission geladen → sofort bereinigen. Nur wenn
-        der Online-Status nicht prüfbar ist, greift delivery_cleanup_delay_seconds
-        als fester Fallback-Delay. Danach werden hinreichend alte pending-Käufe
-        geliefert und die Datei bereinigt."""
+        """Wird nach einem erkannten Server-Neustart aufgerufen (siehe neustart_erkannt).
+        Wartet bei delayed CLEANUP_NACH_NEUSTART_SEKUNDEN nach der Erkennung - so lange braucht der Server, um die
+        cfgEffectArea.json beim Hochfahren einzulesen (zu frühes Entfernen = Items spawnen nie). Bewusst KEIN Warten auf
+        eine A2S-Antwort: Konsolen-Server (PS4/Xbox) antworten oft nie, die Einträge blieben dann fast eine Stunde in der
+        Datei. Danach werden hinreichend alte pending-Käufe geliefert und die Datei bereinigt."""
         self.cleanup_retry_needed = False
         grace = int(self.conn.get("delivery_grace_seconds", 90) or 90)
         poll  = int(self.conn.get("log_poll_interval_seconds", 10) or 10)
@@ -31250,32 +31240,17 @@ class ShopManager:
         if not rows:
             return
         if delayed:
-            delay = max(0, int(self.conn.get("delivery_cleanup_delay_seconds", 600) or 600))
-            log.info(f"[SHOP] Server-Neustart erkannt – warte bis der Server wieder online "
-                     f"ist, danach werden {len(rows)} Lieferung(en) sofort abgeschlossen.")
+            log.info(f"[SHOP] {self.conn.name}: Server-Neustart erkannt – in "
+                     f"{self.CLEANUP_NACH_NEUSTART_SEKUNDEN // 60} Min werden {len(rows)} Lieferung(en) abgeschlossen "
+                     f"(SHOP_-Einträge werden entfernt).")
+            # Fällig CLEANUP_NACH_NEUSTART_SEKUNDEN nach der ZULETZT erkannten Neustart-Erkennung. Meldet der Poller
+            # währenddessen einen weiteren Neustart (spawn_cleanup startet keinen zweiten Task), verschiebt sich der
+            # Zeitpunkt entsprechend - sonst würden die Einträge mitten im nächsten Hochfahren entfernt.
             while True:
-                seen = self._last_restart_at   # Stand vor dem Warten
-                online = await self._wait_for_server_online()
-                if online:
-                    # Server antwortet per A2S → Mission (inkl. cfgEffectArea.json)
-                    # ist geladen, Items sind gespawnt → Einträge sofort entfernen
-                    log.info("[SHOP] Server ist wieder online – SHOP_-Einträge werden "
-                             "jetzt sofort entfernt.")
-                elif delay:
-                    # Online-Status nicht prüfbar (keine server_ip/query_port oder
-                    # A2S-Timeout) → fester Delay als Sicherheits-Fallback, sonst
-                    # könnten die Einträge entfernt werden, bevor der Server die
-                    # Datei eingelesen hat (Item spawnt nie)
-                    log.info(f"[SHOP] Server-online nicht prüfbar – Fallback: warte "
-                             f"{delay // 60} Min festen Delay vor dem Entfernen.")
-                    await asyncio.sleep(delay)
-                # Neuer Restart während des Wartens erkannt? spawn_cleanup startet
-                # keinen zweiten Task, solange dieser läuft → hier von vorn warten,
-                # sonst würden die Einträge mitten im nächsten Boot entfernt.
-                if self._last_restart_at <= seen:
+                rest = self._last_restart_at + self.CLEANUP_NACH_NEUSTART_SEKUNDEN - time.time()
+                if rest <= 0:
                     break
-                log.info("[SHOP] Erneuter Server-Neustart während der Wartezeit erkannt – "
-                         "warte erneut auf Server-online.")
+                await asyncio.sleep(min(rest, 10))
         ids:   List[int] = []
         names: List[str] = []
         for r in rows:
