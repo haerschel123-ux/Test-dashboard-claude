@@ -24012,6 +24012,30 @@ async def _spt_dateien_lesen(conn: ServerConnection, loop) -> Tuple[Optional[str
             _spt_tags_lesen(tags_text if tags_status == "ok" else None))
 
 
+def _spt_katalog_lesen(text: Optional[str]) -> Optional[List[Dict[str, Any]]]:
+    """Item-Katalog fuer den Item Browser: die Klassennamen der db/types.xml DIESES Servers, gruppiert nach ihrer
+    <category name="…"/> (ohne Kategorie: Name ""). Kategorien alphabetisch, ohne Kategorie zuletzt; Namen ohne
+    Beachtung der Gross-/Kleinschreibung sortiert. None, wenn die Datei fehlt oder kaputt ist."""
+    if not text:
+        return None
+    try:
+        wurzel = ET.fromstring(text)
+    except ET.ParseError:
+        return None
+    if wurzel.tag != "types":
+        return None
+    gruppen: Dict[str, List[str]] = {}
+    for t in wurzel.findall("type"):
+        name = (t.get("name") or "").strip()
+        if not name or not _SPT_NAME_RE.match(name):
+            continue
+        kat = next(((c.get("name") or "").strip() for c in t.findall("category") if (c.get("name") or "").strip()), "")
+        gruppen.setdefault(kat, []).append(name)
+    kategorien = [{"name": k, "items": sorted(set(v), key=lambda s: (s.lower(), s))} for k, v in gruppen.items()]
+    kategorien.sort(key=lambda g: (g["name"] == "", g["name"].lower()))
+    return kategorien
+
+
 async def api_tools_spawnabletypes_get(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request, "tools.spawnabletypes")
     if fehler is not None:
@@ -24025,6 +24049,15 @@ async def api_tools_spawnabletypes_get(request: web.Request) -> web.Response:
     if not _mission_dir_of(conn):
         return ok({"eintraege": [], "kein_mission_ordner": True})
     loop = asyncio.get_running_loop()
+    if request.query.get("katalog"):
+        # Item Browser: eigene Abfrage, damit das Oeffnen des Tools nicht jedes Mal auch die (grosse) types.xml liest
+        try:
+            types_text, types_status = await _tools_datei_lesen(conn, "db/types.xml", loop)
+        except Exception as e:  # noqa: BLE001
+            log.exception("[TOOLS] SpawnableTypes: types.xml lesen fehlgeschlagen")
+            return err(f"db/types.xml per FTP nicht lesbar ({type(e).__name__}: {e}).", 502)
+        kategorien = _spt_katalog_lesen(types_text if types_status == "ok" else None)
+        return ok({"katalog": {"gelesen": kategorien is not None, "kategorien": kategorien or []}})
     try:
         text, status, praesets, tags = await _spt_dateien_lesen(conn, loop)
     except Exception as e:  # noqa: BLE001
@@ -51724,6 +51757,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "0559404f19f1db0e1a5438512ae802a5af1ecce82379ea8e588e5454b85353b0",
         "b532e93d2b9b046fc8f8c4e9b0026a0293fea64c79048ae8ee8add00ed42aac8",
         "ce79c3176d9c957cbbbc861bf18996aaa271e095bdb5ca321ccf7aaa52692cd1",
+        "978ee42f18b2264e525962decb256521244cd6da965c533ee0f17cb46c7bdcec",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -51981,6 +52015,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "cda2739ed6a1aeaed6ffb472602be5099422c18b5c7006021b2d66aceb7560a4",
         "399c6c489a59e5b9fd552061490fe01a0f0e9f1b90c7135344a5b83550dd605b",
         "0abd441c5d36335854ba59e697f5ff77541bc06bc111c7b39bc9964ada982e66",
+        "faccc5535e6a68a6d7d27f2f35c945c3eacbb5c87794bff40b106a7bd2f77e64",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
