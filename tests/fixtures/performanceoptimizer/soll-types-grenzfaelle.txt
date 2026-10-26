@@ -1,0 +1,335 @@
+=== DayZ Server Performance Report ===
+File: edge_types.xml | Mode: types
+Score: 0/100 | Total: 99 | Criticals: 37 | Warnings: 31
+
+=== FLAGGED ITEMS ===
+
+[CRITICAL] AlarmClock_Blue
+  - nominal=49 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] AlarmClock_Green
+  - nominal=50 is 2.5× the vanilla value of 20
+    FIX: Vanilla has 20 active. Each extra item is tracked by the CE every cycle.
+  - nominal=50 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] AlarmClock_Red
+  - nominal=51 is 2.5× the vanilla value of 20
+    FIX: Vanilla has 20 active. Each extra item is tracked by the CE every cycle.
+  - nominal=51 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] AmmoBox_00buck_10rnd
+  - nominal=53 is 2.6× the vanilla value of 20
+    FIX: Vanilla has 20 active. Each extra item is tracked by the CE every cycle.
+  - lifetime=14400s is 50% of vanilla 28800s
+    FIX: Vanilla uses 28800s. A shorter lifetime increases CE cycling frequency.
+  - nominal=53 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] AmmoBox_12gaSlug_10Rnd
+  - nominal=57 is 2.9× the vanilla value of 20
+    FIX: Vanilla has 20 active. Each extra item is tracked by the CE every cycle.
+  - lifetime=14400s is 50% of vanilla 28800s
+    FIX: Vanilla uses 28800s. A shorter lifetime increases CE cycling frequency.
+  - nominal=57 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] AmmoBox_308Win_20Rnd
+  - nominal=99 is 5.0× the vanilla value of 20
+    FIX: Vanilla has 20 active. Each extra item is tracked by the CE every cycle.
+  - nominal=99 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] AmmoBox_380_35rnd
+  - nominal=100 is 5.0× the vanilla value of 20
+    FIX: Vanilla uses 20 for this item. A value of 100 will flood the map. Consider reducing toward 20–30.
+  - nominal=100 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] AmmoBox_45ACP_25rnd
+  - nominal=101 is 5.0× the vanilla value of 20
+    FIX: Vanilla uses 20 for this item. A value of 101 will flood the map. Consider reducing toward 20–30.
+  - lifetime=14400s is 50% of vanilla 28800s
+    FIX: Vanilla uses 28800s. A shorter lifetime increases CE cycling frequency.
+  - nominal=101 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] Ammo_12gaRubberSlug
+  - lifetime=14400s is 50% of vanilla 28800s
+    FIX: Vanilla uses 28800s. A shorter lifetime increases CE cycling frequency.
+  - nominal=99 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] BandageDressing
+  - nominal=100 is 2.5× the vanilla value of 40
+    FIX: Vanilla has 40 active. Each extra item is tracked by the CE every cycle.
+  - nominal=100 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] Barrel_Blue
+  - nominal=101 is 2.5× the vanilla value of 40
+    FIX: Vanilla has 40 active. Each extra item is tracked by the CE every cycle.
+  - lifetime=14400s is only 0% of vanilla 3888000s
+    FIX: Very short lifetimes force the CE to respawn this item far more often than vanilla intended. Increase to at least 1944000s.
+  - nominal=101 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] Barrel_Green
+  - nominal=200 is 5.0× the vanilla value of 40
+    FIX: Vanilla uses 40 for this item. A value of 200 will flood the map. Consider reducing toward 40–60.
+  - lifetime=14400s is only 0% of vanilla 3888000s
+    FIX: Very short lifetimes force the CE to respawn this item far more often than vanilla intended. Increase to at least 1944000s.
+  - nominal=200 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[WARNING] AK74_Hndgrd
+  - nominal=13 is 2.6× the vanilla value of 5
+    FIX: Vanilla has 5 active. Each extra item is tracked by the CE every cycle.
+
+[CRITICAL] AK74_WoodBttstck
+  - nominal=25 is 5.0× the vanilla value of 5
+    FIX: Vanilla uses 5 for this item. A value of 25 will flood the map. Consider reducing toward 5–8.
+  - nominal=25 is above recommended limit (20)
+    FIX: Consider reducing nominal. Each additional spawned item adds CE processing overhead every cleanup cycle.
+
+[WARNING] AmmoBox_308WinTracer_20Rnd
+  - lifetime=14400s is 50% of vanilla 28800s
+    FIX: Vanilla uses 28800s. A shorter lifetime increases CE cycling frequency.
+
+[WARNING] AmmoBox_556x45Tracer_20Rnd
+  - nominal=18 is 2.6× the vanilla value of 7
+    FIX: Vanilla has 7 active. Each extra item is tracked by the CE every cycle.
+  - lifetime=14400s is 50% of vanilla 28800s
+    FIX: Vanilla uses 28800s. A shorter lifetime increases CE cycling frequency.
+
+[CRITICAL] AmmoBox_762x39Tracer_20Rnd
+  - nominal=35 is 5.0× the vanilla value of 7
+    FIX: Vanilla uses 7 for this item. A value of 35 will flood the map. Consider reducing toward 7–11.
+  - lifetime=14400s is 50% of vanilla 28800s
+    FIX: Vanilla uses 28800s. A shorter lifetime increases CE cycling frequency.
+  - nominal=35 is above recommended limit (20)
+    FIX: Consider reducing nominal. Each additional spawned item adds CE processing overhead every cleanup cycle.
+
+[CRITICAL] ACOGOptic
+  - lifetime=3599s is only 25% of vanilla 14400s
+    FIX: Very short lifetimes force the CE to respawn this item far more often than vanilla intended. Increase to at least 7200s.
+
+[CRITICAL] AKS74U_Bttstck
+  - lifetime=3600s is only 25% of vanilla 14400s
+    FIX: Very short lifetimes force the CE to respawn this item far more often than vanilla intended. Increase to at least 7200s.
+
+[WARNING] AK_FoldingBttstck
+  - lifetime=3601s is 25% of vanilla 14400s
+    FIX: Vanilla uses 14400s. A shorter lifetime increases CE cycling frequency.
+
+[WARNING] AK_FoldingBttstck_Black
+  - lifetime=7200s is 50% of vanilla 14400s
+    FIX: Vanilla uses 14400s. A shorter lifetime increases CE cycling frequency.
+
+[CRITICAL] AKM
+  - lifetime=1800s is only 25% of vanilla 7200s
+    FIX: Very short lifetimes force the CE to respawn this item far more often than vanilla intended. Increase to at least 3600s.
+
+[WARNING] AmmoBox_12gaRubberSlug_10Rnd
+  - lifetime=1801s is 25% of vanilla 7200s
+    FIX: Vanilla uses 7200s. A shorter lifetime increases CE cycling frequency.
+
+[WARNING] Ammo_CupidsBolt
+  - lifetime=3600s is 50% of vanilla 7200s
+    FIX: Vanilla uses 7200s. A shorter lifetime increases CE cycling frequency.
+
+[CRITICAL] AK101
+  - lifetime=7200s is only 25% of vanilla 28800s
+    FIX: Very short lifetimes force the CE to respawn this item far more often than vanilla intended. Increase to at least 14400s.
+
+[WARNING] AK101_Black
+  - lifetime=7201s is 25% of vanilla 28800s
+    FIX: Vanilla uses 28800s. A shorter lifetime increases CE cycling frequency.
+
+[WARNING] AK101_Green
+  - lifetime=14400s is 50% of vanilla 28800s
+    FIX: Vanilla uses 28800s. A shorter lifetime increases CE cycling frequency.
+
+[WARNING] Abs_Nominal_16
+  - count_in_map=1 with nominal=16 — all 16 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[WARNING] Abs_Nominal_20
+  - count_in_map=1 with nominal=20 — all 20 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[WARNING] Abs_Nominal_21
+  - nominal=21 is above recommended limit (20)
+    FIX: Consider reducing nominal. Each additional spawned item adds CE processing overhead every cleanup cycle.
+  - count_in_map=1 with nominal=21 — all 21 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[WARNING] Abs_Nominal_40
+  - nominal=40 is above recommended limit (20)
+    FIX: Consider reducing nominal. Each additional spawned item adds CE processing overhead every cleanup cycle.
+  - count_in_map=1 with nominal=40 — all 40 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[CRITICAL] Abs_Nominal_41
+  - nominal=41 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+  - count_in_map=1 with nominal=41 — all 41 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[CRITICAL] Abs_Nominal_100
+  - nominal=100 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+  - count_in_map=1 with nominal=100 — all 100 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[WARNING] Abs_Min_20_18
+  - min=18 is 90% of nominal=20
+    FIX: Keep min at around 50–70% of nominal. A min too close to nominal forces the CE to re-spawn items almost immediately after cleanup.
+
+[WARNING] Abs_Min_20_20
+  - min=20 is 100% of nominal=20
+    FIX: Keep min at around 50–70% of nominal. A min too close to nominal forces the CE to re-spawn items almost immediately after cleanup.
+
+[CRITICAL] Abs_Min_20_21
+  - min=21 exceeds nominal=20 — CE will never be satisfied
+    FIX: min must always be ≤ nominal. This creates a perpetual respawn loop that constantly stresses the CE.
+
+[WARNING] Abs_Min_7_6
+  - min=6 is 86% of nominal=7
+    FIX: Keep min at around 50–70% of nominal. A min too close to nominal forces the CE to re-spawn items almost immediately after cleanup.
+
+[WARNING] Abs_Min_7_7
+  - min=7 is 100% of nominal=7
+    FIX: Keep min at around 50–70% of nominal. A min too close to nominal forces the CE to re-spawn items almost immediately after cleanup.
+
+[CRITICAL] Abs_Min_7_8
+  - min=8 exceeds nominal=7 — CE will never be satisfied
+    FIX: min must always be ≤ nominal. This creates a perpetual respawn loop that constantly stresses the CE.
+
+[CRITICAL] Abs_Min_100_85
+  - nominal=100 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] Abs_Min_100_86
+  - nominal=100 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+  - min=86 is 86% of nominal=100
+    FIX: Keep min at around 50–70% of nominal. A min too close to nominal forces the CE to re-spawn items almost immediately after cleanup.
+
+[CRITICAL] Abs_Life_1
+  - lifetime=1s (0 min) is extremely short
+    FIX: Set lifetime to at least 3600s (1 hour). Very short lifetimes cause items to respawn constantly, multiplying CE processing load.
+
+[CRITICAL] Abs_Life_30
+  - lifetime=30s (1 min) is extremely short
+    FIX: Set lifetime to at least 3600s (1 hour). Very short lifetimes cause items to respawn constantly, multiplying CE processing load.
+
+[CRITICAL] Abs_Life_59
+  - lifetime=59s (1 min) is extremely short
+    FIX: Set lifetime to at least 3600s (1 hour). Very short lifetimes cause items to respawn constantly, multiplying CE processing load.
+
+[CRITICAL] Abs_Life_90
+  - lifetime=90s (2 min) is extremely short
+    FIX: Set lifetime to at least 3600s (1 hour). Very short lifetimes cause items to respawn constantly, multiplying CE processing load.
+
+[CRITICAL] Abs_Life_570
+  - lifetime=570s (10 min) is extremely short
+    FIX: Set lifetime to at least 3600s (1 hour). Very short lifetimes cause items to respawn constantly, multiplying CE processing load.
+
+[CRITICAL] Abs_Life_599
+  - lifetime=599s (10 min) is extremely short
+    FIX: Set lifetime to at least 3600s (1 hour). Very short lifetimes cause items to respawn constantly, multiplying CE processing load.
+
+[WARNING] Abs_Life_600
+  - lifetime=600s (10 min) is below 30 minutes
+    FIX: Consider 3600s or above. Shorter lifetimes increase the frequency of CE spawning and cleanup cycles.
+
+[WARNING] Abs_Life_630
+  - lifetime=630s (11 min) is below 30 minutes
+    FIX: Consider 3600s or above. Shorter lifetimes increase the frequency of CE spawning and cleanup cycles.
+
+[WARNING] Abs_Life_1799
+  - lifetime=1799s (30 min) is below 30 minutes
+    FIX: Consider 3600s or above. Shorter lifetimes increase the frequency of CE spawning and cleanup cycles.
+
+[CRITICAL] Abs_Restock_1
+  - restock=1s — extremely aggressive respawn timer
+    FIX: Set restock to 0 (disabled) or at least 1800s. A near-zero restock hammers the CE with respawn requests every minute.
+
+[CRITICAL] Abs_Restock_59
+  - restock=59s — extremely aggressive respawn timer
+    FIX: Set restock to 0 (disabled) or at least 1800s. A near-zero restock hammers the CE with respawn requests every minute.
+
+[WARNING] Abs_Restock_60
+  - restock=60s is below 5 minutes
+    FIX: Restock times under 5 minutes cause frequent CE cycles. Consider 1800–3600s or setting to 0.
+
+[WARNING] Abs_Restock_299
+  - restock=299s is below 5 minutes
+    FIX: Restock times under 5 minutes cause frequent CE cycles. Consider 1800–3600s or setting to 0.
+
+[WARNING] Flag_Cim1_N16
+  - count_in_map=1 with nominal=16 — all 16 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[WARNING] Flag_CimLeer_N16
+  - count_in_map=1 with nominal=16 — all 16 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[WARNING] Flag_OhneAttr_N16
+  - count_in_map=1 with nominal=16 — all 16 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[WARNING] Flag_OhneFlags_N16
+  - count_in_map=1 with nominal=16 — all 16 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[WARNING] Zahl_3
+  - nominal=30 is above recommended limit (20)
+    FIX: Consider reducing nominal. Each additional spawned item adds CE processing overhead every cleanup cycle.
+  - count_in_map=1 with nominal=30 — all 30 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[WARNING] Zahl_4
+  - min=1 is 100% of nominal=1
+    FIX: Keep min at around 50–70% of nominal. A min too close to nominal forces the CE to re-spawn items almost immediately after cleanup.
+
+[WARNING] Zahl_7
+  - nominal=25 is above recommended limit (20)
+    FIX: Consider reducing nominal. Each additional spawned item adds CE processing overhead every cleanup cycle.
+  - count_in_map=1 with nominal=25 — all 25 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[WARNING] Zahl_8
+  - count_in_map=1 with nominal=16 — all 16 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[CRITICAL] Zahl_10
+  - nominal=45 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+  - count_in_map=1 with nominal=45 — all 45 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[CRITICAL] Zahl_11
+  - nominal=41 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+  - count_in_map=1 with nominal=41 — all 41 items physically tracked
+    FIX: Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds significant overhead. Set count_in_map=0 if map presence is not required.
+
+[WARNING] Min_Text
+  - nominal=30 is above recommended limit (20)
+    FIX: Consider reducing nominal. Each additional spawned item adds CE processing overhead every cleanup cycle.
+
+[CRITICAL] Unknown
+  - nominal=50 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] Doppelt_A
+  - nominal=45 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.
+
+[CRITICAL] Name mit Leerzeichen & Sonder
+  - nominal=45 is very high (>40)
+    FIX: Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant TPS drops on console hardware.

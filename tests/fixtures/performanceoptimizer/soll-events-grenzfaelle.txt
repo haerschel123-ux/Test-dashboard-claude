@@ -1,0 +1,217 @@
+=== DayZ Server Performance Report ===
+File: edge_events.xml | Mode: events
+Score: 0/100 | Total: 55 | Criticals: 30 | Warnings: 10
+
+=== FLAGGED ITEMS ===
+
+[WARNING] AnimalSheep
+  - nominal=9 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+
+[WARNING] AnimalSheep
+  - nominal=10 is 2.0× vanilla value of 5
+    FIX: Vanilla runs 5 group(s). Consider staying closer to avoid overloading the entity budget.
+  - nominal=10 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+
+[CRITICAL] AnimalSheep
+  - nominal=19 is 3.8× vanilla value of 5
+    FIX: Vanilla runs 5 group(s). Consider staying closer to avoid overloading the entity budget.
+  - nominal=19 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] AnimalSheep
+  - nominal=20 is 4.0× vanilla value of 5
+    FIX: This event normally runs at 5 groups. Running 20 causes severe console lag.
+  - nominal=20 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] AnimalSheep
+  - nominal=21 is 4.2× vanilla value of 5
+    FIX: This event normally runs at 5 groups. Running 21 causes severe console lag.
+  - nominal=21 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] AnimalCow
+  - nominal=13 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] AnimalCow
+  - nominal=14 is 2.0× vanilla value of 7
+    FIX: Vanilla runs 7 group(s). Consider staying closer to avoid overloading the entity budget.
+  - nominal=14 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] AnimalCow
+  - nominal=27 is 3.9× vanilla value of 7
+    FIX: Vanilla runs 7 group(s). Consider staying closer to avoid overloading the entity budget.
+  - nominal=27 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] AnimalCow
+  - nominal=28 is 4.0× vanilla value of 7
+    FIX: This event normally runs at 7 groups. Running 28 causes severe console lag.
+  - nominal=28 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] AnimalCow
+  - nominal=29 is 4.1× vanilla value of 7
+    FIX: This event normally runs at 7 groups. Running 29 causes severe console lag.
+  - nominal=29 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] StaticBonfire
+  - nominal=39 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] StaticBonfire
+  - nominal=40 is 2.0× vanilla value of 20
+    FIX: Vanilla runs 20 group(s). Consider staying closer to avoid overloading the entity budget.
+  - nominal=40 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] StaticBonfire
+  - nominal=79 is 4.0× vanilla value of 20
+    FIX: Vanilla runs 20 group(s). Consider staying closer to avoid overloading the entity budget.
+  - nominal=79 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] StaticBonfire
+  - nominal=80 is 4.0× vanilla value of 20
+    FIX: This event normally runs at 20 groups. Running 80 causes severe console lag.
+  - nominal=80 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] TrajectoryStones
+  - nominal=199 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] TrajectoryStones
+  - nominal=200 is 2.0× vanilla value of 100
+    FIX: Vanilla runs 100 group(s). Consider staying closer to avoid overloading the entity budget.
+  - nominal=200 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] TrajectoryStones
+  - nominal=399 is 4.0× vanilla value of 100
+    FIX: Vanilla runs 100 group(s). Consider staying closer to avoid overloading the entity budget.
+  - nominal=399 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] TrajectoryStones
+  - nominal=400 is 4.0× vanilla value of 100
+    FIX: This event normally runs at 100 groups. Running 400 causes severe console lag.
+  - nominal=400 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[WARNING] Abs_Nominal_6
+  - nominal=6 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+
+[WARNING] Abs_Nominal_10
+  - nominal=10 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+
+[CRITICAL] Abs_Nominal_11
+  - nominal=11 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] Abs_Nominal_100
+  - nominal=100 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[CRITICAL] Abs_Life_1
+  - lifetime=1s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] Abs_Life_30
+  - lifetime=30s (1 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] Abs_Life_599
+  - lifetime=599s (10 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[WARNING] Abs_Life_600
+  - lifetime=600s is below 30 minutes
+    FIX: Longer lifetimes reduce event cycling frequency, lowering the AI and physics initialization cost per server cycle.
+
+[WARNING] Abs_Life_1799
+  - lifetime=1799s is below 30 minutes
+    FIX: Longer lifetimes reduce event cycling frequency, lowering the AI and physics initialization cost per server cycle.
+
+[CRITICAL] Abs_Restock_1
+  - restock=1s — nearly instant re-spawn after cleanup
+    FIX: Set restock to 0 or at least 1800s. Events restocking constantly force the server to re-initialize entity groups with AI/physics.
+
+[CRITICAL] Abs_Restock_59
+  - restock=59s — nearly instant re-spawn after cleanup
+    FIX: Set restock to 0 or at least 1800s. Events restocking constantly force the server to re-initialize entity groups with AI/physics.
+
+[WARNING] Abs_Restock_60
+  - restock=60s is below 5 minutes
+    FIX: Consider a restock of 1800–7200s to space out event re-initialization.
+
+[WARNING] Abs_Restock_299
+  - restock=299s is below 5 minutes
+    FIX: Consider a restock of 1800–7200s to space out event re-initialization.
+
+[WARNING] Abs_Dist_1001
+  - distanceradius=1001m is larger than recommended (1000m)
+    FIX: Consider reducing to 500–800m. Larger radii increase the cost of finding valid spawn positions.
+
+[WARNING] Abs_Dist_2000
+  - distanceradius=2000m is larger than recommended (1000m)
+    FIX: Consider reducing to 500–800m. Larger radii increase the cost of finding valid spawn positions.
+
+[CRITICAL] Abs_Dist_2001
+  - distanceradius=2001m — very large check radius
+    FIX: The server checks this radius to prevent events spawning near players. A large radius means more calculations per spawn attempt. Reduce to 500–800m.
+
+[CRITICAL] Abs_Dist_5000
+  - distanceradius=5000m — very large check radius
+    FIX: The server checks this radius to prevent events spawning near players. A large radius means more calculations per spawn attempt. Reduce to 500–800m.
+
+[CRITICAL] Aktiv_1
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=1s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+  - restock=1s — nearly instant re-spawn after cleanup
+    FIX: Set restock to 0 or at least 1800s. Events restocking constantly force the server to re-initialize entity groups with AI/physics.
+  - distanceradius=9000m — very large check radius
+    FIX: The server checks this radius to prevent events spawning near players. A large radius means more calculations per spawn attempt. Reduce to 500–800m.
+
+[CRITICAL] Aktiv_false
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=1s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+  - restock=1s — nearly instant re-spawn after cleanup
+    FIX: Set restock to 0 or at least 1800s. Events restocking constantly force the server to re-initialize entity groups with AI/physics.
+  - distanceradius=9000m — very large check radius
+    FIX: The server checks this radius to prevent events spawning near players. A large radius means more calculations per spawn attempt. Reduce to 500–800m.
+
+[CRITICAL] Aktiv_00
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=1s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+  - restock=1s — nearly instant re-spawn after cleanup
+    FIX: Set restock to 0 or at least 1800s. Events restocking constantly force the server to re-initialize entity groups with AI/physics.
+  - distanceradius=9000m — very large check radius
+    FIX: The server checks this radius to prevent events spawning near players. A large radius means more calculations per spawn attempt. Reduce to 500–800m.
+
+[CRITICAL] Aktiv_None
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=1s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+  - restock=1s — nearly instant re-spawn after cleanup
+    FIX: Set restock to 0 or at least 1800s. Events restocking constantly force the server to re-initialize entity groups with AI/physics.
+  - distanceradius=9000m — very large check radius
+    FIX: The server checks this radius to prevent events spawning near players. A large radius means more calculations per spawn attempt. Reduce to 500–800m.
+
+[CRITICAL] Zahl_Text
+  - distanceradius=2001m — very large check radius
+    FIX: The server checks this radius to prevent events spawning near players. A large radius means more calculations per spawn attempt. Reduce to 500–800m.

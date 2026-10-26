@@ -1,0 +1,259 @@
+=== DayZ Server Performance Report ===
+File: events.xml | Mode: events
+Score: 0/100 | Total: 59 | Criticals: 43 | Warnings: 1
+
+=== FLAGGED ITEMS ===
+
+[CRITICAL] AmbientFox
+  - lifetime=33s (1 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+  - restock=25s — nearly instant re-spawn after cleanup
+    FIX: Set restock to 0 or at least 1800s. Events restocking constantly force the server to re-initialize entity groups with AI/physics.
+
+[CRITICAL] AmbientHare
+  - lifetime=33s (1 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+  - restock=30s — nearly instant re-spawn after cleanup
+    FIX: Set restock to 0 or at least 1800s. Events restocking constantly force the server to re-initialize entity groups with AI/physics.
+
+[CRITICAL] AmbientHen
+  - lifetime=33s (1 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+  - restock=15s — nearly instant re-spawn after cleanup
+    FIX: Set restock to 0 or at least 1800s. Events restocking constantly force the server to re-initialize entity groups with AI/physics.
+
+[CRITICAL] AnimalBear
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] AnimalCow
+  - nominal=7 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] AnimalDeer
+  - nominal=9 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] AnimalGoat
+  - nominal=8 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] AnimalPig
+  - nominal=6 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] AnimalRoeDeer
+  - nominal=10 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] AnimalSheep
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] AnimalWildBoar
+  - nominal=7 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] AnimalWolf
+  - nominal=8 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedArmy
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedArmyHard
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedCity
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedCityTier1
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedFirefighter
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedIndustrial
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedMedic
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedNBC
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedPolice
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedPoliceHard
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedPrisoner
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedReligious
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedSanta
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedSolitude
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedVillage
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] InfectedVillageTier1
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=3s (0 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] ItemPlanks
+  - nominal=50 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+
+[WARNING] StaticAirplaneCrate
+  - nominal=9 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+
+[CRITICAL] TrajectoryApple
+  - nominal=140 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] TrajectoryConiferous
+  - nominal=140 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] TrajectoryDeciduous
+  - nominal=140 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] TrajectoryHumus
+  - nominal=140 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] TrajectoryPear
+  - nominal=140 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] TrajectoryPlum
+  - nominal=140 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] TrajectoryStones
+  - nominal=100 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=180s (3 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] VehicleBoat
+  - nominal=22 spawns many simultaneous event groups
+    FIX: Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very expensive on console.
+  - lifetime=600s is below 30 minutes
+    FIX: Longer lifetimes reduce event cycling frequency, lowering the AI and physics initialization cost per server cycle.
+
+[CRITICAL] VehicleCivilianSedan
+  - nominal=8 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+  - lifetime=300s (5 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] VehicleHatchback02
+  - nominal=8 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+  - lifetime=300s (5 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] VehicleOffroad02
+  - lifetime=300s (5 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] VehicleOffroadHatchback
+  - nominal=8 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+  - lifetime=300s (5 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] VehicleSedan02
+  - nominal=8 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+  - lifetime=300s (5 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.
+
+[CRITICAL] VehicleTruck01
+  - nominal=8 is above recommended limit (5)
+    FIX: Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics processing.
+  - lifetime=300s (5 min) — events cycle very rapidly
+    FIX: Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn with AI initialization overhead.

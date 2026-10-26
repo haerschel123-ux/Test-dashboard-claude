@@ -1,0 +1,382 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<events>
+    <event name="AnimalSheep">
+        <nominal>9</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="AnimalSheep">
+        <nominal>10</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="AnimalSheep">
+        <nominal>19</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="AnimalSheep">
+        <nominal>20</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="AnimalSheep">
+        <nominal>21</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="AnimalCow">
+        <nominal>13</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="AnimalCow">
+        <nominal>14</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="AnimalCow">
+        <nominal>27</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="AnimalCow">
+        <nominal>28</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="AnimalCow">
+        <nominal>29</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="StaticBonfire">
+        <nominal>39</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="StaticBonfire">
+        <nominal>40</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="StaticBonfire">
+        <nominal>79</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="StaticBonfire">
+        <nominal>80</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="TrajectoryStones">
+        <nominal>199</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="TrajectoryStones">
+        <nominal>200</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="TrajectoryStones">
+        <nominal>399</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="TrajectoryStones">
+        <nominal>400</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Nominal_0">
+        <nominal>0</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Nominal_1">
+        <nominal>1</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Nominal_5">
+        <nominal>5</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Nominal_6">
+        <nominal>6</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Nominal_10">
+        <nominal>10</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Nominal_11">
+        <nominal>11</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Nominal_100">
+        <nominal>100</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Life_-1">
+        <nominal>3</nominal>
+        <lifetime>-1</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Life_0">
+        <nominal>3</nominal>
+        <lifetime>0</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Life_1">
+        <nominal>3</nominal>
+        <lifetime>1</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Life_30">
+        <nominal>3</nominal>
+        <lifetime>30</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Life_599">
+        <nominal>3</nominal>
+        <lifetime>599</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Life_600">
+        <nominal>3</nominal>
+        <lifetime>600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Life_1799">
+        <nominal>3</nominal>
+        <lifetime>1799</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Life_1800">
+        <nominal>3</nominal>
+        <lifetime>1800</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Restock_-1">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>-1</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Restock_0">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Restock_1">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>1</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Restock_59">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>59</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Restock_60">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>60</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Restock_299">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>299</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Restock_300">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>300</restock>
+        <distanceradius>500</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Dist_0">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>0</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Dist_999">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>999</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Dist_1000">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>1000</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Dist_1001">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>1001</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Dist_2000">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>2000</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Dist_2001">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>2001</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Abs_Dist_5000">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <distanceradius>5000</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Aktiv_0">
+        <nominal>50</nominal>
+        <lifetime>1</lifetime>
+        <restock>1</restock>
+        <distanceradius>9000</distanceradius>
+        <active>0</active>
+    </event>
+    <event name="Aktiv_ 0 ">
+        <nominal>50</nominal>
+        <lifetime>1</lifetime>
+        <restock>1</restock>
+        <distanceradius>9000</distanceradius>
+        <active> 0 </active>
+    </event>
+    <event name="Aktiv_1">
+        <nominal>50</nominal>
+        <lifetime>1</lifetime>
+        <restock>1</restock>
+        <distanceradius>9000</distanceradius>
+        <active>1</active>
+    </event>
+    <event name="Aktiv_false">
+        <nominal>50</nominal>
+        <lifetime>1</lifetime>
+        <restock>1</restock>
+        <distanceradius>9000</distanceradius>
+        <active>false</active>
+    </event>
+    <event name="Aktiv_00">
+        <nominal>50</nominal>
+        <lifetime>1</lifetime>
+        <restock>1</restock>
+        <distanceradius>9000</distanceradius>
+        <active>00</active>
+    </event>
+    <event name="Aktiv_None">
+        <nominal>50</nominal>
+        <lifetime>1</lifetime>
+        <restock>1</restock>
+        <distanceradius>9000</distanceradius>
+    </event>
+    <event name="Fehlt_Alles">
+    </event>
+    <event name="Zahl_Text">
+        <nominal>abc</nominal>
+        <lifetime>x</lifetime>
+        <restock></restock>
+        <distanceradius>0x7D1</distanceradius>
+        <active>1</active>
+    </event>
+</events>

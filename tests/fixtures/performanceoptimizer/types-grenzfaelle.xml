@@ -1,0 +1,689 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<types>
+    <type name="AlarmClock_Blue">
+        <nominal>49</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AlarmClock_Green">
+        <nominal>50</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AlarmClock_Red">
+        <nominal>51</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AmmoBox_00buck_10rnd">
+        <nominal>53</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AmmoBox_12gaSlug_10Rnd">
+        <nominal>57</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AmmoBox_308Win_20Rnd">
+        <nominal>99</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AmmoBox_380_35rnd">
+        <nominal>100</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AmmoBox_45ACP_25rnd">
+        <nominal>101</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Ammo_12gaRubberSlug">
+        <nominal>99</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="BandageDressing">
+        <nominal>100</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Barrel_Blue">
+        <nominal>101</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Barrel_Green">
+        <nominal>200</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="ACOGOptic_6x">
+        <nominal>12</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AK74_Hndgrd">
+        <nominal>13</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AK74_WoodBttstck">
+        <nominal>25</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AmmoBox_308WinTracer_20Rnd">
+        <nominal>17</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AmmoBox_556x45Tracer_20Rnd">
+        <nominal>18</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AmmoBox_762x39Tracer_20Rnd">
+        <nominal>35</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="ACOGOptic">
+        <nominal>3</nominal>
+        <lifetime>3599</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AKS74U_Bttstck">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AK_FoldingBttstck">
+        <nominal>3</nominal>
+        <lifetime>3601</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AK_FoldingBttstck_Black">
+        <nominal>3</nominal>
+        <lifetime>7200</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AK_FoldingBttstck_Green">
+        <nominal>3</nominal>
+        <lifetime>7201</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AK_PlasticBttstck">
+        <nominal>3</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AK_PlasticBttstck_Black">
+        <nominal>3</nominal>
+        <lifetime>20000</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AKM">
+        <nominal>3</nominal>
+        <lifetime>1800</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AmmoBox_12gaRubberSlug_10Rnd">
+        <nominal>3</nominal>
+        <lifetime>1801</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Ammo_CupidsBolt">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Ammo_ImprovisedBolt_1">
+        <nominal>3</nominal>
+        <lifetime>3601</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AK101">
+        <nominal>3</nominal>
+        <lifetime>7200</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AK101_Black">
+        <nominal>3</nominal>
+        <lifetime>7201</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="AK101_Green">
+        <nominal>3</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Nominal_0">
+        <nominal>0</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>0</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Abs_Nominal_1">
+        <nominal>1</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>0</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Abs_Nominal_15">
+        <nominal>15</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>0</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Abs_Nominal_16">
+        <nominal>16</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>0</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Abs_Nominal_20">
+        <nominal>20</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>0</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Abs_Nominal_21">
+        <nominal>21</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>0</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Abs_Nominal_40">
+        <nominal>40</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>0</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Abs_Nominal_41">
+        <nominal>41</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>0</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Abs_Nominal_100">
+        <nominal>100</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>0</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Abs_Min_20_17">
+        <nominal>20</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>17</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Min_20_18">
+        <nominal>20</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>18</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Min_20_20">
+        <nominal>20</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>20</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Min_20_21">
+        <nominal>20</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>21</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Min_0_5">
+        <nominal>0</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>5</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Min_7_6">
+        <nominal>7</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>6</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Min_7_7">
+        <nominal>7</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>7</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Min_7_8">
+        <nominal>7</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>8</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Min_100_85">
+        <nominal>100</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>85</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Min_100_86">
+        <nominal>100</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>86</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Min_3_0">
+        <nominal>3</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>0</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Life_-1">
+        <nominal>3</nominal>
+        <lifetime>-1</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Life_0">
+        <nominal>3</nominal>
+        <lifetime>0</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Life_1">
+        <nominal>3</nominal>
+        <lifetime>1</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Life_30">
+        <nominal>3</nominal>
+        <lifetime>30</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Life_59">
+        <nominal>3</nominal>
+        <lifetime>59</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Life_90">
+        <nominal>3</nominal>
+        <lifetime>90</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Life_570">
+        <nominal>3</nominal>
+        <lifetime>570</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Life_599">
+        <nominal>3</nominal>
+        <lifetime>599</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Life_600">
+        <nominal>3</nominal>
+        <lifetime>600</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Life_630">
+        <nominal>3</nominal>
+        <lifetime>630</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Life_1799">
+        <nominal>3</nominal>
+        <lifetime>1799</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Life_1800">
+        <nominal>3</nominal>
+        <lifetime>1800</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Life_3600">
+        <nominal>3</nominal>
+        <lifetime>3600</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Restock_-5">
+        <nominal>3</nominal>
+        <lifetime>14400</lifetime>
+        <restock>-5</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Restock_0">
+        <nominal>3</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Restock_1">
+        <nominal>3</nominal>
+        <lifetime>14400</lifetime>
+        <restock>1</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Restock_59">
+        <nominal>3</nominal>
+        <lifetime>14400</lifetime>
+        <restock>59</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Restock_60">
+        <nominal>3</nominal>
+        <lifetime>14400</lifetime>
+        <restock>60</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Restock_299">
+        <nominal>3</nominal>
+        <lifetime>14400</lifetime>
+        <restock>299</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Restock_300">
+        <nominal>3</nominal>
+        <lifetime>14400</lifetime>
+        <restock>300</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Abs_Restock_1800">
+        <nominal>3</nominal>
+        <lifetime>14400</lifetime>
+        <restock>1800</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Flag_Cim0_N16">
+        <nominal>16</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Flag_Cim1_N15">
+        <nominal>15</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Flag_Cim1_N16">
+        <nominal>16</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Flag_Cim2_N16">
+        <nominal>16</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="2"/>
+    </type>
+    <type name="Flag_CimLeer_N16">
+        <nominal>16</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map=""/>
+    </type>
+    <type name="Flag_OhneAttr_N16">
+        <nominal>16</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags crafted="0"/>
+    </type>
+    <type name="Flag_OhneFlags_N16">
+        <nominal>16</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+    </type>
+    <type name="Zahl_0">
+        <nominal>abc</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Zahl_1">
+        <nominal></nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Zahl_2">
+        <nominal>12abc</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Zahl_3">
+        <nominal> 30 </nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Zahl_4">
+        <nominal>1e3</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Zahl_5">
+        <nominal>3.9</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Zahl_6">
+        <nominal>-5</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Zahl_7">
+        <nominal>+25</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Zahl_8">
+        <nominal>0x10</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Zahl_9">
+        <nominal>٣٠</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Zahl_10">
+        <nominal>45.7</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Zahl_11">
+        <nominal>00041</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="1"/>
+    </type>
+    <type name="Fehlt_Nominal">
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Fehlt_Alles">
+    </type>
+    <type name="Min_Text">
+        <nominal>30</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>viel</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type>
+        <nominal>50</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Doppelt_A">
+        <nominal>45</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Doppelt_A">
+        <nominal>12</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+    <type name="Name mit Leerzeichen &amp; Sonder">
+        <nominal>45</nominal>
+        <lifetime>14400</lifetime>
+        <restock>0</restock>
+        <min>1</min>
+        <flags count_in_map="0"/>
+    </type>
+</types>

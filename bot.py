@@ -52,6 +52,7 @@ import hmac
 import ssl
 import ipaddress
 import urllib.parse
+from decimal import Decimal, ROUND_HALF_UP
 from collections import deque
 import collections
 import itertools
@@ -1043,6 +1044,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.spawnabletypes":              {"label": "Visual SpawnableTypes Configurator", "gruppe": "Tools"},
     "tools.bunkerbroadcast":             {"label": "Bunker Broadcast Builder", "gruppe": "Tools"},
     "tools.territoryexclusion":          {"label": "Territory Exclusion", "gruppe": "Tools"},
+    "tools.performanceoptimizer":        {"label": "Performance Optimizer", "gruppe": "Tools"},
     "tools.typesbooster":                {"label": "Types Booster", "gruppe": "Tools"},
     "tools.typesreducer":                 {"label": "Types Reducer", "gruppe": "Tools"},
     "tools.typesorganizer":              {"label": "Types Organizer", "gruppe": "Tools"},
@@ -15194,6 +15196,7 @@ _TOOL_LISTE = (
     ("spawnabletypes", "🗃️", "Visual SpawnableTypes Configurator"),
     ("bunkerbroadcast", "📻", "Bunker Broadcast Builder"),
     ("territoryexclusion", "✂️", "Territory Exclusion"),
+    ("performanceoptimizer", "⚡", "Performance Optimizer"),
     ("typesbooster", "📈", "Types Booster"),
     ("typesreducer", "📉", "Types Reducer"),
     ("typesorganizer", "🗂️", "Types Organizer"),
@@ -25653,6 +25656,573 @@ async def _api_tools_types_transform_get(request: web.Request, modul_key: str) -
     return ok({"types_count": len(root.findall("type")),
               "categories": _tool_types_kategorien_lesen(root),
               "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()})
+
+
+# ── Performance Optimizer ────────────────────────────────────────────────
+# Nachbau von doordiehub.com/PerformanceOptimizer: wertet db/types.xml bzw. db/events.xml nach festen Schwellen und
+# gegen eine Vanilla-Referenz (Chernarus) aus. Reine Auswertung - schreibt nie etwas. Regeln, Schwellen, Reihenfolge der
+# Befunde und der englische Wortlaut sind die der Webseite (gegen deren Reports Byte fuer Byte geprueft, siehe
+# tests/test_performanceoptimizer.py); dazu die JavaScript-Eigenheiten (Math.round, toFixed, parseInt).
+_PO_MODUL = "tools.performanceoptimizer"
+_PO_MAX_BYTES = 6 * 1024 * 1024
+_PO_TYPEN = {"nominalWarning": 20, "nominalCritical": 40, "lifetimeWarning": 1800, "lifetimeCritical": 600,
+             "restockWarning": 300, "restockCritical": 60, "minRatioWarning": 0.85}
+_PO_EVENTS = {"nominalWarning": 5, "nominalCritical": 10, "lifetimeWarning": 1800, "lifetimeCritical": 600,
+              "restockWarning": 300, "restockCritical": 60, "distanceWarning": 1000, "distanceCritical": 2000}
+_PO_ZAHL_RE = re.compile(r"\s*([+-]?)(0[xX][0-9a-fA-F]+|[0-9]+)")
+_PO_REFERENZ_CACHE: Dict[str, Any] = {}
+# Vanilla-Werte der Webseite (Chernarus): zlib+base64 von {"types": {Name: [nominal, lifetime, restock, min]}, "events": {...}}
+_PO_REFERENZ_B64 = (
+    "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"
+)
+
+# Meldung und Hinweis je Regel: (de_meldung, de_hinweis, en_meldung, en_hinweis). Der englische Text ist der der Webseite.
+_PO_TEXTE: Dict[str, Tuple[str, str, str, str]] = {
+    "t_nom_vanilla_krit": (
+        "nominal={s} ist {f}× so hoch wie der Vanilla-Wert {V}",
+        "Vanilla nutzt für dieses Item {V}. Mit {s} wird die Karte überflutet. Besser Richtung {V}–{hi} senken.",
+        "nominal={s} is {f}× the vanilla value of {V}",
+        "Vanilla uses {V} for this item. A value of {s} will flood the map. Consider reducing toward {V}–{hi}."),
+    "t_nom_vanilla_warn": (
+        "nominal={s} ist {f}× so hoch wie der Vanilla-Wert {V}",
+        "Vanilla hat {V} aktiv. Jedes zusätzliche Item wird von der CE in jedem Zyklus verfolgt.",
+        "nominal={s} is {f}× the vanilla value of {V}",
+        "Vanilla has {V} active. Each extra item is tracked by the CE every cycle."),
+    "t_life_vanilla_krit": (
+        "lifetime={n}s sind nur {pct}% des Vanilla-Werts {L}s",
+        "Sehr kurze Lifetimes zwingen die CE, dieses Item viel öfter neu zu spawnen, als Vanilla vorsieht. "
+        "Mindestens auf {half}s erhöhen.",
+        "lifetime={n}s is only {pct}% of vanilla {L}s",
+        "Very short lifetimes force the CE to respawn this item far more often than vanilla intended. "
+        "Increase to at least {half}s."),
+    "t_life_vanilla_warn": (
+        "lifetime={n}s sind {pct}% des Vanilla-Werts {L}s",
+        "Vanilla nutzt {L}s. Eine kürzere Lifetime erhöht die Häufigkeit der CE-Zyklen.",
+        "lifetime={n}s is {pct}% of vanilla {L}s",
+        "Vanilla uses {L}s. A shorter lifetime increases CE cycling frequency."),
+    "t_nom_krit": (
+        "nominal={s} ist sehr hoch (>40)",
+        "nominal auf ≤20 senken. Jedes aktive Item wird von der CE verfolgt – hohe Summen verursachen auf "
+        "Konsolen deutliche TPS-Einbrüche.",
+        "nominal={s} is very high (>40)",
+        "Reduce nominal to ≤20. Every active item is tracked by the CE engine — high totals cause significant "
+        "TPS drops on console hardware."),
+    "t_nom_warn": (
+        "nominal={s} liegt über der empfohlenen Grenze (20)",
+        "nominal besser senken. Jedes zusätzliche Item kostet in jedem Aufräumzyklus Rechenzeit der CE.",
+        "nominal={s} is above recommended limit (20)",
+        "Consider reducing nominal. Each additional spawned item adds CE processing overhead every cleanup cycle."),
+    "t_min_krit": (
+        "min={r} ist größer als nominal={s} – die CE wird nie zufrieden",
+        "min muss immer ≤ nominal sein. Sonst entsteht eine endlose Nachspawn-Schleife, die die CE dauernd belastet.",
+        "min={r} exceeds nominal={s} — CE will never be satisfied",
+        "min must always be ≤ nominal. This creates a perpetual respawn loop that constantly stresses the CE."),
+    "t_min_warn": (
+        "min={r} sind {pct}% von nominal={s}",
+        "min bei etwa 50–70 % von nominal halten. Liegt min zu nah an nominal, spawnt die CE Items nach dem "
+        "Aufräumen fast sofort neu.",
+        "min={r} is {pct}% of nominal={s}",
+        "Keep min at around 50–70% of nominal. A min too close to nominal forces the CE to re-spawn items almost "
+        "immediately after cleanup."),
+    "t_life_krit": (
+        "lifetime={n}s ({mins} min) ist extrem kurz",
+        "lifetime auf mindestens 3600s (1 Stunde) setzen. Sehr kurze Lifetimes lassen Items dauernd neu spawnen "
+        "und vervielfachen die CE-Last.",
+        "lifetime={n}s ({mins} min) is extremely short",
+        "Set lifetime to at least 3600s (1 hour). Very short lifetimes cause items to respawn constantly, "
+        "multiplying CE processing load."),
+    "t_life_warn": (
+        "lifetime={n}s ({mins} min) liegt unter 30 Minuten",
+        "3600s oder mehr erwägen. Kürzere Lifetimes erhöhen die Häufigkeit der Spawn- und Aufräumzyklen.",
+        "lifetime={n}s ({mins} min) is below 30 minutes",
+        "Consider 3600s or above. Shorter lifetimes increase the frequency of CE spawning and cleanup cycles."),
+    "t_restock_krit": (
+        "restock={u}s – extrem aggressiver Nachspawn-Timer",
+        "restock auf 0 (aus) oder mindestens 1800s setzen. Ein Wert nahe 0 belastet die CE jede Minute mit "
+        "Nachspawn-Anfragen.",
+        "restock={u}s — extremely aggressive respawn timer",
+        "Set restock to 0 (disabled) or at least 1800s. A near-zero restock hammers the CE with respawn requests "
+        "every minute."),
+    "t_restock_warn": (
+        "restock={u}s liegt unter 5 Minuten",
+        "Ein Restock unter 5 Minuten verursacht häufige CE-Zyklen. 1800–3600s oder 0 erwägen.",
+        "restock={u}s is below 5 minutes",
+        "Restock times under 5 minutes cause frequent CE cycles. Consider 1800–3600s or setting to 0."),
+    "t_cim": (
+        "count_in_map=1 bei nominal={s} – alle {s} Items werden einzeln auf der Karte verfolgt",
+        "Items mit count_in_map=1 werden auf dem Kartenserver einzeln verfolgt. Bei hohem nominal bedeutet das "
+        "deutlichen Mehraufwand. count_in_map=0 setzen, wenn die Anwesenheit auf der Karte nicht gebraucht wird.",
+        "count_in_map=1 with nominal={s} — all {s} items physically tracked",
+        "Items with count_in_map=1 are individually tracked on the map server. At high nominals this adds "
+        "significant overhead. Set count_in_map=0 if map presence is not required."),
+    "e_nom_vanilla_krit": (
+        "nominal={s} ist {f}× so hoch wie der Vanilla-Wert {V}",
+        "Dieses Event läuft normalerweise mit {V} Gruppen. {s} verursachen starke Konsolen-Lags.",
+        "nominal={s} is {f}× vanilla value of {V}",
+        "This event normally runs at {V} groups. Running {s} causes severe console lag."),
+    "e_nom_vanilla_warn": (
+        "nominal={s} ist {f}× so hoch wie der Vanilla-Wert {V}",
+        "Vanilla fährt {V} Gruppe(n). Besser näher daran bleiben, um das Entity-Budget nicht zu überlasten.",
+        "nominal={s} is {f}× vanilla value of {V}",
+        "Vanilla runs {V} group(s). Consider staying closer to avoid overloading the entity budget."),
+    "e_nom_krit": (
+        "nominal={s} spawnt viele Event-Gruppen gleichzeitig",
+        "Auf ≤5 senken. Jede Event-Gruppe spawnt mehrere Entities mit KI, Wegfindung und Physik – auf Konsolen "
+        "sehr teuer.",
+        "nominal={s} spawns many simultaneous event groups",
+        "Reduce to ≤5. Each event group spawns multiple entities with AI, pathfinding, and physics — very "
+        "expensive on console."),
+    "e_nom_warn": (
+        "nominal={s} liegt über der empfohlenen Grenze (5)",
+        "nominal besser senken. Jede Event-Gruppe spawnt mehrere Entities, die KI- und Physik-Berechnung brauchen.",
+        "nominal={s} is above recommended limit (5)",
+        "Consider reducing nominal. Event groups each spawn multiple entities that require AI and physics "
+        "processing."),
+    "e_life_krit": (
+        "lifetime={r}s ({mins} min) – Events wechseln sehr schnell",
+        "Events sollten mindestens 3600s Lifetime haben. Schneller Wechsel verursacht dauerndes Despawnen und "
+        "Respawnen mit KI-Initialisierungsaufwand.",
+        "lifetime={r}s ({mins} min) — events cycle very rapidly",
+        "Events should have a lifetime of at least 3600s. Rapid cycling causes constant entity despawn/respawn "
+        "with AI initialization overhead."),
+    "e_life_warn": (
+        "lifetime={r}s liegt unter 30 Minuten",
+        "Längere Lifetimes senken die Wechselhäufigkeit und damit den KI- und Physik-Initialisierungsaufwand "
+        "pro Server-Zyklus.",
+        "lifetime={r}s is below 30 minutes",
+        "Longer lifetimes reduce event cycling frequency, lowering the AI and physics initialization cost per "
+        "server cycle."),
+    "e_restock_krit": (
+        "restock={n}s – fast sofortiger Respawn nach dem Aufräumen",
+        "restock auf 0 oder mindestens 1800s setzen. Dauernd nachspawnende Events zwingen den Server, "
+        "Entity-Gruppen mit KI/Physik ständig neu zu initialisieren.",
+        "restock={n}s — nearly instant re-spawn after cleanup",
+        "Set restock to 0 or at least 1800s. Events restocking constantly force the server to re-initialize "
+        "entity groups with AI/physics."),
+    "e_restock_warn": (
+        "restock={n}s liegt unter 5 Minuten",
+        "Einen Restock von 1800–7200s erwägen, um die Neu-Initialisierung der Events zu strecken.",
+        "restock={n}s is below 5 minutes",
+        "Consider a restock of 1800–7200s to space out event re-initialization."),
+    "e_dist_krit": (
+        "distanceradius={u}m – sehr großer Prüfradius",
+        "Der Server prüft diesen Radius, damit Events nicht in Spielernähe spawnen. Ein großer Radius bedeutet "
+        "mehr Rechenaufwand je Spawnversuch. Auf 500–800m senken.",
+        "distanceradius={u}m — very large check radius",
+        "The server checks this radius to prevent events spawning near players. A large radius means more "
+        "calculations per spawn attempt. Reduce to 500–800m."),
+    "e_dist_warn": (
+        "distanceradius={u}m ist größer als empfohlen (1000m)",
+        "Auf 500–800m senken. Größere Radien machen die Suche nach gültigen Spawnpositionen teurer.",
+        "distanceradius={u}m is larger than recommended (1000m)",
+        "Consider reducing to 500–800m. Larger radii increase the cost of finding valid spawn positions."),
+    "e_aus": (
+        "Event ist deaktiviert",
+        "Deaktivierte Events haben keine Auswirkung auf die Performance.",
+        "Event is disabled",
+        "Disabled events have no performance impact."),
+}
+
+
+def _po_referenz() -> Dict[str, Dict[str, List[int]]]:
+    """Vanilla-Referenz der Webseite (Chernarus): Name -> [nominal, lifetime, restock, min], getrennt nach types/events."""
+    if not _PO_REFERENZ_CACHE:
+        _PO_REFERENZ_CACHE.update(json.loads(zlib.decompress(base64.b64decode("".join(_PO_REFERENZ_B64)))))
+    return _PO_REFERENZ_CACHE
+
+
+def _po_runden(x: float) -> int:
+    """JavaScript-Math.round: Halbe werden aufgerundet (Python rundet zur geraden Zahl)."""
+    return int(math.floor(x + 0.5))
+
+
+def _po_eins(x: float) -> str:
+    """JavaScript-toFixed(1): exakter Dezimalwert des Double, bei Gleichstand die groessere Zahl."""
+    return str(Decimal(x).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
+
+def _po_zahl(el: Any, tag: str) -> float:
+    """JavaScript-parseInt(element.querySelector(tag)?.textContent || "0"): fehlt/leer -> 0, nicht lesbar -> NaN."""
+    kind = el.find(".//" + tag)
+    text = ("".join(kind.itertext()) if kind is not None else "") or "0"
+    m = _PO_ZAHL_RE.match(text)
+    if not m:
+        return math.nan
+    wert = int(m.group(2), 16) if m.group(2)[:2] in ("0x", "0X") else int(m.group(2))
+    return -wert if m.group(1) == "-" else wert
+
+
+def _po_json_zahl(x: float) -> Optional[float]:
+    return None if isinstance(x, float) and math.isnan(x) else x
+
+
+def _po_befund(code: str, feld: str, grad: str, lang: str, **p: Any) -> Dict[str, Any]:
+    de_m, de_h, en_m, en_h = _PO_TEXTE[code]
+    meldung, hinweis = (en_m, en_h) if lang == "en" else (de_m, de_h)
+    return {"feld": feld, "grad": grad, "meldung": meldung.format(**p), "hinweis": hinweis.format(**p)}
+
+
+def _po_grad(befunde: List[Dict[str, Any]]) -> str:
+    if any(b["grad"] == "critical" for b in befunde):
+        return "critical"
+    return "warning" if any(b["grad"] == "warning" for b in befunde) else "ok"
+
+
+def _po_types_eintrag(el: Any, ref: Dict[str, List[int]], lang: str) -> Dict[str, Any]:
+    v = _PO_TYPEN
+    name = el.get("name") or "Unknown"
+    s, r, n, u = _po_zahl(el, "nominal"), _po_zahl(el, "min"), _po_zahl(el, "lifetime"), _po_zahl(el, "restock")
+    flags = el.find(".//flags")
+    cim = (flags.get("count_in_map") if flags is not None else None) or "1"
+    van = ref.get(name)
+    b: List[Dict[str, Any]] = []
+    if van and van[0] > 0 and s > 0:
+        f = s / van[0]
+        if f >= 5:
+            b.append(_po_befund("t_nom_vanilla_krit", "nominal (vs vanilla)", "critical", lang, s=int(s), f=_po_eins(f),
+                                V=van[0], hi=_po_runden(van[0] * 1.5)))
+        elif f >= 2.5:
+            b.append(_po_befund("t_nom_vanilla_warn", "nominal (vs vanilla)", "warning", lang, s=int(s),
+                                f=_po_eins(f), V=van[0]))
+    if van and van[1] > 0 and n > 0:
+        f = n / van[1]
+        if f <= 0.25:
+            b.append(_po_befund("t_life_vanilla_krit", "lifetime (vs vanilla)", "critical", lang, n=int(n),
+                                pct=_po_runden(f * 100), L=van[1], half=_po_runden(van[1] * 0.5)))
+        elif f <= 0.5:
+            b.append(_po_befund("t_life_vanilla_warn", "lifetime (vs vanilla)", "warning", lang, n=int(n),
+                                pct=_po_runden(f * 100), L=van[1]))
+    if s > v["nominalCritical"]:
+        b.append(_po_befund("t_nom_krit", "nominal", "critical", lang, s=int(s)))
+    elif s > v["nominalWarning"]:
+        b.append(_po_befund("t_nom_warn", "nominal", "warning", lang, s=int(s)))
+    if s > 0 and r > s:
+        b.append(_po_befund("t_min_krit", "min", "critical", lang, r=int(r), s=int(s)))
+    elif s > 0 and r / s > v["minRatioWarning"]:
+        b.append(_po_befund("t_min_warn", "min", "warning", lang, r=int(r), s=int(s), pct=_po_runden(r / s * 100)))
+    if 0 < n < v["lifetimeCritical"]:
+        b.append(_po_befund("t_life_krit", "lifetime", "critical", lang, n=int(n), mins=_po_runden(n / 60)))
+    elif 0 < n < v["lifetimeWarning"]:
+        b.append(_po_befund("t_life_warn", "lifetime", "warning", lang, n=int(n), mins=_po_runden(n / 60)))
+    if 0 < u < v["restockCritical"]:
+        b.append(_po_befund("t_restock_krit", "restock", "critical", lang, u=int(u)))
+    elif 0 < u < v["restockWarning"]:
+        b.append(_po_befund("t_restock_warn", "restock", "warning", lang, u=int(u)))
+    if cim == "1" and s > 15:
+        b.append(_po_befund("t_cim", "count_in_map", "warning", lang, s=int(s)))
+    return {"name": name, "grad": _po_grad(b), "custom": van is None, "vanilla": van, "befunde": b,
+            "nominal": _po_json_zahl(s), "lifetime": _po_json_zahl(n), "restock": _po_json_zahl(u),
+            "min": _po_json_zahl(r)}
+
+
+def _po_events_eintrag(el: Any, ref: Dict[str, List[int]], lang: str) -> Dict[str, Any]:
+    j = _PO_EVENTS
+    name = el.get("name") or "Unknown"
+    s, r, n, u = (_po_zahl(el, "nominal"), _po_zahl(el, "lifetime"), _po_zahl(el, "restock"),
+                  _po_zahl(el, "distanceradius"))
+    aktiv = el.find(".//active")
+    aktiv_text = aktiv.text.strip() if aktiv is not None and aktiv.text is not None else None
+    van = ref.get(name)
+    eintrag = {"name": name, "custom": van is None, "vanilla": van, "nominal": _po_json_zahl(s),
+               "lifetime": _po_json_zahl(r), "restock": _po_json_zahl(n)}
+    if aktiv_text == "0":
+        return {**eintrag, "grad": "ok", "befunde": [_po_befund("e_aus", "active", "ok", lang)]}
+    b: List[Dict[str, Any]] = []
+    if van and van[0] > 0 and s > 0:
+        w = s / van[0]
+        if w >= 4:
+            b.append(_po_befund("e_nom_vanilla_krit", "nominal (vs vanilla)", "critical", lang, s=int(s),
+                                f=_po_eins(w), V=van[0]))
+        elif w >= 2:
+            b.append(_po_befund("e_nom_vanilla_warn", "nominal (vs vanilla)", "warning", lang, s=int(s),
+                                f=_po_eins(w), V=van[0]))
+    if s > j["nominalCritical"]:
+        b.append(_po_befund("e_nom_krit", "nominal", "critical", lang, s=int(s)))
+    elif s > j["nominalWarning"]:
+        b.append(_po_befund("e_nom_warn", "nominal", "warning", lang, s=int(s)))
+    if 0 < r < j["lifetimeCritical"]:
+        b.append(_po_befund("e_life_krit", "lifetime", "critical", lang, r=int(r), mins=_po_runden(r / 60)))
+    elif 0 < r < j["lifetimeWarning"]:
+        b.append(_po_befund("e_life_warn", "lifetime", "warning", lang, r=int(r)))
+    if 0 < n < j["restockCritical"]:
+        b.append(_po_befund("e_restock_krit", "restock", "critical", lang, n=int(n)))
+    elif 0 < n < j["restockWarning"]:
+        b.append(_po_befund("e_restock_warn", "restock", "warning", lang, n=int(n)))
+    if u > j["distanceCritical"]:
+        b.append(_po_befund("e_dist_krit", "distanceradius", "critical", lang, u=int(u)))
+    elif u > j["distanceWarning"]:
+        b.append(_po_befund("e_dist_warn", "distanceradius", "warning", lang, u=int(u)))
+    return {**eintrag, "grad": _po_grad(b), "befunde": b}
+
+
+def _po_zusammenfassung(eintraege: List[Dict[str, Any]]) -> Dict[str, Any]:
+    krit = sum(1 for e in eintraege if e["grad"] == "critical")
+    warn = sum(1 for e in eintraege if e["grad"] == "warning")
+    zaehler: Dict[str, int] = {}
+    for e in eintraege:
+        for b in e["befunde"]:
+            if b["grad"] != "ok":
+                zaehler[b["feld"]] = zaehler.get(b["feld"], 0) + 1
+    top = [f"{anzahl}× {feld}" for feld, anzahl in sorted(zaehler.items(), key=lambda kv: -kv[1])[:5]]
+    return {"total": len(eintraege), "ok": sum(1 for e in eintraege if e["grad"] == "ok"), "warnings": warn,
+            "criticals": krit, "custom": sum(1 for e in eintraege if e["custom"]),
+            "score": max(0, min(100, 100 - krit * 12 - warn * 4)), "topIssues": top}
+
+
+def _po_pruefen(text: str, modus: str, lang: str) -> Optional[Dict[str, Any]]:
+    """Wertet types.xml/events.xml aus; None, wenn das XML nicht lesbar ist. Eintraege in Dateireihenfolge."""
+    try:
+        wurzel = ET.fromstring(text)
+    except (ET.ParseError, ValueError):
+        return None
+    if modus == "events":
+        ref, tag, eintrag = _po_referenz()["events"], "event", _po_events_eintrag
+    else:
+        ref, tag, eintrag = _po_referenz()["types"], "type", _po_types_eintrag
+    eintraege = [eintrag(el, ref, lang) for el in wurzel.iter(tag)]
+    return {"modus": modus, "zusammenfassung": _po_zusammenfassung(eintraege), "eintraege": eintraege}
+
+
+def _po_sprache(roh: Any) -> str:
+    return "en" if str(roh or "").lower() == "en" else "de"
+
+
+def _po_meta(conn: ServerConnection) -> Dict[str, Any]:
+    ref = _po_referenz()
+    return {"referenz": {"types": len(ref["types"]), "events": len(ref["events"]), "karte": "Chernarus"},
+            "server_karte": _canonical_map_name(str(conn.get("map_name") or "")) or str(conn.get("map_name") or ""),
+            "kein_mission_ordner": not _mission_dir_of(conn)}
+
+
+async def api_tools_performanceoptimizer_get(request: web.Request) -> web.Response:
+    conn, fehler = await _brlc_prepare(request, _PO_MODUL, "view")
+    if fehler is not None:
+        return fehler
+    meta = _po_meta(conn)
+    datei = request.query.get("datei", "")
+    if not datei:
+        return ok(meta)
+    if datei not in ("types", "events"):
+        return err("Unbekannte Datei.")
+    if meta["kein_mission_ordner"]:
+        return ok(meta)
+    fehler = _dash_rate_limited(request, f"tools.performanceoptimizer.{datei}", 3)
+    if fehler is not None:
+        return fehler
+    pfad = f"db/{datei}.xml"
+    loop = asyncio.get_running_loop()
+    text, status = await _tools_datei_lesen(conn, pfad, loop)
+    if status != "ok" or text is None:
+        return err(f"{pfad} per FTP nicht lesbar.", 502)
+    if len(text.encode("utf-8")) > _PO_MAX_BYTES:
+        return err(f"{pfad} ist größer als 6 MB und wird nicht geprüft.", 413)
+    ergebnis = await loop.run_in_executor(None, _po_pruefen, text, datei, _po_sprache(request.query.get("sprache")))
+    if ergebnis is None:
+        return err(f"{pfad} ist kein gültiges XML.", 422, code="xml_kaputt")
+    return ok({**meta, **ergebnis, "datei": pfad})
+
+
+async def api_tools_performanceoptimizer_post(request: web.Request) -> web.Response:
+    conn, fehler = await _brlc_prepare(request, _PO_MODUL, "view")
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    name = str(data.get("datei") or "")[:200]
+    xml = data.get("xml")
+    if not name.endswith(".xml"):
+        return err("Bitte eine .xml-Datei hochladen.", 400, code="keine_xml")
+    if not isinstance(xml, str):
+        return err("Keine Datei übergeben.")
+    if len(xml.encode("utf-8")) > _PO_MAX_BYTES:
+        return err("Die Datei ist größer als 6 MB und wird nicht geprüft.", 413)
+    fehler = _dash_rate_limited(request, "tools.performanceoptimizer.upload", 2)
+    if fehler is not None:
+        return fehler
+    modus = "events" if "event" in name.lower() else "types"
+    ergebnis = await asyncio.get_running_loop().run_in_executor(
+        None, _po_pruefen, xml, modus, _po_sprache(data.get("sprache")))
+    if ergebnis is None:
+        return err("Die Datei ist kein gültiges XML.", 422, code="xml_kaputt", datei=name)
+    return ok({**_po_meta(conn), **ergebnis, "datei": name})
 
 
 async def api_tools_typesbooster_get(request: web.Request) -> web.Response:
@@ -51038,6 +51608,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/spawnpoint", api_tools_spawnpoint_post)
     r.add_get("/api/tools/territory", api_tools_territory_get)
     r.add_post("/api/tools/territory", api_tools_territory_post)
+    r.add_get("/api/tools/performanceoptimizer", api_tools_performanceoptimizer_get)
+    r.add_post("/api/tools/performanceoptimizer", api_tools_performanceoptimizer_post)
     r.add_get("/api/tools/bunkerbroadcast", api_tools_bunkerbroadcast_get)
     r.add_post("/api/tools/bunkerbroadcast", api_tools_bunkerbroadcast_post)
     r.add_get("/api/tools/territoryexclusion", api_tools_territoryexclusion_get)
@@ -51758,6 +52330,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "b532e93d2b9b046fc8f8c4e9b0026a0293fea64c79048ae8ee8add00ed42aac8",
         "ce79c3176d9c957cbbbc861bf18996aaa271e095bdb5ca321ccf7aaa52692cd1",
         "978ee42f18b2264e525962decb256521244cd6da965c533ee0f17cb46c7bdcec",
+        "83a6fd78c6bdd0683d09d76e8e77ab0a2c4b1b95ac1b0131d793d85b3a511b80",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -52016,6 +52589,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "399c6c489a59e5b9fd552061490fe01a0f0e9f1b90c7135344a5b83550dd605b",
         "0abd441c5d36335854ba59e697f5ff77541bc06bc111c7b39bc9964ada982e66",
         "faccc5535e6a68a6d7d27f2f35c945c3eacbb5c87794bff40b106a7bd2f77e64",
+        "20e7cdf91e3aef11be4797e061600e76936d0c80d9a649cb5eb40cca41a4d8de",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
