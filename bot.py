@@ -30180,6 +30180,20 @@ class EconomyDB:
                 "WHERE service_id=? AND guild_id=? AND user_id=? ORDER BY created_at DESC, id DESC LIMIT ?",
                 (str(service_id or ""), guild_id, user_id, max(1, int(limit)))).fetchall())
 
+    def purchase_count(self, service_id: str, item_name: str, seit: float,
+                       user_id: Optional[int] = None) -> Tuple[int, Optional[float]]:
+        """Gekaufte Stueck eines Items auf EINEM Server seit ``seit`` (optional nur eines Spielers): (Stueckzahl, aeltester
+        Zeitpunkt). Fuer das Kauf-Limit des Items; je Server, damit ein anderer Kunde nie mitzaehlt."""
+        q = ("SELECT COALESCE(SUM(MAX(COALESCE(amount, 1), 1)), 0), MIN(created_at) FROM purchases "
+             "WHERE service_id=? AND item_name=? AND created_at>=?")
+        args: List[Any] = [str(service_id or ""), str(item_name), float(seit)]
+        if user_id is not None:
+            q += " AND user_id=?"
+            args.append(int(user_id))
+        with self._lock:
+            zeile = self._conn.execute(q, tuple(args)).fetchone()
+        return int(zeile[0] or 0), (float(zeile[1]) if zeile[1] is not None else None)
+
     def pending_purchases(self, created_before: Optional[float] = None,
                           guild_id: Optional[int] = None,
                           service_id: Optional[str] = None) -> List[sqlite3.Row]:
@@ -33737,7 +33751,9 @@ class ShopCatalog:
             cls_list = _item_classnames(it)
             if not cls_list:
                 continue
-            is_bundle = len(cls_list) > 1
+            # Bundle = mehrere VERSCHIEDENE Classnames; ein Classname mehrfach ist nur eine Menge (Canteen ×3).
+            verschieden = list(dict.fromkeys(c.lower() for c in cls_list))
+            is_bundle = len(verschieden) > 1
             name = str(it.get("name") or cls_list[0])
             self._by_key.setdefault(name.lower(), it)
             if not is_bundle:
@@ -33745,13 +33761,18 @@ class ShopCatalog:
                 self._by_key.setdefault(cls_list[0].lower(), it)
             self.by_category.setdefault(str(it.get("category", "Misc")), []).append(it)
             enabled = bool(it.get("enabled", True))
+            versteckt = bool(it.get("hidden", False))
             flag  = "" if enabled else "🚫 "
+            if enabled and versteckt:
+                flag = "🙈 "
             if is_bundle:
                 label = f"{flag}{name} – {int(it.get('price', 0)):,} {sym} (Bundle · {len(cls_list)} items)"
             else:
                 label = f"{flag}{name} – {int(it.get('price', 0)):,} {sym} ({it.get('category', 'Misc')})"
-            search = " ".join([name.lower()] + [c.lower() for c in cls_list])
-            self._ac_index.append((search, label[:100], name[:100], enabled))
+            search = " ".join([name.lower()] + list(dict.fromkeys(c.lower() for c in cls_list)))
+            # 4. Feld = in den Listen der Spieler sichtbar: ein verstecktes Item taucht in /buy nicht auf,
+            # bleibt aber mit genauem Namen kaufbar; Admin-Befehle zeigen es weiterhin.
+            self._ac_index.append((search, label[:100], name[:100], enabled and not versteckt))
 
     def find(self, key: str) -> Optional[Dict]:
         return self._by_key.get(key.strip().lower())
@@ -33815,11 +33836,12 @@ def _shop_line(it: Dict) -> str:
     cls_list = _item_classnames(it)
     name = str(it.get("name") or (cls_list[0] if cls_list else "?"))
     extra = ""
-    if len(cls_list) > 1:
-        inhalt = " + ".join(cls_list)
+    gruppen = _inhalt_gruppiert(cls_list)
+    if len(gruppen) > 1 or (gruppen and gruppen[0]["qty"] > 1):
+        inhalt = " + ".join(f"{g['classname']} ×{g['qty']}" if g["qty"] > 1 else g["classname"] for g in gruppen)
         if len(inhalt) > 60:
             inhalt = inhalt[:57] + "…"
-        extra = f"Bundle: {inhalt}, "
+        extra = f"Bundle: {inhalt}, " if len(gruppen) > 1 else f"{inhalt}, "
     return (f"• **{name}** — {_fmt_money(int(it.get('price', 0)))} "
             f"*({extra}max {int(it.get('max_amount_per_buy', 1))}/buy)*")
 
@@ -33869,7 +33891,7 @@ async def _shop_category_autocomplete(interaction: discord.Interaction,
         for cat in katalog.by_category:
             if cur and cur not in cat.lower():
                 continue
-            n = sum(1 for i in katalog.by_category[cat] if i.get("enabled", True))
+            n = sum(1 for i in katalog.by_category[cat] if _item_sichtbar(i))
             if n:
                 zaehler[cat] = zaehler.get(cat, 0) + n
     out: List[app_commands.Choice] = []
@@ -33923,7 +33945,7 @@ async def shop_list(interaction: discord.Interaction, category: Optional[str] = 
     katalog = await _require_catalog(interaction, server=server)
     if katalog is None:
         return
-    enabled_items = [it for it in katalog.items if it.get("enabled", True)]
+    enabled_items = [it for it in katalog.items if _item_sichtbar(it)]
     if not enabled_items:
         return await interaction.response.send_message(_t(
             interaction,
@@ -33939,7 +33961,7 @@ async def shop_list(interaction: discord.Interaction, category: Optional[str] = 
         # Eine Kategorie komplett auflisten
         wanted = category.strip().lower()
         match = next((c for c in katalog.by_category if c.lower() == wanted), None)
-        items = ([i for i in katalog.by_category.get(match, []) if i.get("enabled", True)]
+        items = ([i for i in katalog.by_category.get(match, []) if _item_sichtbar(i)]
                  if match else [])
         if not items:
             return await interaction.response.send_message(_t(
@@ -33954,7 +33976,7 @@ async def shop_list(interaction: discord.Interaction, category: Optional[str] = 
         lines = []
         items_wort = _t(interaction, "Items", "items")
         for cat in sorted(katalog.by_category):
-            items = [i for i in katalog.by_category[cat] if i.get("enabled", True)]
+            items = [i for i in katalog.by_category[cat] if _item_sichtbar(i)]
             if not items:
                 continue
             prices = [int(i.get("price", 0)) for i in items]
@@ -34351,10 +34373,14 @@ class _Preis:
     total: int = 0
 
 
-def _bester_rabatt(gid: int, rollen_ids: Set[int], preis: int) -> Tuple[int, Optional[Dict[str, Any]]]:
-    """Der groesste dauerhafte Rabatt aus den Rollen des Kaeufers: (Abzug, Regel) - (0, None) ohne Rabatt."""
+def _bester_rabatt(gid: int, rollen_ids: Set[int], preis: int,
+                   item_regeln: Optional[List[Dict[str, Any]]] = None) -> Tuple[int, Optional[Dict[str, Any]]]:
+    """Der groesste dauerhafte Rabatt aus den Rollen des Kaeufers: (Abzug, Regel) - (0, None) ohne Rabatt.
+    Neben den Rabatten der Guild zaehlen die des Items (``item_regeln``); es gilt immer genau ein Rabatt, der groesste."""
     beste: Tuple[int, Optional[Dict[str, Any]]] = (0, None)
-    for r in db.rabatt_liste(gid):
+    regeln = [{"role_id": int(r["role_id"]), "typ": r["typ"], "betrag": int(r["betrag"])} for r in db.rabatt_liste(gid)]
+    regeln.extend(item_regeln or [])
+    for r in regeln:
         if int(r["role_id"]) not in rollen_ids:
             continue
         a = _abzug(r["typ"], int(r["betrag"]), preis)
@@ -34414,12 +34440,13 @@ def _gutschein_fehlversuch(uid: Optional[int]) -> None:
 
 
 def _preis_berechnen(gid: int, rollen_ids: Optional[Set[int]], liste: int, gutschein: Optional[str],
-                     en: bool, uid: Optional[int] = None) -> Union[_Preis, "_KaufFehler"]:
+                     en: bool, uid: Optional[int] = None,
+                     item_regeln: Optional[List[Dict[str, Any]]] = None) -> Union[_Preis, "_KaufFehler"]:
     """Endpreis fuer einen Listenpreis: Rollen-Rabatt, dann optional ein Gutschein. Ein unbrauchbarer Gutschein
     ist ein Fehler (der Kaeufer soll nicht stillschweigend ohne Rabatt zahlen). ``uid`` (der Kaeufer) dient nur
-    dem Schutz vor dem Durchprobieren von Codes."""
+    dem Schutz vor dem Durchprobieren von Codes. ``item_regeln`` sind die Rabatte, die am Item selbst stehen."""
     p = _Preis(liste=int(liste))
-    p.rabatt, p.rabatt_regel = _bester_rabatt(gid, rollen_ids or set(), p.liste)
+    p.rabatt, p.rabatt_regel = _bester_rabatt(gid, rollen_ids or set(), p.liste, item_regeln)
     rest = p.liste - p.rabatt
     if gutschein:
         if _gutschein_gesperrt(uid):
@@ -36973,6 +37000,7 @@ class _KaufPlan:
     total: int
     wallet: int
     preis: Optional[_Preis] = None
+    rollen_ids: Optional[Set[int]] = None        # fuer die Wiederholung der Limit-Pruefung beim Ausliefern
 
 
 @dataclasses.dataclass
@@ -36988,6 +37016,97 @@ class _KaufErgebnis:
 
     def text(self, en: bool) -> str:
         return self.en if en else self.de
+
+
+def _limit_dauer(sekunden: float, en: bool) -> str:
+    """Dauer kurz und lesbar: 90061 -> „1 d 1 h 1 min“. Mindestens eine Sekunde."""
+    s = max(1, int(math.ceil(sekunden)))
+    tage, rest = divmod(s, 86400)
+    std, rest = divmod(rest, 3600)
+    minu, sek = divmod(rest, 60)
+    teile = []
+    if tage:
+        teile.append(f"{tage} d")
+    if std:
+        teile.append(f"{std} h")
+    if minu:
+        teile.append(f"{minu} min")
+    if sek and not tage and not std:
+        teile.append(f"{sek} s")
+    return " ".join(teile[:3]) or "1 s"
+
+
+def _limit_stand(service_id: str, uid: int, it: Dict[str, Any], rollen_ids: Optional[Set[int]],
+                 jetzt: Optional[float] = None) -> Optional[Tuple[int, int, Optional[float], Dict[str, Any]]]:
+    """Stand des Kauf-Limits fuer diesen Spieler: (erlaubt, schon gekauft, aeltester Kauf, Limit) - ``None`` ohne Limit oder
+    mit einer Ausnahme „unbegrenzt“. Eine Ausnahme fuer die Rolle oder den Spieler gibt eine andere Zahl; trifft mehr als eine
+    zu, gilt die grosszuegigste (0 = unbegrenzt). Gezaehlt werden die Stuecke dieses Items auf DIESEM Server - ein anderer
+    Kunde zaehlt nie mit."""
+    lim = _item_limit(it)
+    if not lim:
+        return None
+    erlaubt = lim["max"]
+    for a in lim["exceptions"]:
+        trifft = (a["kind"] == "user" and a["id"] == uid) or \
+                 (a["kind"] == "role" and rollen_ids is not None and a["id"] in rollen_ids)
+        if trifft:
+            if a["max"] == 0:
+                return None
+            erlaubt = max(erlaubt, a["max"])
+    jetzt = time.time() if jetzt is None else jetzt
+    anzahl, aeltester = db.purchase_count(service_id, str(it.get("name") or ""), jetzt - lim["per_seconds"],
+                                          None if lim["shared"] else uid)
+    return erlaubt, anzahl, aeltester, lim
+
+
+def _kauf_limit_pruefen(service_id: str, uid: int, it: Dict[str, Any], rollen_ids: Optional[Set[int]],
+                        menge: int = 1, jetzt: Optional[float] = None) -> Optional["_KaufFehler"]:
+    """Prueft das Kauf-Limit des Items (siehe ``_limit_stand``) fuer ``menge`` Stueck."""
+    jetzt = time.time() if jetzt is None else jetzt
+    stand = _limit_stand(service_id, uid, it, rollen_ids, jetzt)
+    if stand is None:
+        return None
+    erlaubt, anzahl, aeltester, lim = stand
+    menge = max(1, int(menge))
+    if anzahl + menge <= erlaubt:
+        return None
+    rest = max(0, erlaubt - anzahl)
+    warte = max(1.0, (aeltester or jetzt) + lim["per_seconds"] - jetzt)
+    name = str(it.get("name") or "?")
+    zeit_de, zeit_en = _limit_dauer(lim["per_seconds"], False), _limit_dauer(lim["per_seconds"], True)
+    gemeinsam_de = " (für alle Spieler zusammen)" if lim["shared"] else ""
+    gemeinsam_en = " (for all players together)" if lim["shared"] else ""
+    daten = {"warte_sekunden": int(math.ceil(warte)), "max": erlaubt, "rest": rest, "per_seconds": lim["per_seconds"],
+             "shared": lim["shared"]}
+    if menge > erlaubt:
+        return _KaufFehler(
+            "limit",
+            f"❌ Kauf-Limit: **{name}** gibt es höchstens **{erlaubt}×** innerhalb von {zeit_de}{gemeinsam_de} – "
+            f"wähle eine kleinere Menge.",
+            f"❌ Purchase limit: **{name}** can be bought at most **{erlaubt}×** within {zeit_en}{gemeinsam_en} – "
+            f"pick a smaller amount.", daten=daten)
+    if rest > 0:
+        return _KaufFehler(
+            "limit",
+            f"❌ Kauf-Limit: Von **{name}** kannst du jetzt nur noch **{rest}×** kaufen (höchstens **{erlaubt}×** "
+            f"innerhalb von {zeit_de}{gemeinsam_de}). Mehr in **{_limit_dauer(warte, False)}**.",
+            f"❌ Purchase limit: you can only buy **{rest}×** of **{name}** right now (at most **{erlaubt}×** "
+            f"within {zeit_en}{gemeinsam_en}). More in **{_limit_dauer(warte, True)}**.", daten=daten)
+    return _KaufFehler(
+        "limit",
+        f"❌ Kauf-Limit erreicht: **{name}** gibt es höchstens **{erlaubt}×** innerhalb von {zeit_de}{gemeinsam_de}. "
+        f"Wieder möglich in **{_limit_dauer(warte, False)}**.",
+        f"❌ Purchase limit reached: **{name}** can be bought at most **{erlaubt}×** within {zeit_en}{gemeinsam_en}. "
+        f"Available again in **{_limit_dauer(warte, True)}**.", daten=daten)
+
+
+# Ein Kauf mit Limit laeuft je (Server, Item) nacheinander: sonst koennten zwei gleichzeitige Kaeufe (Doppelklick, /buy und
+# Dashboard zugleich) beide die Pruefung bestehen und das Limit umgehen.
+_KAUF_LIMIT_SPERREN: Dict[Tuple[str, str], asyncio.Lock] = {}
+
+
+def _kauf_limit_sperre(service_id: str, name: str) -> asyncio.Lock:
+    return _KAUF_LIMIT_SPERREN.setdefault((str(service_id), str(name).lower()), asyncio.Lock())
 
 
 def _kauf_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, amount: int,
@@ -37006,18 +37125,23 @@ def _kauf_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, amoun
     # Rollen-Beschraenkung: leer heisst, alle duerfen kaufen. Vor allen weiteren Pruefungen, damit niemand ueber
     # die Fehlermeldungen erfaehrt, was er ohnehin nicht kaufen darf.
     noetig = _item_role_ids(it)
-    if noetig and not (rollen_ids is not None and any(r in rollen_ids for r in noetig)):
+    alle_noetig = bool(it.get("require_all_roles")) and len(noetig) > 1
+    if noetig and not (rollen_ids is not None
+                       and (all(r in rollen_ids for r in noetig) if alle_noetig else any(r in rollen_ids for r in noetig))):
         return _KaufFehler(
             "rolle",
             f"❌ Du hast nicht die erforderliche Rolle, um **{it['name']}** zu kaufen.\n"
-            "Benötigt wird: " + ", ".join(f"<@&{r}>" for r in noetig),
+            + ("Benötigt werden alle diese Rollen: " if alle_noetig else "Benötigt wird: ") + ", ".join(f"<@&{r}>" for r in noetig),
             f"❌ You don't have the required role to buy **{it['name']}**.\n"
-            "Required: " + ", ".join(f"<@&{r}>" for r in noetig),
+            + ("Required (all of them): " if alle_noetig else "Required: ") + ", ".join(f"<@&{r}>" for r in noetig),
             daten={"role_ids": [str(r) for r in noetig]})
     max_amount = int(it.get("max_amount_per_buy", 1))
     if amount > max_amount:
         return _KaufFehler("menge", f"❌ Du kannst höchstens **{max_amount}× {it['name']}** pro Kauf erwerben.",
                            f"❌ You can buy at most **{max_amount}× {it['name']}** per purchase.")
+    fehler_limit = _kauf_limit_pruefen(conn.service_id, uid, it, rollen_ids, amount)
+    if fehler_limit is not None:
+        return fehler_limit
     cls_list = _item_classnames(it)
     if not cls_list:
         return _KaufFehler(
@@ -37062,7 +37186,8 @@ def _kauf_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, amoun
                            "❌ Height `y` out of range (−100 … 1000). Leave it empty for ground level.")
 
     # Preis pruefen (Vorpruefung, Abbuchung erst nach FTP-Erfolg): Rollen-Rabatt, dann Gutschein
-    preis = _preis_berechnen(gid, rollen_ids, int(it.get("price", 0)) * int(amount), gutschein, en, uid)
+    preis = _preis_berechnen(gid, rollen_ids, int(it.get("price", 0)) * int(amount), gutschein, en, uid,
+                             item_regeln=_item_rabatte(it))
     if isinstance(preis, _KaufFehler):
         return preis
     total = preis.total
@@ -37073,7 +37198,8 @@ def _kauf_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, amoun
             f"❌ Du brauchst **{_fmt_money(total, conn)}**, dein Wallet hat nur **{_fmt_money(wallet, conn)}**.",
             f"❌ You need **{_fmt_money(total, conn)}** but your wallet only has **{_fmt_money(wallet, conn)}**.",
             wallet=wallet, total=total)
-    return _KaufPlan(it, cls_list, int(amount), float(x), y_val, float(z), ort_label, total, wallet, preis)
+    return _KaufPlan(it, cls_list, int(amount), float(x), y_val, float(z), ort_label, total, wallet, preis,
+                     rollen_ids=set(rollen_ids) if rollen_ids is not None else None)
 
 
 def _kauf_ort_info(conn: "ServerConnection", x: float, z: float) -> Tuple[str, Optional[str]]:
@@ -37084,6 +37210,19 @@ def _kauf_ort_info(conn: "ServerConnection", x: float, z: float) -> Tuple[str, O
 
 async def _kauf_ausfuehren(conn: "ServerConnection", gid: int, uid: int, user_name: str,
                            plan: _KaufPlan) -> _KaufErgebnis:
+    """Liefert den vorgeprueften Kauf aus. Hat das Item ein Kauf-Limit, laeuft der Kauf je Server und Item nacheinander
+    und das Limit wird direkt davor noch einmal geprueft."""
+    if _item_limit(plan.item) is None:
+        return await _kauf_ausfuehren_innen(conn, gid, uid, user_name, plan)
+    async with _kauf_limit_sperre(conn.service_id, str(plan.item.get("name") or "")):
+        fehler = _kauf_limit_pruefen(conn.service_id, uid, plan.item, plan.rollen_ids, plan.amount)
+        if fehler is not None:
+            return _KaufErgebnis(False, fehler.code, fehler.de, fehler.en)
+        return await _kauf_ausfuehren_innen(conn, gid, uid, user_name, plan)
+
+
+async def _kauf_ausfuehren_innen(conn: "ServerConnection", gid: int, uid: int, user_name: str,
+                                 plan: _KaufPlan) -> _KaufErgebnis:
     """Liefert den vorgeprueften Kauf aus: erst in cfgEffectArea.json schreiben, dann abbuchen (atomar, bei
     Fehlschlag Rollback), dann als ausstehend vormerken und im shop_log-Feed melden."""
     # Auslieferung auf genau dem gewaehlten Server – hier wird nur noch geprueft, ob er einsatzbereit ist.
@@ -47296,20 +47435,235 @@ def _item_role_ids(it: dict) -> List[int]:
     return out
 
 
+# ── Shop-Items wie bei DayZ++: Inhalt mit Menge, Kauf-Limit, Rabatte je Item, versteckt ──────────────
+# Die Menge je Inhalt steht im Katalog als wiederholter Classname (["Canteen", "Canteen"]): so bleiben Auslieferung (ein
+# Eintrag je Stueck), /shop list und Export unveraendert; das Dashboard zeigt und bearbeitet es nur gruppiert ("Canteen ×2").
+_SHOP_INHALT_MAX = 50                       # Teile je Kauf (Summe aller Mengen)
+_SHOP_RABATTE_MAX = 15
+_SHOP_AUSNAHMEN_MAX = 20
+_SHOP_LIMIT_ZAHL_MAX = 1_000_000
+_SHOP_LIMIT_FENSTER_MAX = 366 * 86400
+_SHOP_CLASSNAME_RE = re.compile(r"^[^\s,;]{1,100}$")
+
+
+def _inhalt_gruppiert(cls: List[str]) -> List[Dict[str, Any]]:
+    """[{classname, qty}] in der Reihenfolge des ersten Auftretens; gleiche Namen (ohne Gross-/Kleinschreibung) zaehlen zusammen."""
+    reihen: Dict[str, Dict[str, Any]] = {}
+    for c in cls:
+        k = str(c).lower()
+        if k in reihen:
+            reihen[k]["qty"] += 1
+        else:
+            reihen[k] = {"classname": str(c), "qty": 1}
+    return list(reihen.values())
+
+
+def _inhalt_aus_daten(data: dict) -> Tuple[Optional[List[str]], Optional[str]]:
+    """Inhalt aus ``contents`` [{classname, qty}] des Dashboards als Classname-Liste mit Wiederholungen.
+    (None, None) = das Feld fehlt (dann gilt ``classnames`` wie bisher); (None, Text) = Fehler."""
+    roh = data.get("contents")
+    if roh is None:
+        return None, None
+    if not isinstance(roh, list):
+        return None, "Inhalt: ungültige Angabe."
+    reihen: Dict[str, Dict[str, Any]] = {}
+    for z in roh:
+        if not isinstance(z, dict):
+            return None, "Inhalt: ungültige Zeile."
+        cn = str(z.get("classname") or "").strip()
+        if not cn:
+            continue                                  # leere Zeile des Formulars
+        if not _SHOP_CLASSNAME_RE.match(cn):
+            return None, f"Inhalt: „{cn[:40]}“ ist kein gültiger Classname (keine Leerzeichen oder Kommas)."
+        try:
+            qty = int(z.get("qty", 1))
+        except (TypeError, ValueError):
+            return None, f"Inhalt: Die Menge von „{cn}“ ist keine Zahl."
+        if qty < 1 or qty > _SHOP_INHALT_MAX:
+            return None, f"Inhalt: Die Menge von „{cn}“ muss zwischen 1 und {_SHOP_INHALT_MAX} liegen."
+        k = cn.lower()
+        if k in reihen:
+            reihen[k]["qty"] += qty
+        else:
+            reihen[k] = {"classname": cn, "qty": qty}
+    liste = [r["classname"] for r in reihen.values() for _ in range(r["qty"])]
+    if not liste:
+        return None, "Mindestens einen Classname angeben."
+    if len(liste) > _SHOP_INHALT_MAX:
+        return None, f"Inhalt: höchstens {_SHOP_INHALT_MAX} Teile je Kauf (jetzt {len(liste)})."
+    return liste, None
+
+
+def _zahl_in(wert: Any, lo: int, hi: int) -> Optional[int]:
+    if isinstance(wert, bool):
+        return None
+    try:
+        n = int(wert)
+    except (TypeError, ValueError):
+        return None
+    return n if lo <= n <= hi else None
+
+
+def _limit_aus_daten(roh: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Kauf-Limit aus dem Formular. ``None``/aus = kein Limit (der Schluessel verschwindet aus dem Katalogeintrag)."""
+    if roh is None or roh is False:
+        return None, None
+    if not isinstance(roh, dict):
+        return None, "Kauf-Limit: ungültige Angabe."
+    if not roh.get("enabled", True):
+        return None, None
+    mx = _zahl_in(roh.get("max"), 1, _SHOP_LIMIT_ZAHL_MAX)
+    if mx is None:
+        return None, f"Kauf-Limit: „Höchstens“ muss eine Zahl von 1 bis {_SHOP_LIMIT_ZAHL_MAX} sein."
+    per = _zahl_in(roh.get("per_seconds"), 1, _SHOP_LIMIT_FENSTER_MAX)
+    if per is None:
+        return None, "Kauf-Limit: Der Zeitraum muss zwischen 1 Sekunde und 366 Tagen liegen."
+    roh_a = roh.get("exceptions") or []
+    if not isinstance(roh_a, list) or len(roh_a) > _SHOP_AUSNAHMEN_MAX:
+        return None, f"Kauf-Limit: höchstens {_SHOP_AUSNAHMEN_MAX} Ausnahmen."
+    ausnahmen: List[Dict[str, Any]] = []
+    gesehen = set()
+    for a in roh_a:
+        if not isinstance(a, dict):
+            return None, "Kauf-Limit: ungültige Ausnahme."
+        kind = str(a.get("kind") or "")
+        if kind not in ("role", "user"):
+            return None, "Kauf-Limit: Eine Ausnahme gilt für eine Rolle oder für einen Spieler."
+        ids = _rollen_aus_daten(a.get("id"))
+        if len(ids) != 1:
+            return None, "Kauf-Limit: Jede Ausnahme braucht genau eine gültige Discord-ID."
+        m = _zahl_in(a.get("max"), 0, _SHOP_LIMIT_ZAHL_MAX)
+        if m is None:
+            return None, "Kauf-Limit: Die Zahl einer Ausnahme muss zwischen 0 und 1000000 liegen (0 = unbegrenzt)."
+        if (kind, ids[0]) in gesehen:
+            return None, "Kauf-Limit: Dieselbe Ausnahme steht doppelt."
+        gesehen.add((kind, ids[0]))
+        ausnahmen.append({"kind": kind, "id": ids[0], "max": m})
+    return {"max": mx, "per_seconds": per, "shared": bool(roh.get("shared")), "exceptions": ausnahmen}, None
+
+
+def _item_limit(it: dict) -> Optional[Dict[str, Any]]:
+    """Kauf-Limit eines Katalogeintrags in sauberer Form; kaputte Angaben werden uebergangen (kein Limit statt Absturz)."""
+    roh = it.get("purchase_limit")
+    if not isinstance(roh, dict):
+        return None
+    try:
+        mx, per = int(roh.get("max")), int(roh.get("per_seconds"))
+    except (TypeError, ValueError):
+        return None
+    if mx < 1 or per < 1:
+        return None
+    ausnahmen: List[Dict[str, Any]] = []
+    for a in roh.get("exceptions") or []:
+        try:
+            kind, rid, m = str(a.get("kind")), int(a.get("id")), int(a.get("max"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if kind in ("role", "user") and rid > 0 and m >= 0:
+            ausnahmen.append({"kind": kind, "id": rid, "max": m})
+    return {"max": mx, "per_seconds": per, "shared": bool(roh.get("shared")), "exceptions": ausnahmen}
+
+
+def _rabatte_aus_daten(roh: Any) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """Rabatte je Rolle fuer EIN Item. (None, None) = Feld fehlt; ([], None) = keine Rabatte."""
+    if roh is None:
+        return None, None
+    if not isinstance(roh, list):
+        return None, "Rabatte: ungültige Angabe."
+    if len(roh) > _SHOP_RABATTE_MAX:
+        return None, f"Rabatte: höchstens {_SHOP_RABATTE_MAX} Rollen."
+    out: List[Dict[str, Any]] = []
+    gesehen = set()
+    for r in roh:
+        if not isinstance(r, dict):
+            return None, "Rabatte: ungültige Zeile."
+        ids = _rollen_aus_daten(r.get("role_id"))
+        if len(ids) != 1:
+            return None, "Rabatte: Jede Zeile braucht eine Rolle."
+        typ = str(r.get("typ") or "")
+        if typ not in ("percent", "fixed"):
+            return None, "Rabatte: Die Art ist Prozent oder fester Betrag."
+        betrag = _zahl_in(r.get("betrag"), 1, 100 if typ == "percent" else _SHOP_LIMIT_ZAHL_MAX)
+        if betrag is None:
+            return None, "Rabatte: Prozent von 1 bis 100, fester Betrag von 1 bis 1000000."
+        if ids[0] in gesehen:
+            return None, "Rabatte: Jede Rolle nur einmal."
+        gesehen.add(ids[0])
+        out.append({"role_id": ids[0], "typ": typ, "betrag": betrag})
+    return out, None
+
+
+def _item_rabatte(it: dict) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for r in it.get("discounts") or []:
+        try:
+            rid, betrag = int(r.get("role_id")), int(r.get("betrag"))
+            typ = str(r.get("typ"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if rid > 0 and betrag > 0 and typ in ("percent", "fixed"):
+            out.append({"role_id": rid, "typ": typ, "betrag": betrag})
+    return out
+
+
+def _item_sichtbar(it: dict) -> bool:
+    """Steht das Item in den Listen der Spieler? Ein verstecktes oder abgeschaltetes Item erscheint dort nicht; versteckte Items
+    bleiben mit ihrem genauen Namen kaufbar (abgeschaltete nicht)."""
+    return bool(it.get("enabled", True)) and not it.get("hidden")
+
+
+def _item_zusatz_pruefen(data: dict) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Die neuen Felder (versteckt, jede Rolle noetig, Kauf-Limit, Rabatte) aus dem Formular lesen und pruefen - ohne den
+    Katalogeintrag anzufassen. Nur Felder, die im Formular stehen, kommen ins Ergebnis."""
+    erg: Dict[str, Any] = {}
+    if "hidden" in data:
+        erg["hidden"] = bool(data.get("hidden"))
+    if "require_all_roles" in data:
+        erg["require_all_roles"] = bool(data.get("require_all_roles"))
+    if "purchase_limit" in data:
+        lim, fehler = _limit_aus_daten(data.get("purchase_limit"))
+        if fehler:
+            return {}, fehler
+        erg["purchase_limit"] = lim
+    if "discounts" in data:
+        rab, fehler = _rabatte_aus_daten(data.get("discounts"))
+        if fehler:
+            return {}, fehler
+        erg["discounts"] = rab or []
+    return erg, None
+
+
+def _item_zusatz_anwenden(it: dict, erg: Dict[str, Any]) -> None:
+    """Leere Werte entfernen den Schluessel, damit ein Katalog ohne Besonderheiten sauber bleibt."""
+    for k, v in erg.items():
+        if v:
+            it[k] = v
+        else:
+            it.pop(k, None)
+
+
 def _item_view(it: dict) -> dict:
     cls = _classnames(it)
+    lim = _item_limit(it)
+    if lim:
+        lim = dict(lim, exceptions=[dict(a, id=str(a["id"])) for a in lim["exceptions"]])
     return {
         "name": str(it.get("name") or (cls[0] if cls else "?")),
         "classnames": cls,
-        "is_bundle": len(cls) > 1,
+        "contents": _inhalt_gruppiert(cls),
+        "is_bundle": len({c.lower() for c in cls}) > 1,
         "price": int(it.get("price", 0)),
         "category": str(it.get("category", "Misc")),
         "enabled": bool(it.get("enabled", True)),
+        "hidden": bool(it.get("hidden", False)),
         "max_amount_per_buy": int(it.get("max_amount_per_buy", 1)),
         "custom": bool(it.get("custom", False)),
         # Als Zeichenketten: Discord-IDs sind 19-stellig und verlieren als
         # JavaScript-Zahl die letzten Stellen.
         "role_ids": [str(r) for r in _item_role_ids(it)],
+        "require_all_roles": bool(it.get("require_all_roles", False)),
+        "purchase_limit": lim,
+        "discounts": [dict(r, role_id=str(r["role_id"])) for r in _item_rabatte(it)],
     }
 
 
@@ -47445,7 +47799,7 @@ async def api_shop_classnames(request: web.Request) -> web.Response:
     # einer Datei - dient AUSSCHLIESSLICH dem Autofill, legt nie Shop-Items an), zuletzt der
     # mitgelieferte DayZ-Katalog (damit auch neue 1.30-Items vorgeschlagen werden).
     katalog_items = [{"classname": _classnames(it)[0], "name": it.get("name"), "category": it.get("category", "Misc")}
-                     for it in conn.catalog.items if len(_classnames(it)) == 1]
+                     for it in conn.catalog.items if len({c.lower() for c in _classnames(it)}) == 1]
     out = _shop_autofill_treffer(
         [katalog_items, list(conn.data.get("shop_autofill_classnames") or []), _shop_eingebaute_classnames()],
         q, limit)
@@ -47502,11 +47856,18 @@ async def create_item(request: web.Request) -> web.Response:
         return fehler
     katalog = conn.catalog
     data = await body(request)
-    parts = _split_classnames(data.get("classnames") or data.get("classname"))
+    parts, fehler_inhalt = _inhalt_aus_daten(data)
+    if fehler_inhalt:
+        return err(fehler_inhalt)
+    if parts is None:
+        parts = _split_classnames(data.get("classnames") or data.get("classname"))
     if not parts:
         return err("Mindestens einen Classname angeben (z. B. M4A1 oder "
                    "M4A1, Mag_STANAG_60Rnd für ein Bundle).")
-    is_bundle = len(parts) > 1
+    zusatz, fehler_zusatz = _item_zusatz_pruefen(data)
+    if fehler_zusatz:
+        return err(fehler_zusatz)
+    is_bundle = len({c.lower() for c in parts}) > 1
     display = str(data.get("name", "")).strip() or (
         f"{parts[0]} Bundle ({len(parts)} items)" if is_bundle else parts[0])
     if katalog.find(display):
@@ -47541,13 +47902,14 @@ async def create_item(request: web.Request) -> web.Response:
     rollen = _rollen_aus_daten(data.get("role_ids"))
     if rollen:
         it["role_ids"] = rollen
-    if is_bundle:
+    if len(parts) > 1:
         it["classnames"] = parts
     else:
         it["classname"] = parts[0]
+    _item_zusatz_anwenden(it, zusatz)
 
     # Unbekannte Classnames (Tippfehler-Hinweis, nicht blockierend)
-    unknown = [c for c in parts if katalog.find(c) is None]
+    unknown = [c for c in dict.fromkeys(parts) if katalog.find(c) is None]
 
     katalog.items.append(it)
     saved = _shop_persist(katalog)
@@ -47578,6 +47940,13 @@ async def update_item(request: web.Request) -> web.Response:
     if not it:
         return err("Item nicht gefunden.", 404)
     data = await body(request)
+    # Alles Neue zuerst pruefen: bei einem Fehler bleibt der Eintrag im Speicher unveraendert.
+    neue_teile, fehler_inhalt = _inhalt_aus_daten(data)
+    if fehler_inhalt:
+        return err(fehler_inhalt)
+    zusatz, fehler_zusatz = _item_zusatz_pruefen(data)
+    if fehler_zusatz:
+        return err(fehler_zusatz)
 
     if "name" in data:
         new_name = str(data["name"]).strip()
@@ -47608,8 +47977,8 @@ async def update_item(request: web.Request) -> web.Response:
             it["max_amount_per_buy"] = max(1, int(data.get("max_amount_per_buy") or data.get("limit")))
         except (TypeError, ValueError):
             return err("Limit muss eine Zahl ≥ 1 sein.")
-    if "classnames" in data or "classname" in data:
-        parts = _split_classnames(data.get("classnames") or data.get("classname"))
+    if neue_teile is not None or "classnames" in data or "classname" in data:
+        parts = neue_teile if neue_teile is not None else _split_classnames(data.get("classnames") or data.get("classname"))
         if not parts:
             return err("Mindestens einen Classname angeben.")
         it.pop("classname", None)
@@ -47618,6 +47987,7 @@ async def update_item(request: web.Request) -> web.Response:
             it["classnames"] = parts
         else:
             it["classname"] = parts[0]
+    _item_zusatz_anwenden(it, zusatz)
 
     saved = _shop_persist(katalog)
     return ok({"item": _item_view(it), "saved": saved})
@@ -48198,11 +48568,15 @@ async def api_shop_export(request: web.Request) -> web.Response:
     fehler = await _dash_gate(request, conn, "shop", "view")
     if fehler is not None:
         return fehler
-    # Rollen-Beschraenkungen bleiben draussen: Rollen-IDs gelten nur in EINER
-    # Discord-Guild. Beim Empfaenger wuerden sie auf nichts zeigen und das Item
-    # still unverkaeuflich machen.
-    items = [{k: v for k, v in _item_view(it).items() if k != "role_ids"}
-             for it in conn.catalog.items]
+    # Alles mit Rollen- oder Spieler-IDs bleibt draussen (Rollen, "alle Rollen noetig", Rabatte je Rolle, Ausnahmen
+    # des Kauf-Limits): diese IDs gelten nur in EINER Discord-Guild. Beim Empfaenger wuerden sie auf nichts zeigen und
+    # das Item still unverkaeuflich machen.
+    items = []
+    for it in conn.catalog.items:
+        v = {k: x for k, x in _item_view(it).items() if k not in ("role_ids", "require_all_roles", "discounts")}
+        if v.get("purchase_limit"):
+            v["purchase_limit"] = dict(v["purchase_limit"], exceptions=[])
+        items.append(v)
     return ok({
         "format": _SHOP_EXPORT_FORMAT,
         "version": 1,
@@ -48259,11 +48633,21 @@ async def api_shop_import(request: web.Request) -> web.Response:
         if not isinstance(eintrag, dict):
             ungueltig += 1
             continue
-        parts = _split_classnames(eintrag.get("classnames") or eintrag.get("classname"))
+        parts, fehler_inhalt = _inhalt_aus_daten(eintrag)
+        if fehler_inhalt:
+            ungueltig += 1
+            continue
+        if parts is None:
+            roh_cn = eintrag.get("classnames") or eintrag.get("classname")
+            if isinstance(roh_cn, list):
+                # Wiederholte Classnames sind eine Menge (Canteen, Canteen = 2 Stueck) und bleiben erhalten.
+                parts = [str(c).strip() for c in roh_cn if str(c).strip()][:_SHOP_INHALT_MAX]
+            else:
+                parts = _split_classnames(roh_cn)
         if not parts:
             ungueltig += 1
             continue
-        is_bundle = len(parts) > 1
+        is_bundle = len({c.lower() for c in parts}) > 1
         name = (str(eintrag.get("name") or "").strip()
                 or (f"{parts[0]} Bundle ({len(parts)} items)" if is_bundle else parts[0]))
         name = name[:100]
@@ -48297,10 +48681,16 @@ async def api_shop_import(request: web.Request) -> web.Response:
             # role_ids werden BEWUSST nicht uebernommen: sie gelten nur in der
             # Guild des Absenders und wuerden hier auf nichts zeigen.
         }
-        if is_bundle:
+        if len(parts) > 1:
             it["classnames"] = parts
         else:
             it["classname"] = parts[0]
+        # Versteckt und Kauf-Limit reisen mit; die Ausnahmen des Limits nicht (Rollen-/Spieler-IDs, siehe oben).
+        if eintrag.get("hidden"):
+            it["hidden"] = True
+        limit, _fehler_limit = _limit_aus_daten(eintrag.get("purchase_limit"))
+        if limit:
+            it["purchase_limit"] = dict(limit, exceptions=[])
         gesehen.add(name.lower())
         neu.append(it)
 
@@ -49491,7 +49881,8 @@ async def post_me_quote(request: web.Request) -> web.Response:
     if liste is None:
         return err("Dieses Item gibt es nicht." if not en else "This item does not exist.", 404)
     gutschein = str(data.get("gutschein") or "").strip() or None
-    preis = _preis_berechnen(gid, ctx["rollen"], liste, gutschein, en, ctx["uid"])
+    item_regeln = _item_rabatte(it) if art == "shop" else None
+    preis = _preis_berechnen(gid, ctx["rollen"], liste, gutschein, en, ctx["uid"], item_regeln=item_regeln)
     if isinstance(preis, _KaufFehler):
         return err(_klartext(preis.text(en)), 400, code=preis.code)
     return ok(_preis_view(preis, conn, en))
@@ -49603,20 +49994,34 @@ async def api_me_shop(request: web.Request) -> web.Response:
     guild = bot.get_guild(ctx["gid"])
     items = []
     for it in katalog.items:
-        if not it.get("enabled", True):
+        if not _item_sichtbar(it):       # abgeschaltet oder versteckt: steht nicht in der Liste
             continue
         noetig = _item_role_ids(it)
-        kaufbar = (not noetig) or any(r in ctx["rollen"] for r in noetig)
+        alle = bool(it.get("require_all_roles")) and len(noetig) > 1
+        kaufbar = (not noetig) or (all(r in ctx["rollen"] for r in noetig) if alle
+                                   else any(r in ctx["rollen"] for r in noetig))
         rollen_namen = []
         for r in noetig:
             rolle = guild.get_role(r) if guild is not None else None
             rollen_namen.append(rolle.name if rolle is not None else str(r))
-        items.append({"name": str(it.get("name") or "?"), "price": int(it.get("price", 0)),
-                      "price_text": _spieler_geld(conn, int(it.get("price", 0))),
-                      "category": str(it.get("category", "Misc")),
-                      "max_amount": int(it.get("max_amount_per_buy", 1)),
-                      "bundle": len(_item_classnames(it)) > 1,
-                      "kaufbar": kaufbar, "rollen": rollen_namen})
+        gruppen = _inhalt_gruppiert(_item_classnames(it))
+        # Rabatt am Item: nur die Regeln, die dem Spieler mit seinen Rollen zustehen, und der Preis, den er dafuer zahlt.
+        preis = int(it.get("price", 0))
+        abzug, regel = _bester_rabatt(ctx["gid"], ctx["rollen"], preis, _item_rabatte(it))
+        eintrag = {"name": str(it.get("name") or "?"), "price": preis,
+                   "price_text": _spieler_geld(conn, preis),
+                   "category": str(it.get("category", "Misc")),
+                   "max_amount": int(it.get("max_amount_per_buy", 1)),
+                   "bundle": len(gruppen) > 1,
+                   "inhalt": [{"classname": g["classname"], "qty": g["qty"]} for g in gruppen],
+                   "kaufbar": kaufbar, "alle_rollen": alle, "rollen": rollen_namen,
+                   "rabatt_preis_text": _spieler_geld(conn, max(0, preis - abzug)) if abzug > 0 else None}
+        stand = _limit_stand(conn.service_id, ctx["uid"], it, ctx["rollen"])
+        if stand is not None:
+            erlaubt, gekauft, _alt, lim = stand
+            eintrag["limit"] = {"max": erlaubt, "rest": max(0, erlaubt - gekauft), "shared": lim["shared"],
+                                "zeitraum": _limit_dauer(lim["per_seconds"], ctx["en"])}
+        items.append(eintrag)
     wallet, _bank = db.get_balance(ctx["gid"], ctx["uid"])
     return ok({"items": items, "wallet": wallet, "wallet_text": _spieler_geld(conn, wallet),
                "rabatte": _spieler_rabatte(ctx),
@@ -52331,6 +52736,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "ce79c3176d9c957cbbbc861bf18996aaa271e095bdb5ca321ccf7aaa52692cd1",
         "978ee42f18b2264e525962decb256521244cd6da965c533ee0f17cb46c7bdcec",
         "83a6fd78c6bdd0683d09d76e8e77ab0a2c4b1b95ac1b0131d793d85b3a511b80",
+        "79f46aad545b12f32060e5c6298a4238ad413a83497a34c86100cd409fe04aba",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -52590,6 +52996,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "0abd441c5d36335854ba59e697f5ff77541bc06bc111c7b39bc9964ada982e66",
         "faccc5535e6a68a6d7d27f2f35c945c3eacbb5c87794bff40b106a7bd2f77e64",
         "20e7cdf91e3aef11be4797e061600e76936d0c80d9a649cb5eb40cca41a4d8de",
+        "c41898f9011aea35f395334cf54ce0aecb9f9741ee606a309bf7787f9e722438",
+        "defa773b787ad2a48bcce058abb9015d34202886b46b233e5600a7fb57dd131c",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
@@ -52612,6 +53020,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "9d83e6b99cb7b5e3aff72b59c7a8c535157ac3e7f0727af2a797831c3fc9ad3e",
         "348ef6ec03933c640b7a2c90543530e9a0881c17e807fdc066c7ea9436c7f1a2",
         "014c591a3cd6aa6862e1583939b437c8b2c2b2d23c009d10f61107a470f84e99",
+        "a71f69bc408ce4ea832f4593e005298c884eef31fefd2b08f8e3e17f30d71b00",
     ),
     "vendor/leaflet.css": (
         "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",
