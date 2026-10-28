@@ -5932,6 +5932,13 @@ class DayZBot(discord.Client):
     async def _poll_connection(self, conn: ServerConnection):
         # Waehrung/Anzeige gehoeren zu DIESEM Server (siehe _cur_symbol)
         _setze_aktuellen_server(conn)
+        if conn.shop:
+            # Neustart ueber den Nitrado-Status erkennen - bewusst ganz vorn: Waehrend des Neustarts ist der FTP-Zugang oft
+            # nicht erreichbar, der Zyklus bricht dann weiter unten ab.
+            try:
+                await conn.shop.nitrado_zustand_pruefen()
+            except Exception as e:  # noqa: BLE001
+                log.debug(f"[SHOP] {conn.name}: Nitrado-Zustandspruefung: {e}")
         log_dir = conn.get("ftp_log_dir")
         if not log_dir:
             # Discovery beim Start fehlgeschlagen oder noch nicht gelaufen →
@@ -7920,6 +7927,10 @@ class DayZBot(discord.Client):
             # einen Server-Neustart, den es gar nicht gab.
             log.info(f"[POLL] {conn.name}: RPT-Stand gemerkt ({neueste}).")
             return
+        if conn.shop:
+            # Zweite Absicherung fuer das Aufraeumen gekaufter Shop-Eintraege: Die ADM-Erkennung (siehe _poll_connection)
+            # bleibt die erste. Vor dem Download/Feed, damit ein FTP-Fehler dort die Meldung nicht verhindert.
+            conn.shop.neustart_erkannt(neueste, zusatzquelle=True)
         if alter_pfad:
             await self._post_log_download(conn, "rpt_download", alter_pfad, loop)
         # Aus DayZServer_PS4_x64_20260808_142104.RPT wird 08.08.2026 14:21:04
@@ -31534,6 +31545,11 @@ class ShopManager:
     # So lange nach einem erkannten Neustart bleiben die gelieferten SHOP_-Eintraege in der Datei (der Server liest sie beim
     # Hochfahren und spawnt die Items), danach werden sie entfernt. Fest und unabhaengig davon, wodurch der Neustart kam.
     CLEANUP_NACH_NEUSTART_SEKUNDEN = 120
+    # So lange nach einem erkannten Neustart gilt die Meldung einer Zusatzquelle (RPT, Nitrado) als derselbe Neustart.
+    ZUSATZQUELLE_DOPPELT_SEKUNDEN = 300
+    # Wie oft der Nitrado-Status abgefragt wird - und zwar NUR, solange es offene Lieferungen gibt.
+    NITRADO_PRUEF_SEKUNDEN = 30
+    _NITRADO_UEBERGANG = ("starting", "stopping", "stopped", "restarting")
 
     def __init__(self, bot_ref: "DayZBot", conn: "ServerConnection"):
         self.bot  = bot_ref
@@ -31547,20 +31563,60 @@ class ShopManager:
         self.cleanup_retry_needed = False   # FTP-Fehler beim Cleanup → Retry im Poll-Zyklus
         self._last_restart_at = 0.0         # Zeitpunkt des zuletzt ERKANNTEN Server-Neustarts
         self._gemeldete_kennung = ""        # Datei, deren Neustart schon gemeldet wurde (siehe neustart_erkannt)
+        self._gemeldete_zusatz = ""         # dasselbe fuer die Zusatzquellen (.RPT, Nitrado-Status)
+        self._nitrado_geprueft_ts = 0.0     # letzte Abfrage des Nitrado-Status (siehe nitrado_zustand_pruefen)
+        self._nitrado_uebergang = False     # Nitrado meldete zuletzt stopping/stopped/restarting/starting
 
     # ── Neustart erkannt: Aufraeum-Frist starten ──────────────
-    def neustart_erkannt(self, kennung: str = "") -> None:
+    def neustart_erkannt(self, kennung: str = "", zusatzquelle: bool = False) -> None:
         """Der Log-Poller hat einen Server-Neustart bemerkt - gleich, ob der Bot, der Neustart-Plan, Nitrado oder ein Absturz
         ihn ausgeloest hat; erkannt wird er nur an den Logdateien. Startet die Frist von CLEANUP_NACH_NEUSTART_SEKUNDEN, nach
         der die SHOP_-Eintraege entfernt werden.
         kennung (z. B. der Name der neuen ADM-Datei) entprellt: solange die Rotation nicht abgeschlossen ist, sieht der Poller
-        denselben Neustart in jedem Zyklus wieder - das darf die Frist nicht jedes Mal neu starten."""
-        if kennung:
+        denselben Neustart in jedem Zyklus wieder - das darf die Frist nicht jedes Mal neu starten.
+        zusatzquelle=True: Meldung aus der .RPT (jeder Serverstart legt eine neue an) oder aus dem Nitrado-Status. Sie ist nur
+        eine weitere Absicherung neben der ADM-Erkennung: Hat die ADM denselben Neustart schon gemeldet, zaehlt die Zusatzquelle
+        nicht noch einmal. Kommt die ADM-Meldung spaeter, verschiebt sie die Frist (der Server hat dann wirklich geladen)."""
+        if zusatzquelle:
+            if kennung and kennung == self._gemeldete_zusatz:
+                return
+            self._gemeldete_zusatz = kennung
+            if time.time() - self._last_restart_at < self.ZUSATZQUELLE_DOPPELT_SEKUNDEN:
+                return            # schon bekannt (ADM war schneller) - die Frist laeuft bereits
+        elif kennung:
             if kennung == self._gemeldete_kennung:
                 return
             self._gemeldete_kennung = kennung
         self._last_restart_at = time.time()
         self.spawn_cleanup(delayed=True)
+
+    # ── Neustart ueber den Nitrado-Status erkennen ────────────
+    async def nitrado_zustand_pruefen(self) -> None:
+        """Dritte Absicherung neben ADM und RPT: der Status, den auch die Anzeige oben im Dashboard zeigt (gestartet, neustart,
+        gestoppt ...). Geht er aus einem Uebergang zurueck auf „gestartet“, ist der Server neu gestartet - unabhaengig davon,
+        ob die Logdateien erreichbar sind. Gefragt wird nur, solange es offene Lieferungen gibt (sonst gaebe es nichts zu
+        entfernen), und hoechstens alle NITRADO_PRUEF_SEKUNDEN."""
+        jetzt = time.time()
+        if jetzt - self._nitrado_geprueft_ts < self.NITRADO_PRUEF_SEKUNDEN:
+            return
+        self._nitrado_geprueft_ts = jetzt
+        if self.conn.api is None or not self._offene_kaeufe():
+            self._nitrado_uebergang = False
+            return
+        try:
+            info = await self.conn.api.get_info()
+        except Exception as e:  # noqa: BLE001 - Zugabe, darf den Poll nie kippen
+            log.debug(f"[SHOP] {self.conn.name}: Nitrado-Status nicht abrufbar ({e})")
+            return
+        zustand = str((info or {}).get("status") or (info or {}).get("state") or "").lower()
+        if not zustand:
+            return
+        if zustand in self._NITRADO_UEBERGANG:
+            self._nitrado_uebergang = True
+        elif zustand == "started" and self._nitrado_uebergang:
+            self._nitrado_uebergang = False
+            log.info(f"[SHOP] {self.conn.name}: Nitrado meldet den Server wieder als gestartet – Neustart erkannt.")
+            self.neustart_erkannt(f"nitrado-{int(jetzt)}", zusatzquelle=True)
 
     # ── Cleanup als Task starten (Referenz halten, Fehler loggen) ─
     def spawn_cleanup(self, delayed: bool = False):
@@ -31677,6 +31733,15 @@ class ShopManager:
                 return False, "FTP write failed – purchase cancelled, nothing was charged.", []
             return True, "", names
 
+    def _offene_kaeufe(self, created_before: Optional[float] = None) -> List[sqlite3.Row]:
+        """Offene Kaeufe DIESES Servers aus ALLEN Guilds, die ihn nutzen duerfen. Nicht ``conn.guild_id``: das ist nur die erste
+        Guild - ein Kauf aus einer weiteren Guild blieb sonst mit seinen SHOP_-Eintraegen ewig in der Datei."""
+        rows: List[sqlite3.Row] = []
+        for gid in self.conn.guild_ids:
+            rows.extend(db.pending_purchases(created_before=created_before, guild_id=gid,
+                                             service_id=self.conn.service_id))
+        return sorted(rows, key=lambda r: int(r["id"]))
+
     # ── Cleanup: Einträge nach Auslieferung entfernen ─────────
     async def remove_area_entries(self, area_names: List[str]) -> bool:
         """Entfernt Einträge aus cfgEffectArea.json (verhindert Respawn bei jedem Neustart)."""
@@ -31715,8 +31780,7 @@ class ShopManager:
         if not path:
             return -1
         valid: set = set()
-        for r in db.pending_purchases(guild_id=self.conn.guild_id,
-                                      service_id=self.conn.service_id):
+        for r in self._offene_kaeufe():
             try:
                 valid.update(json.loads(r["area_names"] or "[]"))
             except Exception:
@@ -31757,8 +31821,7 @@ class ShopManager:
         if not path:
             report["status"] = "no_path"
             return report
-        pending = db.pending_purchases(guild_id=self.conn.guild_id,
-                                       service_id=self.conn.service_id)
+        pending = self._offene_kaeufe()
         report["pending"] = len(pending)
         async with self.lock:
             loop = asyncio.get_running_loop()
@@ -31855,10 +31918,12 @@ class ShopManager:
         # dürfen nicht als geliefert markiert werden
         restart_at = self._last_restart_at or time.time()
         cutoff = restart_at - grace
-        rows = db.pending_purchases(created_before=cutoff,
-                                    guild_id=self.conn.guild_id,
-                                    service_id=self.conn.service_id)
+        rows = self._offene_kaeufe(created_before=cutoff)
         if not rows:
+            if delayed:
+                # Ohne diese Zeile laesst sich "Neustart erkannt, aber nichts zu tun" nicht von "Neustart nie erkannt" trennen.
+                log.info(f"[SHOP] {self.conn.name}: Server-Neustart erkannt – keine offenen Lieferungen "
+                         f"(Guilds: {self.conn.guild_ids}).")
             return
         if delayed:
             log.info(f"[SHOP] {self.conn.name}: Server-Neustart erkannt – in "
