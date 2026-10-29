@@ -24324,6 +24324,159 @@ async def api_ce_events_post(request: web.Request) -> web.Response:
     return ok(_ce_events_payload(conn))
 
 
+# Voraussetzung des Feeds: Der Server muss den periodischen Zaehler-Dump der Dynamic Events und die Fahrzeug-Zeilen
+# ueberhaupt ins Log schreiben - das steht in der cfgeconomycore.xml des Servers. Ohne beides bleibt der Feed stumm, ohne
+# dass irgendwo ein Fehler steht. Deshalb liest der Bot die beiden Werte selbst und laesst den Feed erst zu, wenn beide true sind.
+_CE_LOG_SCHLUESSEL = ("log_ce_dynamicevent", "log_ce_vehicle")
+_CE_LOG_DATEI = "cfgeconomycore.xml"
+_CE_DATEI_MAX_BYTES = 2_000_000
+# So viel vom Ende der RPT wird fuer den Beleg gelesen - unter der 65535-Byte-Grenze eines einzelnen Nitrado-API-Abrufs.
+_CE_RPT_BELEG_BYTES = 60_000
+
+
+def _ce_log_werte_lesen(wurzel: ET.Element) -> Dict[str, Dict[str, Any]]:
+    """Die beiden Log-Schalter aus der cfgeconomycore.xml (``<default name="log_ce_dynamicevent" value="true"/>``).
+    Je Schluessel: ``zustand`` = an / aus / fehlt / ungueltig, ``wert`` = True/False/None und der rohe Text. Nur „true“ und
+    „false“ gelten, wie in der Originaldatei; alles andere ist „ungueltig“. Steht ein Schluessel mehrfach da, gilt der letzte."""
+    out: Dict[str, Dict[str, Any]] = {k: {"zustand": "fehlt", "wert": None, "roh": None} for k in _CE_LOG_SCHLUESSEL}
+    for el in wurzel.iter("default"):
+        name = el.attrib.get("name")
+        if name not in out:
+            continue
+        roh = el.attrib.get("value")
+        text = (roh or "").strip()
+        if text == "true":
+            out[name] = {"zustand": "an", "wert": True, "roh": roh}
+        elif text == "false":
+            out[name] = {"zustand": "aus", "wert": False, "roh": roh}
+        else:
+            out[name] = {"zustand": "ungueltig", "wert": None, "roh": roh}
+    return out
+
+
+def _ce_log_datei_lesen_sync(conn: ServerConnection) -> Tuple[Optional[str], Optional[str], str]:
+    """(Pfad, Inhalt, Status) der cfgeconomycore.xml - komplett synchron fuer run_in_executor (die Pfad-Suche listet den Ordner)."""
+    pfad = _mission_datei_pfad(conn, _CE_LOG_DATEI)
+    if not pfad or conn.ftp is None:
+        return None, None, "kein_mission_ordner"
+    text, status = conn.ftp.read_file_ex(pfad)
+    return pfad, text, status
+
+
+async def _ce_log_status(conn: ServerConnection) -> Dict[str, Any]:
+    """Liest die cfgeconomycore.xml des Servers frisch per FTP und meldet, ob beide Log-Schalter true sind.
+    ``beide_an`` ist nur dann True, wenn die Datei gelesen werden konnte UND beide Werte „true“ sind - bei jedem Lesefehler
+    bleibt es False (lieber gesperrt als geraten)."""
+    out: Dict[str, Any] = {"geprueft": time.time(), "datei": _CE_LOG_DATEI, "pfad": None, "lesbar": False, "fehler": None,
+                           "bedingungen": [], "beide_an": False}
+    if conn.ftp is None:
+        out["fehler"] = "Kein FTP-Zugang eingerichtet – der Bot kann die cfgeconomycore.xml nicht lesen."
+        return out
+    loop = asyncio.get_running_loop()
+    try:
+        pfad, text, status = await loop.run_in_executor(None, _ce_log_datei_lesen_sync, conn)
+        out["pfad"] = pfad                  # zeigt im Dialog, WELCHE Datei gelesen wurde (richtiger Mission-Ordner?)
+    except Exception as e:  # noqa: BLE001 - FTP-Fehler duerfen den Dialog nicht zerlegen
+        log.debug(f"[CE] {conn.name}: cfgeconomycore.xml nicht lesbar ({e})")
+        text, status = None, "error"
+    if status == "kein_mission_ordner":
+        out["fehler"] = "Der Mission-Ordner des Servers ist nicht bekannt – bitte unter Optionen den FTP-Zugang prüfen."
+        return out
+    if status == "missing":
+        out["fehler"] = "Die cfgeconomycore.xml wurde im Mission-Ordner nicht gefunden."
+        return out
+    if status != "ok" or text is None:
+        out["fehler"] = "Die cfgeconomycore.xml konnte per FTP nicht gelesen werden."
+        return out
+    if len(text) > _CE_DATEI_MAX_BYTES:
+        out["fehler"] = "Die cfgeconomycore.xml ist ungewöhnlich groß und wird nicht geprüft."
+        return out
+    try:
+        werte = _ce_log_werte_lesen(ET.fromstring(text.lstrip("\ufeff")))
+    except ET.ParseError:
+        out["fehler"] = "Die cfgeconomycore.xml ist kein gültiges XML."
+        return out
+    out["lesbar"] = True
+    out["bedingungen"] = [{"key": k, **werte[k]} for k in _CE_LOG_SCHLUESSEL]
+    out["beide_an"] = all(werte[k]["wert"] is True for k in _CE_LOG_SCHLUESSEL)
+    return out
+
+
+def _ce_aktivierung_text(status: Dict[str, Any]) -> str:
+    """Die Absage, wenn sich der Feed (noch) nicht aktivieren laesst."""
+    if not status["lesbar"]:
+        return f"CE-Events lassen sich erst aktivieren, wenn der Bot die cfgeconomycore.xml prüfen kann: {status['fehler']}"
+    aktuell = ", ".join(f"{b['key']} = " + {"an": "true", "aus": "false", "fehlt": "fehlt", "ungueltig": "ungültig"}[b["zustand"]]
+                        for b in status["bedingungen"])
+    return ("CE-Events lassen sich erst aktivieren, wenn in der cfgeconomycore.xml log_ce_dynamicevent und log_ce_vehicle "
+            f"beide auf true stehen (danach den Server neu starten). Aktuell: {aktuell}")
+
+
+async def _ce_rpt_beleg(conn: ServerConnection) -> Dict[str, Any]:
+    """Beleg aus dem Server-Log selbst: Steht im letzten Abschnitt der aktuellen RPT ein Zaehler-Dump der Dynamic Events?
+    Das ist der eigentliche Beweis, dass die Einstellung beim Server angekommen ist (nach einer Aenderung der
+    cfgeconomycore.xml braucht es einen Neustart). Rein lesend und nur zur Anzeige - sperrt nichts."""
+    log_dir = conn.get("ftp_log_dir")
+    if not log_dir:
+        return {"zustand": "unbekannt"}
+    try:
+        rpt = await _log_dateien(conn, log_dir, ".rpt")
+        if not rpt:
+            return {"zustand": "keine_rpt"}
+        datei = rpt[-1]
+        groesse = await _log_dateigroesse(conn, datei)
+        if groesse is None:
+            return {"zustand": "nicht_lesbar", "datei": datei.split("/")[-1]}
+        text, _off = await _log_lesen_ab_offset(conn, datei, max(0, int(groesse) - _CE_RPT_BELEG_BYTES))
+    except Exception as e:  # noqa: BLE001
+        log.debug(f"[CE] {conn.name}: RPT-Beleg nicht lesbar ({e})")
+        return {"zustand": "nicht_lesbar"}
+    name = datei.split("/")[-1]
+    if text is None:
+        return {"zustand": "nicht_lesbar", "datei": name}
+    bloecke, _rest = _ce_events_bloecke_extrahieren(text)
+    if not bloecke:
+        return {"zustand": "kein_dump", "datei": name}
+    zaehler: List[Dict[str, Any]] = []
+    for zeile in bloecke[-1]:
+        m = _CE_EVENT_ZEILE_RE.match(zeile)
+        if not m:
+            continue
+        typ = m.group(1)
+        schalter = _CE_EVENT_TYP_ZU_SCHALTER.get(typ) or ("vehicle_event" if typ.startswith("Vehicle") else None)
+        if schalter:
+            zaehler.append({"typ": typ, "schalter": schalter, "anzahl": int(m.group(2))})
+    return {"zustand": "dump", "datei": name, "typen": len(bloecke[-1]), "bekannt": zaehler}
+
+
+async def _ce_aktivierung_pruefen(conn: ServerConnection) -> Optional[web.Response]:
+    """None = der CE-Events-Feed darf aktiviert werden, sonst die fertige Absage (409)."""
+    status = await _ce_log_status(conn)
+    if status["beide_an"]:
+        return None
+    return err(_ce_aktivierung_text(status), 409, code="ce_log_schalter")
+
+
+async def api_ce_events_status(request: web.Request) -> web.Response:
+    """Live-Pruefung der Voraussetzungen fuer den CE-Events-Feed (siehe _CE_LOG_SCHLUESSEL) plus Beleg aus der RPT."""
+    conn, fehler = _session_conn(request, "ce_events")
+    if fehler is not None:
+        return fehler
+    fehler = await _modul_pruefen("ce_events", request, conn)
+    if fehler is not None:
+        return fehler
+    fehler = await _dash_gate(request, conn, "feeds", "view")
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "feeds.ce_events.status", 3)
+    if fehler is not None:
+        return fehler
+    status = await _ce_log_status(conn)
+    status["rpt"] = await _ce_rpt_beleg(conn)
+    status["aktivierbar"] = bool(status["beide_an"])
+    return ok(status)
+
+
 # ── 11. Bunker Broadcast Builder ──────────────────────────────────────────
 # Editor fuer cfgbunkerbroadcast.json (DayZ 1.30 / Badlands) samt Schalter WorldsData.bunkerBroadcastEnabled in der
 # cfggameplay.json. Beide Dateien werden NICHT neu geschrieben: ein JSON-Parser liefert zu jedem Wert die Textposition,
@@ -42923,6 +43076,10 @@ async def set_feed(request: web.Request) -> web.Response:
         vorhanden = cfg.feed_settings(int(gid), log_type, conn.service_id)
         if not vorhanden:
             return err("Für diesen Feed ist noch kein Channel eingerichtet.", 409)
+        if log_type == "ce_events" and bool(data["enabled"]) and not vorhanden.get("enabled", True):
+            absage = await _ce_aktivierung_pruefen(conn)
+            if absage is not None:
+                return absage
         vorhanden["enabled"] = bool(data["enabled"])
         cfg.server_feeds(int(gid), conn.service_id, anlegen=True)[log_type] = vorhanden
         cfg.save_guilds()
@@ -42968,6 +43125,13 @@ async def set_feed(request: web.Request) -> web.Response:
     # Speichern im Einstellungsdialog einen zuvor pausierten Feed wieder
     # stillschweigend einschalten.
     bisher = cfg.feed_settings(int(gid), log_type, conn.service_id)
+    if (log_type == "ce_events" and bool(data.get("enabled", bisher["enabled"] if bisher else True))
+            and not (bisher and bisher["enabled"])):
+        # Neu angelegt oder von „pausiert“ auf „aktiv“: nur mit beiden Log-Schaltern. Ein schon aktiver Feed darf weiter
+        # gespeichert werden (Farbe, Channel ...), auch wenn sich die Datei inzwischen geaendert hat.
+        absage = await _ce_aktivierung_pruefen(conn)
+        if absage is not None:
+            return absage
     eintrag = {
         "channel_id": kanal,
         "colour": farbe,
@@ -52094,6 +52258,7 @@ def build_app() -> web.Application:
     r.add_post("/api/feeds/abandoned-bases/settings", api_abandoned_bases_post)
     r.add_get("/api/feeds/ce-events/settings", api_ce_events_get)
     r.add_post("/api/feeds/ce-events/settings", api_ce_events_post)
+    r.add_get("/api/feeds/ce-events/status", api_ce_events_status)
 
     # ── Karte / Events ──
     r.add_get("/api/map/meta", api_map_meta)
@@ -53067,6 +53232,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "defa773b787ad2a48bcce058abb9015d34202886b46b233e5600a7fb57dd131c",
         "207a2596ec68a268cbab9ed90d5a933588a46b627bb53d24a419d3286a6f371f",
         "b58c409c3fc457998bea10f47f43c71312b13958167f29b9c0662afe1a1a4920",
+        "235b0aac310a9c8bc5bdffd64173a388b59562c3740ce139374f620a216eef00",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
