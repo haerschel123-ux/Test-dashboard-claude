@@ -1,0 +1,212 @@
+{
+ "quelle": "doordiehub.com/ObjectToMapGroupPos, echte Laeufe im Browser (29.10.2026)",
+ "faelle": [
+  {
+   "name": "json_platzhalter",
+   "modus": "json",
+   "eingabe": "{\"Objects\": [{\"name\": \"Land_Misc_FeedShack\", \"pos\": [80.262581, 113.793480, 4422.178223], \"ypr\": [0, 0, -70.013718]}]}",
+   "ergebnis": {
+    "art": "ausgabe",
+    "seite": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<map>\n    <group name=\"Land_Misc_FeedShack\" pos=\"80.262581 113.793480 4422.178223\" rpy=\"0.000000 -70.013718 0.000000\" a=\"0.000000\" />\n</map>"
+   }
+  },
+  {
+   "name": "spawn_platzhalter",
+   "modus": "spawnobject",
+   "eingabe": "SpawnObject(\"Land_Misc_FeedShack\", \"80.262581 113.793480 4422.178223\", \"0 0 -70.013718\", 1);",
+   "ergebnis": {
+    "art": "ausgabe",
+    "seite": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<map>\n    <group name=\"Land_Misc_FeedShack\" pos=\"80.262581 113.793480 4422.178223\" rpy=\"0.000000 -70.013718 0.000000\" a=\"0.000000\" />\n</map>"
+   }
+  },
+  {
+   "name": "spawn_mehrere",
+   "modus": "spawnobject",
+   "eingabe": "// Basis\n  spawnobject( \"Land_A\" , \"1 2 3\" , \"10 20 30\" ) ;\nSpawnObject(\"Land_B\",\"  4.5   5.5  6.5 \",\"-10.123456789 0.0000004 359.9999996\",0.5);\n//SpawnObject(\"Land_C\", \"7 8 9\", \"0 0 0\", 1);\nSpawnObject(\"Land_D\", \"1e3 -2e-2 .5\", \"1e1 2 3\");\nSpawnObject(\"Land_E\", \"1 2\", \"5\");\nSpawnObject(\"Land_F\", \"abc 2 3\", \"0 0 0\", 1);",
+   "ergebnis": {
+    "art": "ausgabe",
+    "seite": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<map>\n    <group name=\"Land_A\" pos=\"1.000000 2.000000 3.000000\" rpy=\"20.000000 30.000000 10.000000\" a=\"-10.000000\" />\n    <group name=\"Land_B\" pos=\"4.500000 5.500000 6.500000\" rpy=\"0.000000 360.000000 -10.123457\" a=\"10.123457\" />\n    <group name=\"Land_C\" pos=\"7.000000 8.000000 9.000000\" rpy=\"0.000000 0.000000 0.000000\" a=\"0.000000\" />\n    <group name=\"Land_D\" pos=\"1000.000000 -0.020000 0.500000\" rpy=\"2.000000 3.000000 10.000000\" a=\"-10.000000\" />\n    <group name=\"Land_E\" pos=\"1.000000 2.000000 0.000000\" rpy=\"0.000000 0.000000 5.000000\" a=\"-5.000000\" />\n    <group name=\"Land_F\" pos=\"NaN 2.000000 3.000000\" rpy=\"0.000000 0.000000 0.000000\" a=\"0.000000\" />\n</map>"
+   }
+  },
+  {
+   "name": "spawn_ohne_treffer",
+   "modus": "spawnobject",
+   "eingabe": "SpawnObject(\"Land_A\", \"1 2 3\");\nGetGame().CreateObject(\"x\", pos);",
+   "ergebnis": {
+    "art": "fehler",
+    "seite": "No objects found in the input."
+   }
+  },
+  {
+   "name": "spawn_text_im_json_modus",
+   "modus": "json",
+   "eingabe": "SpawnObject(\"Land_A\", \"1 2 3\", \"0 0 0\", 1);",
+   "ergebnis": {
+    "art": "fehler",
+    "seite": "Failed to parse JSON input."
+   }
+  },
+  {
+   "name": "json_text_im_spawn_modus",
+   "modus": "spawnobject",
+   "eingabe": "{\"Objects\": [{\"name\": \"A\", \"pos\": [1,2,3], \"ypr\": [0,0,0]}]}",
+   "ergebnis": {
+    "art": "fehler",
+    "seite": "No objects found in the input."
+   }
+  },
+  {
+   "name": "leer",
+   "modus": "json",
+   "eingabe": "   \n  ",
+   "ergebnis": {
+    "art": "fehler",
+    "seite": "No content to convert."
+   }
+  },
+  {
+   "name": "json_ungueltig",
+   "modus": "json",
+   "eingabe": "{\"Objects\": [ {",
+   "ergebnis": {
+    "art": "fehler",
+    "seite": "Failed to parse JSON input."
+   }
+  },
+  {
+   "name": "json_wurzel_array",
+   "modus": "json",
+   "eingabe": "[{\"name\":\"A\",\"pos\":[1,2,3]},{\"name\":\"B\",\"pos\":[4,5],\"ypr\":[7,8,9]}]",
+   "ergebnis": {
+    "art": "ausgabe",
+    "seite": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<map>\n    <group name=\"A\" pos=\"1.000000 2.000000 3.000000\" rpy=\"0.000000 0.000000 0.000000\" a=\"0.000000\" />\n    <group name=\"B\" pos=\"4.000000 5.000000 0.000000\" rpy=\"8.000000 9.000000 7.000000\" a=\"-7.000000\" />\n</map>"
+   }
+  },
+  {
+   "name": "json_ohne_objects",
+   "modus": "json",
+   "eingabe": "{\"EditorObjects\":[{\"Type\":\"A\",\"Position\":[1,2,3],\"Orientation\":[0,0,0]}]}",
+   "ergebnis": {
+    "art": "fehler",
+    "seite": "No objects found in the input."
+   }
+  },
+  {
+   "name": "json_objects_leer",
+   "modus": "json",
+   "eingabe": "{\"Objects\": []}",
+   "ergebnis": {
+    "art": "fehler",
+    "seite": "No objects found in the input."
+   }
+  },
+  {
+   "name": "json_pos_fehlt",
+   "modus": "json",
+   "eingabe": "{\"Objects\": [{\"name\":\"A\"}]}",
+   "ergebnis": {
+    "art": "fehler",
+    "seite": "Failed to parse JSON input."
+   }
+  },
+  {
+   "name": "json_name_fehlt",
+   "modus": "json",
+   "eingabe": "{\"Objects\": [{\"pos\":[1,2,3],\"ypr\":[1,2,3]}]}",
+   "ergebnis": {
+    "art": "ausgabe",
+    "seite": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<map>\n    <group name=\"undefined\" pos=\"1.000000 2.000000 3.000000\" rpy=\"2.000000 3.000000 1.000000\" a=\"-1.000000\" />\n</map>"
+   }
+  },
+  {
+   "name": "json_ypr_kurz",
+   "modus": "json",
+   "eingabe": "{\"Objects\": [{\"name\":\"A\",\"pos\":[1,2,3],\"ypr\":[10]}]}",
+   "ergebnis": {
+    "art": "stumm",
+    "seite": null
+   }
+  },
+  {
+   "name": "json_zahlen_als_text",
+   "modus": "json",
+   "eingabe": "{\"Objects\": [{\"name\":\"A\",\"pos\":[\"1\",\"2\",\"3\"],\"ypr\":[1,2,3]}]}",
+   "ergebnis": {
+    "art": "stumm",
+    "seite": null
+   }
+  },
+  {
+   "name": "json_null_werte",
+   "modus": "json",
+   "eingabe": "{\"Objects\": [{\"name\":\"A\",\"pos\":[null,2,3],\"ypr\":[null,2,3]}]}",
+   "ergebnis": {
+    "art": "stumm",
+    "seite": null
+   }
+  },
+  {
+   "name": "json_sonderzeichen_name",
+   "modus": "json",
+   "eingabe": "{\"Objects\": [{\"name\":\"A\\\"B<C&D>E\",\"pos\":[1,2,3],\"ypr\":[1,2,3]}]}",
+   "ergebnis": {
+    "art": "ausgabe",
+    "seite": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<map>\n    <group name=\"A\"B<C&D>E\" pos=\"1.000000 2.000000 3.000000\" rpy=\"2.000000 3.000000 1.000000\" a=\"-1.000000\" />\n</map>"
+   }
+  },
+  {
+   "name": "json_rundung",
+   "modus": "json",
+   "eingabe": "{\"Objects\": [{\"name\":\"R\",\"pos\":[0.0000005,-0.0000005,1234567.1234565],\"ypr\":[-0.0,0.1,-0.0000001]}]}",
+   "ergebnis": {
+    "art": "ausgabe",
+    "seite": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<map>\n    <group name=\"R\" pos=\"0.000000 -0.000000 1234567.123457\" rpy=\"0.100000 -0.000000 0.000000\" a=\"0.000000\" />\n</map>"
+   }
+  },
+  {
+   "name": "json_negativ_null",
+   "modus": "json",
+   "eingabe": "{\"Objects\": [{\"name\":\"Z\",\"pos\":[-0.0,0,0],\"ypr\":[-0.0,-0.0,-0.0]}]}",
+   "ergebnis": {
+    "art": "ausgabe",
+    "seite": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<map>\n    <group name=\"Z\" pos=\"0.000000 0.000000 0.000000\" rpy=\"0.000000 0.000000 0.000000\" a=\"0.000000\" />\n</map>"
+   }
+  },
+  {
+   "name": "json_zusatzfelder",
+   "modus": "json",
+   "eingabe": "{\"Objects\": [{\"name\":\"A\",\"pos\":[1,2,3],\"ypr\":[1,2,3],\"scale\":2.5,\"enableCEPersistency\":1,\"customString\":\"x\"}], \"Foo\": 1}",
+   "ergebnis": {
+    "art": "ausgabe",
+    "seite": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<map>\n    <group name=\"A\" pos=\"1.000000 2.000000 3.000000\" rpy=\"2.000000 3.000000 1.000000\" a=\"-1.000000\" />\n</map>"
+   }
+  },
+  {
+   "name": "json_objects_kein_array",
+   "modus": "json",
+   "eingabe": "{\"Objects\": {\"a\": 1}}",
+   "ergebnis": {
+    "art": "fehler",
+    "seite": "Failed to parse JSON input."
+   }
+  },
+  {
+   "name": "json_pos_zu_viele_werte",
+   "modus": "json",
+   "eingabe": "{\"Objects\": [{\"name\":\"A\",\"pos\":[1,2,3,4,5],\"ypr\":[1,2,3,4]}]}",
+   "ergebnis": {
+    "art": "ausgabe",
+    "seite": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<map>\n    <group name=\"A\" pos=\"1.000000 2.000000 3.000000\" rpy=\"2.000000 3.000000 1.000000\" a=\"-1.000000\" />\n</map>"
+   }
+  },
+  {
+   "name": "json_bom_und_leerraum",
+   "modus": "json",
+   "eingabe": "﻿  {\"Objects\": [{\"name\":\"A\",\"pos\":[1,2,3],\"ypr\":[1,2,3]}]}  ",
+   "ergebnis": {
+    "art": "ausgabe",
+    "seite": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<map>\n    <group name=\"A\" pos=\"1.000000 2.000000 3.000000\" rpy=\"2.000000 3.000000 1.000000\" a=\"-1.000000\" />\n</map>"
+   }
+  }
+ ]
+}

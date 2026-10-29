@@ -1050,6 +1050,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.typesorganizer":              {"label": "Types Organizer", "gruppe": "Tools"},
     "tools.randompresets":                {"label": "Random Presets Generator", "gruppe": "Tools"},
     "tools.dzejson":                      {"label": "DZE → JSON Converter", "gruppe": "Tools"},
+    "tools.objecttomapgrouppos":          {"label": "Object to MapGroupPos", "gruppe": "Tools"},
     "tools.messages":                     {"label": "Messages Generator", "gruppe": "Tools"},
     "tools.lootexclusion":                {"label": "Loot-Ausschlusszonen", "gruppe": "Tools"},
     "tools.custombuildmap":                {"label": "Custom Build Mapping", "gruppe": "Tools"},
@@ -15213,6 +15214,7 @@ _TOOL_LISTE = (
     ("typesorganizer", "🗂️", "Types Organizer"),
     ("randompresets", "🎲", "Random Presets Generator"),
     ("dzejson", "🧩", "DZE → JSON Converter"),
+    ("objecttomapgrouppos", "🏗️", "Object to MapGroupPos"),
     ("messages", "🔔", "Messages Generator"),
     ("lootexclusion", "🚫", "Loot-Ausschlusszonen"),
     ("custombuildmap", "🗺️", "Custom Build Mapping"),
@@ -53064,6 +53066,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c41898f9011aea35f395334cf54ce0aecb9f9741ee606a309bf7787f9e722438",
         "defa773b787ad2a48bcce058abb9015d34202886b46b233e5600a7fb57dd131c",
         "207a2596ec68a268cbab9ed90d5a933588a46b627bb53d24a419d3286a6f371f",
+        "b58c409c3fc457998bea10f47f43c71312b13958167f29b9c0662afe1a1a4920",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
