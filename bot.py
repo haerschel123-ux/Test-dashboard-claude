@@ -1043,6 +1043,7 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
     "tools.territory":                   {"label": "Territory Zone Creator", "gruppe": "Tools"},
     "tools.spawnabletypes":              {"label": "Visual SpawnableTypes Configurator", "gruppe": "Tools"},
     "tools.bunkerbroadcast":             {"label": "Bunker Broadcast Builder", "gruppe": "Tools"},
+    "tools.cfggameplay":                 {"label": "CFGGameplay Editor", "gruppe": "Tools"},
     "tools.territoryexclusion":          {"label": "Territory Exclusion", "gruppe": "Tools"},
     "tools.performanceoptimizer":        {"label": "Performance Optimizer", "gruppe": "Tools"},
     "tools.typesbooster":                {"label": "Types Booster", "gruppe": "Tools"},
@@ -15207,6 +15208,7 @@ _TOOL_LISTE = (
     ("territory", "🧭", "Territory Zone Creator"),
     ("spawnabletypes", "🗃️", "Visual SpawnableTypes Configurator"),
     ("bunkerbroadcast", "📻", "Bunker Broadcast Builder"),
+    ("cfggameplay", "⚙️", "CFGGameplay Editor"),
     ("territoryexclusion", "✂️", "Territory Exclusion"),
     ("performanceoptimizer", "⚡", "Performance Optimizer"),
     ("typesbooster", "📈", "Types Booster"),
@@ -24730,6 +24732,31 @@ class _JtBearbeiter:
         innen = self.zeilenende + ("," + self.zeilenende).join(zeilen) + self.zeilenende + ind
         self.aenderungen.append((obj.start + 1, obj.ende - 1, innen))
 
+    def entferne_glieder(self, obj: _JtKnoten, namen: Iterable[str]) -> None:
+        """Entfernt Schluessel samt Wert und Komma aus einem Objekt - Zeilen und Einzug der uebrigen bleiben."""
+        namen = set(namen)
+        weg = [i for i, g in enumerate(obj.glieder) if g[0] in namen]
+        if not weg:
+            return
+        if len(weg) == len(obj.glieder):
+            self.aenderungen.append((obj.start + 1, obj.ende - 1, ""))
+            return
+
+        lauf: List[List[int]] = []
+        for i in weg:
+            if lauf and lauf[-1][-1] == i - 1:
+                lauf[-1].append(i)
+            else:
+                lauf.append([i])
+        for gruppe in lauf:
+            erst, letzt = gruppe[0], gruppe[-1]
+            if letzt + 1 < len(obj.glieder):
+                # von diesem Schluessel bis zum Anfang des naechsten uebrigen: Komma und Zeilenumbruch fallen mit weg, der Einzug
+                # des ersten bleibt stehen und dient dem naechsten Schluessel
+                self.aenderungen.append((obj.glieder[erst][1], obj.glieder[letzt + 1][1], ""))
+            else:
+                self.aenderungen.append((obj.glieder[erst - 1][3].ende, obj.glieder[letzt][3].ende, ""))
+
     def array_neu(self, arr: _JtKnoten, eintraege: List[Tuple[Optional[int], Optional[str]]]) -> None:
         """Baut ein Array neu zusammen. ``eintraege``: (alter Index, None) = vorhandenen Eintrag samt seiner eigenen
         Aenderungen uebernehmen, (None, Text) = neuer Eintrag. Anfang, Ende und Trenner kommen aus der Originaldatei."""
@@ -25489,6 +25516,759 @@ async def api_tools_bunkerbroadcast_post(request: web.Request) -> web.Response:
                                  "schalter_nachher": zustand if zustand in (True, False) else None},
                    "backup": ([f"{_BB_DATEI}.bak"] if commit and bb_aenderung is not None and bb_vorher is not None else [])
                              + ([f"{_BB_GAMEPLAY_DATEI}.bak"] if commit and gp_neu is not None else [])})
+
+
+# ── 11b. CFGGameplay Editor ───────────────────────────────────────────────
+# Bearbeitet die cfggameplay.json des Servers (Mission-Ordner). Vorbild ist doordiehub.com/CFGGameplayEditor: Kategorien,
+# Felder nach Werttyp, Presets, Hilfetexte. Anders als dort wird NICHT die ganze Datei neu geschrieben, sondern chirurgisch
+# (_JtBearbeiter): nur die Werte, die sich geaendert haben - unbekannte Schluessel (z. B. von Mods), Reihenfolge,
+# Einrueckung und Zahlenschreibweise bleiben. Die Karte kommt aus dem Server (wie bei allen Tools); ihre Standarddatei
+# dient nur als Ausgangspunkt, wenn es auf dem Server noch keine cfggameplay.json gibt, und fuer "Standardwerte laden".
+# Die Zahlenbereiche (_CG_REGELN) sind wie auf der Seite nur Warnungen; Typfehler dagegen blockieren das Speichern.
+_CG_MODUL = "tools.cfggameplay"
+_CG_DATEI = "cfggameplay.json"
+_CG_MAX_AENDERUNGEN = 300
+
+_CG_BASIS: Dict[str, Any] = {
+    "version": 123,
+    "GeneralData": {
+        "disableBaseDamage": False,
+        "disableContainerDamage": False,
+        "disableRespawnDialog": False,
+        "disableRespawnInUnconsciousness": False,
+    },
+    "PlayerData": {
+        "disablePersonalLight": False,
+        "StaminaData": {
+            "sprintStaminaModifierErc": 1,
+            "sprintStaminaModifierCro": 1,
+            "staminaWeightLimitThreshold": 6000,
+            "staminaMax": 100,
+            "staminaKgToStaminaPercentPenalty": 1.75,
+            "staminaMinCap": 5,
+            "sprintSwimmingStaminaModifier": 1,
+            "sprintLadderStaminaModifier": 1,
+            "meleeStaminaModifier": 1,
+            "obstacleTraversalStaminaModifier": 1,
+            "holdBreathStaminaModifier": 1,
+        },
+        "ShockHandlingData": {
+            "shockRefillSpeedConscious": 5,
+            "shockRefillSpeedUnconscious": 1,
+            "allowRefillSpeedModifier": True,
+        },
+        "MovementData": {
+            "timeToStrafeJog": 0.1,
+            "rotationSpeedJog": 0.15,
+            "timeToSprint": 0.45,
+            "timeToStrafeSprint": 0.3,
+            "rotationSpeedSprint": 0.15,
+            "allowStaminaAffectInertia": True,
+        },
+        "DrowningData": {
+            "staminaDepletionSpeed": 10,
+            "healthDepletionSpeed": 10,
+            "shockDepletionSpeed": 10,
+        },
+        "WeaponObstructionData": {
+            "staticMode": 1,
+            "dynamicMode": 1,
+        },
+    },
+    "WorldsData": {
+        "lightingConfig": 0,
+        "objectSpawnersArr": [],
+        "environmentMinTemps": [-3, -2, 0, 4, 9, 14, 18, 17, 13, 11, 9, 0],
+        "environmentMaxTemps": [3, 5, 7, 14, 19, 24, 26, 25, 18, 14, 10, 5],
+        "wetnessWeightModifiers": [1, 1, 1.33, 1.66, 2],
+        "playerRestrictedAreaFiles": [],
+    },
+    "BaseBuildingData": {
+        "HologramData": {
+            "disableIsCollidingBBoxCheck": False,
+            "disableIsCollidingPlayerCheck": False,
+            "disableIsClippingRoofCheck": False,
+            "disableIsBaseViableCheck": False,
+            "disableIsCollidingGPlotCheck": False,
+            "disableIsCollidingAngleCheck": False,
+            "disableIsPlacementPermittedCheck": False,
+            "disableHeightPlacementCheck": False,
+            "disableIsUnderwaterCheck": False,
+            "disableIsInTerrainCheck": False,
+            "disableColdAreaBuildingCheck": True,
+            "disallowedTypesInUnderground": ["FenceKit", "TerritoryFlagKit", "WatchtowerKit"],
+        },
+        "ConstructionData": {
+            "disablePerformRoofCheck": False,
+            "disableIsCollidingCheck": False,
+            "disableDistanceCheck": False,
+            "disableItemFalling": False,
+            "disableDropAttachmentsOnFall": False,
+            "disableRefundMaterialsOnFall": False,
+        },
+    },
+    "UIData": {
+        "use3DMap": False,
+        "HitIndicationData": {
+            "hitDirectionOverrideEnabled": False,
+            "hitDirectionBehaviour": 1,
+            "hitDirectionStyle": 0,
+            "hitDirectionIndicatorColorStr": "0xffbb0a1e",
+            "hitDirectionMaxDuration": 2,
+            "hitDirectionBreakPointRelative": 0.2,
+            "hitDirectionScatter": 10,
+            "hitIndicationPostProcessEnabled": True,
+        },
+    },
+    "MapData": {
+        "ignoreMapOwnership": False,
+        "ignoreNavItemsOwnership": False,
+        "displayPlayerPosition": False,
+        "displayNavInfo": True,
+    },
+    "VehicleData": {
+        "boatDecayMultiplier": 1,
+        "canDetachAttachedCarWheels": True,
+        "canDamageAttachedCarWheels": True,
+        "canDetachAttachedBikeWheels": True,
+        "canDamageAttachedBikeWheels": True,
+    },
+}
+
+_CG_REGELN: Dict[str, Tuple[float, float]] = {
+    "PlayerData.StaminaData.sprintStaminaModifierErc": (0, 5),
+    "PlayerData.StaminaData.sprintStaminaModifierCro": (0, 5),
+    "PlayerData.StaminaData.staminaWeightLimitThreshold": (1000, 20000),
+    "PlayerData.StaminaData.staminaMax": (50, 200),
+    "PlayerData.StaminaData.staminaKgToStaminaPercentPenalty": (0, 10),     # Seite: 0.5 - ihr eigenes Preset "Unlimited Stamina" setzt 0.01
+    "PlayerData.StaminaData.staminaMinCap": (0, 50),
+    "PlayerData.StaminaData.sprintSwimmingStaminaModifier": (0, 5),
+    "PlayerData.StaminaData.sprintLadderStaminaModifier": (0, 5),
+    "PlayerData.StaminaData.meleeStaminaModifier": (0, 5),
+    "PlayerData.StaminaData.obstacleTraversalStaminaModifier": (0, 5),
+    "PlayerData.StaminaData.holdBreathStaminaModifier": (0, 5),
+    "PlayerData.ShockHandlingData.shockRefillSpeedConscious": (0, 20),
+    "PlayerData.ShockHandlingData.shockRefillSpeedUnconscious": (0, 20),
+    "PlayerData.MovementData.timeToStrafeJog": (0, 2),
+    "PlayerData.MovementData.rotationSpeedJog": (0, 2),
+    "PlayerData.MovementData.timeToSprint": (0, 2),
+    "PlayerData.MovementData.timeToStrafeSprint": (0, 2),
+    "PlayerData.MovementData.rotationSpeedSprint": (0, 2),
+    "PlayerData.DrowningData.staminaDepletionSpeed": (1, 50),
+    "PlayerData.DrowningData.healthDepletionSpeed": (1, 50),
+    "PlayerData.DrowningData.shockDepletionSpeed": (1, 50),
+    "PlayerData.WeaponObstructionData.staticMode": (0, 2),
+    "PlayerData.WeaponObstructionData.dynamicMode": (0, 2),
+    "WorldsData.lightingConfig": (0, 3),
+    "VehicleData.boatDecayMultiplier": (0, 10),
+}
+
+_CG_HILFE: Dict[str, Tuple[str, str]] = {
+    "disableBaseDamage": ("Schaden an Bauteilen der Basis ist abgeschaltet.",
+        "Damage from structures built through base-building is disabled."),
+    "disableContainerDamage": ("Schaden an Behältern wie Zelten und Fässern ist abgeschaltet.",
+        "Disable damage from items such as tents and barrels."),
+    "disableRespawnDialog": ("Blendet das Fenster aus, in dem der Spieler nach dem Respawn-Knopf die Art des Respawns wählt.",
+        "Disable the UI dialogue window where the player selects the type of respawn after pressing the respawn button."),
+    "disableRespawnInUnconsciousness": ("Entfernt den Respawn-Knopf im Pausenmenü (Esc), solange der Spieler bewusstlos ist.",
+        "Disables the \"Respawn\" button in the pause menu (Esc) when the player is unconscious, disallowing them to respawn."),
+    "disablePersonalLight": ("Schaltet das ständige Eigenlicht ab, das nachts Objekte in der Nähe des Spielers beleuchtet.",
+        "Disables the omnipresent personal light that lights up objects close to the player during night-time."),
+    "spawnGearPresetFiles": ("Wenn die Liste nicht leer ist, werden die Dateien mit der Start-Ausrüstung der Spieler (Player Gear Spawn, JSON) geladen.",
+        "If not empty, enables loading and processing of Player Gear Spawn JSON configuration file(s)."),
+    "sprintStaminaModifierErc": ("Wie schnell beim Sprinten im Stehen Ausdauer verbraucht wird.",
+        "Modifies the rate at which stamina is consumed during erected sprint."),
+    "sprintStaminaModifierCro": ("Wie schnell beim Sprinten in der Hocke Ausdauer verbraucht wird.",
+        "Modifies the rate at which stamina is consumed during crouched sprint."),
+    "staminaWeightLimitThreshold": ("Bis zu dieser Last (Gramm, durch 1000 geteilt als Ausdauerpunkte) wird nichts von der Ausdauer abgezogen.",
+        "This amount of stamina points (divided by 1000) will not count towards stamina weight deduction."),
+    "staminaMax": ("Maximale Ausdauer. Der Wert 0 kann zu unerwartetem Verhalten führen.",
+        "Maximum stamina. Setting to 0 may produce unexpected results."),
+    "staminaKgToStaminaPercentPenalty": ("Faktor, mit dem das Gewicht der Last die maximale Ausdauer senkt.",
+        "Multiplier used when calculating stamina points deducted from max stamina given the player load."),
+    "staminaMinCap": ("Kleinste mögliche Ausdauer-Obergrenze. Der Wert 0 kann zu unerwartetem Verhalten führen.",
+        "Minimum size of stamina cap. Setting to 0 may produce unexpected results."),
+    "sprintSwimmingStaminaModifier": ("Wie schnell beim schnellen Schwimmen Ausdauer verbraucht wird.",
+        "Modifies the rate at which stamina is consumed during fast swimming."),
+    "sprintLadderStaminaModifier": ("Wie schnell beim schnellen Leiterklettern Ausdauer verbraucht wird.",
+        "Modifies the rate at which stamina is consumed during fast ladder climbing."),
+    "meleeStaminaModifier": ("Wie viel Ausdauer schwere Nahkampfangriffe und Ausweichen kosten.",
+        "Modifies how much stamina is consumed when performing heavy melee attacks and evasion."),
+    "obstacleTraversalStaminaModifier": ("Wie viel Ausdauer Springen, Klettern und Überwinden von Hindernissen kosten.",
+        "Modifies how much stamina is consumed when performing jumping, climbing and vaulting."),
+    "holdBreathStaminaModifier": ("Wie schnell beim Luftanhalten Ausdauer verbraucht wird.",
+        "Modifies the rate at which stamina is consumed when holding breath."),
+    "shockRefillSpeedConscious": ("Erholung des Schock-Werts pro Sekunde, solange der Spieler bei Bewusstsein ist.",
+        "Shock value recovery while the player is conscious (per second)."),
+    "shockRefillSpeedUnconscious": ("Erholung des Schock-Werts pro Sekunde, solange der Spieler bewusstlos ist.",
+        "Shock value recovery while the player is unconscious (per second)."),
+    "allowRefillSpeedModifier": ("Erlaubt, dass die Munitionsart die Erholung beeinflusst (meist schnelleres Aufwachen nach einem Treffer).",
+        "Allow/disallow modifier of Shock value recovery based on ammo type settings (typically faster waking-up from unconscious after getting shot)."),
+    "timeToStrafeJog": ("Übergangszeit beim seitlichen (diagonalen) Joggen. Kleinster Wert 0,01.",
+        "Time to blend strafing (diagonal movement) while jogging. Min possible value 0.01."),
+    "rotationSpeedJog": ("Drehgeschwindigkeit der Spielfigur beim Joggen. Kleinster Wert 0,01.",
+        "Rotation speed of the character while jogging. Min possible value 0.01."),
+    "timeToSprint": ("Zeit vom Joggen bis zum Sprint. Kleinster Wert 0,01.",
+        "Time to reach sprint from jog. Min possible value 0.01."),
+    "timeToStrafeSprint": ("Übergangszeit beim seitlichen (diagonalen) Sprinten. Kleinster Wert 0,01.",
+        "Time to blend strafing (diagonal movement) while sprinting. Min possible value 0.01."),
+    "rotationSpeedSprint": ("Drehgeschwindigkeit der Spielfigur beim Sprinten. Kleinster Wert 0,01.",
+        "Rotation speed of the character while sprinting. Min possible value 0.01."),
+    "allowStaminaAffectInertia": ("Wenn an, beeinflusst die Ausdauer die Trägheit der Spielfigur.",
+        "When enabled, allows the stamina value to influence the player's inertia."),
+    "staminaDepletionSpeed": ("Wie schnell beim Ertrinken (unter Wasser) die Ausdauer sinkt, pro Sekunde. Höher = ertrinkt schneller.",
+        "Rate at which stamina depletes while drowning/underwater (per second). Higher = faster drown."),
+    "healthDepletionSpeed": ("Wie schnell beim Ertrinken (unter Wasser) die Gesundheit sinkt, pro Sekunde. Höher = ertrinkt schneller.",
+        "Rate at which health depletes while drowning/underwater (per second). Higher = faster drown."),
+    "shockDepletionSpeed": ("Wie schnell beim Ertrinken (unter Wasser) der Schock-Wert sinkt, pro Sekunde. Höher = ertrinkt schneller.",
+        "Rate at which shock depletes while drowning/underwater (per second). Higher = faster drown."),
+    "staticMode": ("Waffen-Behinderung (statisch). 1 = an (die Waffe senkt sich an Wänden und Objekten), 0 = aus.",
+        "Static weapon obstruction mode. 1 = enabled (weapon lowers when colliding with walls/objects), 0 = disabled."),
+    "dynamicMode": ("Waffen-Behinderung (dynamisch). 1 = an (reagiert stärker auf Bewegung), 0 = aus.",
+        "Dynamic weapon obstruction mode. 1 = enabled (more reactive obstruction based on movement), 0 = disabled."),
+    "lightingConfig": ("Welche Nachtbeleuchtung verwendet wird. 0 = hell, 1 = dunkel. Weitere Werte gelten nur, wenn die Mission sie kennt.",
+        "Which night lighting is used. 0 = bright, 1 = dark. Further values only apply if the mission knows them."),
+    "objectSpawnersArr": ("Dateinamen der JSON-Dateien mit den Spawner-Daten (Object Spawner).",
+        "File names of the JSON files containing spawner data (Object Spawner)."),
+    "environmentMinTemps": ("Niedrigste Umgebungstemperatur je Monat (Jan–Dez). Wirkt auf Körpertemperatur und Überleben.",
+        "Minimum environment temperatures per month (Jan–Dec). Affects player temperature & survival."),
+    "environmentMaxTemps": ("Höchste Umgebungstemperatur je Monat (Jan–Dez). Wirkt auf Körpertemperatur und Überleben.",
+        "Maximum environment temperatures per month (Jan–Dec). Affects player temperature & survival."),
+    "wetnessWeightModifiers": ("Gewichtsfaktor der Gegenstände je Nässestufe, von links nach rechts: trocken, feucht, nass, durchnässt, triefend.",
+        "Values for item weight modification based on wetness level. Left to right: [DRY, DAMP, WET, SOAKED, DRENCHED]."),
+    "playerRestrictedAreaFiles": ("Wenn die Liste nicht leer ist, werden die Dateien mit den gesperrten Bereichen für Spieler (JSON) geladen.",
+        "If not empty, enables loading and processing of player restricted areas JSON configuration file(s)."),
+    "disableIsCollidingBBoxCheck": ("Erlaubt das Platzieren, auch wenn das Hologramm mit Objekten der Welt kollidiert.",
+        "Allows placement when the hologram is colliding with objects in the world."),
+    "disableIsCollidingPlayerCheck": ("Erlaubt das Platzieren, auch wenn das Hologramm mit dem Spieler kollidiert.",
+        "Allows placement when the hologram is colliding with the player."),
+    "disableIsClippingRoofCheck": ("Erlaubt das Platzieren, auch wenn dabei das Dach durchstoßen würde.",
+        "Allows placement where placing would cause clipping with the roof."),
+    "disableIsBaseViableCheck": ("Erlaubt das Platzieren auf beweglichen Objekten und sonst ungeeignetem Untergrund.",
+        "Allows placement on dynamic objects and other otherwise incompatible base."),
+    "disableIsCollidingGPlotCheck": ("Erlaubt Gartenbeete auch auf ungeeignetem Untergrund.",
+        "Allows placement of garden plots despite incompatible surface type."),
+    "disableIsCollidingAngleCheck": ("Erlaubt das Platzieren, auch wenn die Grenzen für Neigung und Drehung überschritten sind.",
+        "Allows placement despite exceeding roll/pitch/yaw limits."),
+    "disableIsPlacementPermittedCheck": ("Erlaubt das Platzieren, auch wenn die einfachen Vorabprüfungen es nicht zulassen.",
+        "Allows placement even when not permitted by rudimentary checks."),
+    "disableHeightPlacementCheck": ("Erlaubt das Platzieren bei wenig Platz nach oben.",
+        "Allows placement with limited height space."),
+    "disableIsUnderwaterCheck": ("Erlaubt das Platzieren unter Wasser.",
+        "Allows placement under water."),
+    "disableIsInTerrainCheck": ("Erlaubt das Platzieren, auch wenn das Objekt im Gelände steckt.",
+        "Allows placement when clipping with terrain."),
+    "disableColdAreaPlacementCheck": ("Erlaubt Gartenbeete, auch wenn der Boden gefroren ist.",
+        "Allows placement of garden plots when the ground is frozen."),
+    "disableColdAreaBuildingCheck": ("Erlaubt das Bauen in kalten Gebieten, auch wenn der Boden gefroren ist.",
+        "Allows building in cold areas when the ground is frozen."),
+    "disallowedTypesInUnderground": ("Diese Bau-Typen (samt den davon abgeleiteten) dürfen in unterirdischen Bereichen nicht gebaut werden.",
+        "Prevents construction of these item types (including inherited ones) in underground areas."),
+    "disablePerformRoofCheck": ("Erlaubt das Bauen, auch wenn dabei das Dach durchstoßen würde.",
+        "Allows construction when clipping with the roof."),
+    "disableIsCollidingCheck": ("Erlaubt das Bauen, auch wenn es mit Objekten der Welt kollidiert.",
+        "Allows construction when colliding with objects in the world."),
+    "disableDistanceCheck": ("Verhindert das Bauen, wenn der Spieler unter einen bestimmten Abstand kommt.",
+        "Prevents construction when the player gets below a specified range."),
+    "disableItemFalling": ("Verhindert, dass gebaute Teile nach dem Platzieren zu Boden fallen.",
+        "Prevents constructed items from falling to the ground after placement."),
+    "disableDropAttachmentsOnFall": ("Verhindert, dass Anbauteile fallen gelassen werden, wenn ein Teil herunterfällt.",
+        "Prevents dropping attachments when an item falls."),
+    "disableRefundMaterialsOnFall": ("Verhindert die Rückgabe von Baumaterial, wenn ein Teil herunterfällt.",
+        "Prevents refunding construction materials when an item falls."),
+    "use3DMap": ("Nutzt nur die 3D-Karte (schaltet die normale 2D-Karte ab).",
+        "Enables use of the 3D map only (disables the default 2D map overlay)."),
+    "hitDirectionOverrideEnabled": ("Legt fest, ob die Werte der Treffer-Anzeige verwendet werden.",
+        "Decides whether the hit-indicator values are used."),
+    "hitDirectionBehaviour": ("Grundverhalten der Treffer-Anzeige. 0 = aus, 1 = fest, 2 = dynamisch (bewegt sich beim Anzeigen, in Arbeit).",
+        "Dictates general behaviour of the hit indicator. 0 = Disabled, 1 = Static, 2 = Dynamic (moving when displayed, WIP)."),
+    "hitDirectionStyle": ("Art der Anzeige. 0 = Fleck, 1 = Spitze, 2 = Pfeil.",
+        "Dictates which type of indicator gets used. 0 = splash, 1 = spike, 2 = arrow."),
+    "hitDirectionIndicatorColorStr": ("Farbe der Anzeige im ARGB-Format (z. B. \"0xffbb0a1e\").",
+        "Color of the indicator widget, in ARGB format (e.g. \"0xffbb0a1e\")."),
+    "hitDirectionMaxDuration": ("Längste Anzeigedauer. Je nach Schwere des Treffers sind es 0,6 bis 1,0 dieses Werts.",
+        "Maximal duration of the hit indicator. Actual duration is 0.6–1.0 of this value depending on hit severity."),
+    "hitDirectionBreakPointRelative": ("Anteil der Dauer, nach dem die Anzeige verblasst. 0,0 = verblasst von Anfang an, 1,0 = verblasst nicht.",
+        "Fraction of the duration after which the indicator begins to recede. 0.0 = fades from start, 1.0 = no fading."),
+    "hitDirectionScatter": ("Streuung (Ungenauigkeit) in Grad. Bei 10 sind es ±10° (insgesamt 20°).",
+        "Amount of scatter (inaccuracy) in degrees. A value of 10 gives ±10° (20° total) potential scatter."),
+    "hitIndicationPostProcessEnabled": ("Erlaubt, den alten Treffer-Effekt (roter Blitz) abzuschalten.",
+        "Allows disabling of the old hit effect (red flash)."),
+    "ignoreMapOwnership": ("Der Spieler kann die Karte mit der Karten-Taste („M“) auch ohne Karte im Inventar öffnen.",
+        "Player can open a map (just the map) using the dedicated input (\"M\") even without a map in their inventory."),
+    "ignoreNavItemsOwnership": ("Kompass und GPS werden nicht gebraucht, um Hilfen auf der 2D-Karte anzuzeigen.",
+        "Compass and/or GPS receiver are not needed for displaying helpers on the 2D map."),
+    "displayPlayerPosition": ("Zeigt die Position des Spielers auf der Karte. true = sichtbar, false = verborgen.",
+        "Show the player's position on the map. true = visible, false = hidden."),
+    "displayNavInfo": ("Zeigt Navigations-Hilfen auf der Karte.",
+        "Display navigation info/helpers on the map."),
+    "boatDecayMultiplier": ("Faktor für die Verfallsgeschwindigkeit von Booten. Höher = Boote verfallen schneller.",
+        "Multiplies the speed of boat decay. Higher = boats decay faster."),
+    "canDetachAttachedCarWheels": ("Erlaubt das Abmontieren angebrachter Autoräder.",
+        "Allows detaching wheels that are attached to cars."),
+    "canDamageAttachedCarWheels": ("Erlaubt Schaden an angebrachten Autorädern.",
+        "Allows damaging wheels that are attached to cars."),
+    "canDetachAttachedBikeWheels": ("Erlaubt das Abmontieren angebrachter Fahrradräder.",
+        "Allows detaching wheels that are attached to bikes."),
+    "canDamageAttachedBikeWheels": ("Erlaubt Schaden an angebrachten Fahrradrädern.",
+        "Allows damaging wheels that are attached to bikes."),
+    "bunkerBroadcastEnabled": ("Schaltet den Bunker-Funk (DayZ 1.30, Badlands) ein oder aus. Die Sendungen stehen in der cfgbunkerbroadcast.json.",
+        "Turns the bunker radio (DayZ 1.30, Badlands) on or off. The broadcasts are defined in cfgbunkerbroadcast.json."),
+}
+
+_CG_PRESETS: List[Dict[str, Any]] = [
+    {"pfad": "StaminaData", "de": "Ausdauer", "en": "Stamina", "eintraege": [
+        {"id": "unlimited", "de": "Unbegrenzte Ausdauer", "en": "Unlimited Stamina",
+         "text_de": "Fast kein Verbrauch bei jeder Aktion. Endlos sprinten, schwimmen, kämpfen.",
+         "text_en": "Near-zero drain on every action. Sprint, swim, melee forever.",
+         "werte": {
+            "sprintStaminaModifierErc": 0.01,
+            "sprintStaminaModifierCro": 0.01,
+            "staminaWeightLimitThreshold": 6000,
+            "staminaMax": 100,
+            "staminaKgToStaminaPercentPenalty": 0.01,
+            "staminaMinCap": 0.01,
+            "sprintSwimmingStaminaModifier": 0.01,
+            "sprintLadderStaminaModifier": 0.01,
+            "meleeStaminaModifier": 0.01,
+            "obstacleTraversalStaminaModifier": 0.01,
+            "holdBreathStaminaModifier": 0.01,
+        }},
+        {"id": "better", "de": "Bessere Ausdauer", "en": "Better Stamina",
+         "text_de": "Halber Verbrauch, höhere Traglast-Schwelle, mehr maximale Ausdauer.",
+         "text_en": "Halved drain, higher carry threshold, more max stamina.",
+         "werte": {
+            "sprintStaminaModifierErc": 0.5,
+            "sprintStaminaModifierCro": 0.5,
+            "staminaWeightLimitThreshold": 12000,
+            "staminaMax": 150,
+            "staminaKgToStaminaPercentPenalty": 0.8,
+            "staminaMinCap": 2.5,
+            "sprintSwimmingStaminaModifier": 0.5,
+            "sprintLadderStaminaModifier": 0.5,
+            "meleeStaminaModifier": 0.5,
+            "obstacleTraversalStaminaModifier": 0.5,
+            "holdBreathStaminaModifier": 0.5,
+        }},
+        {"id": "vanilla", "de": "Standardwerte", "en": "Vanilla Default",
+         "text_de": "Originalwerte von DayZ – die Balance von Bohemia.",
+         "text_en": "Stock DayZ values — the original Bohemia balance.",
+         "werte": {
+            "sprintStaminaModifierErc": 1,
+            "sprintStaminaModifierCro": 1,
+            "staminaWeightLimitThreshold": 6000,
+            "staminaMax": 100,
+            "staminaKgToStaminaPercentPenalty": 1.75,
+            "staminaMinCap": 5,
+            "sprintSwimmingStaminaModifier": 1,
+            "sprintLadderStaminaModifier": 1,
+            "meleeStaminaModifier": 1,
+            "obstacleTraversalStaminaModifier": 1,
+            "holdBreathStaminaModifier": 1,
+        }},
+        {"id": "hardcore", "de": "Hardcore-Verbrauch", "en": "Hardcore Drain",
+         "text_de": "Doppelter Verbrauch, niedrigere Traglast-Schwelle, weniger maximale Ausdauer.",
+         "text_en": "Double drain, lower carry threshold, less max stamina.",
+         "werte": {
+            "sprintStaminaModifierErc": 2,
+            "sprintStaminaModifierCro": 2,
+            "staminaWeightLimitThreshold": 4000,
+            "staminaMax": 75,
+            "staminaKgToStaminaPercentPenalty": 2.5,
+            "staminaMinCap": 10,
+            "sprintSwimmingStaminaModifier": 2,
+            "sprintLadderStaminaModifier": 2,
+            "meleeStaminaModifier": 1.5,
+            "obstacleTraversalStaminaModifier": 1.5,
+            "holdBreathStaminaModifier": 1.5,
+        }},
+    ]},
+    {"pfad": "ShockHandlingData", "de": "Schock-Erholung", "en": "Shock recovery", "eintraege": [
+        {"id": "fast", "de": "Schnelle Erholung", "en": "Fast Recovery",
+         "text_de": "Doppelte Erholungsgeschwindigkeit – Schock wird schnell abgeschüttelt.",
+         "text_en": "Double refill speeds — shake off shock quickly.",
+         "werte": {
+            "shockRefillSpeedConscious": 10,
+            "shockRefillSpeedUnconscious": 5,
+            "allowRefillSpeedModifier": True,
+        }},
+        {"id": "instant", "de": "Sofortige Erholung", "en": "Instant Recovery",
+         "text_de": "Vierfache Erholung – Schock ist fast sofort vorbei.",
+         "text_en": "4x refill — near-instant shock recovery.",
+         "werte": {
+            "shockRefillSpeedConscious": 20,
+            "shockRefillSpeedUnconscious": 10,
+            "allowRefillSpeedModifier": True,
+        }},
+        {"id": "vanilla", "de": "Standardwerte", "en": "Vanilla Default",
+         "text_de": "Originalwerte von DayZ für die Schock-Erholung.",
+         "text_en": "Stock DayZ shock refill values.",
+         "werte": {
+            "shockRefillSpeedConscious": 5,
+            "shockRefillSpeedUnconscious": 1,
+            "allowRefillSpeedModifier": True,
+        }},
+    ]},
+    {"pfad": "MovementData", "de": "Bewegung", "en": "Movement", "eintraege": [
+        {"id": "fast", "de": "Schnelle Bewegung", "en": "Fast Movement",
+         "text_de": "Flotte Übergänge bei Seitwärts- und Sprintbewegung, schnelle Drehung.",
+         "text_en": "Snappy strafe & sprint transitions, quick rotation.",
+         "werte": {
+            "timeToStrafeJog": 0.1,
+            "rotationSpeedJog": 0.1,
+            "timeToSprint": 0.1,
+            "timeToStrafeSprint": 0.3,
+            "rotationSpeedSprint": 0.1,
+            "allowStaminaAffectInertia": True,
+        }},
+        {"id": "vanilla", "de": "Standardwerte", "en": "Vanilla Default",
+         "text_de": "Originale Bewegungszeiten von DayZ.",
+         "text_en": "Stock DayZ movement timing.",
+         "werte": {
+            "timeToStrafeJog": 0.1,
+            "rotationSpeedJog": 0.3,
+            "timeToSprint": 0.45,
+            "timeToStrafeSprint": 0.3,
+            "rotationSpeedSprint": 0.15,
+            "allowStaminaAffectInertia": True,
+        }},
+        {"id": "sluggish", "de": "Träge", "en": "Sluggish",
+         "text_de": "Langsamere Übergänge – schwerer, bedächtiger Eindruck.",
+         "text_en": "Slower transitions — heavier, deliberate feel.",
+         "werte": {
+            "timeToStrafeJog": 0.3,
+            "rotationSpeedJog": 0.5,
+            "timeToSprint": 0.8,
+            "timeToStrafeSprint": 0.5,
+            "rotationSpeedSprint": 0.3,
+            "allowStaminaAffectInertia": True,
+        }},
+    ]},
+]
+
+_CG_BELEUCHTUNG: List[Dict[str, Any]] = [
+    {"wert": 0, "de": "Helle Nächte", "en": "Bright nights",
+     "text_de": "Die Nacht ist hell und gut zu überblicken. Weniger Atmosphäre, gut für entspannte oder PvE-Server.",
+     "text_en": "The night is bright and easy to see in. Less atmosphere, good for relaxed or PvE servers."},
+    {"wert": 1, "de": "Dunkle Nächte", "en": "Dark nights",
+     "text_de": "Stockdunkle Nächte mit viel Atmosphäre. Taschenlampen und Nachtsichtgeräte zählen.",
+     "text_en": "Pitch-black nights with a lot of atmosphere. Flashlights and night-vision goggles matter."},
+    {"wert": 2, "de": "Sakhal – hellere Nächte", "en": "Sakhal \u2013 brighter nights",
+     "text_de": "Beleuchtung der Karte Sakhal – hellere Nächte, abgestimmt auf die Umgebung. Für Sakhal-Missionen.",
+     "text_en": "Lighting of the map Sakhal – brighter nights, tuned for its environment. For Sakhal missions."},
+    {"wert": 3, "de": "Eigene Einstellung 3", "en": "Custom setting 3",
+     "text_de": "Nicht offiziell dokumentiert. Kartenspezifische Beleuchtung – wirkt nur, wenn die Mission sie kennt.",
+     "text_en": "Not officially documented. Map-specific lighting – only works if the mission knows it."},
+]
+
+
+def _cg_schluessel_tauschen(d: Dict[str, Any], alt: str, neu: str, wert: Any) -> Dict[str, Any]:
+    """Ersetzt einen Schluessel an derselben Stelle (Reihenfolge bleibt)."""
+    return {(neu if k == alt else k): (wert if k == alt else v) for k, v in d.items()}
+
+
+def _cg_standard(karte: Optional[str]) -> Tuple[Dict[str, Any], bool]:
+    """Standarddatei der Karte (Werte der Webseite). Rueckgabe: (Datei, Karte bekannt). Unbekannte Karte = Chernarus-Werte."""
+    d = copy.deepcopy(_CG_BASIS)
+    w, holo = d["WorldsData"], d["BaseBuildingData"]["HologramData"]
+    if karte == "Livonia":
+        w["environmentMinTemps"] = [-7, -7.4, -4.1, 1.5, 7, 11.3, 20.4, 19.1, 18, 5.3, 0.8, -3.6]
+        w["environmentMaxTemps"] = [-2.5, -2.1, 2.3, 9, 15.5, 19.4, 25, 22, 21, 10.5, 4.2, 0.1]
+    elif karte == "Sakhal":
+        w["lightingConfig"] = 2
+        w["environmentMinTemps"] = [-6.5, -9.5, -6.5, -9.5, 2, 6, 9, 10, 6, 1, -5, -10]
+        w["environmentMaxTemps"] = [-3, -5, -3, -5, 9, 14, 16, 17, 14, 8, 1, -3]
+        w["playerRestrictedAreaFiles"] = ["pra/warheadstorage.json"]
+        d["BaseBuildingData"]["HologramData"] = _cg_schluessel_tauschen(holo, "disableColdAreaBuildingCheck", "disableColdAreaPlacementCheck", False)
+    elif karte == "Nasdara":
+        d["version"] = 130
+        d["PlayerData"]["disablePersonalLight"] = True
+        d["WorldsData"] = {
+            "lightingConfig": 3, "bunkerBroadcastEnabled": True, "objectSpawnersArr": [],
+            "environmentMinTemps": [3.4, 5.4, 7.4, 8.4, 9.4, 12.4, 14.4, 13.4, 11.4, 8.4, 7.4, 4.4],
+            "environmentMaxTemps": [17.4, 19.4, 22.4, 25.4, 29.4, 34.4, 38.4, 37.4, 34.4, 28.4, 22.4, 18.4],
+            "wetnessWeightModifiers": w["wetnessWeightModifiers"]}
+        d["BaseBuildingData"]["HologramData"] = _cg_schluessel_tauschen(holo, "disableColdAreaBuildingCheck", "disableColdAreaPlacementCheck", True)
+        d["ExternalLockData"] = {"protectionCountStageOne": 3, "protectionCountStageTwo": 1, "protectionTime": 30,
+                                 "protectionResetTime": 3600}
+        d["SandstormData"] = {"sandstormFrequency": 1}
+    return d, karte in ("ChernarusPlus", "Livonia", "Sakhal", "Nasdara")
+
+
+# Zahlenlisten mit fester Laenge (Monate, Naessestufen) - auf der Seite eine freie Liste ohne Pruefung, hier fest.
+_CG_ZAHLENLISTEN = {"WorldsData.environmentMinTemps": 12, "WorldsData.environmentMaxTemps": 12,
+                    "WorldsData.wetnessWeightModifiers": 5}
+_CG_TYPEN_CACHE: Dict[str, str] = {}
+
+
+def _cg_typen() -> Dict[str, str]:
+    """Pfad -> 'objekt' | 'bool' | 'zahl' | 'text' | 'liste' fuer alle Felder, die eine Standarddatei irgendeiner Karte kennt."""
+    if not _CG_TYPEN_CACHE:
+        def lauf(d: Dict[str, Any], vor: str) -> None:
+            for k, v in d.items():
+                p = vor + k
+                if isinstance(v, dict):
+                    _CG_TYPEN_CACHE[p] = "objekt"
+                    lauf(v, p + ".")
+                elif isinstance(v, bool):
+                    _CG_TYPEN_CACHE[p] = "bool"
+                elif isinstance(v, (int, float)):
+                    _CG_TYPEN_CACHE[p] = "zahl"
+                elif isinstance(v, str):
+                    _CG_TYPEN_CACHE[p] = "text"
+                elif isinstance(v, list):
+                    _CG_TYPEN_CACHE[p] = "liste"
+        for karte in (None, "Livonia", "Sakhal", "Nasdara"):
+            lauf(_cg_standard(karte)[0], "")
+        _CG_TYPEN_CACHE["PlayerData.spawnGearPresetFiles"] = "liste"
+    return _CG_TYPEN_CACHE
+
+
+def _cg_ist_zahl(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _cg_pruefen(modell: Any) -> Tuple[List[str], List[str]]:
+    """(Fehler, Warnungen). Fehler: bekannte Felder mit falschem Typ, Listen mit falscher Laenge oder leeren Eintraegen -
+    sie blockieren das Speichern. Warnungen: Zahlen ausserhalb des ueblichen Bereichs, doppelte Listeneintraege."""
+    fehler: List[str] = []
+    warn: List[str] = []
+    if not isinstance(modell, dict):
+        return ["Die Datei muss ein JSON-Objekt sein."], warn
+    typen = _cg_typen()
+
+    def lauf(d: Dict[str, Any], vor: str) -> None:
+        for k, v in d.items():
+            p = vor + k
+            soll = typen.get(p)
+            if soll == "objekt":
+                if not isinstance(v, dict):
+                    fehler.append(f"{p}: Muss ein Abschnitt (Objekt) sein.")
+                    continue
+                lauf(v, p + ".")
+                continue
+            if soll == "bool" and not isinstance(v, bool):
+                fehler.append(f"{p}: Muss true oder false sein.")
+            elif soll == "zahl":
+                if not _cg_ist_zahl(v):
+                    fehler.append(f"{p}: Muss eine Zahl sein.")
+                elif p in _CG_REGELN and not (_CG_REGELN[p][0] <= v <= _CG_REGELN[p][1]):
+                    mn, mx = _CG_REGELN[p]
+                    warn.append(f"{p}: {v:g} liegt außerhalb des üblichen Bereichs {mn:g}–{mx:g}.")
+            elif soll == "text" and not isinstance(v, str):
+                fehler.append(f"{p}: Muss ein Text sein.")
+            elif soll == "liste":
+                if not isinstance(v, list):
+                    fehler.append(f"{p}: Muss eine Liste sein.")
+                elif p in _CG_ZAHLENLISTEN:
+                    if len(v) != _CG_ZAHLENLISTEN[p] or not all(_cg_ist_zahl(x) for x in v):
+                        fehler.append(f"{p}: Braucht genau {_CG_ZAHLENLISTEN[p]} Zahlen.")
+                elif not all(isinstance(x, str) and x.strip() for x in v):
+                    fehler.append(f"{p}: Die Einträge müssen nicht-leere Texte sein.")
+                elif len(set(v)) != len(v):
+                    warn.append(f"{p}: Enthält doppelte Einträge.")
+    lauf(modell, "")
+    if "version" in modell and not (_cg_ist_zahl(modell["version"]) and float(modell["version"]).is_integer()):
+        fehler.append("version: Muss eine ganze Zahl sein.")
+    return fehler, warn
+
+
+def _cg_gleich(a: Any, b: Any) -> bool:
+    """Wertgleich, aber true != 1 (Python wuerde sie gleichsetzen)."""
+    if isinstance(a, bool) or isinstance(b, bool):
+        return isinstance(a, bool) and isinstance(b, bool) and a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a == b
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_cg_gleich(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(_cg_gleich(x, y) for x, y in zip(a, b))
+    return type(a) is type(b) and a == b
+
+
+def _cg_aenderungen(alt: Any, neu: Any, vor: str = "") -> List[Dict[str, Any]]:
+    """Liste der geaenderten Stellen: Abschnitte werden aufgeloest, Listen und Werte zaehlen als eine Aenderung."""
+    out: List[Dict[str, Any]] = []
+    if isinstance(alt, dict) and isinstance(neu, dict):
+        for k, v in neu.items():
+            p = vor + k
+            if k not in alt:
+                out.append({"pfad": p, "vorher": None, "nachher": v, "art": "neu"})
+            else:
+                out.extend(_cg_aenderungen(alt[k], v, p + "."))
+        for k, v in alt.items():
+            if k not in neu:
+                out.append({"pfad": vor + k, "vorher": v, "nachher": None, "art": "entfernt"})
+    elif not _cg_gleich(alt, neu):
+        out.append({"pfad": vor[:-1], "vorher": alt, "nachher": neu, "art": "geaendert"})
+    return out
+
+
+def _cg_liste_anwenden(ed: _JtBearbeiter, arr: _JtKnoten, alt: List[Any], neu: List[Any]) -> None:
+    """Aendert eine Liste, ohne ihr Layout umzuwerfen: unveraenderte Eintraege behalten ihren Originaltext."""
+    benutzt: Set[int] = set()
+    eintraege: List[Tuple[Optional[int], Optional[str]]] = []
+    ind = ed.einzug_von(arr.start)
+    for i, x in enumerate(neu):
+        j: Optional[int] = i if (i < len(alt) and i not in benutzt and _cg_gleich(alt[i], x)) else None
+        if j is None:
+            for jj, y in enumerate(alt):
+                if jj not in benutzt and _cg_gleich(y, x):
+                    j = jj
+                    break
+        if j is None:
+            eintraege.append((None, ed.literal(x, ind + ed.einheit)))
+        else:
+            benutzt.add(j)
+            eintraege.append((j, None))
+    ed.array_neu(arr, eintraege)
+
+
+def _cg_abschnitt_anwenden(ed: _JtBearbeiter, obj: _JtKnoten, alt: Dict[str, Any], neu: Dict[str, Any]) -> None:
+    """Uebertraegt die Unterschiede von ``alt`` nach ``neu`` auf den Text des Objekts ``obj``."""
+    einzufuegen: List[Tuple[str, str]] = []
+    ind = _bb_glied_einzug(ed, obj)
+    for name, wert in neu.items():
+        k = obj.hole(name)
+        if k is None:
+            einzufuegen.append((name, ed.literal(wert, ind)))
+            continue
+        av = alt.get(name)
+        if isinstance(wert, dict) and isinstance(av, dict) and k.art == "objekt":
+            _cg_abschnitt_anwenden(ed, k, av, wert)
+        elif isinstance(wert, list) and isinstance(av, list) and k.art == "array":
+            if not _cg_gleich(av, wert):
+                _cg_liste_anwenden(ed, k, av, wert)
+        elif not _cg_gleich(av, wert):
+            ed.ersetze(k, ed.literal(wert, ed.einzug_von(k.start)))
+    weg = [name for name in alt if name not in neu]
+    if weg and einzufuegen and len(weg) == len(obj.glieder):
+        # Alles Alte faellt weg und Neues kommt dazu: der Abschnitt wird als Ganzes ersetzt (sonst ueberlappen die Aenderungen)
+        ed.ersetze(obj, ed.literal(neu, ed.einzug_von(obj.start)))
+        return
+    if weg:
+        ed.entferne_glieder(obj, weg)
+    if einzufuegen:
+        ed.fuege_glieder_ein(obj, einzufuegen)
+
+
+def _cg_anwenden(text: Optional[str], neu: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Fertiger Dateitext. Ohne vorhandene Datei: komplett neu (zwei Leerzeichen Einzug wie auf der Webseite).
+    ValueError = die Datei kann nicht automatisch geaendert werden (kaputt, mehrdeutig, keine Objekt-Wurzel)."""
+    if text is None:
+        return json.dumps(neu, indent=2, ensure_ascii=False), {}
+    ed = _JtBearbeiter(text)
+    if ed.wurzel.art != "objekt":
+        raise ValueError("Die Wurzel der Datei ist kein JSON-Objekt.")
+    if ed.doppelt:
+        namen = ", ".join(f"„{n}“ (Zeile {z})" for n, z in ed.doppelt[:5])
+        raise ValueError(f"Die cfggameplay.json ist mehrdeutig – ein Schlüssel kommt doppelt vor: {namen}. "
+                         "Sie wird nicht automatisch geändert.")
+    alt = ed.wurzel.py()
+    _cg_abschnitt_anwenden(ed, ed.wurzel, alt, neu)
+    return ed.ergebnis(), alt
+
+
+async def api_tools_cfggameplay_get(request: web.Request) -> web.Response:
+    conn, fehler = await _brlc_prepare(request, _CG_MODUL, "view")
+    if fehler is not None:
+        return fehler
+    karte, welt = _bb_karte(conn)
+    standard, bekannt = _cg_standard(karte)
+    out: Dict[str, Any] = {
+        "karte": karte, "welt": welt, "karte_bekannt": bekannt, "datei": _CG_DATEI, "standard": standard,
+        "regeln": {p: [mn, mx] for p, (mn, mx) in _CG_REGELN.items()}, "zahlenlisten": _CG_ZAHLENLISTEN,
+        "hilfe": {k: list(v) for k, v in _CG_HILFE.items()}, "presets": _CG_PRESETS, "beleuchtung": _CG_BELEUCHTUNG,
+        "kein_mission_ordner": not bool(_mission_dir_of(conn)), "vorhanden": False, "hash": _spawn_datei_hash(""),
+        "modell": None, "kaputt": None, "doppelt": []}
+    if out["kein_mission_ordner"]:
+        return ok(out)
+    loop = asyncio.get_running_loop()
+    try:
+        text, status = await _tools_datei_lesen(conn, _CG_DATEI, loop)
+    except Exception as e:  # noqa: BLE001
+        log.exception("[TOOLS] CFGGameplay: Lesen fehlgeschlagen")
+        return err(f"Die Datei konnte nicht gelesen werden ({type(e).__name__}: {e}).", 502)
+    if status == "error":
+        return err(f"{_CG_DATEI} per FTP nicht lesbar.", 502)
+    out["vorhanden"] = status == "ok"
+    if status != "ok":
+        out["modell"] = standard
+        return ok(out)
+    if len(text.encode("utf-8")) > _JT_MAX_BYTES:
+        return err(f"{_CG_DATEI} ist größer als 2 MB und wird nicht geladen.", 413)
+    out["hash"] = _spawn_datei_hash(text)
+    try:
+        wurzel, doppelt = _jt_parse(text)
+    except ValueError as e:
+        out["kaputt"] = str(e)
+        return ok(out)
+    if wurzel.art != "objekt":
+        out["kaputt"] = "Die Wurzel der Datei ist kein JSON-Objekt."
+        return ok(out)
+    out["doppelt"] = [{"name": n, "zeile": z} for n, z in doppelt]
+    out["modell"] = wurzel.py()
+    return ok(out)
+
+
+async def api_tools_cfggameplay_post(request: web.Request) -> web.Response:
+    conn, fehler = await _brlc_prepare(request, _CG_MODUL, "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data_in = await body(request)
+    commit = bool(data_in.get("commit"))
+    if commit:
+        fehler = _dash_rate_limited(request, _CG_MODUL, 10)
+        if fehler is not None:
+            return fehler
+    neu = data_in.get("modell")
+    fehler_liste, warn = _cg_pruefen(neu)
+    if fehler_liste:
+        return err(fehler_liste[0], 422, fehler=fehler_liste)
+    loop = asyncio.get_running_loop()
+    async with _schaden_lock(conn.service_id):          # derselbe Lock wie die Schaden-Schalter: gleiche cfggameplay.json
+        try:
+            text, status = await _tools_datei_lesen(conn, _CG_DATEI, loop)
+        except Exception as e:  # noqa: BLE001
+            log.exception("[TOOLS] CFGGameplay: Lesen fehlgeschlagen")
+            return err(f"Die Datei konnte nicht gelesen werden ({type(e).__name__}: {e}).", 502)
+        if status == "error":
+            return err(f"{_CG_DATEI} per FTP nicht lesbar.", 502)
+        vorher = text if status == "ok" else None
+        datei_hash = _spawn_datei_hash(vorher)
+        if commit and str(data_in.get("erwartet_hash") or "") != datei_hash:
+            return err("Die cfggameplay.json auf dem Server hat sich seit der Vorschau geändert (oder die Vorschau fehlt) – "
+                       "bitte „Speichern“ erneut klicken und die neue Vorschau prüfen. Nichts wurde gespeichert.", 409)
+        if vorher is not None and len(vorher.encode("utf-8")) > _JT_MAX_BYTES:
+            return err(f"{_CG_DATEI} ist größer als 2 MB und wird nicht bearbeitet.", 413)
+        try:
+            ergebnis_text, alt = _cg_anwenden(vorher, neu)
+            if vorher is not None:
+                _jt_parse(ergebnis_text)                  # Gegenprobe: das Ergebnis muss wieder gueltiges JSON sein
+        except ValueError as e:
+            return err(str(e))
+        aenderungen = _cg_aenderungen(alt, neu) if vorher is not None else []
+        unveraendert = vorher is not None and ergebnis_text == vorher
+        hinweise: List[str] = []
+        if vorher is None:
+            hinweise.append("Die cfggameplay.json gibt es auf dem Server noch nicht – sie wird beim Speichern neu angelegt. "
+                            "Aktiv wird sie nur mit enableCfgGameplayFile = 1; in der serverDZ.cfg.")
+        schreib: Dict[str, str] = {}
+        if commit and not unveraendert:
+            if vorher is not None and not await _tools_datei_schreiben(conn, _CG_DATEI + ".bak", vorher, loop):
+                return err(f"Sichern der {_CG_DATEI}.bak ist fehlgeschlagen – nichts wurde geändert.", 502)
+            if not await _tools_datei_schreiben(conn, _CG_DATEI, ergebnis_text, loop):
+                return err(f"Die {_CG_DATEI} konnte nicht gespeichert werden – bitte erneut versuchen.", 502)
+            schreib = {"datei": "geschrieben"}
+            _audit_add("dashboard", _audit_actor(_sess_get(request)), "Tool: CFGGameplay gespeichert",
+                       f"{len(aenderungen) if vorher is not None else 'neu'} · {conn.name}")
+        return ok({"generated": [{"filename": _CG_DATEI, "content": ergebnis_text}], "unveraendert": unveraendert,
+                   "datei_hash": datei_hash, "warnungen": warn, "hinweise": hinweise, "ergebnis": schreib,
+                   "neu_angelegt": vorher is None, "anzahl": len(aenderungen),
+                   "aenderungen": aenderungen[:_CG_MAX_AENDERUNGEN],
+                   "backup": [f"{_CG_DATEI}.bak"] if commit and not unveraendert and vorher is not None else []})
 
 
 # ── 12. Territory Exclusion ───────────────────────────────────────────────
@@ -52248,6 +53028,8 @@ def build_app() -> web.Application:
     r.add_post("/api/tools/performanceoptimizer", api_tools_performanceoptimizer_post)
     r.add_get("/api/tools/bunkerbroadcast", api_tools_bunkerbroadcast_get)
     r.add_post("/api/tools/bunkerbroadcast", api_tools_bunkerbroadcast_post)
+    r.add_get("/api/tools/cfggameplay", api_tools_cfggameplay_get)
+    r.add_post("/api/tools/cfggameplay", api_tools_cfggameplay_post)
     r.add_get("/api/tools/territoryexclusion", api_tools_territoryexclusion_get)
     r.add_post("/api/tools/territoryexclusion", api_tools_territoryexclusion_post)
     r.add_get("/api/tools/spawnabletypes", api_tools_spawnabletypes_get)
@@ -52969,6 +53751,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "978ee42f18b2264e525962decb256521244cd6da965c533ee0f17cb46c7bdcec",
         "83a6fd78c6bdd0683d09d76e8e77ab0a2c4b1b95ac1b0131d793d85b3a511b80",
         "79f46aad545b12f32060e5c6298a4238ad413a83497a34c86100cd409fe04aba",
+        "37fb98a556892255577f628f40cc14a2126d6cb25186a8cbb2c089ed479c0115",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -53233,6 +54016,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "207a2596ec68a268cbab9ed90d5a933588a46b627bb53d24a419d3286a6f371f",
         "b58c409c3fc457998bea10f47f43c71312b13958167f29b9c0662afe1a1a4920",
         "235b0aac310a9c8bc5bdffd64173a388b59562c3740ce139374f620a216eef00",
+        "f5d3c5ea442b35fc695f8c54e4791feb4e62529bbd8420592cb750d94482550d",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",

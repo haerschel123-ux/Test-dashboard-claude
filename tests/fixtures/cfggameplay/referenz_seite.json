@@ -1,0 +1,1030 @@
+{
+ "quelle": "https://doordiehub.com/CFGGameplayEditor, Bundle CFGGameplayEditor-SF59Akjk.js, gemessen im Browser (Playwright)",
+ "standardwerte": {
+  "Chernarus": {
+   "version": 123,
+   "GeneralData": {
+    "disableBaseDamage": false,
+    "disableContainerDamage": false,
+    "disableRespawnDialog": false,
+    "disableRespawnInUnconsciousness": false
+   },
+   "PlayerData": {
+    "disablePersonalLight": false,
+    "StaminaData": {
+     "sprintStaminaModifierErc": 1,
+     "sprintStaminaModifierCro": 1,
+     "staminaWeightLimitThreshold": 6000,
+     "staminaMax": 100,
+     "staminaKgToStaminaPercentPenalty": 1.75,
+     "staminaMinCap": 5,
+     "sprintSwimmingStaminaModifier": 1,
+     "sprintLadderStaminaModifier": 1,
+     "meleeStaminaModifier": 1,
+     "obstacleTraversalStaminaModifier": 1,
+     "holdBreathStaminaModifier": 1
+    },
+    "ShockHandlingData": {
+     "shockRefillSpeedConscious": 5,
+     "shockRefillSpeedUnconscious": 1,
+     "allowRefillSpeedModifier": true
+    },
+    "MovementData": {
+     "timeToStrafeJog": 0.1,
+     "rotationSpeedJog": 0.15,
+     "timeToSprint": 0.45,
+     "timeToStrafeSprint": 0.3,
+     "rotationSpeedSprint": 0.15,
+     "allowStaminaAffectInertia": true
+    },
+    "DrowningData": {
+     "staminaDepletionSpeed": 10,
+     "healthDepletionSpeed": 10,
+     "shockDepletionSpeed": 10
+    },
+    "WeaponObstructionData": {
+     "staticMode": 1,
+     "dynamicMode": 1
+    }
+   },
+   "WorldsData": {
+    "lightingConfig": 0,
+    "objectSpawnersArr": [],
+    "environmentMinTemps": [
+     -3,
+     -2,
+     0,
+     4,
+     9,
+     14,
+     18,
+     17,
+     13,
+     11,
+     9,
+     0
+    ],
+    "environmentMaxTemps": [
+     3,
+     5,
+     7,
+     14,
+     19,
+     24,
+     26,
+     25,
+     18,
+     14,
+     10,
+     5
+    ],
+    "wetnessWeightModifiers": [
+     1,
+     1,
+     1.33,
+     1.66,
+     2
+    ],
+    "playerRestrictedAreaFiles": []
+   },
+   "BaseBuildingData": {
+    "HologramData": {
+     "disableIsCollidingBBoxCheck": false,
+     "disableIsCollidingPlayerCheck": false,
+     "disableIsClippingRoofCheck": false,
+     "disableIsBaseViableCheck": false,
+     "disableIsCollidingGPlotCheck": false,
+     "disableIsCollidingAngleCheck": false,
+     "disableIsPlacementPermittedCheck": false,
+     "disableHeightPlacementCheck": false,
+     "disableIsUnderwaterCheck": false,
+     "disableIsInTerrainCheck": false,
+     "disableColdAreaBuildingCheck": true,
+     "disallowedTypesInUnderground": [
+      "FenceKit",
+      "TerritoryFlagKit",
+      "WatchtowerKit"
+     ]
+    },
+    "ConstructionData": {
+     "disablePerformRoofCheck": false,
+     "disableIsCollidingCheck": false,
+     "disableDistanceCheck": false,
+     "disableItemFalling": false,
+     "disableDropAttachmentsOnFall": false,
+     "disableRefundMaterialsOnFall": false
+    }
+   },
+   "UIData": {
+    "use3DMap": false,
+    "HitIndicationData": {
+     "hitDirectionOverrideEnabled": false,
+     "hitDirectionBehaviour": 1,
+     "hitDirectionStyle": 0,
+     "hitDirectionIndicatorColorStr": "0xffbb0a1e",
+     "hitDirectionMaxDuration": 2,
+     "hitDirectionBreakPointRelative": 0.2,
+     "hitDirectionScatter": 10,
+     "hitIndicationPostProcessEnabled": true
+    }
+   },
+   "MapData": {
+    "ignoreMapOwnership": false,
+    "ignoreNavItemsOwnership": false,
+    "displayPlayerPosition": false,
+    "displayNavInfo": true
+   },
+   "VehicleData": {
+    "boatDecayMultiplier": 1,
+    "canDetachAttachedCarWheels": true,
+    "canDamageAttachedCarWheels": true,
+    "canDetachAttachedBikeWheels": true,
+    "canDamageAttachedBikeWheels": true
+   }
+  },
+  "Livonia": {
+   "version": 123,
+   "GeneralData": {
+    "disableBaseDamage": false,
+    "disableContainerDamage": false,
+    "disableRespawnDialog": false,
+    "disableRespawnInUnconsciousness": false
+   },
+   "PlayerData": {
+    "disablePersonalLight": false,
+    "StaminaData": {
+     "sprintStaminaModifierErc": 1,
+     "sprintStaminaModifierCro": 1,
+     "staminaWeightLimitThreshold": 6000,
+     "staminaMax": 100,
+     "staminaKgToStaminaPercentPenalty": 1.75,
+     "staminaMinCap": 5,
+     "sprintSwimmingStaminaModifier": 1,
+     "sprintLadderStaminaModifier": 1,
+     "meleeStaminaModifier": 1,
+     "obstacleTraversalStaminaModifier": 1,
+     "holdBreathStaminaModifier": 1
+    },
+    "ShockHandlingData": {
+     "shockRefillSpeedConscious": 5,
+     "shockRefillSpeedUnconscious": 1,
+     "allowRefillSpeedModifier": true
+    },
+    "MovementData": {
+     "timeToStrafeJog": 0.1,
+     "rotationSpeedJog": 0.15,
+     "timeToSprint": 0.45,
+     "timeToStrafeSprint": 0.3,
+     "rotationSpeedSprint": 0.15,
+     "allowStaminaAffectInertia": true
+    },
+    "DrowningData": {
+     "staminaDepletionSpeed": 10,
+     "healthDepletionSpeed": 10,
+     "shockDepletionSpeed": 10
+    },
+    "WeaponObstructionData": {
+     "staticMode": 1,
+     "dynamicMode": 1
+    }
+   },
+   "WorldsData": {
+    "lightingConfig": 0,
+    "objectSpawnersArr": [],
+    "environmentMinTemps": [
+     -7,
+     -7.4,
+     -4.1,
+     1.5,
+     7,
+     11.3,
+     20.4,
+     19.1,
+     18,
+     5.3,
+     0.8,
+     -3.6
+    ],
+    "environmentMaxTemps": [
+     -2.5,
+     -2.1,
+     2.3,
+     9,
+     15.5,
+     19.4,
+     25,
+     22,
+     21,
+     10.5,
+     4.2,
+     0.1
+    ],
+    "wetnessWeightModifiers": [
+     1,
+     1,
+     1.33,
+     1.66,
+     2
+    ],
+    "playerRestrictedAreaFiles": []
+   },
+   "BaseBuildingData": {
+    "HologramData": {
+     "disableIsCollidingBBoxCheck": false,
+     "disableIsCollidingPlayerCheck": false,
+     "disableIsClippingRoofCheck": false,
+     "disableIsBaseViableCheck": false,
+     "disableIsCollidingGPlotCheck": false,
+     "disableIsCollidingAngleCheck": false,
+     "disableIsPlacementPermittedCheck": false,
+     "disableHeightPlacementCheck": false,
+     "disableIsUnderwaterCheck": false,
+     "disableIsInTerrainCheck": false,
+     "disableColdAreaBuildingCheck": true,
+     "disallowedTypesInUnderground": [
+      "FenceKit",
+      "TerritoryFlagKit",
+      "WatchtowerKit"
+     ]
+    },
+    "ConstructionData": {
+     "disablePerformRoofCheck": false,
+     "disableIsCollidingCheck": false,
+     "disableDistanceCheck": false,
+     "disableItemFalling": false,
+     "disableDropAttachmentsOnFall": false,
+     "disableRefundMaterialsOnFall": false
+    }
+   },
+   "UIData": {
+    "use3DMap": false,
+    "HitIndicationData": {
+     "hitDirectionOverrideEnabled": false,
+     "hitDirectionBehaviour": 1,
+     "hitDirectionStyle": 0,
+     "hitDirectionIndicatorColorStr": "0xffbb0a1e",
+     "hitDirectionMaxDuration": 2,
+     "hitDirectionBreakPointRelative": 0.2,
+     "hitDirectionScatter": 10,
+     "hitIndicationPostProcessEnabled": true
+    }
+   },
+   "MapData": {
+    "ignoreMapOwnership": false,
+    "ignoreNavItemsOwnership": false,
+    "displayPlayerPosition": false,
+    "displayNavInfo": true
+   },
+   "VehicleData": {
+    "boatDecayMultiplier": 1,
+    "canDetachAttachedCarWheels": true,
+    "canDamageAttachedCarWheels": true,
+    "canDetachAttachedBikeWheels": true,
+    "canDamageAttachedBikeWheels": true
+   }
+  },
+  "Sakhal": {
+   "version": 123,
+   "GeneralData": {
+    "disableBaseDamage": false,
+    "disableContainerDamage": false,
+    "disableRespawnDialog": false,
+    "disableRespawnInUnconsciousness": false
+   },
+   "PlayerData": {
+    "disablePersonalLight": false,
+    "StaminaData": {
+     "sprintStaminaModifierErc": 1,
+     "sprintStaminaModifierCro": 1,
+     "staminaWeightLimitThreshold": 6000,
+     "staminaMax": 100,
+     "staminaKgToStaminaPercentPenalty": 1.75,
+     "staminaMinCap": 5,
+     "sprintSwimmingStaminaModifier": 1,
+     "sprintLadderStaminaModifier": 1,
+     "meleeStaminaModifier": 1,
+     "obstacleTraversalStaminaModifier": 1,
+     "holdBreathStaminaModifier": 1
+    },
+    "ShockHandlingData": {
+     "shockRefillSpeedConscious": 5,
+     "shockRefillSpeedUnconscious": 1,
+     "allowRefillSpeedModifier": true
+    },
+    "MovementData": {
+     "timeToStrafeJog": 0.1,
+     "rotationSpeedJog": 0.15,
+     "timeToSprint": 0.45,
+     "timeToStrafeSprint": 0.3,
+     "rotationSpeedSprint": 0.15,
+     "allowStaminaAffectInertia": true
+    },
+    "DrowningData": {
+     "staminaDepletionSpeed": 10,
+     "healthDepletionSpeed": 10,
+     "shockDepletionSpeed": 10
+    },
+    "WeaponObstructionData": {
+     "staticMode": 1,
+     "dynamicMode": 1
+    }
+   },
+   "WorldsData": {
+    "lightingConfig": 2,
+    "objectSpawnersArr": [],
+    "environmentMinTemps": [
+     -6.5,
+     -9.5,
+     -6.5,
+     -9.5,
+     2,
+     6,
+     9,
+     10,
+     6,
+     1,
+     -5,
+     -10
+    ],
+    "environmentMaxTemps": [
+     -3,
+     -5,
+     -3,
+     -5,
+     9,
+     14,
+     16,
+     17,
+     14,
+     8,
+     1,
+     -3
+    ],
+    "wetnessWeightModifiers": [
+     1,
+     1,
+     1.33,
+     1.66,
+     2
+    ],
+    "playerRestrictedAreaFiles": [
+     "pra/warheadstorage.json"
+    ]
+   },
+   "BaseBuildingData": {
+    "HologramData": {
+     "disableIsCollidingBBoxCheck": false,
+     "disableIsCollidingPlayerCheck": false,
+     "disableIsClippingRoofCheck": false,
+     "disableIsBaseViableCheck": false,
+     "disableIsCollidingGPlotCheck": false,
+     "disableIsCollidingAngleCheck": false,
+     "disableIsPlacementPermittedCheck": false,
+     "disableHeightPlacementCheck": false,
+     "disableIsUnderwaterCheck": false,
+     "disableIsInTerrainCheck": false,
+     "disableColdAreaPlacementCheck": false,
+     "disallowedTypesInUnderground": [
+      "FenceKit",
+      "TerritoryFlagKit",
+      "WatchtowerKit"
+     ]
+    },
+    "ConstructionData": {
+     "disablePerformRoofCheck": false,
+     "disableIsCollidingCheck": false,
+     "disableDistanceCheck": false,
+     "disableItemFalling": false,
+     "disableDropAttachmentsOnFall": false,
+     "disableRefundMaterialsOnFall": false
+    }
+   },
+   "UIData": {
+    "use3DMap": false,
+    "HitIndicationData": {
+     "hitDirectionOverrideEnabled": false,
+     "hitDirectionBehaviour": 1,
+     "hitDirectionStyle": 0,
+     "hitDirectionIndicatorColorStr": "0xffbb0a1e",
+     "hitDirectionMaxDuration": 2,
+     "hitDirectionBreakPointRelative": 0.2,
+     "hitDirectionScatter": 10,
+     "hitIndicationPostProcessEnabled": true
+    }
+   },
+   "MapData": {
+    "ignoreMapOwnership": false,
+    "ignoreNavItemsOwnership": false,
+    "displayPlayerPosition": false,
+    "displayNavInfo": true
+   },
+   "VehicleData": {
+    "boatDecayMultiplier": 1,
+    "canDetachAttachedCarWheels": true,
+    "canDamageAttachedCarWheels": true,
+    "canDetachAttachedBikeWheels": true,
+    "canDamageAttachedBikeWheels": true
+   }
+  },
+  "Nasdara": {
+   "version": 130,
+   "GeneralData": {
+    "disableBaseDamage": false,
+    "disableContainerDamage": false,
+    "disableRespawnDialog": false,
+    "disableRespawnInUnconsciousness": false
+   },
+   "PlayerData": {
+    "disablePersonalLight": true,
+    "StaminaData": {
+     "sprintStaminaModifierErc": 1,
+     "sprintStaminaModifierCro": 1,
+     "staminaWeightLimitThreshold": 6000,
+     "staminaMax": 100,
+     "staminaKgToStaminaPercentPenalty": 1.75,
+     "staminaMinCap": 5,
+     "sprintSwimmingStaminaModifier": 1,
+     "sprintLadderStaminaModifier": 1,
+     "meleeStaminaModifier": 1,
+     "obstacleTraversalStaminaModifier": 1,
+     "holdBreathStaminaModifier": 1
+    },
+    "ShockHandlingData": {
+     "shockRefillSpeedConscious": 5,
+     "shockRefillSpeedUnconscious": 1,
+     "allowRefillSpeedModifier": true
+    },
+    "MovementData": {
+     "timeToStrafeJog": 0.1,
+     "rotationSpeedJog": 0.15,
+     "timeToSprint": 0.45,
+     "timeToStrafeSprint": 0.3,
+     "rotationSpeedSprint": 0.15,
+     "allowStaminaAffectInertia": true
+    },
+    "DrowningData": {
+     "staminaDepletionSpeed": 10,
+     "healthDepletionSpeed": 10,
+     "shockDepletionSpeed": 10
+    },
+    "WeaponObstructionData": {
+     "staticMode": 1,
+     "dynamicMode": 1
+    }
+   },
+   "WorldsData": {
+    "lightingConfig": 3,
+    "bunkerBroadcastEnabled": true,
+    "objectSpawnersArr": [],
+    "environmentMinTemps": [
+     3.4,
+     5.4,
+     7.4,
+     8.4,
+     9.4,
+     12.4,
+     14.4,
+     13.4,
+     11.4,
+     8.4,
+     7.4,
+     4.4
+    ],
+    "environmentMaxTemps": [
+     17.4,
+     19.4,
+     22.4,
+     25.4,
+     29.4,
+     34.4,
+     38.4,
+     37.4,
+     34.4,
+     28.4,
+     22.4,
+     18.4
+    ],
+    "wetnessWeightModifiers": [
+     1,
+     1,
+     1.33,
+     1.66,
+     2
+    ]
+   },
+   "BaseBuildingData": {
+    "HologramData": {
+     "disableIsCollidingBBoxCheck": false,
+     "disableIsCollidingPlayerCheck": false,
+     "disableIsClippingRoofCheck": false,
+     "disableIsBaseViableCheck": false,
+     "disableIsCollidingGPlotCheck": false,
+     "disableIsCollidingAngleCheck": false,
+     "disableIsPlacementPermittedCheck": false,
+     "disableHeightPlacementCheck": false,
+     "disableIsUnderwaterCheck": false,
+     "disableIsInTerrainCheck": false,
+     "disableColdAreaPlacementCheck": true,
+     "disallowedTypesInUnderground": [
+      "FenceKit",
+      "TerritoryFlagKit",
+      "WatchtowerKit"
+     ]
+    },
+    "ConstructionData": {
+     "disablePerformRoofCheck": false,
+     "disableIsCollidingCheck": false,
+     "disableDistanceCheck": false,
+     "disableItemFalling": false,
+     "disableDropAttachmentsOnFall": false,
+     "disableRefundMaterialsOnFall": false
+    }
+   },
+   "UIData": {
+    "use3DMap": false,
+    "HitIndicationData": {
+     "hitDirectionOverrideEnabled": false,
+     "hitDirectionBehaviour": 1,
+     "hitDirectionStyle": 0,
+     "hitDirectionIndicatorColorStr": "0xffbb0a1e",
+     "hitDirectionMaxDuration": 2,
+     "hitDirectionBreakPointRelative": 0.2,
+     "hitDirectionScatter": 10,
+     "hitIndicationPostProcessEnabled": true
+    }
+   },
+   "MapData": {
+    "ignoreMapOwnership": false,
+    "ignoreNavItemsOwnership": false,
+    "displayPlayerPosition": false,
+    "displayNavInfo": true
+   },
+   "VehicleData": {
+    "boatDecayMultiplier": 1,
+    "canDetachAttachedCarWheels": true,
+    "canDamageAttachedCarWheels": true,
+    "canDetachAttachedBikeWheels": true,
+    "canDamageAttachedBikeWheels": true
+   },
+   "ExternalLockData": {
+    "protectionCountStageOne": 3,
+    "protectionCountStageTwo": 1,
+    "protectionTime": 30,
+    "protectionResetTime": 3600
+   },
+   "SandstormData": {
+    "sandstormFrequency": 1
+   }
+  }
+ },
+ "regeln": {
+  "PlayerData.StaminaData.sprintStaminaModifierErc": {
+   "min": 0,
+   "max": 5,
+   "label": "Sprint Stamina Modifier (Erect)"
+  },
+  "PlayerData.StaminaData.sprintStaminaModifierCro": {
+   "min": 0,
+   "max": 5,
+   "label": "Sprint Stamina Modifier (Crouch)"
+  },
+  "PlayerData.StaminaData.staminaWeightLimitThreshold": {
+   "min": 1000,
+   "max": 20000,
+   "label": "Stamina Weight Limit Threshold (g)"
+  },
+  "PlayerData.StaminaData.staminaMax": {
+   "min": 50,
+   "max": 200,
+   "label": "Max Stamina"
+  },
+  "PlayerData.StaminaData.staminaKgToStaminaPercentPenalty": {
+   "min": 0.5,
+   "max": 10,
+   "label": "Stamina Kg to Percent Penalty"
+  },
+  "PlayerData.StaminaData.staminaMinCap": {
+   "min": 0,
+   "max": 50,
+   "label": "Stamina Min Cap"
+  },
+  "PlayerData.StaminaData.sprintSwimmingStaminaModifier": {
+   "min": 0,
+   "max": 5,
+   "label": "Sprint Swimming Stamina Modifier"
+  },
+  "PlayerData.StaminaData.sprintLadderStaminaModifier": {
+   "min": 0,
+   "max": 5,
+   "label": "Sprint Ladder Stamina Modifier"
+  },
+  "PlayerData.StaminaData.meleeStaminaModifier": {
+   "min": 0,
+   "max": 5,
+   "label": "Melee Stamina Modifier"
+  },
+  "PlayerData.StaminaData.obstacleTraversalStaminaModifier": {
+   "min": 0,
+   "max": 5,
+   "label": "Obstacle Traversal Stamina Modifier"
+  },
+  "PlayerData.StaminaData.holdBreathStaminaModifier": {
+   "min": 0,
+   "max": 5,
+   "label": "Hold Breath Stamina Modifier"
+  },
+  "PlayerData.ShockHandlingData.shockRefillSpeedConscious": {
+   "min": 0,
+   "max": 20,
+   "label": "Shock Refill Speed (Conscious)"
+  },
+  "PlayerData.ShockHandlingData.shockRefillSpeedUnconscious": {
+   "min": 0,
+   "max": 20,
+   "label": "Shock Refill Speed (Unconscious)"
+  },
+  "PlayerData.MovementData.timeToStrafeJog": {
+   "min": 0,
+   "max": 2,
+   "label": "Time to Strafe Jog"
+  },
+  "PlayerData.MovementData.rotationSpeedJog": {
+   "min": 0,
+   "max": 2,
+   "label": "Rotation Speed Jog"
+  },
+  "PlayerData.MovementData.timeToSprint": {
+   "min": 0,
+   "max": 2,
+   "label": "Time to Sprint"
+  },
+  "PlayerData.MovementData.timeToStrafeSprint": {
+   "min": 0,
+   "max": 2,
+   "label": "Time to Strafe Sprint"
+  },
+  "PlayerData.MovementData.rotationSpeedSprint": {
+   "min": 0,
+   "max": 2,
+   "label": "Rotation Speed Sprint"
+  },
+  "PlayerData.DrowningData.staminaDepletionSpeed": {
+   "min": 1,
+   "max": 50,
+   "label": "Stamina Depletion Speed (Drowning)"
+  },
+  "PlayerData.DrowningData.healthDepletionSpeed": {
+   "min": 1,
+   "max": 50,
+   "label": "Health Depletion Speed (Drowning)"
+  },
+  "PlayerData.DrowningData.shockDepletionSpeed": {
+   "min": 1,
+   "max": 50,
+   "label": "Shock Depletion Speed (Drowning)"
+  },
+  "PlayerData.WeaponObstructionData.staticMode": {
+   "min": 0,
+   "max": 2,
+   "label": "Static Mode"
+  },
+  "PlayerData.WeaponObstructionData.dynamicMode": {
+   "min": 0,
+   "max": 2,
+   "label": "Dynamic Mode"
+  },
+  "WorldsData.lightingConfig": {
+   "min": 0,
+   "max": 2,
+   "label": "Lighting Config"
+  },
+  "GeneralData.disableBaseDamage": {
+   "min": 0,
+   "max": 1,
+   "label": "Disable Base Damage"
+  },
+  "VehicleData.boatDecayMultiplier": {
+   "min": 0,
+   "max": 10,
+   "label": "Boat Decay Multiplier"
+  }
+ },
+ "tooltips": {
+  "disableBaseDamage": "Damage from structures built through base-building is disabled.",
+  "disableContainerDamage": "Disable damage from items such as tents and barrels.",
+  "disableRespawnDialog": "Disable the UI dialogue window where the player selects the type of respawn after pressing the respawn button.",
+  "disableRespawnInUnconsciousness": "Disables the \"Respawn\" button in the pause menu (Esc) when the player is unconscious, disallowing them to respawn.",
+  "disablePersonalLight": "Disables the omnipresent personal light that lights up objects close to the player during night-time.",
+  "spawnGearPresetFiles": "If not empty, enables loading and processing of Player Gear Spawn JSON configuration file(s).",
+  "sprintStaminaModifierErc": "Modifies the rate at which stamina is consumed during erected sprint.",
+  "sprintStaminaModifierCro": "Modifies the rate at which stamina is consumed during crouched sprint.",
+  "staminaWeightLimitThreshold": "This amount of stamina points (divided by 1000) will not count towards stamina weight deduction.",
+  "staminaMax": "Maximum stamina. Setting to 0 may produce unexpected results.",
+  "staminaKgToStaminaPercentPenalty": "Multiplier used when calculating stamina points deducted from max stamina given the player load.",
+  "staminaMinCap": "Minimum size of stamina cap. Setting to 0 may produce unexpected results.",
+  "sprintSwimmingStaminaModifier": "Modifies the rate at which stamina is consumed during fast swimming.",
+  "sprintLadderStaminaModifier": "Modifies the rate at which stamina is consumed during fast ladder climbing.",
+  "meleeStaminaModifier": "Modifies how much stamina is consumed when performing heavy melee attacks and evasion.",
+  "obstacleTraversalStaminaModifier": "Modifies how much stamina is consumed when performing jumping, climbing and vaulting.",
+  "holdBreathStaminaModifier": "Modifies the rate at which stamina is consumed when holding breath.",
+  "shockRefillSpeedConscious": "Shock value recovery while the player is conscious (per second).",
+  "shockRefillSpeedUnconscious": "Shock value recovery while the player is unconscious (per second).",
+  "allowRefillSpeedModifier": "Allow/disallow modifier of Shock value recovery based on ammo type settings (typically faster waking-up from unconscious after getting shot).",
+  "timeToStrafeJog": "Time to blend strafing (diagonal movement) while jogging. Min possible value 0.01.",
+  "rotationSpeedJog": "Rotation speed of the character while jogging. Min possible value 0.01.",
+  "timeToSprint": "Time to reach sprint from jog. Min possible value 0.01.",
+  "timeToStrafeSprint": "Time to blend strafing (diagonal movement) while sprinting. Min possible value 0.01.",
+  "rotationSpeedSprint": "Rotation speed of the character while sprinting. Min possible value 0.01.",
+  "allowStaminaAffectInertia": "When enabled, allows the stamina value to influence the player's inertia.",
+  "staminaDepletionSpeed": "Rate at which stamina depletes while drowning/underwater (per second). Higher = faster drown.",
+  "healthDepletionSpeed": "Rate at which health depletes while drowning/underwater (per second). Higher = faster drown.",
+  "shockDepletionSpeed": "Rate at which shock depletes while drowning/underwater (per second). Higher = faster drown.",
+  "staticMode": "Static weapon obstruction mode. 1 = enabled (weapon lowers when colliding with walls/objects), 0 = disabled.",
+  "dynamicMode": "Dynamic weapon obstruction mode. 1 = enabled (more reactive obstruction based on movement), 0 = disabled.",
+  "lightingConfig": "What type of lighting will be used during night time. 0 = bright, 1 = dark (default).",
+  "objectSpawnersArr": "File names of the JSON files containing spawner data (Object Spawner).",
+  "environmentMinTemps": "Minimum environment temperatures per month (Jan–Dec). Affects player temperature & survival.",
+  "environmentMaxTemps": "Maximum environment temperatures per month (Jan–Dec). Affects player temperature & survival.",
+  "wetnessWeightModifiers": "Values for item weight modification based on wetness level. Left to right: [DRY, DAMP, WET, SOAKED, DRENCHED].",
+  "playerRestrictedAreaFiles": "If not empty, enables loading and processing of player restricted areas JSON configuration file(s).",
+  "disableIsCollidingBBoxCheck": "Allows placement when the hologram is colliding with objects in the world.",
+  "disableIsCollidingPlayerCheck": "Allows placement when the hologram is colliding with the player.",
+  "disableIsClippingRoofCheck": "Allows placement where placing would cause clipping with the roof.",
+  "disableIsBaseViableCheck": "Allows placement on dynamic objects and other otherwise incompatible base.",
+  "disableIsCollidingGPlotCheck": "Allows placement of garden plots despite incompatible surface type.",
+  "disableIsCollidingAngleCheck": "Allows placement despite exceeding roll/pitch/yaw limits.",
+  "disableIsPlacementPermittedCheck": "Allows placement even when not permitted by rudimentary checks.",
+  "disableHeightPlacementCheck": "Allows placement with limited height space.",
+  "disableIsUnderwaterCheck": "Allows placement under water.",
+  "disableIsInTerrainCheck": "Allows placement when clipping with terrain.",
+  "disableColdAreaPlacementCheck": "Allows placement of garden plots when the ground is frozen.",
+  "disableColdAreaBuildingCheck": "Allows building in cold areas when the ground is frozen.",
+  "disallowedTypesInUnderground": "Prevents construction of these item types (including inherited ones) in underground areas.",
+  "disablePerformRoofCheck": "Allows construction when clipping with the roof.",
+  "disableIsCollidingCheck": "Allows construction when colliding with objects in the world.",
+  "disableDistanceCheck": "Prevents construction when the player gets below a specified range.",
+  "disableItemFalling": "Prevents constructed items from falling to the ground after placement.",
+  "disableDropAttachmentsOnFall": "Prevents dropping attachments when an item falls.",
+  "disableRefundMaterialsOnFall": "Prevents refunding construction materials when an item falls.",
+  "use3DMap": "Enables use of the 3D map only (disables the default 2D map overlay).",
+  "hitDirectionOverrideEnabled": "Decides whether the hit-indicator values get used. Allows the game to determine that valid data was loaded.",
+  "hitDirectionBehaviour": "Dictates general behaviour of the hit indicator. 0 = Disabled, 1 = Static, 2 = Dynamic (moving when displayed, WIP).",
+  "hitDirectionStyle": "Dictates which type of indicator gets used. 0 = splash, 1 = spike, 2 = arrow.",
+  "hitDirectionIndicatorColorStr": "Color of the indicator widget, in ARGB format (e.g. \"0xffbb0a1e\").",
+  "hitDirectionMaxDuration": "Maximal duration of the hit indicator. Actual duration is 0.6–1.0 of this value depending on hit severity.",
+  "hitDirectionBreakPointRelative": "Fraction of the duration after which the indicator begins to recede. 0.0 = fades from start, 1.0 = no fading.",
+  "hitDirectionScatter": "Amount of scatter (inaccuracy) in degrees. A value of 10 gives ±10° (20° total) potential scatter.",
+  "hitIndicationPostProcessEnabled": "Allows disabling of the old hit effect (red flash).",
+  "ignoreMapOwnership": "Player can open a map (just the map) using the dedicated input (\"M\") even without a map in their inventory.",
+  "ignoreNavItemsOwnership": "Compass and/or GPS receiver are not needed for displaying helpers on the 2D map.",
+  "displayPlayerPosition": "Show the player's position on the map. true = visible, false = hidden.",
+  "displayNavInfo": "Display navigation info/helpers on the map.",
+  "boatDecayMultiplier": "Multiplies the speed of boat decay. Higher = boats decay faster.",
+  "canDetachAttachedCarWheels": "Allows detaching wheels that are attached to cars.",
+  "canDamageAttachedCarWheels": "Allows damaging wheels that are attached to cars.",
+  "canDetachAttachedBikeWheels": "Allows detaching wheels that are attached to bikes.",
+  "canDamageAttachedBikeWheels": "Allows damaging wheels that are attached to bikes."
+ },
+ "presets": [
+  {
+   "id": "stamina",
+   "label": "Stamina",
+   "path": "StaminaData",
+   "presets": [
+    {
+     "id": "unlimited",
+     "label": "Unlimited Stamina",
+     "description": "Near-zero drain on every action. Sprint, swim, melee forever.",
+     "values": {
+      "sprintStaminaModifierErc": 0.01,
+      "sprintStaminaModifierCro": 0.01,
+      "staminaWeightLimitThreshold": 6000,
+      "staminaMax": 100,
+      "staminaKgToStaminaPercentPenalty": 0.01,
+      "staminaMinCap": 0.01,
+      "sprintSwimmingStaminaModifier": 0.01,
+      "sprintLadderStaminaModifier": 0.01,
+      "meleeStaminaModifier": 0.01,
+      "obstacleTraversalStaminaModifier": 0.01,
+      "holdBreathStaminaModifier": 0.01
+     }
+    },
+    {
+     "id": "better",
+     "label": "Better Stamina",
+     "description": "Halved drain, higher carry threshold, more max stamina.",
+     "values": {
+      "sprintStaminaModifierErc": 0.5,
+      "sprintStaminaModifierCro": 0.5,
+      "staminaWeightLimitThreshold": 12000,
+      "staminaMax": 150,
+      "staminaKgToStaminaPercentPenalty": 0.8,
+      "staminaMinCap": 2.5,
+      "sprintSwimmingStaminaModifier": 0.5,
+      "sprintLadderStaminaModifier": 0.5,
+      "meleeStaminaModifier": 0.5,
+      "obstacleTraversalStaminaModifier": 0.5,
+      "holdBreathStaminaModifier": 0.5
+     }
+    },
+    {
+     "id": "vanilla",
+     "label": "Vanilla Default",
+     "description": "Stock DayZ values — the original Bohemia balance.",
+     "values": {
+      "sprintStaminaModifierErc": 1,
+      "sprintStaminaModifierCro": 1,
+      "staminaWeightLimitThreshold": 6000,
+      "staminaMax": 100,
+      "staminaKgToStaminaPercentPenalty": 1.75,
+      "staminaMinCap": 5,
+      "sprintSwimmingStaminaModifier": 1,
+      "sprintLadderStaminaModifier": 1,
+      "meleeStaminaModifier": 1,
+      "obstacleTraversalStaminaModifier": 1,
+      "holdBreathStaminaModifier": 1
+     }
+    },
+    {
+     "id": "hardcore",
+     "label": "Hardcore Drain",
+     "description": "Double drain, lower carry threshold, less max stamina.",
+     "values": {
+      "sprintStaminaModifierErc": 2,
+      "sprintStaminaModifierCro": 2,
+      "staminaWeightLimitThreshold": 4000,
+      "staminaMax": 75,
+      "staminaKgToStaminaPercentPenalty": 2.5,
+      "staminaMinCap": 10,
+      "sprintSwimmingStaminaModifier": 2,
+      "sprintLadderStaminaModifier": 2,
+      "meleeStaminaModifier": 1.5,
+      "obstacleTraversalStaminaModifier": 1.5,
+      "holdBreathStaminaModifier": 1.5
+     }
+    }
+   ]
+  },
+  {
+   "id": "shock",
+   "label": "Shock Recovery",
+   "path": "ShockHandlingData",
+   "presets": [
+    {
+     "id": "fast",
+     "label": "Fast Recovery",
+     "description": "Double refill speeds — shake off shock quickly.",
+     "values": {
+      "shockRefillSpeedConscious": 10,
+      "shockRefillSpeedUnconscious": 5,
+      "allowRefillSpeedModifier": true
+     }
+    },
+    {
+     "id": "instant",
+     "label": "Instant Recovery",
+     "description": "4x refill — near-instant shock recovery.",
+     "values": {
+      "shockRefillSpeedConscious": 20,
+      "shockRefillSpeedUnconscious": 10,
+      "allowRefillSpeedModifier": true
+     }
+    },
+    {
+     "id": "vanilla",
+     "label": "Vanilla Default",
+     "description": "Stock DayZ shock refill values.",
+     "values": {
+      "shockRefillSpeedConscious": 5,
+      "shockRefillSpeedUnconscious": 1,
+      "allowRefillSpeedModifier": true
+     }
+    }
+   ]
+  },
+  {
+   "id": "movement",
+   "label": "Movement",
+   "path": "MovementData",
+   "presets": [
+    {
+     "id": "fast",
+     "label": "Fast Movement",
+     "description": "Snappy strafe & sprint transitions, quick rotation.",
+     "values": {
+      "timeToStrafeJog": 0.1,
+      "rotationSpeedJog": 0.1,
+      "timeToSprint": 0.1,
+      "timeToStrafeSprint": 0.3,
+      "rotationSpeedSprint": 0.1,
+      "allowStaminaAffectInertia": true
+     }
+    },
+    {
+     "id": "vanilla",
+     "label": "Vanilla Default",
+     "description": "Stock DayZ movement timing.",
+     "values": {
+      "timeToStrafeJog": 0.1,
+      "rotationSpeedJog": 0.3,
+      "timeToSprint": 0.45,
+      "timeToStrafeSprint": 0.3,
+      "rotationSpeedSprint": 0.15,
+      "allowStaminaAffectInertia": true
+     }
+    },
+    {
+     "id": "sluggish",
+     "label": "Sluggish",
+     "description": "Slower transitions — heavier, deliberate feel.",
+     "values": {
+      "timeToStrafeJog": 0.3,
+      "rotationSpeedJog": 0.5,
+      "timeToSprint": 0.8,
+      "timeToStrafeSprint": 0.5,
+      "rotationSpeedSprint": 0.3,
+      "allowStaminaAffectInertia": true
+     }
+    }
+   ]
+  }
+ ],
+ "beleuchtung": [
+  {
+   "value": 0,
+   "label": "Bright Nights",
+   "description": "Default DayZ lighting. Night-time is bright and visible. Easier spotting, less atmosphere. Good for casual/PvE servers.",
+   "isDefault": true
+  },
+  {
+   "value": 1,
+   "label": "Dark Nights",
+   "description": "Pitch-black nights, immersive atmosphere. Flashlights & NVGs matter.",
+   "isDefault": false
+  },
+  {
+   "value": 2,
+   "label": "Sakhal Brighter Nights",
+   "description": "Sakhal map lighting — brighter nights tuned for the Sakhal environment. Use on Sakhal missions for clearer night visibility.",
+   "isDefault": false
+  },
+  {
+   "value": 3,
+   "label": "Custom Preset 3",
+   "description": "Not officially documented. Map-specific custom lighting — only works if the mission defines it.",
+   "isDefault": false
+  }
+ ],
+ "kategorien_je_karte": {
+  "Chernarus": [
+   "⚙️\nGeneral",
+   "🧑\nPlayer",
+   "🌍\nWorlds",
+   "🏗️\nBase Building",
+   "🎮\nUI",
+   "🗺️\nMap",
+   "🚗\nVehicle",
+   "Copy JSON",
+   "Download",
+   "Reset"
+  ],
+  "Livonia": [
+   "⚙️\nGeneral",
+   "🧑\nPlayer",
+   "🌍\nWorlds",
+   "🏗️\nBase Building",
+   "🎮\nUI",
+   "🗺️\nMap",
+   "🚗\nVehicle",
+   "Copy JSON",
+   "Download",
+   "Reset"
+  ],
+  "Sakhal": [
+   "⚙️\nGeneral",
+   "🧑\nPlayer",
+   "🌍\nWorlds",
+   "🏗️\nBase Building",
+   "🎮\nUI",
+   "🗺️\nMap",
+   "🚗\nVehicle",
+   "Copy JSON",
+   "Download",
+   "Reset"
+  ],
+  "Nasdara": [
+   "⚙️\nGeneral",
+   "🧑\nPlayer",
+   "🌍\nWorlds",
+   "🏗️\nBase Building",
+   "🎮\nUI",
+   "🗺️\nMap",
+   "🚗\nVehicle",
+   "🔒\nExternal Lock",
+   "🏜️\nSandstorm",
+   "Copy JSON",
+   "Download",
+   "Reset"
+  ]
+ }
+}
