@@ -4836,6 +4836,33 @@ async def _log_lesen_ab_offset(conn: "ServerConnection", path: str,
     return await loop.run_in_executor(None, conn.ftp.read_from_offset, path, offset)
 
 
+async def _log_lesen_bereich(conn: "ServerConnection", path: str, start: int,
+                             ende: Optional[int] = None, max_aufrufe: int = 40) -> Tuple[Optional[str], int]:
+    """Liest ab ``start`` bis zum Dateiende (oder bis ``ende``, wenn bekannt) - wahlweise ueber FTP oder die Nitrado-API.
+
+    Wie ``_log_lesen_ab_offset``, aber in einer Schleife: die API liefert je Aufruf hoechstens 65535 Byte, FTP dagegen den
+    ganzen Rest auf einmal. Gebraucht fuer Lesevorgaenge, die das Dateiende wirklich erreichen muessen (Neuaufbau des
+    Online-Zustands, Diagnose-Nachlesen) - der laufende Poll holt einen Rueckstand dagegen ueber mehrere Zyklen nach.
+    Rueckgabe ``(inhalt, naechster Offset)``; ``inhalt is None`` heisst FEHLER - auch dann, wenn erst ein spaeterer Teil
+    scheitert (ein Stueck ohne das Dateiende waere keine Antwort auf die Frage, die der Aufrufer stellt).
+    """
+    teile: List[str] = []
+    pos = int(start)
+    for _ in range(max(1, int(max_aufrufe))):
+        if ende is not None and pos >= ende:
+            break
+        text, neu = await _log_lesen_ab_offset(conn, path, pos)
+        if text is None:
+            return None, pos
+        if not text or neu <= pos:
+            break
+        teile.append(text)
+        pos = neu
+        if not _log_lesen_via_api(conn):
+            break                       # FTP liefert den ganzen Rest in einem Zug - ein zweiter Aufruf waere ueberfluessig
+    return "".join(teile), pos
+
+
 async def _log_kompletten_inhalt(conn: "ServerConnection", path: str) -> str:
     """Liest eine Log-Datei GANZ ein, ab Offset 0 - fuer den einmaligen
     Ruecklese-Abgleich alter ADM-Dateien (siehe
@@ -7604,7 +7631,7 @@ class DayZBot(discord.Client):
             return False
         try:
             loop = asyncio.get_running_loop()
-            adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
+            adm_files = await _log_dateien(conn, log_dir, ".adm")      # dieselben Pfade wie der Poll (API: volle Pfade)
             if not adm_files:
                 return False
             conn.parser_hydrated = False        # erneut versuchen (gedrosselt)
@@ -7673,7 +7700,10 @@ class DayZBot(discord.Client):
         """Der eigentliche Lesevorgang von :meth:`_hydrate_online_state` –
         ausgelagert, damit das Lock dort als schmaler ``async with``-Block
         sichtbar bleibt. Wird NUR von dort aufgerufen (Lock gehalten)."""
-        groesse = await loop.run_in_executor(None, conn.ftp.file_size_or_none, latest)
+        # Wie der Poll ueber FTP ODER die Nitrado-API lesen: ``latest`` kommt aus dem Poll und ist bei API-Betrieb der VOLLE
+        # Pfad (/games/<ftp_user>/noftp/dayzps/config/...), den der FTP-Zugang nicht kennt - der FTP-Zugriff scheiterte dort
+        # immer ("FTP-Fehler beim Hydrieren"), der Online-Zustand wurde nach einem Neustart nie aufgebaut.
+        groesse = await _log_dateigroesse(conn, latest)
         if groesse is not None:
             # Nur bei einem echten Wert ueberschreiben: sonst stuende auf der
             # Diagnose-Seite "Rueckstand unbekannt", obwohl der Poll die
@@ -7691,8 +7721,7 @@ class DayZBot(discord.Client):
         for weite in fenster:
             start = 0 if groesse is None else max(0, int(groesse) - int(weite))
             conn.last_read_versuch_ts = time.time()
-            inhalt, _neu = await loop.run_in_executor(
-                None, conn.ftp.read_from_offset, latest, start)
+            inhalt, _neu = await _log_lesen_bereich(conn, latest, start, groesse)
             if inhalt is None:
                 conn.last_read_status = "FTP-Fehler beim Hydrieren"
                 log.warning(f"[HYDRATE] {conn.name}: {latest} ab Offset {start} nicht lesbar.")
@@ -43823,6 +43852,30 @@ def _kanal_gehoert_guild(gid: int, kanal_id: int,
     return None
 
 
+def _kanal_gehoert_guilds(guild_ids: Iterable[int], kanal_id: int,
+                          feld: str = "Channel") -> Optional[web.Response]:
+    """Wie ``_kanal_gehoert_guild``, aber fuer Server mit MEHREREN Discord-Guilds: der Channel darf in jeder der
+    zugeordneten Guilds liegen - nie in einer fremden (``guild_ids`` ist immer die Liste DIESES Servers).
+
+    Hintergrund: Die Auswahlliste im Dashboard zeigt die Channels der gewaehlten Guild, die Pruefung nahm aber nur
+    die ERSTE zugeordnete (``conn.guild_id``). Ein Channel aus der zweiten Guild wurde deshalb abgelehnt ("Diese
+    Channel-ID gibt es in dem gewaehlten Discord-Server nicht"), obwohl er existiert und der Bot dort alle Rechte hat."""
+    ids = [int(g) for g in guild_ids]
+    if len(ids) <= 1:
+        return _kanal_gehoert_guild(ids[0], kanal_id, feld) if ids else None
+    erreichbar = False
+    for gid in ids:
+        g = bot.get_guild(gid) if bot else None
+        if g is None:
+            continue
+        erreichbar = True
+        if g.get_channel(int(kanal_id)) is not None:
+            return None
+    if not erreichbar:
+        return _kanal_gehoert_guild(ids[0], kanal_id, feld)       # liefert die passende "Bot nicht erreichbar"-Meldung
+    return err(f"Diese {feld}-ID gibt es in dem gewählten Discord-Server nicht.")
+
+
 async def set_feed(request: web.Request) -> web.Response:
     gid = request.match_info["guild_id"]
     log_type = request.match_info["log_type"]
@@ -44115,21 +44168,21 @@ async def api_diagnose_nachlesen(request: web.Request) -> web.Response:
         return err("Dieser Server ist noch keinem Discord-Server zugeordnet.", 409)
     if conn.ftp is None:
         return err("Kein FTP aufgebaut – siehe Ampel oben.", 409)
-    loop = asyncio.get_running_loop()
+    # Wie der Poll ueber FTP ODER die Nitrado-API (die gespeicherte Datei ist bei API-Betrieb der volle API-Pfad)
     latest = (conn.log_state.get("current") or {}).get("file")
     if not latest:
         log_dir = conn.get("ftp_log_dir")
         if not log_dir:
             return err("Noch kein Log-Verzeichnis bekannt.", 409)
-        adm_files = await loop.run_in_executor(None, conn.ftp.list_adm_files, log_dir)
+        adm_files = await _log_dateien(conn, log_dir, ".adm")
         if not adm_files:
             return err(f"Keine .ADM-Dateien in {log_dir} gefunden.", 409)
         latest = adm_files[-1]
-    size = await loop.run_in_executor(None, conn.ftp.file_size_or_none, latest)
+    size = await _log_dateigroesse(conn, latest)
     if size is None:
         return err(f"Dateigröße von {latest} nicht ermittelbar (FTP-Fehler).", 502)
     start = max(0, size - DIAGNOSE_NACHLESEN_BYTES)
-    content, _ = await loop.run_in_executor(None, conn.ftp.read_from_offset, latest, start)
+    content, _ = await _log_lesen_bereich(conn, latest, start, size)
     if content is None:
         return err(f"{latest} nicht lesbar (FTP-Fehler).", 502)
     zeilen = content.splitlines()
@@ -47846,7 +47899,7 @@ async def create_scheduled_task(request: web.Request) -> web.Response:
     if fehler:
         return err(fehler)
     if not werte["channel_ignore"] and werte["channel_id"] and _c.guild_id is not None:
-        denied = _kanal_gehoert_guild(int(_c.guild_id), int(werte["channel_id"]))
+        denied = _kanal_gehoert_guilds(_c.guild_ids, int(werte["channel_id"]))
         if denied is not None:
             return denied
 
@@ -47883,7 +47936,7 @@ async def update_scheduled_task(request: web.Request) -> web.Response:
     if fehler:
         return err(fehler)
     if not werte["channel_ignore"] and werte["channel_id"] and _c.guild_id is not None:
-        denied = _kanal_gehoert_guild(int(_c.guild_id), int(werte["channel_id"]))
+        denied = _kanal_gehoert_guilds(_c.guild_ids, int(werte["channel_id"]))
         if denied is not None:
             return denied
 
@@ -51987,7 +52040,7 @@ async def create_announcement(request: web.Request) -> web.Response:
     if conn.guild_id is None:
         return err("Für diesen Server ist noch kein Discord-Server zugeordnet – "
                    "der Bot-Betreiber schaltet ihn frei.", 409)
-    fehler = _kanal_gehoert_guild(int(conn.guild_id), kanal)
+    fehler = _kanal_gehoert_guilds(conn.guild_ids, kanal)
     if fehler is not None:
         return fehler
 
