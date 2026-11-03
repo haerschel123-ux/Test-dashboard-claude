@@ -1,0 +1,4515 @@
+{
+ "quelle": "dayzfiletoolbox.com/teleports: GET /get_teleport_assets und die Funktion exportAllObjects() im Browser (30 Laeufe)",
+ "assets": [
+  {
+   "displayName": "Land_Misc_Toilet_Mobile",
+   "image": "/static/images/teleport_assets/Land_Misc_Toilet_Mobile.png",
+   "name": "Land_Misc_Toilet_Mobile",
+   "type": "single"
+  },
+  {
+   "displayName": "Land_Mil_GuardShed",
+   "image": "/static/images/teleport_assets/Land_Mil_GuardShed.png",
+   "name": "Land_Misc_Toilet_Mobile",
+   "type": "single"
+  },
+  {
+   "displayName": "Skulls Teleport Stage",
+   "image": "/static/images/teleport_assets/skulls_teleporter.jpg",
+   "objects": [
+    {
+     "name": "StaticObj_Furniture_yellow_star",
+     "pos": [
+      0,
+      0,
+      0
+     ],
+     "scale": 2.999950408935547,
+     "ypr": [
+      -2.0651862621307373,
+      -90,
+      179.99989318847656
+     ]
+    },
+    {
+     "name": "Land_Wall_Gate_FenG",
+     "pos": [
+      0.171875,
+      0.9375,
+      -0.6796875
+     ],
+     "scale": 1.189998984336853,
+     "ypr": [
+      174.64004516601562,
+      0,
+      0
+     ]
+    },
+    {
+     "name": "StaticObj_Misc_ConcretePipe_Gate",
+     "pos": [
+      0.03759765625,
+      2.860504150390625,
+      -0.1259765625
+     ],
+     "scale": 0.9999983310699463,
+     "ypr": [
+      -131.44432067871094,
+      90,
+      -0.00010427406232338399
+     ]
+    },
+    {
+     "name": "StaticObj_Furniture_radar_panel_flat",
+     "pos": [
+      1.37353515625,
+      0,
+      -0.9755859375
+     ],
+     "scale": 0.7099621295928955,
+     "ypr": [
+      -4.213317394256592,
+      0,
+      0
+     ]
+    },
+    {
+     "name": "StaticObj_Misc_SatDish",
+     "pos": [
+      2.32373046875,
+      4.184967041015625,
+      0.859375
+     ],
+     "scale": 2.1050004959106445,
+     "ypr": [
+      32.23441314697266,
+      40.05234909057617,
+      0
+     ]
+    },
+    {
+     "name": "Misc_Spotlight",
+     "pos": [
+      -0.06591796875,
+      3.400909423828125,
+      0.224609375
+     ],
+     "scale": 0.8450119495391846,
+     "ypr": [
+      42.57827377319336,
+      -0.7605018019676208,
+      -175.19993591308594
+     ]
+    },
+    {
+     "name": "StaticObj_Cemetery_Fence4",
+     "pos": [
+      0.033203125,
+      -0.48590087890625,
+      0.1923828125
+     ],
+     "scale": 3.319983720779419,
+     "ypr": [
+      -6.93755578994751,
+      90,
+      179.99989318847656
+     ]
+    },
+    {
+     "name": "StaticObj_Pipe_Small2_High_Ground",
+     "pos": [
+      -1.92724609375,
+      -2.342376708984375,
+      0.06640625
+     ],
+     "scale": 0.9999983310699463,
+     "ypr": [
+      -96.68782806396484,
+      0,
+      0
+     ]
+    },
+    {
+     "name": "StaticObj_Pipe_Small2_High_Ground",
+     "pos": [
+      1.83203125,
+      -2.342376708984375,
+      0.5263671875
+     ],
+     "scale": 0.9999982714653015,
+     "ypr": [
+      81.58124542236328,
+      0,
+      0
+     ]
+    },
+    {
+     "name": "StaticObj_Power_HV_Tower",
+     "pos": [
+      -1.27685546875,
+      2.791351318359375,
+      -0.146484375
+     ],
+     "scale": 0.525000810623169,
+     "ypr": [
+      172.98291015625,
+      0,
+      0
+     ]
+    },
+    {
+     "name": "StaticObj_Power_HV_Tower",
+     "pos": [
+      1.36279296875,
+      2.791351318359375,
+      0.19140625
+     ],
+     "scale": 0.525000810623169,
+     "ypr": [
+      177.50039672851562,
+      0,
+      0
+     ]
+    },
+    {
+     "name": "StaticObj_Furniture_yellow_star",
+     "pos": [
+      0,
+      0.346893310546875,
+      0
+     ],
+     "scale": 2.999957323074341,
+     "ypr": [
+      -2.0650634765625,
+      -90,
+      179.99989318847656
+     ]
+    },
+    {
+     "name": "StaticObj_Cemetery_Tombstone12",
+     "pos": [
+      0.0537109375,
+      -1.265289306640625,
+      0.0234375
+     ],
+     "scale": 2.5099992752075195,
+     "ypr": [
+      -2.064483642578125,
+      1.2572391824505758e-05,
+      179.99989318847656
+     ]
+    },
+    {
+     "name": "StaticObj_Road_Sidewalk_Stairs",
+     "pos": [
+      0.24999999999999956,
+      -2.184112548828125,
+      -3.63671875
+     ],
+     "scale": 0.9999987483024597,
+     "ypr": [
+      177.93446350097656,
+      0.4999980032444,
+      0
+     ]
+    },
+    {
+     "name": "StaticObj_Cemetery_Tombstone12",
+     "pos": [
+      0.0537109375,
+      -2.05242919921875,
+      0.0234375
+     ],
+     "scale": 2.5099992752075195,
+     "ypr": [
+      -2.064483642578125,
+      3.155682861688547e-05,
+      179.99989318847656
+     ]
+    },
+    {
+     "name": "StaticObj_Wall_FenR_Pole",
+     "pos": [
+      -0.88671875,
+      1.04638671875,
+      0.453125
+     ],
+     "scale": 0.9999992847442627,
+     "ypr": [
+      177.934326171875,
+      0,
+      0
+     ]
+    },
+    {
+     "name": "StaticObj_Wall_FenR_Pole",
+     "pos": [
+      -0.82275390625,
+      1.04638671875,
+      -0.6142578125
+     ],
+     "scale": 0.9999985694885254,
+     "ypr": [
+      177.1309814453125,
+      0,
+      0
+     ]
+    },
+    {
+     "name": "StaticObj_Wall_FenR_Pole",
+     "pos": [
+      0.92138671875,
+      1.04638671875,
+      -0.4287109375
+     ],
+     "scale": 0.9999985694885254,
+     "ypr": [
+      177.1309814453125,
+      0,
+      0
+     ]
+    },
+    {
+     "name": "StaticObj_Wall_FenR_Pole",
+     "pos": [
+      0.83740234375,
+      1.04638671875,
+      0.603515625
+     ],
+     "scale": 0.9999988079071045,
+     "ypr": [
+      177.13082885742188,
+      0,
+      0
+     ]
+    },
+    {
+     "name": "StaticObj_Wall_Tin_5",
+     "pos": [
+      0.02978515625,
+      0.83935546875,
+      0.681640625
+     ],
+     "scale": 0.409997820854187,
+     "ypr": [
+      175.56500244140625,
+      0,
+      0
+     ]
+    },
+    {
+     "name": "StaticObj_Wall_Tin_5",
+     "pos": [
+      0.02978515625,
+      1.8553466796875,
+      0.681640625
+     ],
+     "scale": 0.409997820854187,
+     "ypr": [
+      175.56500244140625,
+      0,
+      0
+     ]
+    }
+   ],
+   "type": "group"
+  }
+ ],
+ "faelle": [
+  {
+   "asset": "Land_Misc_Toilet_Mobile",
+   "position": [
+    100,
+    20,
+    200
+   ],
+   "orientierung": [
+    0,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       100,
+       21.25,
+       200
+      ],
+      "ypr": [
+       0,
+       0,
+       0
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Misc_Toilet_Mobile",
+   "position": [
+    7500.5,
+    33.25,
+    11845.75
+   ],
+   "orientierung": [
+    30,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       7500.5,
+       34.5,
+       11845.75
+      ],
+      "ypr": [
+       30,
+       0,
+       0
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Misc_Toilet_Mobile",
+   "position": [
+    0,
+    0,
+    0
+   ],
+   "orientierung": [
+    90,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       0,
+       1.25,
+       0
+      ],
+      "ypr": [
+       90,
+       0,
+       0
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Misc_Toilet_Mobile",
+   "position": [
+    -5,
+    -6,
+    -7
+   ],
+   "orientierung": [
+    180,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       -5,
+       -4.75,
+       -7
+      ],
+      "ypr": [
+       180,
+       0,
+       0
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Misc_Toilet_Mobile",
+   "position": [
+    100,
+    20,
+    200
+   ],
+   "orientierung": [
+    -45,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       100,
+       21.25,
+       200
+      ],
+      "ypr": [
+       -45,
+       0,
+       0
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Misc_Toilet_Mobile",
+   "position": [
+    7500.5,
+    33.25,
+    11845.75
+   ],
+   "orientierung": [
+    270,
+    10,
+    20
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       7500.5,
+       34.5,
+       11845.75
+      ],
+      "ypr": [
+       270,
+       10,
+       20
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Misc_Toilet_Mobile",
+   "position": [
+    0,
+    0,
+    0
+   ],
+   "orientierung": [
+    400,
+    -5,
+    7
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       0,
+       1.25,
+       0
+      ],
+      "ypr": [
+       400,
+       -5,
+       7
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Misc_Toilet_Mobile",
+   "position": [
+    -5,
+    -6,
+    -7
+   ],
+   "orientierung": [
+    12.5,
+    0.5,
+    -3.25
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       -5,
+       -4.75,
+       -7
+      ],
+      "ypr": [
+       12.5,
+       0.5,
+       -3.25
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Misc_Toilet_Mobile",
+   "position": [
+    100,
+    20,
+    200
+   ],
+   "orientierung": [
+    359.9,
+    90,
+    -90
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       100,
+       21.25,
+       200
+      ],
+      "ypr": [
+       359.9,
+       90,
+       -90
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Misc_Toilet_Mobile",
+   "position": [
+    7500.5,
+    33.25,
+    11845.75
+   ],
+   "orientierung": [
+    -720,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       7500.5,
+       34.5,
+       11845.75
+      ],
+      "ypr": [
+       -720,
+       0,
+       0
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Mil_GuardShed",
+   "position": [
+    100,
+    20,
+    200
+   ],
+   "orientierung": [
+    0,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       100,
+       21.25,
+       200
+      ],
+      "ypr": [
+       0,
+       0,
+       0
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Mil_GuardShed",
+   "position": [
+    7500.5,
+    33.25,
+    11845.75
+   ],
+   "orientierung": [
+    30,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       7500.5,
+       34.5,
+       11845.75
+      ],
+      "ypr": [
+       30,
+       0,
+       0
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Mil_GuardShed",
+   "position": [
+    0,
+    0,
+    0
+   ],
+   "orientierung": [
+    90,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       0,
+       1.25,
+       0
+      ],
+      "ypr": [
+       90,
+       0,
+       0
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Mil_GuardShed",
+   "position": [
+    -5,
+    -6,
+    -7
+   ],
+   "orientierung": [
+    180,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       -5,
+       -4.75,
+       -7
+      ],
+      "ypr": [
+       180,
+       0,
+       0
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Mil_GuardShed",
+   "position": [
+    100,
+    20,
+    200
+   ],
+   "orientierung": [
+    -45,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       100,
+       21.25,
+       200
+      ],
+      "ypr": [
+       -45,
+       0,
+       0
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Mil_GuardShed",
+   "position": [
+    7500.5,
+    33.25,
+    11845.75
+   ],
+   "orientierung": [
+    270,
+    10,
+    20
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       7500.5,
+       34.5,
+       11845.75
+      ],
+      "ypr": [
+       270,
+       10,
+       20
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Mil_GuardShed",
+   "position": [
+    0,
+    0,
+    0
+   ],
+   "orientierung": [
+    400,
+    -5,
+    7
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       0,
+       1.25,
+       0
+      ],
+      "ypr": [
+       400,
+       -5,
+       7
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Mil_GuardShed",
+   "position": [
+    -5,
+    -6,
+    -7
+   ],
+   "orientierung": [
+    12.5,
+    0.5,
+    -3.25
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       -5,
+       -4.75,
+       -7
+      ],
+      "ypr": [
+       12.5,
+       0.5,
+       -3.25
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Mil_GuardShed",
+   "position": [
+    100,
+    20,
+    200
+   ],
+   "orientierung": [
+    359.9,
+    90,
+    -90
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       100,
+       21.25,
+       200
+      ],
+      "ypr": [
+       359.9,
+       90,
+       -90
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Land_Mil_GuardShed",
+   "position": [
+    7500.5,
+    33.25,
+    11845.75
+   ],
+   "orientierung": [
+    -720,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "Land_Misc_Toilet_Mobile",
+      "pos": [
+       7500.5,
+       34.5,
+       11845.75
+      ],
+      "ypr": [
+       -720,
+       0,
+       0
+      ],
+      "scale": 1,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Skulls Teleport Stage",
+   "position": [
+    100,
+    20,
+    200
+   ],
+   "orientierung": [
+    0,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       100,
+       20,
+       200
+      ],
+      "ypr": [
+       0,
+       0,
+       0
+      ],
+      "scale": 2.999950408935547,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Land_Wall_Gate_FenG",
+      "pos": [
+       100.171875,
+       20.9375,
+       199.3203125
+      ],
+      "ypr": [
+       174.64004516601562,
+       0,
+       0
+      ],
+      "scale": 1.189998984336853,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_ConcretePipe_Gate",
+      "pos": [
+       100.03759765625,
+       22.860504150390625,
+       199.8740234375
+      ],
+      "ypr": [
+       -131.44432067871094,
+       90,
+       -0.00010427406232338399
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_radar_panel_flat",
+      "pos": [
+       101.37353515625,
+       20,
+       199.0244140625
+      ],
+      "ypr": [
+       -4.213317394256592,
+       0,
+       0
+      ],
+      "scale": 0.7099621295928955,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_SatDish",
+      "pos": [
+       102.32373046875,
+       24.184967041015625,
+       200.859375
+      ],
+      "ypr": [
+       32.23441314697266,
+       40.05234909057617,
+       0
+      ],
+      "scale": 2.1050004959106445,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Misc_Spotlight",
+      "pos": [
+       99.93408203125,
+       23.400909423828125,
+       200.224609375
+      ],
+      "ypr": [
+       42.57827377319336,
+       -0.7605018019676208,
+       -175.19993591308594
+      ],
+      "scale": 0.8450119495391846,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Fence4",
+      "pos": [
+       100.033203125,
+       19.51409912109375,
+       200.1923828125
+      ],
+      "ypr": [
+       -6.93755578994751,
+       90,
+       179.99989318847656
+      ],
+      "scale": 3.319983720779419,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       98.07275390625,
+       17.657623291015625,
+       200.06640625
+      ],
+      "ypr": [
+       -96.68782806396484,
+       0,
+       0
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       101.83203125,
+       17.657623291015625,
+       200.5263671875
+      ],
+      "ypr": [
+       81.58124542236328,
+       0,
+       0
+      ],
+      "scale": 0.9999982714653015,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       98.72314453125,
+       22.791351318359375,
+       199.853515625
+      ],
+      "ypr": [
+       172.98291015625,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       101.36279296875,
+       22.791351318359375,
+       200.19140625
+      ],
+      "ypr": [
+       177.50039672851562,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       100,
+       20.346893310546875,
+       200
+      ],
+      "ypr": [
+       -2.0650634765625,
+       -90,
+       179.99989318847656
+      ],
+      "scale": 2.999957323074341,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       100.0537109375,
+       18.734710693359375,
+       200.0234375
+      ],
+      "ypr": [
+       -2.064483642578125,
+       1.2572391824505758e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Road_Sidewalk_Stairs",
+      "pos": [
+       100.25,
+       17.815887451171875,
+       196.36328125
+      ],
+      "ypr": [
+       177.93446350097656,
+       0.4999980032444,
+       0
+      ],
+      "scale": 0.9999987483024597,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       100.0537109375,
+       17.94757080078125,
+       200.0234375
+      ],
+      "ypr": [
+       -2.064483642578125,
+       3.155682861688547e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       99.11328125,
+       21.04638671875,
+       200.453125
+      ],
+      "ypr": [
+       177.934326171875,
+       0,
+       0
+      ],
+      "scale": 0.9999992847442627,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       99.17724609375,
+       21.04638671875,
+       199.3857421875
+      ],
+      "ypr": [
+       177.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       100.92138671875,
+       21.04638671875,
+       199.5712890625
+      ],
+      "ypr": [
+       177.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       100.83740234375,
+       21.04638671875,
+       200.603515625
+      ],
+      "ypr": [
+       177.13082885742188,
+       0,
+       0
+      ],
+      "scale": 0.9999988079071045,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       100.02978515625,
+       20.83935546875,
+       200.681640625
+      ],
+      "ypr": [
+       175.56500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       100.02978515625,
+       21.8553466796875,
+       200.681640625
+      ],
+      "ypr": [
+       175.56500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Skulls Teleport Stage",
+   "position": [
+    7500.5,
+    33.25,
+    11845.75
+   ],
+   "orientierung": [
+    30,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       7500.5,
+       33.25,
+       11845.75
+      ],
+      "ypr": [
+       30,
+       0,
+       0
+      ],
+      "scale": 2.999950408935547,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Land_Wall_Gate_FenG",
+      "pos": [
+       7500.309004366275,
+       34.1875,
+       11845.075435858365
+      ],
+      "ypr": [
+       204.64004516601562,
+       0,
+       0
+      ],
+      "scale": 1.189998984336853,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_ConcretePipe_Gate",
+      "pos": [
+       7500.469572244186,
+       36.110504150390625,
+       11845.62210226847
+      ],
+      "ypr": [
+       -101.44432067871094,
+       90,
+       -0.00010427406232338399
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_radar_panel_flat",
+      "pos": [
+       7501.201723369553,
+       33.25,
+       11844.218350216424
+      ],
+      "ypr": [
+       25.786682605743408,
+       0,
+       0
+      ],
+      "scale": 0.7099621295928955,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_SatDish",
+      "pos": [
+       7502.942097117485,
+       37.434967041015625,
+       11845.332375347003
+      ],
+      "ypr": [
+       62.23441314697266,
+       40.05234909057617,
+       0
+      ],
+      "scale": 2.1050004959106445,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Misc_Spotlight",
+      "pos": [
+       7500.555218051996,
+       36.650909423828125,
+       11845.977476409053
+      ],
+      "ypr": [
+       72.57827377319336,
+       -0.7605018019676208,
+       -175.19993591308594
+      ],
+      "scale": 0.8450119495391846,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Fence4",
+      "pos": [
+       7500.624946155985,
+       32.76409912109375,
+       11845.900006840377
+      ],
+      "ypr": [
+       23.06244421005249,
+       90,
+       179.99989318847656
+      ],
+      "scale": 3.319983720779419,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       7498.8641590484685,
+       30.907623291015625,
+       11846.771132546344
+      ],
+      "ypr": [
+       -66.68782806396484,
+       0,
+       0
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       7502.349769196777,
+       30.907623291015625,
+       11845.289831731094
+      ],
+      "ypr": [
+       111.58124542236328,
+       0,
+       0
+      ],
+      "scale": 0.9999982714653015,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       7499.320968539601,
+       36.041351318359375,
+       11846.261568544367
+      ],
+      "ypr": [
+       202.98291015625,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       7501.775916456037,
+       36.041351318359375,
+       11845.234366190569
+      ],
+      "ypr": [
+       207.50039672851562,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       7500.5,
+       33.596893310546875,
+       11845.75
+      ],
+      "ypr": [
+       27.9349365234375,
+       -90,
+       179.99989318847656
+      ],
+      "scale": 2.999957323074341,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       7500.558233786336,
+       31.984710693359375,
+       11845.74344200165
+      ],
+      "ypr": [
+       27.935516357421875,
+       1.2572391824505758e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Road_Sidewalk_Stairs",
+      "pos": [
+       7498.8981469759465,
+       31.065887451171875,
+       11842.475509176082
+      ],
+      "ypr": [
+       207.93446350097656,
+       0.4999980032444,
+       0
+      ],
+      "scale": 0.9999987483024597,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       7500.558233786336,
+       31.19757080078125,
+       11845.74344200165
+      ],
+      "ypr": [
+       27.935516357421875,
+       3.155682861688547e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       7499.958641536488,
+       34.29638671875,
+       11846.58577713609
+      ],
+      "ypr": [
+       207.934326171875,
+       0,
+       0
+      ],
+      "scale": 0.9999992847442627,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       7499.480345309875,
+       34.29638671875,
+       11845.629414083027
+      ],
+      "ypr": [
+       207.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       7501.083588836397,
+       34.29638671875,
+       11844.91803207787
+      ],
+      "ypr": [
+       207.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       7501.526969515377,
+       34.29638671875,
+       11845.853958690956
+      ],
+      "ypr": [
+       207.13082885742188,
+       0,
+       0
+      ],
+      "scale": 0.9999988079071045,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       7500.866615014468,
+       34.08935546875,
+       11846.325425519377
+      ],
+      "ypr": [
+       205.56500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       7500.866615014468,
+       35.1053466796875,
+       11846.325425519377
+      ],
+      "ypr": [
+       205.56500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Skulls Teleport Stage",
+   "position": [
+    0,
+    0,
+    0
+   ],
+   "orientierung": [
+    90,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       0,
+       0,
+       0
+      ],
+      "ypr": [
+       90,
+       0,
+       0
+      ],
+      "scale": 2.999950408935547,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Land_Wall_Gate_FenG",
+      "pos": [
+       -0.6796875,
+       0.9375,
+       -0.17187500000000003
+      ],
+      "ypr": [
+       264.6400451660156,
+       0,
+       0
+      ],
+      "scale": 1.189998984336853,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_ConcretePipe_Gate",
+      "pos": [
+       -0.1259765625,
+       2.860504150390625,
+       -0.03759765625000001
+      ],
+      "ypr": [
+       -41.44432067871094,
+       90,
+       -0.00010427406232338399
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_radar_panel_flat",
+      "pos": [
+       -0.9755859374999999,
+       0,
+       -1.37353515625
+      ],
+      "ypr": [
+       85.78668260574341,
+       0,
+       0
+      ],
+      "scale": 0.7099621295928955,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_SatDish",
+      "pos": [
+       0.8593750000000001,
+       4.184967041015625,
+       -2.32373046875
+      ],
+      "ypr": [
+       122.23441314697266,
+       40.05234909057617,
+       0
+      ],
+      "scale": 2.1050004959106445,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Misc_Spotlight",
+      "pos": [
+       0.224609375,
+       3.400909423828125,
+       0.06591796875000001
+      ],
+      "ypr": [
+       132.57827377319336,
+       -0.7605018019676208,
+       -175.19993591308594
+      ],
+      "scale": 0.8450119495391846,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Fence4",
+      "pos": [
+       0.1923828125,
+       -0.48590087890625,
+       -0.033203124999999986
+      ],
+      "ypr": [
+       83.06244421005249,
+       90,
+       179.99989318847656
+      ],
+      "scale": 3.319983720779419,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       0.06640624999999988,
+       -2.342376708984375,
+       1.92724609375
+      ],
+      "ypr": [
+       -6.687828063964844,
+       0,
+       0
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       0.5263671875000001,
+       -2.342376708984375,
+       -1.83203125
+      ],
+      "ypr": [
+       171.58124542236328,
+       0,
+       0
+      ],
+      "scale": 0.9999982714653015,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       -0.14648437500000008,
+       2.791351318359375,
+       1.27685546875
+      ],
+      "ypr": [
+       262.98291015625,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       0.19140625000000008,
+       2.791351318359375,
+       -1.36279296875
+      ],
+      "ypr": [
+       267.5003967285156,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       0,
+       0.346893310546875,
+       0
+      ],
+      "ypr": [
+       87.9349365234375,
+       -90,
+       179.99989318847656
+      ],
+      "scale": 2.999957323074341,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       0.023437500000000003,
+       -1.265289306640625,
+       -0.0537109375
+      ],
+      "ypr": [
+       87.93551635742188,
+       1.2572391824505758e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Road_Sidewalk_Stairs",
+      "pos": [
+       -3.63671875,
+       -2.184112548828125,
+       -0.24999999999999978
+      ],
+      "ypr": [
+       267.93446350097656,
+       0.4999980032444,
+       0
+      ],
+      "scale": 0.9999987483024597,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       0.023437500000000003,
+       -2.05242919921875,
+       -0.0537109375
+      ],
+      "ypr": [
+       87.93551635742188,
+       3.155682861688547e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       0.45312499999999994,
+       1.04638671875,
+       0.88671875
+      ],
+      "ypr": [
+       267.934326171875,
+       0,
+       0
+      ],
+      "scale": 0.9999992847442627,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       -0.6142578125,
+       1.04638671875,
+       0.82275390625
+      ],
+      "ypr": [
+       267.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       -0.42871093749999994,
+       1.04638671875,
+       -0.92138671875
+      ],
+      "ypr": [
+       267.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       0.603515625,
+       1.04638671875,
+       -0.83740234375
+      ],
+      "ypr": [
+       267.1308288574219,
+       0,
+       0
+      ],
+      "scale": 0.9999988079071045,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       0.681640625,
+       0.83935546875,
+       -0.02978515624999996
+      ],
+      "ypr": [
+       265.56500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       0.681640625,
+       1.8553466796875,
+       -0.02978515624999996
+      ],
+      "ypr": [
+       265.56500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Skulls Teleport Stage",
+   "position": [
+    -5,
+    -6,
+    -7
+   ],
+   "orientierung": [
+    180,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       -5,
+       -6,
+       -7
+      ],
+      "ypr": [
+       180,
+       0,
+       0
+      ],
+      "scale": 2.999950408935547,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Land_Wall_Gate_FenG",
+      "pos": [
+       -5.171875,
+       -5.0625,
+       -6.3203125
+      ],
+      "ypr": [
+       354.6400451660156,
+       0,
+       0
+      ],
+      "scale": 1.189998984336853,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_ConcretePipe_Gate",
+      "pos": [
+       -5.03759765625,
+       -3.139495849609375,
+       -6.8740234375
+      ],
+      "ypr": [
+       48.55567932128906,
+       90,
+       -0.00010427406232338399
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_radar_panel_flat",
+      "pos": [
+       -6.37353515625,
+       -6,
+       -6.0244140625
+      ],
+      "ypr": [
+       175.7866826057434,
+       0,
+       0
+      ],
+      "scale": 0.7099621295928955,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_SatDish",
+      "pos": [
+       -7.32373046875,
+       -1.815032958984375,
+       -7.859375
+      ],
+      "ypr": [
+       212.23441314697266,
+       40.05234909057617,
+       0
+      ],
+      "scale": 2.1050004959106445,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Misc_Spotlight",
+      "pos": [
+       -4.93408203125,
+       -2.599090576171875,
+       -7.224609375
+      ],
+      "ypr": [
+       222.57827377319336,
+       -0.7605018019676208,
+       -175.19993591308594
+      ],
+      "scale": 0.8450119495391846,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Fence4",
+      "pos": [
+       -5.033203125,
+       -6.48590087890625,
+       -7.1923828125
+      ],
+      "ypr": [
+       173.0624442100525,
+       90,
+       179.99989318847656
+      ],
+      "scale": 3.319983720779419,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       -3.07275390625,
+       -8.342376708984375,
+       -7.06640625
+      ],
+      "ypr": [
+       83.31217193603516,
+       0,
+       0
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       -6.83203125,
+       -8.342376708984375,
+       -7.5263671875
+      ],
+      "ypr": [
+       261.5812454223633,
+       0,
+       0
+      ],
+      "scale": 0.9999982714653015,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       -3.72314453125,
+       -3.208648681640625,
+       -6.853515625
+      ],
+      "ypr": [
+       352.98291015625,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       -6.36279296875,
+       -3.208648681640625,
+       -7.19140625
+      ],
+      "ypr": [
+       357.5003967285156,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       -5,
+       -5.653106689453125,
+       -7
+      ],
+      "ypr": [
+       177.9349365234375,
+       -90,
+       179.99989318847656
+      ],
+      "scale": 2.999957323074341,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       -5.0537109375,
+       -7.265289306640625,
+       -7.0234375
+      ],
+      "ypr": [
+       177.93551635742188,
+       1.2572391824505758e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Road_Sidewalk_Stairs",
+      "pos": [
+       -5.25,
+       -8.184112548828125,
+       -3.36328125
+      ],
+      "ypr": [
+       357.93446350097656,
+       0.4999980032444,
+       0
+      ],
+      "scale": 0.9999987483024597,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       -5.0537109375,
+       -8.05242919921875,
+       -7.0234375
+      ],
+      "ypr": [
+       177.93551635742188,
+       3.155682861688547e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       -4.11328125,
+       -4.95361328125,
+       -7.453125
+      ],
+      "ypr": [
+       357.934326171875,
+       0,
+       0
+      ],
+      "scale": 0.9999992847442627,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       -4.17724609375,
+       -4.95361328125,
+       -6.3857421875
+      ],
+      "ypr": [
+       357.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       -5.92138671875,
+       -4.95361328125,
+       -6.5712890625
+      ],
+      "ypr": [
+       357.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       -5.83740234375,
+       -4.95361328125,
+       -7.603515625
+      ],
+      "ypr": [
+       357.1308288574219,
+       0,
+       0
+      ],
+      "scale": 0.9999988079071045,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       -5.02978515625,
+       -5.16064453125,
+       -7.681640625
+      ],
+      "ypr": [
+       355.56500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       -5.02978515625,
+       -4.1446533203125,
+       -7.681640625
+      ],
+      "ypr": [
+       355.56500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Skulls Teleport Stage",
+   "position": [
+    100,
+    20,
+    200
+   ],
+   "orientierung": [
+    -45,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       100,
+       20,
+       200
+      ],
+      "ypr": [
+       -45,
+       0,
+       0
+      ],
+      "scale": 2.999950408935547,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Land_Wall_Gate_FenG",
+      "pos": [
+       100.60214561835417,
+       20.9375,
+       199.64092233767872
+      ],
+      "ypr": [
+       129.64004516601562,
+       0,
+       0
+      ],
+      "scale": 1.189998984336853,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_ConcretePipe_Gate",
+      "pos": [
+       100.11566443930542,
+       22.860504150390625,
+       199.93750667607677
+      ],
+      "ypr": [
+       -176.44432067871094,
+       90,
+       -0.00010427406232338399
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_radar_panel_flat",
+      "pos": [
+       101.66107945521898,
+       20,
+       200.28139259114602
+      ],
+      "ypr": [
+       -49.21331739425659,
+       0,
+       0
+      ],
+      "scale": 0.7099621295928955,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_SatDish",
+      "pos": [
+       101.03545568202073,
+       24.184967041015625,
+       202.2507954621851
+      ],
+      "ypr": [
+       -12.765586853027337,
+       40.05234909057617,
+       0
+      ],
+      "scale": 2.1050004959106445,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Misc_Spotlight",
+      "pos": [
+       99.79456614511426,
+       23.400909423828125,
+       200.1122117694754
+      ],
+      "ypr": [
+       -2.4217262268066406,
+       -0.7605018019676208,
+       -175.19993591308594
+      ],
+      "scale": 0.8450119495391846,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Fence4",
+      "pos": [
+       99.88744296354159,
+       19.51409912109375,
+       200.15951334614658
+      ],
+      "ypr": [
+       -51.93755578994751,
+       90,
+       179.99989318847656
+      ],
+      "scale": 3.319983720779419,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       98.59027490840592,
+       17.657623291015625,
+       198.68418752778226
+      ],
+      "ypr": [
+       -141.68782806396484,
+       0,
+       0
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       100.92324391254533,
+       17.657623291015625,
+       201.667639527896
+      ],
+      "ypr": [
+       36.58124542236328,
+       0,
+       0
+      ],
+      "scale": 0.9999982714653015,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       99.20070693435213,
+       22.791351318359375,
+       198.99354674455137
+      ],
+      "ypr": [
+       127.98291015625,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       100.82829549221998,
+       22.791351318359375,
+       201.09898480689296
+      ],
+      "ypr": [
+       132.50039672851562,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       100,
+       20.346893310546875,
+       200
+      ],
+      "ypr": [
+       -47.0650634765625,
+       -90,
+       179.99989318847656
+      ],
+      "scale": 2.999957323074341,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       100.02140655294608,
+       18.734710693359375,
+       200.0545521833142
+      ],
+      "ypr": [
+       -47.064483642578125,
+       1.2572391824505758e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Road_Sidewalk_Stairs",
+      "pos": [
+       102.7483251846899,
+       17.815887451171875,
+       197.60522820590336
+      ],
+      "ypr": [
+       132.93446350097656,
+       0.4999980032444,
+       0
+      ],
+      "scale": 0.9999987483024597,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       100.02140655294608,
+       17.94757080078125,
+       200.0545521833142
+      ],
+      "ypr": [
+       -47.064483642578125,
+       3.155682861688547e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       99.05258739864459,
+       21.04638671875,
+       199.6934029190949
+      ],
+      "ypr": [
+       132.934326171875,
+       0,
+       0
+      ],
+      "scale": 0.9999992847442627,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       99.85257099825847,
+       21.04638671875,
+       198.98387926902734
+      ],
+      "ypr": [
+       132.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       100.95466320799844,
+       21.04638671875,
+       200.34837438584825
+      ],
+      "ypr": [
+       132.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       100.16538288485759,
+       21.04638671875,
+       201.01888286683666
+      ],
+      "ypr": [
+       132.13082885742188,
+       0,
+       0
+      ],
+      "scale": 0.9999988079071045,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       99.53906857769334,
+       20.83935546875,
+       200.5030539942328
+      ],
+      "ypr": [
+       130.56500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       99.53906857769334,
+       21.8553466796875,
+       200.5030539942328
+      ],
+      "ypr": [
+       130.56500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Skulls Teleport Stage",
+   "position": [
+    7500.5,
+    33.25,
+    11845.75
+   ],
+   "orientierung": [
+    270,
+    10,
+    20
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       7500.5,
+       33.25,
+       11845.75
+      ],
+      "ypr": [
+       270,
+       10,
+       20
+      ],
+      "scale": 2.999950408935547,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Land_Wall_Gate_FenG",
+      "pos": [
+       7501.1796875,
+       34.1875,
+       11845.921875
+      ],
+      "ypr": [
+       444.6400451660156,
+       0,
+       0
+      ],
+      "scale": 1.189998984336853,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_ConcretePipe_Gate",
+      "pos": [
+       7500.6259765625,
+       36.110504150390625,
+       11845.78759765625
+      ],
+      "ypr": [
+       138.55567932128906,
+       90,
+       -0.00010427406232338399
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_radar_panel_flat",
+      "pos": [
+       7501.4755859375,
+       33.25,
+       11847.12353515625
+      ],
+      "ypr": [
+       265.7866826057434,
+       0,
+       0
+      ],
+      "scale": 0.7099621295928955,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_SatDish",
+      "pos": [
+       7499.640625,
+       37.434967041015625,
+       11848.07373046875
+      ],
+      "ypr": [
+       302.23441314697266,
+       40.05234909057617,
+       0
+      ],
+      "scale": 2.1050004959106445,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Misc_Spotlight",
+      "pos": [
+       7500.275390625,
+       36.650909423828125,
+       11845.68408203125
+      ],
+      "ypr": [
+       312.57827377319336,
+       -0.7605018019676208,
+       -175.19993591308594
+      ],
+      "scale": 0.8450119495391846,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Fence4",
+      "pos": [
+       7500.3076171875,
+       32.76409912109375,
+       11845.783203125
+      ],
+      "ypr": [
+       263.0624442100525,
+       90,
+       179.99989318847656
+      ],
+      "scale": 3.319983720779419,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       7500.43359375,
+       30.907623291015625,
+       11843.82275390625
+      ],
+      "ypr": [
+       173.31217193603516,
+       0,
+       0
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       7499.9736328125,
+       30.907623291015625,
+       11847.58203125
+      ],
+      "ypr": [
+       351.5812454223633,
+       0,
+       0
+      ],
+      "scale": 0.9999982714653015,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       7500.646484375,
+       36.041351318359375,
+       11844.47314453125
+      ],
+      "ypr": [
+       442.98291015625,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       7500.30859375,
+       36.041351318359375,
+       11847.11279296875
+      ],
+      "ypr": [
+       447.5003967285156,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       7500.5,
+       33.596893310546875,
+       11845.75
+      ],
+      "ypr": [
+       267.9349365234375,
+       -90,
+       179.99989318847656
+      ],
+      "scale": 2.999957323074341,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       7500.4765625,
+       31.984710693359375,
+       11845.8037109375
+      ],
+      "ypr": [
+       267.9355163574219,
+       1.2572391824505758e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Road_Sidewalk_Stairs",
+      "pos": [
+       7504.13671875,
+       31.065887451171875,
+       11846
+      ],
+      "ypr": [
+       447.93446350097656,
+       0.4999980032444,
+       0
+      ],
+      "scale": 0.9999987483024597,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       7500.4765625,
+       31.19757080078125,
+       11845.8037109375
+      ],
+      "ypr": [
+       267.9355163574219,
+       3.155682861688547e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       7500.046875,
+       34.29638671875,
+       11844.86328125
+      ],
+      "ypr": [
+       447.934326171875,
+       0,
+       0
+      ],
+      "scale": 0.9999992847442627,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       7501.1142578125,
+       34.29638671875,
+       11844.92724609375
+      ],
+      "ypr": [
+       447.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       7500.9287109375,
+       34.29638671875,
+       11846.67138671875
+      ],
+      "ypr": [
+       447.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       7499.896484375,
+       34.29638671875,
+       11846.58740234375
+      ],
+      "ypr": [
+       447.1308288574219,
+       0,
+       0
+      ],
+      "scale": 0.9999988079071045,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       7499.818359375,
+       34.08935546875,
+       11845.77978515625
+      ],
+      "ypr": [
+       445.56500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       7499.818359375,
+       35.1053466796875,
+       11845.77978515625
+      ],
+      "ypr": [
+       445.56500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Skulls Teleport Stage",
+   "position": [
+    0,
+    0,
+    0
+   ],
+   "orientierung": [
+    400,
+    -5,
+    7
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       0,
+       0,
+       0
+      ],
+      "ypr": [
+       400,
+       -5,
+       7
+      ],
+      "scale": 2.999950408935547,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Land_Wall_Gate_FenG",
+      "pos": [
+       -0.3052308147977452,
+       0.9375,
+       -0.6311499528473044
+      ],
+      "ypr": [
+       574.6400451660156,
+       0,
+       0
+      ],
+      "scale": 1.189998984336853,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_ConcretePipe_Gate",
+      "pos": [
+       -0.05217469784129188,
+       2.860504150390625,
+       -0.1206709532571093
+      ],
+      "ypr": [
+       268.55567932128906,
+       90,
+       -0.00010427406232338399
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_radar_panel_flat",
+      "pos": [
+       0.4250944210644435,
+       0,
+       -1.6302335661132583
+      ],
+      "ypr": [
+       395.7866826057434,
+       0,
+       0
+      ],
+      "scale": 0.7099621295928955,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_SatDish",
+      "pos": [
+       2.3324764149665653,
+       4.184967041015625,
+       -0.8353457102582218
+      ],
+      "ypr": [
+       432.23441314697266,
+       40.05234909057617,
+       0
+      ],
+      "scale": 2.1050004959106445,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Misc_Spotlight",
+      "pos": [
+       0.09388002960680955,
+       3.400909423828125,
+       0.2144320171593812
+      ],
+      "ypr": [
+       442.57827377319336,
+       -0.7605018019676208,
+       -175.19993591308594
+      ],
+      "scale": 0.8450119495391846,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Fence4",
+      "pos": [
+       0.14909635759208348,
+       -0.48590087890625,
+       0.1260312271143519
+      ],
+      "ypr": [
+       393.0624442100525,
+       90,
+       179.99989318847656
+      ],
+      "scale": 3.319983720779419,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       -1.433671045934198,
+       -2.342376708984375,
+       1.2896800486801518
+      ],
+      "ypr": [
+       303.31217193603516,
+       0,
+       0
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       1.7417596649533666,
+       -2.342376708984375,
+       -0.7743863290340023
+      ],
+      "ypr": [
+       481.5812454223633,
+       0,
+       0
+      ],
+      "scale": 0.9999982714653015,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       -1.072286377764692,
+       2.791351318359375,
+       0.7085333332004915
+      ],
+      "ypr": [
+       572.98291015625,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       1.166993546749117,
+       2.791351318359375,
+       -0.729360740689693
+      ],
+      "ypr": [
+       577.5003967285156,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       0,
+       0.346893310546875,
+       0
+      ],
+      "ypr": [
+       397.9349365234375,
+       -90,
+       179.99989318847656
+      ],
+      "scale": 2.999957323074341,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       0.056210299808614,
+       -1.265289306640625,
+       -0.016570558494047045
+      ],
+      "ypr": [
+       397.9355163574219,
+       1.2572391824505758e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Road_Sidewalk_Stairs",
+      "pos": [
+       -2.1461266416349742,
+       -2.184112548828125,
+       -2.946585092045731
+      ],
+      "ypr": [
+       577.9344635009766,
+       0.4999980032444,
+       0
+      ],
+      "scale": 0.9999987483024597,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       0.056210299808614,
+       -2.05242919921875,
+       -0.016570558494047045
+      ],
+      "ypr": [
+       397.9355163574219,
+       3.155682861688547e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       -0.3880028354076933,
+       1.04638671875,
+       0.9170857140650228
+      ],
+      "ypr": [
+       577.934326171875,
+       0,
+       0
+      ],
+      "scale": 0.9999992847442627,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       -1.0251033689654026,
+       1.04638671875,
+       0.058307232850656254
+      ],
+      "ypr": [
+       577.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       0.43025309709996595,
+       1.04638671875,
+       -0.9206675979184386
+      ],
+      "ypr": [
+       577.1309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       1.0294197780867236,
+       1.04638671875,
+       -0.07595206001824106
+      ],
+      "ypr": [
+       577.1308288574219,
+       0,
+       0
+      ],
+      "scale": 0.9999988079071045,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       0.4609669014417316,
+       0.83935546875,
+       0.5030214835953196
+      ],
+      "ypr": [
+       575.5650024414062,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       0.4609669014417316,
+       1.8553466796875,
+       0.5030214835953196
+      ],
+      "ypr": [
+       575.5650024414062,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Skulls Teleport Stage",
+   "position": [
+    -5,
+    -6,
+    -7
+   ],
+   "orientierung": [
+    12.5,
+    0.5,
+    -3.25
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       -5,
+       -6,
+       -7
+      ],
+      "ypr": [
+       12.5,
+       0.5,
+       -3.25
+      ],
+      "scale": 2.999950408935547,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Land_Wall_Gate_FenG",
+      "pos": [
+       -4.979310423874816,
+       -5.0625,
+       -7.700776750984941
+      ],
+      "ypr": [
+       187.14004516601562,
+       0,
+       0
+      ],
+      "scale": 1.189998984336853,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_ConcretePipe_Gate",
+      "pos": [
+       -4.990559876878806,
+       -3.139495849609375,
+       -7.1311280371631725
+      ],
+      "ypr": [
+       -118.94432067871094,
+       90,
+       -0.00010427406232338399
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_radar_panel_flat",
+      "pos": [
+       -3.8701785549902135,
+       -6,
+       -8.249748074332768
+      ],
+      "ypr": [
+       8.286682605743408,
+       0,
+       0
+      ],
+      "scale": 0.7099621295928955,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_SatDish",
+      "pos": [
+       -2.5453484285083867,
+       -1.815032958984375,
+       -6.663942944433764
+      ],
+      "ypr": [
+       44.73441314697266,
+       40.05234909057617,
+       0
+      ],
+      "scale": 2.1050004959106445,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Misc_Spotlight",
+      "pos": [
+       -5.015741083276203,
+       -2.599090576171875,
+       -6.766447504317962
+      ],
+      "ypr": [
+       55.07827377319336,
+       -0.7605018019676208,
+       -175.19993591308594
+      ],
+      "scale": 0.8450119495391846,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Fence4",
+      "pos": [
+       -4.925944659972769,
+       -6.48590087890625,
+       -6.819363899874285
+      ],
+      "ypr": [
+       5.56244421005249,
+       90,
+       179.99989318847656
+      ],
+      "scale": 3.319983720779419,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       -6.867189722952537,
+       -8.342376708984375,
+       -6.518035442782225
+      ],
+      "ypr": [
+       -84.18782806396484,
+       0,
+       0
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       -3.0974684948538744,
+       -8.342376708984375,
+       -6.882633953037341
+      ],
+      "ypr": [
+       94.08124542236328,
+       0,
+       0
+      ],
+      "scale": 0.9999982714653015,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       -6.27829391738284,
+       -3.208648681640625,
+       -6.866650005706954
+      ],
+      "ypr": [
+       185.48291015625,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       -3.628082771222915,
+       -3.208648681640625,
+       -7.108093226421011
+      ],
+      "ypr": [
+       190.00039672851562,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       -5,
+       -5.653106689453125,
+       -7
+      ],
+      "ypr": [
+       10.4349365234375,
+       -90,
+       179.99989318847656
+      ],
+      "scale": 2.999957323074341,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       -4.942489422728407,
+       -7.265289306640625,
+       -6.9887432369098805
+      ],
+      "ypr": [
+       10.435516357421875,
+       1.2572391824505758e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Road_Sidewalk_Stairs",
+      "pos": [
+       -5.543056000471477,
+       -8.184112548828125,
+       -10.60462389812772
+      ],
+      "ypr": [
+       190.43446350097656,
+       0.4999980032444,
+       0
+      ],
+      "scale": 0.9999987483024597,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       -4.942489422728407,
+       -8.05242919921875,
+       -6.9887432369098805
+      ],
+      "ypr": [
+       10.435516357421875,
+       3.155682861688547e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       -5.767625774997676,
+       -4.95361328125,
+       -6.365694807852103
+      ],
+      "ypr": [
+       190.434326171875,
+       0,
+       0
+      ],
+      "scale": 0.9999992847442627,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       -5.936201077310167,
+       -4.95361328125,
+       -7.421620911851159
+      ],
+      "ypr": [
+       189.6309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       -4.19324385527458,
+       -4.95361328125,
+       -7.617973362183839
+      ],
+      "ypr": [
+       189.6309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       -4.0518227465633885,
+       -4.95361328125,
+       -6.592037145070122
+      ],
+      "ypr": [
+       189.63082885742188,
+       0,
+       0
+      ],
+      "scale": 0.9999988079071045,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       -4.823386837162155,
+       -5.16064453125,
+       -6.3409636672416
+      ],
+      "ypr": [
+       188.06500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       -4.823386837162155,
+       -4.1446533203125,
+       -6.3409636672416
+      ],
+      "ypr": [
+       188.06500244140625,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Skulls Teleport Stage",
+   "position": [
+    100,
+    20,
+    200
+   ],
+   "orientierung": [
+    359.9,
+    90,
+    -90
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       100,
+       20,
+       200
+      ],
+      "ypr": [
+       359.9,
+       90,
+       -90
+      ],
+      "scale": 2.999950408935547,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Land_Wall_Gate_FenG",
+      "pos": [
+       100.17306101609317,
+       20.9375,
+       199.32061351353587
+      ],
+      "ypr": [
+       534.5400451660156,
+       0,
+       0
+      ],
+      "scale": 1.189998984336853,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_ConcretePipe_Gate",
+      "pos": [
+       100.03781746945347,
+       22.860504150390625,
+       199.87408924962918
+      ],
+      "ypr": [
+       228.45567932128904,
+       90,
+       -0.00010427406232338399
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_radar_panel_flat",
+      "pos": [
+       101.37523578204694,
+       20,
+       199.02681281827174
+      ],
+      "ypr": [
+       355.6866826057434,
+       0,
+       0
+      ],
+      "scale": 0.7099621295928955,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_SatDish",
+      "pos": [
+       102.32222703794255,
+       24.184967041015625,
+       200.86342936379916
+      ],
+      "ypr": [
+       392.13441314697263,
+       40.05234909057617,
+       0
+      ],
+      "scale": 2.1050004959106445,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Misc_Spotlight",
+      "pos": [
+       99.93369011453535,
+       23.400909423828125,
+       200.22449398439977
+      ],
+      "ypr": [
+       402.47827377319334,
+       -0.7605018019676208,
+       -175.19993591308594
+      ],
+      "scale": 0.8450119495391846,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Fence4",
+      "pos": [
+       100.03286730324899,
+       19.51409912109375,
+       200.1924404698402
+      ],
+      "ypr": [
+       352.96244421005247,
+       90,
+       179.99989318847656
+      ],
+      "scale": 3.319983720779419,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       98.07264094090112,
+       17.657623291015625,
+       200.06304247158204
+      ],
+      "ypr": [
+       263.21217193603513,
+       0,
+       0
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       101.83110977607433,
+       17.657623291015625,
+       200.52956388190498
+      ],
+      "ypr": [
+       441.48124542236326,
+       0,
+       0
+      ],
+      "scale": 0.9999982714653015,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       98.72340213934645,
+       22.791351318359375,
+       199.85128731603965
+      ],
+      "ypr": [
+       532.88291015625,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       101.3624568263406,
+       22.791351318359375,
+       200.1937844796969
+      ],
+      "ypr": [
+       537.4003967285156,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       100,
+       20.346893310546875,
+       200
+      ],
+      "ypr": [
+       357.8349365234375,
+       -90,
+       179.99989318847656
+      ],
+      "scale": 2.999957323074341,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       100.05366994956,
+       18.734710693359375,
+       200.02353120752542
+      ],
+      "ypr": [
+       357.83551635742185,
+       1.2572391824505758e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Road_Sidewalk_Stairs",
+      "pos": [
+       100.25634688762149,
+       17.815887451171875,
+       196.36372312112948
+      ],
+      "ypr": [
+       537.8344635009765,
+       0.4999980032444,
+       0
+      ],
+      "scale": 0.9999987483024597,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       100.05366994956,
+       17.94757080078125,
+       200.02353120752542
+      ],
+      "ypr": [
+       357.83551635742185,
+       3.155682861688547e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       99.11249174863374,
+       21.04638671875,
+       200.4515766944644
+      ],
+      "ypr": [
+       537.834326171875,
+       0,
+       0
+      ],
+      "scale": 0.9999992847442627,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       99.17831942845967,
+       21.04638671875,
+       199.38430714733718
+      ],
+      "ypr": [
+       537.0309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       100.92213355675813,
+       21.04638671875,
+       199.57289783784012
+      ],
+      "ypr": [
+       537.0309814453125,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       100.83634773537405,
+       21.04638671875,
+       200.6049762478576
+      ],
+      "ypr": [
+       537.0308288574219,
+       0,
+       0
+      ],
+      "scale": 0.9999988079071045,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       100.02859542416647,
+       20.83935546875,
+       200.68169157168032
+      ],
+      "ypr": [
+       535.4650024414062,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       100.02859542416647,
+       21.8553466796875,
+       200.68169157168032
+      ],
+      "ypr": [
+       535.4650024414062,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  },
+  {
+   "asset": "Skulls Teleport Stage",
+   "position": [
+    7500.5,
+    33.25,
+    11845.75
+   ],
+   "orientierung": [
+    -720,
+    0,
+    0
+   ],
+   "ergebnis": {
+    "Objects": [
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       7500.5,
+       33.25,
+       11845.75
+      ],
+      "ypr": [
+       -720,
+       0,
+       0
+      ],
+      "scale": 2.999950408935547,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Land_Wall_Gate_FenG",
+      "pos": [
+       7500.671875,
+       34.1875,
+       11845.0703125
+      ],
+      "ypr": [
+       -545.3599548339844,
+       0,
+       0
+      ],
+      "scale": 1.189998984336853,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_ConcretePipe_Gate",
+      "pos": [
+       7500.53759765625,
+       36.110504150390625,
+       11845.6240234375
+      ],
+      "ypr": [
+       -851.4443206787109,
+       90,
+       -0.00010427406232338399
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_radar_panel_flat",
+      "pos": [
+       7501.87353515625,
+       33.25,
+       11844.7744140625
+      ],
+      "ypr": [
+       -724.2133173942566,
+       0,
+       0
+      ],
+      "scale": 0.7099621295928955,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Misc_SatDish",
+      "pos": [
+       7502.82373046875,
+       37.434967041015625,
+       11846.609375
+      ],
+      "ypr": [
+       -687.7655868530273,
+       40.05234909057617,
+       0
+      ],
+      "scale": 2.1050004959106445,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "Misc_Spotlight",
+      "pos": [
+       7500.43408203125,
+       36.650909423828125,
+       11845.974609375
+      ],
+      "ypr": [
+       -677.4217262268066,
+       -0.7605018019676208,
+       -175.19993591308594
+      ],
+      "scale": 0.8450119495391846,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Fence4",
+      "pos": [
+       7500.533203125,
+       32.76409912109375,
+       11845.9423828125
+      ],
+      "ypr": [
+       -726.9375557899475,
+       90,
+       179.99989318847656
+      ],
+      "scale": 3.319983720779419,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       7498.57275390625,
+       30.907623291015625,
+       11845.81640625
+      ],
+      "ypr": [
+       -816.6878280639648,
+       0,
+       0
+      ],
+      "scale": 0.9999983310699463,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Pipe_Small2_High_Ground",
+      "pos": [
+       7502.33203125,
+       30.907623291015625,
+       11846.2763671875
+      ],
+      "ypr": [
+       -638.4187545776367,
+       0,
+       0
+      ],
+      "scale": 0.9999982714653015,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       7499.22314453125,
+       36.041351318359375,
+       11845.603515625
+      ],
+      "ypr": [
+       -547.01708984375,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Power_HV_Tower",
+      "pos": [
+       7501.86279296875,
+       36.041351318359375,
+       11845.94140625
+      ],
+      "ypr": [
+       -542.4996032714844,
+       0,
+       0
+      ],
+      "scale": 0.525000810623169,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Furniture_yellow_star",
+      "pos": [
+       7500.5,
+       33.596893310546875,
+       11845.75
+      ],
+      "ypr": [
+       -722.0650634765625,
+       -90,
+       179.99989318847656
+      ],
+      "scale": 2.999957323074341,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       7500.5537109375,
+       31.984710693359375,
+       11845.7734375
+      ],
+      "ypr": [
+       -722.0644836425781,
+       1.2572391824505758e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Road_Sidewalk_Stairs",
+      "pos": [
+       7500.75,
+       31.065887451171875,
+       11842.11328125
+      ],
+      "ypr": [
+       -542.0655364990234,
+       0.4999980032444,
+       0
+      ],
+      "scale": 0.9999987483024597,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Cemetery_Tombstone12",
+      "pos": [
+       7500.5537109375,
+       31.19757080078125,
+       11845.7734375
+      ],
+      "ypr": [
+       -722.0644836425781,
+       3.155682861688547e-05,
+       179.99989318847656
+      ],
+      "scale": 2.5099992752075195,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       7499.61328125,
+       34.29638671875,
+       11846.203125
+      ],
+      "ypr": [
+       -542.065673828125,
+       0,
+       0
+      ],
+      "scale": 0.9999992847442627,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       7499.67724609375,
+       34.29638671875,
+       11845.1357421875
+      ],
+      "ypr": [
+       -542.8690185546875,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       7501.42138671875,
+       34.29638671875,
+       11845.3212890625
+      ],
+      "ypr": [
+       -542.8690185546875,
+       0,
+       0
+      ],
+      "scale": 0.9999985694885254,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_FenR_Pole",
+      "pos": [
+       7501.33740234375,
+       34.29638671875,
+       11846.353515625
+      ],
+      "ypr": [
+       -542.8691711425781,
+       0,
+       0
+      ],
+      "scale": 0.9999988079071045,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       7500.52978515625,
+       34.08935546875,
+       11846.431640625
+      ],
+      "ypr": [
+       -544.4349975585938,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     },
+     {
+      "name": "StaticObj_Wall_Tin_5",
+      "pos": [
+       7500.52978515625,
+       35.1053466796875,
+       11846.431640625
+      ],
+      "ypr": [
+       -544.4349975585938,
+       0,
+       0
+      ],
+      "scale": 0.409997820854187,
+      "enableCEPersistency": 0,
+      "customString": ""
+     }
+    ]
+   }
+  }
+ ],
+ "meldungen": [
+  "No objects have been assigned to any PRABoxes. Nothing to export.",
+  "Skipping PRABox 1 because its position or Yaw values are missing or invalid.",
+  "No objects have been assigned to any PRABoxes. Nothing to export."
+ ]
+}

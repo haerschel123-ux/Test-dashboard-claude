@@ -86,7 +86,7 @@ def payload(name="Gate_A", commit=True):
     return {"name": name, "commit": commit,
             "boxes": [{"x": 5000, "y": 220, "z": 6000, "width": 3, "height": 4,
                        "depth": 5, "yaw": 90, "pitch": 0, "roll": 0,
-                       "object": "Land_Sign_Warning", "objectYaw": 180}],
+                       "objekt": {"quelle": "standard", "name": "Land_Mil_GuardShed"}}],
             "targets": [{"x": 7000, "y": 210, "z": 8000}]}
 
 
@@ -113,7 +113,8 @@ def test_commit_format_registration_and_persistence(monkeypatch, servers):
     assert pra == {"areaName": "Gate_A", "PRABoxes": [[[3, 4, 5], [90, 0, 0], [5000, 220, 6000]]],
                    "safePositions3D": [[7000, 210, 8000]]}
     objects = json.loads(conn.ftp.files["/mission/custom/Gate_A_objects.json"])
-    assert objects["Objects"][0]["ypr"] == [180, 0, 0]
+    assert objects["Objects"] == [{"name": "Land_Mil_GuardShed", "pos": [5000, 221.25, 6000], "ypr": [90, 0, 0], "scale": 1.0,
+                                   "enableCEPersistency": 0, "customString": ""}]
     gameplay = json.loads(conn.ftp.files["/mission/cfggameplay.json"])
     assert gameplay["WorldsData"]["playerRestrictedAreaFiles"].pop() == "custom/pra/Gate_A.json"
     assert gameplay["WorldsData"]["objectSpawnersArr"].pop() == "custom/Gate_A_objects.json"
@@ -191,7 +192,7 @@ def test_remove_out_of_order_preserves_other_changes(monkeypatch, servers, first
 def test_no_objects_no_spawner_changes(monkeypatch, servers):
     conn, _ = servers
     data = payload()
-    data["boxes"][0]["object"] = ""
+    data["boxes"][0]["objekt"] = None
     item = deploy(monkeypatch, conn, data)
     assert len(item["generated"]) == 2
     assert "/mission/custom/Gate_A_objects.json" not in conn.ftp.files
@@ -257,7 +258,7 @@ def test_new_pra_list_is_placed_after_object_spawners(monkeypatch, servers):
         "lightingConfig": 0, "objectSpawnersArr": ["custom/a.json"],
         "environmentMinTemps": [1, 2]}})
     data = payload(name="Name", commit=False)
-    data["boxes"][0]["object"] = ""
+    data["boxes"][0]["objekt"] = None
     status, response = call(monkeypatch, conn, data)
     assert status == 200, response
     vorschau = next(g["content"] for g in response["data"]["generated"]

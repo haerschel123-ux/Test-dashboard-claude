@@ -20760,6 +20760,228 @@ async def api_tools_qrcode_remove(request: web.Request) -> web.Response:
         return failure or ok({"entfernt": entry["id"]})
 
 
+# ── Teleport-Objekte: Katalog (Standard, Betreiber, Eigene) und die Berechnung der Objekt-Datei ──────────────────────
+# Wie auf dayzfiletoolbox.com/teleports: Jede Box kann ein Objekt bekommen - ein EINZELNES (steht 1,25 m ueber der Box) oder
+# eine GRUPPE (das erste Objekt ist der Anker und steht auf der Box, alle anderen behalten Abstand und Drehung dazu). Der
+# Bot rechnet die Objekt-Datei selbst: Gruppenteile werden nur um den Yaw der Box gedreht (Draufsicht), Pitch und Roll der
+# Box gehen nur an den Anker. Die Rechnung ist gegen 30 Laeufe der Seite geprueft (tests/fixtures/teleports/referenz_export.json).
+# Katalog wie beim Airdrop: "Standard" ist fest im Code, "Betreiber" (premade) legt nur der Betreiber an und gilt fuer alle
+# Server, "Eigene" legt jeder Kunde fuer seinen Server an (nie fuer andere sichtbar).
+_TPO_ORDNER = "teleport_objekte"
+_TPO_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,40}\Z")
+_TPO_CLASS_RE = re.compile(r"[A-Za-z0-9_]{1,128}\Z")
+_TPO_MAX_PREMADE = 100
+_TPO_MAX_EIGENE = 30
+_TPO_MAX_OBJEKTE = 500                    # Teile je Gruppe
+_TPO_MAX_BYTES = 2_000_000                # je Katalogdatei
+_TPO_Y_VERSATZ = 1.25                     # Einzelobjekte stehen so hoch ueber der Box (wie auf der Seite)
+_TPO_MAX_OBJEKTE_GESAMT = 5000            # Objekte in einer erzeugten Objekt-Datei
+_TPO_LOCK = threading.Lock()
+
+_TPO_STANDARD_GRUPPE: List[Dict[str, Any]] = [
+    {"name": "StaticObj_Furniture_yellow_star", "pos": [0, 0, 0], "ypr": [-2.0651862621307373, -90, 179.99989318847656], "scale": 2.999950408935547},
+    {"name": "Land_Wall_Gate_FenG", "pos": [0.171875, 0.9375, -0.6796875], "ypr": [174.64004516601562, 0, 0], "scale": 1.189998984336853},
+    {"name": "StaticObj_Misc_ConcretePipe_Gate", "pos": [0.03759765625, 2.860504150390625, -0.1259765625], "ypr": [-131.44432067871094, 90, -0.00010427406232338399], "scale": 0.9999983310699463},
+    {"name": "StaticObj_Furniture_radar_panel_flat", "pos": [1.37353515625, 0, -0.9755859375], "ypr": [-4.213317394256592, 0, 0], "scale": 0.7099621295928955},
+    {"name": "StaticObj_Misc_SatDish", "pos": [2.32373046875, 4.184967041015625, 0.859375], "ypr": [32.23441314697266, 40.05234909057617, 0], "scale": 2.1050004959106445},
+    {"name": "Misc_Spotlight", "pos": [-0.06591796875, 3.400909423828125, 0.224609375], "ypr": [42.57827377319336, -0.7605018019676208, -175.19993591308594], "scale": 0.8450119495391846},
+    {"name": "StaticObj_Cemetery_Fence4", "pos": [0.033203125, -0.48590087890625, 0.1923828125], "ypr": [-6.93755578994751, 90, 179.99989318847656], "scale": 3.319983720779419},
+    {"name": "StaticObj_Pipe_Small2_High_Ground", "pos": [-1.92724609375, -2.342376708984375, 0.06640625], "ypr": [-96.68782806396484, 0, 0], "scale": 0.9999983310699463},
+    {"name": "StaticObj_Pipe_Small2_High_Ground", "pos": [1.83203125, -2.342376708984375, 0.5263671875], "ypr": [81.58124542236328, 0, 0], "scale": 0.9999982714653015},
+    {"name": "StaticObj_Power_HV_Tower", "pos": [-1.27685546875, 2.791351318359375, -0.146484375], "ypr": [172.98291015625, 0, 0], "scale": 0.525000810623169},
+    {"name": "StaticObj_Power_HV_Tower", "pos": [1.36279296875, 2.791351318359375, 0.19140625], "ypr": [177.50039672851562, 0, 0], "scale": 0.525000810623169},
+    {"name": "StaticObj_Furniture_yellow_star", "pos": [0, 0.346893310546875, 0], "ypr": [-2.0650634765625, -90, 179.99989318847656], "scale": 2.999957323074341},
+    {"name": "StaticObj_Cemetery_Tombstone12", "pos": [0.0537109375, -1.265289306640625, 0.0234375], "ypr": [-2.064483642578125, 1.2572391824505758e-05, 179.99989318847656], "scale": 2.5099992752075195},
+    {"name": "StaticObj_Road_Sidewalk_Stairs", "pos": [0.24999999999999956, -2.184112548828125, -3.63671875], "ypr": [177.93446350097656, 0.4999980032444, 0], "scale": 0.9999987483024597},
+    {"name": "StaticObj_Cemetery_Tombstone12", "pos": [0.0537109375, -2.05242919921875, 0.0234375], "ypr": [-2.064483642578125, 3.155682861688547e-05, 179.99989318847656], "scale": 2.5099992752075195},
+    {"name": "StaticObj_Wall_FenR_Pole", "pos": [-0.88671875, 1.04638671875, 0.453125], "ypr": [177.934326171875, 0, 0], "scale": 0.9999992847442627},
+    {"name": "StaticObj_Wall_FenR_Pole", "pos": [-0.82275390625, 1.04638671875, -0.6142578125], "ypr": [177.1309814453125, 0, 0], "scale": 0.9999985694885254},
+    {"name": "StaticObj_Wall_FenR_Pole", "pos": [0.92138671875, 1.04638671875, -0.4287109375], "ypr": [177.1309814453125, 0, 0], "scale": 0.9999985694885254},
+    {"name": "StaticObj_Wall_FenR_Pole", "pos": [0.83740234375, 1.04638671875, 0.603515625], "ypr": [177.13082885742188, 0, 0], "scale": 0.9999988079071045},
+    {"name": "StaticObj_Wall_Tin_5", "pos": [0.02978515625, 0.83935546875, 0.681640625], "ypr": [175.56500244140625, 0, 0], "scale": 0.409997820854187},
+    {"name": "StaticObj_Wall_Tin_5", "pos": [0.02978515625, 1.8553466796875, 0.681640625], "ypr": [175.56500244140625, 0, 0], "scale": 0.409997820854187},
+]
+
+_TPO_STANDARD: List[Dict[str, Any]] = [
+    {"name": "Land_Misc_Toilet_Mobile", "typ": "einzel", "classname": "Land_Misc_Toilet_Mobile", "scale": 1.0,
+     "y_versatz": _TPO_Y_VERSATZ},
+    # Auf der Webseite exportiert dieser Eintrag faelschlich ebenfalls Land_Misc_Toilet_Mobile - hier der richtige Name.
+    {"name": "Land_Mil_GuardShed", "typ": "einzel", "classname": "Land_Mil_GuardShed", "scale": 1.0,
+     "y_versatz": _TPO_Y_VERSATZ},
+    {"name": "Skulls_Teleport_Stage", "typ": "gruppe", "objekte": _TPO_STANDARD_GRUPPE},
+]
+
+
+def _tpo_zahl(wert: Any, tief: float, hoch: float) -> Optional[float]:
+    z = _adj_zahl(wert)
+    return z if z is not None and tief <= z <= hoch else None
+
+
+def _tpo_asset_pruefen(a: Any) -> Optional[Dict[str, Any]]:
+    """Gespeicherten/eingegebenen Katalogeintrag pruefen und normalisieren (None = unbrauchbar)."""
+    if not isinstance(a, dict) or not isinstance(a.get("name"), str) or not _TPO_NAME_RE.match(a["name"]):
+        return None
+    if a.get("typ") == "einzel":
+        cn = a.get("classname")
+        sc = _tpo_zahl(a.get("scale", 1.0), 0.000001, 1000)
+        yv = _tpo_zahl(a.get("y_versatz", _TPO_Y_VERSATZ), -100, 1000)
+        if not isinstance(cn, str) or not _TPO_CLASS_RE.match(cn) or sc is None or yv is None:
+            return None
+        return {"name": a["name"], "typ": "einzel", "classname": cn, "scale": sc, "y_versatz": yv}
+    if a.get("typ") == "gruppe":
+        roh = a.get("objekte")
+        if not isinstance(roh, list) or not 2 <= len(roh) <= _TPO_MAX_OBJEKTE:
+            return None
+        objekte: List[Dict[str, Any]] = []
+        for o in roh:
+            if not isinstance(o, dict) or not isinstance(o.get("name"), str) or not _TPO_CLASS_RE.match(o["name"]):
+                return None
+            pos, ypr = o.get("pos"), o.get("ypr", [0, 0, 0])
+            sc = _tpo_zahl(o.get("scale", 1.0), 0.000001, 1000)
+            if (not isinstance(pos, list) or len(pos) != 3 or not isinstance(ypr, list) or len(ypr) != 3 or sc is None
+                    or any(_adj_zahl(v) is None for v in list(pos) + list(ypr))):
+                return None
+            objekte.append({"name": o["name"], "pos": [float(v) for v in pos], "ypr": [float(v) for v in ypr], "scale": sc})
+        return {"name": a["name"], "typ": "gruppe", "objekte": objekte}
+    return None
+
+
+def _tpo_standard() -> Dict[str, Dict[str, Any]]:
+    return {a["name"]: a for a in (_tpo_asset_pruefen(copy.deepcopy(x)) for x in _TPO_STANDARD) if a}
+
+
+def _tpo_datei(quelle: str, service_id: str = "") -> str:
+    if quelle == "premade":
+        return os.path.join(_TPO_ORDNER, "premade.json")
+    sid = re.sub(r"[^A-Za-z0-9_-]", "_", str(service_id))[:40] or "x"
+    return os.path.join(_TPO_ORDNER, "eigene", sid + ".json")
+
+
+def _tpo_lesen(quelle: str, service_id: str = "") -> Dict[str, Dict[str, Any]]:
+    """Katalog einer Quelle: 'standard' (fest), 'premade' (Betreiber, alle Server) oder 'eigen' (dieser Server)."""
+    if quelle == "standard":
+        return _tpo_standard()
+    try:
+        with open(_tpo_datei(quelle, service_id), "r", encoding="utf-8") as f:
+            roh = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(roh, dict):
+        return {}
+    ausgabe: Dict[str, Dict[str, Any]] = {}
+    for name, eintrag in roh.items():
+        a = _tpo_asset_pruefen(eintrag)
+        if a and a["name"] == name:
+            ausgabe[name] = a
+    return ausgabe
+
+
+def _tpo_schreiben(quelle: str, service_id: str, katalog: Dict[str, Dict[str, Any]]) -> None:
+    text = json.dumps(katalog, indent=1, ensure_ascii=False) + "\n"
+    if len(text.encode("utf-8")) > _TPO_MAX_BYTES:
+        raise ValueError("Der Katalog ist zu groß – bitte erst Objekte löschen.")
+    _adj_atomar_schreiben(_tpo_datei(quelle, service_id), text)
+
+
+def _tpo_finden(quelle: Any, name: Any, service_id: str) -> Optional[Dict[str, Any]]:
+    if quelle not in ("standard", "premade", "eigen") or not isinstance(name, str):
+        return None
+    return _tpo_lesen(quelle, service_id).get(name)
+
+
+def _tpo_view(quelle: str, a: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"quelle": quelle, "name": a["name"], "typ": a["typ"]}
+    if a["typ"] == "einzel":
+        out.update(classname=a["classname"], scale=a["scale"], y_versatz=a["y_versatz"], anzahl=1)
+    else:
+        out.update(anzahl=len(a["objekte"]), anker=a["objekte"][0]["name"])
+    return out
+
+
+def _tpo_uebersicht(conn: ServerConnection) -> Dict[str, List[Dict[str, Any]]]:
+    def liste(quelle: str) -> List[Dict[str, Any]]:
+        katalog = _tpo_lesen(quelle, conn.service_id)
+        return [_tpo_view(quelle, katalog[n]) for n in sorted(katalog, key=str.lower)]
+    return {"standard": liste("standard"), "premade": liste("premade"), "eigen": liste("eigen")}
+
+
+def _tpo_gruppe_aus_objekten(objekte: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Object-Spawner-Objekte (absolute Lage) -> Gruppe: Das ERSTE Objekt ist der Anker. Alle anderen werden relativ zu ihm
+    gespeichert - Abstand in der Drehung des Ankers (Umkehrung der Rechnung beim Export) und Yaw als Unterschied zum Anker -,
+    damit der Export sie um den Yaw der Box drehen kann. Der Anker selbst steht danach auf 0/0/0."""
+    anker = objekte[0]
+    yaw = math.radians(anker["ypr"][0])
+    c, s = math.cos(yaw), math.sin(yaw)
+    ergebnis = [{"name": anker["name"], "pos": [0.0, 0.0, 0.0], "ypr": list(anker["ypr"]), "scale": anker["scale"]}]
+    for o in objekte[1:]:
+        dx, dy, dz = (o["pos"][i] - anker["pos"][i] for i in range(3))
+        ergebnis.append({"name": o["name"], "pos": [round(dx * c - dz * s, 6), round(dy, 6), round(dx * s + dz * c, 6)],
+                         "ypr": [round(o["ypr"][0] - anker["ypr"][0], 6), o["ypr"][1], o["ypr"][2]],
+                         "scale": o["scale"]})
+    return ergebnis
+
+
+def _tpo_aus_anfrage(data: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Eingabe 'Objekt hinzufuegen' -> Katalogeintrag oder Fehlertext."""
+    name = str(data.get("name") or "").strip()
+    if not _TPO_NAME_RE.match(name):
+        return None, "Der Name darf nur Buchstaben, Ziffern, _ und - enthalten (1–40 Zeichen)."
+    typ = data.get("typ")
+    if typ == "einzel":
+        a = _tpo_asset_pruefen({"name": name, "typ": "einzel", "classname": str(data.get("classname") or "").strip(),
+                                "scale": data.get("scale", 1.0), "y_versatz": data.get("y_versatz", _TPO_Y_VERSATZ)})
+        if a is None:
+            return None, ("Einzelobjekt: Classname aus Buchstaben, Ziffern und _ (höchstens 128), Skalierung größer 0 und "
+                          "Höhe über der Box zwischen −100 und 1000 m angeben.")
+        return a, None
+    if typ == "gruppe":
+        inhalt = data.get("content")
+        if not isinstance(inhalt, str) or not inhalt.strip():
+            return None, "Bitte den JSON-Inhalt der Objektgruppe einfügen."
+        objekte, fehler = _adj_pruefen(inhalt)
+        if fehler:
+            return None, fehler
+        if len(objekte or []) < 2:
+            return None, "Eine Gruppe braucht mindestens 2 Objekte (das erste ist der Ankerpunkt)."
+        if len(objekte or []) > _TPO_MAX_OBJEKTE:
+            return None, f"Eine Gruppe darf höchstens {_TPO_MAX_OBJEKTE} Objekte haben."
+        a = _tpo_asset_pruefen({"name": name, "typ": "gruppe", "objekte": _tpo_gruppe_aus_objekten(objekte or [])})
+        if a is None:
+            return None, "Die Objektgruppe enthält ungültige Namen (nur Buchstaben, Ziffern und _) oder Werte."
+        return a, None
+    return None, "Bitte Einzelobjekt oder Gruppe wählen."
+
+
+def _tpo_rund(wert: float) -> Union[int, float]:
+    """Auf 6 Nachkommastellen runden. Alles unter 0,0001 wird 0: Python schreibt solche Zahlen als 1.3e-05, und das soll
+    nicht in einer Server-Datei stehen (0,1 mm bzw. 0,0001 Grad sind ohnehin ohne Wirkung)."""
+    r = round(float(wert), 6)
+    if abs(r) < 0.0001:
+        return 0
+    return int(r) if r == int(r) else r            # 5000 statt 5000.0, wie die Webseite es schreibt
+
+
+def _tpo_objekt(name: str, pos: List[float], ypr: List[float], scale: float) -> Dict[str, Any]:
+    return {"name": name, "pos": [_tpo_rund(v) for v in pos], "ypr": [_tpo_rund(v) for v in ypr],
+            "scale": _tpo_rund(scale), "enableCEPersistency": 0, "customString": ""}
+
+
+def _tpo_berechnen(a: Dict[str, Any], pos: List[float], ypr: List[float]) -> List[Dict[str, Any]]:
+    """Objekte fuer EINE Box (Position pos, Drehung ypr = [Yaw, Pitch, Roll]) - dieselbe Rechnung wie die Webseite."""
+    if a["typ"] == "einzel":
+        return [_tpo_objekt(a["classname"], [pos[0], pos[1] + a["y_versatz"], pos[2]], ypr, a["scale"])]
+    anker, kinder = a["objekte"][0], a["objekte"][1:]
+    ergebnis = [_tpo_objekt(anker["name"], pos, ypr, anker["scale"])]
+    yaw = math.radians(ypr[0])
+    c, s = math.cos(yaw), math.sin(yaw)
+    for k in kinder:
+        x, y, z = k["pos"]
+        ergebnis.append(_tpo_objekt(k["name"], [pos[0] + x * c + z * s, pos[1] + y, pos[2] - x * s + z * c],
+                                    [ypr[0] + k["ypr"][0], k["ypr"][1], k["ypr"][2]], k["scale"]))
+    return ergebnis
+
+
+
 # PlayerBase.AfterStoreLoad checks these areas on loading a saved character.
 _TELEPORT_NAME = re.compile(r"[A-Za-z0-9_]{1,64}")
 
@@ -20804,14 +21026,20 @@ def _teleport_files(data: Dict[str, Any], conn: ServerConnection):
     for box in boxes:
         pos = position(box)
         size = [number(box.get(key), 0.1, world_size) for key in ("width", "height", "depth")]
-        pra_boxes.append([size, rotation(box, ("yaw", "pitch", "roll")), pos])
-        classname = box.get("object", "")
-        if not isinstance(classname, str) or (classname and not re.fullmatch(r"[A-Za-z0-9_]{1,128}", classname)):
-            raise ValueError("Ungültiger Objekt-Classname.")
-        if classname:
-            objects.append({"name": classname, "pos": pos,
-                            "ypr": rotation(box, ("objectYaw", "objectPitch", "objectRoll")),
-                            "scale": 1, "enableCEPersistency": 0})
+        ypr = rotation(box, ("yaw", "pitch", "roll"))
+        pra_boxes.append([size, ypr, pos])
+        # Objekt dieser Box (optional): Verweis auf einen Katalogeintrag - Standard, Betreiber oder Eigene dieses Servers.
+        verweis = box.get("objekt")
+        if verweis in (None, "", {}):
+            continue
+        if not isinstance(verweis, dict):
+            raise ValueError("Ungültiges Objekt.")
+        asset = _tpo_finden(verweis.get("quelle"), verweis.get("name"), conn.service_id)
+        if asset is None:
+            raise ValueError(f"Das Objekt „{str(verweis.get('name'))[:60]}“ gibt es nicht (mehr) – bitte neu wählen.")
+        objects.extend(_tpo_berechnen(asset, pos, ypr))
+        if len(objects) > _TPO_MAX_OBJEKTE_GESAMT:
+            raise ValueError(f"Zu viele Objekte (höchstens {_TPO_MAX_OBJEKTE_GESAMT} in einer Datei).")
     pra = {"areaName": name, "PRABoxes": pra_boxes,
            "safePositions3D": [position(p) for p in targets]}
     files = [(f"custom/pra/{name}.json", pra)]
@@ -20835,9 +21063,76 @@ async def api_tools_teleports_get(request: web.Request) -> web.Response:
     conn, error = await _teleport_prepare(request, "view")
     if error is not None:
         return error
+    loop = asyncio.get_running_loop()
     return ok({"teleports": [{k: item.get(k) for k in ("id", "name", "files", "created")}
                              for item in _teleports(conn)],
+               "objekte": await loop.run_in_executor(None, _tpo_uebersicht, conn),
+               "ist_betreiber": bool((_sess_get(request) or {}).get("is_admin")),
                "kein_mission_ordner": not bool(_mission_dir_of(conn))})
+
+
+async def _tpo_katalog_aendern(request: web.Request, loeschen: bool) -> web.Response:
+    """Objekt zum Katalog hinzufuegen/ueberschreiben (loeschen=False) oder entfernen (loeschen=True).
+    'global': true = Katalog des Betreibers (nur Admin, gilt fuer alle Server), sonst die Eigenen dieses Servers."""
+    conn, error = await _teleport_prepare(request, "edit")
+    if error is not None:
+        return error
+    data = await body(request)
+    if not isinstance(data, dict):
+        return err("Ungültige Teleport-Anfrage.")
+    betreiber = data.get("global") is True
+    if betreiber:
+        error = await _require_admin(request)
+        if error is not None:
+            return error
+    error = _dash_rate_limited(request, "tools.teleports.objekt", 2)
+    if error is not None:
+        return error
+    quelle, sid = ("premade", "") if betreiber else ("eigen", conn.service_id)
+    loop = asyncio.get_running_loop()
+    sess = _sess_get(request)
+    if loeschen:
+        name = str(data.get("name") or "").strip()
+        if not _TPO_NAME_RE.match(name):
+            return err("Ungültiger Name.")
+        with _TPO_LOCK:
+            katalog = _tpo_lesen(quelle, sid)
+            if name not in katalog:
+                return err("Dieses Objekt gibt es nicht.", 404)
+            del katalog[name]
+            try:
+                _tpo_schreiben(quelle, sid, katalog)
+            except (ValueError, OSError) as exc:
+                return err(str(exc), 502)
+        _audit_add("dashboard", _audit_actor(sess), "Tool: Teleport-Objekt gelöscht", f"{name} · {conn.name}")
+        return ok({"geloescht": True, "objekte": await loop.run_in_executor(None, _tpo_uebersicht, conn)})
+    asset, fehler = _tpo_aus_anfrage(data)
+    if fehler:
+        return err(fehler)
+    with _TPO_LOCK:
+        katalog = _tpo_lesen(quelle, sid)
+        if asset["name"] in katalog and data.get("overwrite") is not True:
+            return ok({"konflikt": True, "name": asset["name"]})
+        if asset["name"] not in katalog and len(katalog) >= (_TPO_MAX_PREMADE if betreiber else _TPO_MAX_EIGENE):
+            return err(f"Es sind höchstens {_TPO_MAX_PREMADE if betreiber else _TPO_MAX_EIGENE} Objekte erlaubt – "
+                       "bitte erst welche löschen.")
+        katalog[asset["name"]] = asset
+        try:
+            _tpo_schreiben(quelle, sid, katalog)
+        except (ValueError, OSError) as exc:
+            return err(str(exc), 502)
+    _audit_add("dashboard", _audit_actor(sess), "Tool: Teleport-Objekt gespeichert",
+               f"{asset['name']} ({'Betreiber' if betreiber else 'eigen'}, {asset['typ']}) · {conn.name}")
+    return ok({"gespeichert": True, "objekt": _tpo_view(quelle, asset),
+               "objekte": await loop.run_in_executor(None, _tpo_uebersicht, conn)})
+
+
+async def api_tools_teleports_objekt_post(request: web.Request) -> web.Response:
+    return await _tpo_katalog_aendern(request, False)
+
+
+async def api_tools_teleports_objekt_loeschen(request: web.Request) -> web.Response:
+    return await _tpo_katalog_aendern(request, True)
 
 
 async def _teleport_gameplay(conn, loop):
@@ -53053,6 +53348,8 @@ def build_app() -> web.Application:
     r.add_get("/api/tools/teleports", api_tools_teleports_get)
     r.add_post("/api/tools/teleports", api_tools_teleports_post)
     r.add_post("/api/tools/teleports/remove", api_tools_teleports_remove)
+    r.add_post("/api/tools/teleports/objekt", api_tools_teleports_objekt_post)
+    r.add_post("/api/tools/teleports/objekt/loeschen", api_tools_teleports_objekt_loeschen)
     r.add_get("/api/tools/qrcode", api_tools_qrcode_get)
     r.add_post("/api/tools/qrcode", api_tools_qrcode_post)
     r.add_post("/api/tools/qrcode/remove", api_tools_qrcode_remove)
@@ -53805,6 +54102,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "83a6fd78c6bdd0683d09d76e8e77ab0a2c4b1b95ac1b0131d793d85b3a511b80",
         "79f46aad545b12f32060e5c6298a4238ad413a83497a34c86100cd409fe04aba",
         "37fb98a556892255577f628f40cc14a2126d6cb25186a8cbb2c089ed479c0115",
+        "bce3178c72a3e1685b47378cb3f70ddb75d8424ca3b76241466c0ac262d857ce",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -54070,6 +54368,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "b58c409c3fc457998bea10f47f43c71312b13958167f29b9c0662afe1a1a4920",
         "235b0aac310a9c8bc5bdffd64173a388b59562c3740ce139374f620a216eef00",
         "f5d3c5ea442b35fc695f8c54e4791feb4e62529bbd8420592cb750d94482550d",
+        "49e817ade6b1366e4d24aa71c7253c77c1100025b9e1a4454e84eb9ebaab66ad",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
