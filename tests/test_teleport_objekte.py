@@ -457,3 +457,52 @@ def test_expansion_airdrop_datei_wird_mit_klarer_meldung_abgelehnt(monkeypatch, 
     conn, _ = servers
     st, j = _add(monkeypatch, conn, {"name": "Ex", "typ": "gruppe", "content": '{"Containers": []}'})
     assert st == 400 and "Expansion" in j["error"]
+
+
+# ── Gast-Rechte: Betreiber-Katalog bleibt dem Betreiber, eigene Objekte brauchen Schreibrecht ─────────────
+def _gast(monkeypatch, conn, handler, daten=None, methode="POST"):
+    """Ein Gast (weder Betreiber noch Besitzer, Discord-ID 900) mit den in conn.data["dashboard_perms"] eingetragenen Rechten."""
+    sid = str(time.time_ns())
+    bot._SESS_STORE[sid] = {"token": "x", "discord": {"id": "900"}, "is_admin": False, "is_guest": True,
+                            "service_id": conn.service_id, "seen": time.time(), "admin_geprueft_ts": time.time()}
+    req = make_mocked_request(methode, "/api/tools/teleports", headers={"Cookie": f"{bot._SESS_COOKIE}={sid}"})
+
+    async def body(_r):
+        return daten
+    monkeypatch.setattr(bot, "body", body)
+    bot._DASH_RATE_LIMIT_LAST.clear()
+    r = asyncio.run(handler(req))
+    return r.status, json.loads(r.body)
+
+
+def test_gast_nur_ansehen_sieht_kein_schreiben_und_kann_nichts_aendern(monkeypatch, servers):
+    conn, _ = servers
+    conn.data["dashboard_perms"] = {"user:900": {"tools": ["view"]}}
+    st, j = _gast(monkeypatch, conn, bot.api_tools_teleports_get, None, "GET")
+    assert st == 200 and j["data"]["kann_edit"] is False and j["data"]["ist_betreiber"] is False
+    objekt = {"name": "Gast_Objekt", "typ": "einzel", "classname": "Land_X"}
+    assert _gast(monkeypatch, conn, bot.api_tools_teleports_objekt_post, objekt)[0] == 403
+    assert _gast(monkeypatch, conn, bot.api_tools_teleports_objekt_post, dict(objekt, **{"global": True}))[0] == 403
+    assert _get(monkeypatch, conn)["objekte"]["eigen"] == [] and _get(monkeypatch, conn)["objekte"]["premade"] == []
+
+
+def test_gast_mit_schreibrecht_darf_eigene_aber_nie_betreiber_objekte(monkeypatch, servers):
+    conn, _ = servers
+    conn.data["dashboard_perms"] = {"user:900": {"tools": ["view", "edit"]}}
+    st, j = _gast(monkeypatch, conn, bot.api_tools_teleports_get, None, "GET")
+    assert st == 200 and j["data"]["kann_edit"] is True and j["data"]["ist_betreiber"] is False
+    objekt = {"name": "Gast_Objekt", "typ": "einzel", "classname": "Land_X"}
+    assert _gast(monkeypatch, conn, bot.api_tools_teleports_objekt_post, objekt)[0] == 200
+    st, j = _gast(monkeypatch, conn, bot.api_tools_teleports_objekt_post, dict(objekt, **{"global": True, "name": "Fuer_Alle"}))
+    assert st == 403
+    st, j = _gast(monkeypatch, conn, bot.api_tools_teleports_objekt_loeschen, {"name": "Gast_Objekt", "global": True})
+    assert st == 403
+    d = _get(monkeypatch, conn)
+    assert [o["name"] for o in d["objekte"]["eigen"]] == ["Gast_Objekt"] and d["objekte"]["premade"] == []
+
+
+def test_kunde_besitzer_sieht_kann_edit_und_ist_kein_betreiber(monkeypatch, servers):
+    conn, _ = servers
+    d = _get(monkeypatch, conn, admin=False)
+    assert d["kann_edit"] is True and d["ist_betreiber"] is False
+    assert _get(monkeypatch, conn)["kann_edit"] is True

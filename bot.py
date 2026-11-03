@@ -21068,6 +21068,7 @@ async def api_tools_teleports_get(request: web.Request) -> web.Response:
                              for item in _teleports(conn)],
                "objekte": await loop.run_in_executor(None, _tpo_uebersicht, conn),
                "ist_betreiber": bool((_sess_get(request) or {}).get("is_admin")),
+               "kann_edit": _dash_perm_allowed(_sess_get(request), conn, "tools", "edit"),
                "kein_mission_ordner": not bool(_mission_dir_of(conn))})
 
 
@@ -54369,6 +54370,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "235b0aac310a9c8bc5bdffd64173a388b59562c3740ce139374f620a216eef00",
         "f5d3c5ea442b35fc695f8c54e4791feb4e62529bbd8420592cb750d94482550d",
         "49e817ade6b1366e4d24aa71c7253c77c1100025b9e1a4454e84eb9ebaab66ad",
+        "5637c672cad474cdb597fe89bbbaafeab825fc5cc39b21ffb67df9d1f3a97420",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
