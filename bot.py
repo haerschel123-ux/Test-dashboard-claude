@@ -28507,6 +28507,112 @@ async def api_tools_randompresets_post(request: web.Request) -> web.Response:
 # Organizer), das Frontend zeigt dazu eine Warnung.
 _TOOL_MESSAGES_MAX_TEXT = 160
 
+# Vorschläge für den Messages Generator: fertige Nachrichten zum Anklicken. Jeder Vorschlag hat den Text auf Deutsch UND
+# Englisch (der Text erscheint den Spielern im Spiel - seine Sprache ist die des Servers, nicht die des Dashboards) und
+# nur Flag-Kombinationen, die der Generator ohnehin kennt (On Connect + Delay, Repeat, Countdown/Deadline [+ Shutdown]).
+# Nach dem Hinzufügen kann alles geändert werden; "discord.gg/deinserver" ist ein Platzhalter für den eigenen Link.
+_TOOL_MESSAGES_KATEGORIEN = (
+    ("willkommen", "Willkommen", "Welcome"),
+    ("regeln", "Regeln", "Rules"),
+    ("community", "Community", "Community"),
+    ("neustart", "Neustart", "Restart"),
+    ("tipps", "Spielertipps", "Player tips"),
+)
+_TOOL_MESSAGES_VORSCHLAEGE: Tuple[Dict[str, Any], ...] = (
+    {"id": "willkommen_einfach", "kategorie": "willkommen", "onconnect": True, "delay": 1,
+     "titel": ("Einfache Begrüßung", "Simple greeting"),
+     "text": ("Willkommen auf #name! Viel Spaß und überlebe!", "Welcome to #name! Have fun and stay alive!")},
+    {"id": "willkommen_discord", "kategorie": "willkommen", "onconnect": True, "delay": 2,
+     "titel": ("Begrüßung mit Discord-Link", "Greeting with Discord link"),
+     "text": ("Willkommen auf #name! Unser Discord: discord.gg/deinserver",
+              "Welcome to #name! Join our Discord: discord.gg/yourserver")},
+    {"id": "willkommen_regeln", "kategorie": "willkommen", "onconnect": True, "delay": 3,
+     "titel": ("Regeln im Discord lesen", "Read the rules on Discord"),
+     "text": ("Bitte lies die Regeln im Discord, bevor du loslegst: discord.gg/deinserver",
+              "Please read the rules on Discord before you start: discord.gg/yourserver")},
+    {"id": "willkommen_neuspieler", "kategorie": "willkommen", "onconnect": True, "delay": 4,
+     "titel": ("Hilfe für neue Spieler", "Help for new players"),
+     "text": ("Neu hier? Frag im Discord nach Hilfe - wir freuen uns über neue Spieler.",
+              "New here? Ask for help on Discord - new players are welcome.")},
+    {"id": "regeln_fairplay", "kategorie": "regeln", "repeat": 45,
+     "titel": ("Fair Play", "Fair play"),
+     "text": ("Cheating, Glitchen und Exploits führen zum Bann. Bitte fair spielen!",
+              "Cheating, glitching and exploiting lead to a ban. Please play fair!")},
+    {"id": "regeln_respekt", "kategorie": "regeln", "repeat": 60,
+     "titel": ("Respektvoller Umgang", "Respectful behaviour"),
+     "text": ("Bitte bleibt respektvoll - Beleidigungen und Hassrede werden nicht geduldet.",
+              "Please stay respectful - insults and hate speech will not be tolerated.")},
+    {"id": "regeln_combatlog", "kategorie": "regeln", "repeat": 50,
+     "titel": ("Kein Combat-Logging", "No combat logging"),
+     "text": ("Combat-Logging ist verboten: Wer mitten im Kampf den Server verlässt, wird bestraft.",
+              "Combat logging is forbidden: leaving the server during a fight will be punished.")},
+    {"id": "regeln_basebau", "kategorie": "regeln", "repeat": 90,
+     "titel": ("Basebau-Regel", "Base building rule"),
+     "text": ("Basen nur an erlaubten Orten bauen. Bauen in Sicherheitszonen ist verboten.",
+              "Only build bases in allowed areas. Building inside safe zones is forbidden.")},
+    {"id": "regeln_safezone", "kategorie": "regeln", "repeat": 75,
+     "titel": ("Keine Kämpfe in Safe Zones", "No fighting in safe zones"),
+     "text": ("In Safe Zones und Handelszonen ist Kämpfen verboten.",
+              "Fighting is forbidden in safe zones and trade zones.")},
+    {"id": "community_discord", "kategorie": "community", "repeat": 60,
+     "titel": ("Discord bewerben", "Promote your Discord"),
+     "text": ("Tritt unserer Discord-Community bei: discord.gg/deinserver",
+              "Join our Discord community: discord.gg/yourserver")},
+    {"id": "community_support", "kategorie": "community", "repeat": 120,
+     "titel": ("Support im Discord", "Support on Discord"),
+     "text": ("Fragen, Bugs oder Ideen? Unser Team hilft dir im Discord: discord.gg/deinserver",
+              "Questions, bugs or ideas? Our team will help you on Discord: discord.gg/yourserver")},
+    {"id": "community_events", "kategorie": "community", "repeat": 120,
+     "titel": ("Events und Verlosungen", "Events and giveaways"),
+     "text": ("Schau regelmäßig im Discord vorbei - dort kündigen wir Events und Verlosungen an!",
+              "Check our Discord regularly - we announce events and giveaways there!")},
+    {"id": "community_unterstuetzen", "kategorie": "community", "repeat": 180,
+     "titel": ("Server unterstützen", "Support the server"),
+     "text": ("Du möchtest den Server unterstützen? Infos zu VIP und Spenden findest du im Discord.",
+              "Want to support the server? You will find info about VIP and donations on Discord.")},
+    {"id": "neustart_countdown", "kategorie": "neustart", "deadline": 15, "shutdown": True,
+     "titel": ("Neustart-Countdown 15 Min. (stoppt den Server)", "Restart countdown 15 min (stops the server)"),
+     "text": ("Server #name startet in #tmin Minuten neu. Bitte sucht einen sicheren Ort und loggt aus.",
+              "Server #name restarts in #tmin minutes. Please find a safe place and log out.")},
+    {"id": "neustart_3h", "kategorie": "neustart", "deadline": 180, "shutdown": True,
+     "titel": ("Neustart nach 3 Stunden (stoppt den Server)", "Restart after 3 hours (stops the server)"),
+     "text": ("Nächster Neustart in #tmin Minuten.", "Next restart in #tmin minutes.")},
+    {"id": "neustart_6h", "kategorie": "neustart", "deadline": 360, "shutdown": True,
+     "titel": ("Neustart nach 6 Stunden (stoppt den Server)", "Restart after 6 hours (stops the server)"),
+     "text": ("Nächster Neustart in #tmin Minuten.", "Next restart in #tmin minutes.")},
+    {"id": "neustart_hinweis", "kategorie": "neustart", "deadline": 120, "shutdown": False,
+     "titel": ("Countdown-Hinweis (stoppt den Server nicht)", "Countdown notice (does not stop the server)"),
+     "text": ("Server #name: noch #tmin Minuten bis zum geplanten Neustart.",
+              "Server #name: #tmin minutes until the scheduled restart.")},
+    {"id": "tipps_essen", "kategorie": "tipps", "repeat": 70,
+     "titel": ("Essen und Trinken", "Food and water"),
+     "text": ("Tipp: Iss und trink regelmäßig - Hunger und Durst schwächen dich.",
+              "Tip: Eat and drink regularly - hunger and thirst weaken you.")},
+    {"id": "tipps_gruppe", "kategorie": "tipps", "repeat": 100,
+     "titel": ("Mitspieler finden", "Find teammates"),
+     "text": ("Tipp: Zu zweit überlebt man länger. Suche dir Mitspieler im Discord.",
+              "Tip: You survive longer in a team. Find teammates on Discord.")},
+    {"id": "tipps_waerme", "kategorie": "tipps", "repeat": 110,
+     "titel": ("Warm und trocken bleiben", "Stay warm and dry"),
+     "text": ("Tipp: Bleib warm und trocken - Nässe und Kälte machen krank.",
+              "Tip: Stay warm and dry - wet and cold make you sick.")},
+    {"id": "tipps_ausloggen", "kategorie": "tipps", "repeat": 130,
+     "titel": ("Sicher ausloggen", "Log out safely"),
+     "text": ("Tipp: Logge nur an sicheren Orten aus - beim Wiedereinstieg erscheinst du am selben Ort.",
+              "Tip: Only log out in safe places - when you come back you appear at the same spot.")},
+)
+
+
+def _tool_messages_vorschlaege() -> Dict[str, Any]:
+    """Die Vorschläge für das Dashboard (immer dieselben, unabhängig vom Server)."""
+    return {"kategorien": [{"id": k, "de": de, "en": en} for k, de, en in _TOOL_MESSAGES_KATEGORIEN],
+            "vorschlaege": [{"id": v["id"], "kategorie": v["kategorie"],
+                             "titel": {"de": v["titel"][0], "en": v["titel"][1]},
+                             "text": {"de": v["text"][0], "en": v["text"][1]},
+                             "onconnect": bool(v.get("onconnect")), "delay": v.get("delay"), "repeat": v.get("repeat"),
+                             "deadline": v.get("deadline"), "shutdown": bool(v.get("shutdown"))}
+                            for v in _TOOL_MESSAGES_VORSCHLAEGE]}
+
 
 def _tool_messages_lesen(root: Optional[ET.Element]) -> List[Dict[str, Any]]:
     eintraege = []
@@ -28601,11 +28707,11 @@ async def api_tools_messages_get(request: web.Request) -> web.Response:
     if fehler is not None:
         return fehler
     if not _mission_dir_of(conn):
-        return ok({"eintraege": [], "kein_mission_ordner": True})
+        return ok({"eintraege": [], "kein_mission_ordner": True, **_tool_messages_vorschlaege()})
     loop = asyncio.get_running_loop()
     text, status = await _tools_datei_lesen(conn, "db/messages.xml", loop)
     if status == "missing":
-        return ok({"eintraege": [], "existiert_nicht": True, "hash": None})
+        return ok({"eintraege": [], "existiert_nicht": True, "hash": None, **_tool_messages_vorschlaege()})
     if status != "ok":
         return err("db/messages.xml per FTP nicht lesbar.", 502)
     try:
@@ -28613,7 +28719,7 @@ async def api_tools_messages_get(request: web.Request) -> web.Response:
     except ET.ParseError:
         return err("db/messages.xml ist kein gültiges XML.")
     return ok({"eintraege": _tool_messages_lesen(root),
-              "hash": hashlib.sha256(text.encode("utf-8")).hexdigest()})
+              "hash": hashlib.sha256(text.encode("utf-8")).hexdigest(), **_tool_messages_vorschlaege()})
 
 
 async def api_tools_messages_post(request: web.Request) -> web.Response:
@@ -54372,6 +54478,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "49e817ade6b1366e4d24aa71c7253c77c1100025b9e1a4454e84eb9ebaab66ad",
         "5637c672cad474cdb597fe89bbbaafeab825fc5cc39b21ffb67df9d1f3a97420",
         "344b3f7f5fbaa1864865f6132dcff8aac90121d2abbfb346d3fa27e2441e05bf",
+        "8a18e52c1f964038aff6323288fbf841c4de9dccdd4da39136d0ada97f9950f1",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
