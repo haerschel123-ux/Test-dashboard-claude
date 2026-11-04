@@ -52,6 +52,8 @@ import hmac
 import ssl
 import ipaddress
 import urllib.parse
+import html as _html
+import email.utils as _email_utils
 from decimal import Decimal, ROUND_HALF_UP
 from collections import deque
 import collections
@@ -3994,6 +3996,8 @@ class ServerConnection:
         "welcome_message", "leave_message", "reaction_roles",
         "ticket_categories", "ticket_open", "ticket_language", "ticket_transcript_channel",
         "level_system", "honeypot", "guild_daten",
+        # Social-Benachrichtigungen: Feed-Adressen (koennen Zugangsschluessel enthalten) gehoeren genau einer Guild.
+        "social_feeds",
         # KI-Helfer: Einstellungen je Guild inkl. eigenem API-Schluessel; der
         # Betreiber-Schluessel liegt nur in der Umgebung bzw. config.json und
         # darf auf keinem Weg als "Vorgabe" bei einem Kunden ankommen.
@@ -4507,7 +4511,7 @@ class ConnectionRegistry:
 _GUILD_SCHLUESSEL_GRUPPEN: Tuple[Tuple[str, ...], ...] = (
     ("welcome_message",), ("leave_message",), ("reaction_roles",),
     ("ticket_categories", "ticket_open", "ticket_language", "ticket_transcript_channel"),
-    ("level_system",), ("honeypot",), ("ki_helfer",),
+    ("level_system",), ("honeypot",), ("ki_helfer",), ("social_feeds",),
     ("giveaways", "giveaway_farbe", "giveaway_required_role_id"),
     ("ban_immune_role_ids",), ("link_add_role_ids", "link_remove_role_ids"),
     ("log_ban_temp_channel_id", "log_ban_perm_channel_id", "log_unban_channel_id"),
@@ -5732,6 +5736,8 @@ class DayZBot(discord.Client):
             self.scheduled_tasks_loop.start()
         if not self.giveaways_loop.is_running():
             self.giveaways_loop.start()
+        if not self.social_feeds_loop.is_running():
+            self.social_feeds_loop.start()
         if not self.temp_unban_loop.is_running():
             self.temp_unban_loop.start()
         if not self.rollen_ablauf_loop.is_running():
@@ -7451,6 +7457,18 @@ class DayZBot(discord.Client):
     async def _before_giveaways_loop(self):
         await self.wait_until_ready()
 
+    # ── Social-Benachrichtigungen: neue Beitraege aus Feeds (YouTube, Instagram, TikTok, X) ──
+    @tasks.loop(minutes=1)
+    async def social_feeds_loop(self):
+        try:
+            await _social_lauf()
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stoppen
+            log.error(f"[SOCIAL] Fehler: {type(e).__name__}: {e}")
+
+    @social_feeds_loop.before_loop
+    async def _before_social_feeds_loop(self):
+        await self.wait_until_ready()
+
     @tasks.loop(minutes=5)
     async def temp_unban_loop(self):
         """Zeitlich begrenzte Bans (Zonen-Auto-Ban mit ``temp_ban``) wieder
@@ -8883,7 +8901,8 @@ def _conn_store(conn: ServerConnection, key: str, value: Any, *, strict: bool = 
         connections.save()
     # New tenant-only data has no legacy config consumers to mirror to.
     # ki_helfer enthaelt den API-Schluessel des Kunden - nie nach config.json spiegeln.
-    if key in ("eigene_npcs", "airstrikes", "ki_helfer", "airdrop_json"):
+    # social_feeds: Feed-Adressen koennen Zugangsschluessel enthalten - ebenfalls nie nach config.json spiegeln.
+    if key in ("eigene_npcs", "airstrikes", "ki_helfer", "airdrop_json", "social_feeds"):
         return
     if connections.primary() is conn:
         cfg.config[key] = value
@@ -43669,6 +43688,7 @@ async def post_select_server(request: web.Request) -> web.Response:
         conn.data["guild_ids"] = []
         conn.data.pop("guild_id", None)
         _ki_helfer_verwerfen(conn)
+        _social_feeds_verwerfen(conn)
         conn.data["guild_ids_requested"] = []
         conn.data.pop("guild_id_requested", None)
         connections.save()
@@ -45380,7 +45400,8 @@ def _discord_mgmt_payload(conn: "ServerConnection") -> Dict[str, Any]:
             "level_system": {"enabled": bool(_level_einstellungen(conn)["enabled"])},
             "honeypot": {"enabled": bool(_honeypot_einstellungen(conn)["enabled"])},
             "ki_helfer": {"enabled": bool(_ki_einstellungen(conn)["befehl_aktiv"]
-                                          or _ki_einstellungen(conn)["ticket_aktiv"])}}
+                                          or _ki_einstellungen(conn)["ticket_aktiv"])},
+            **{f"social_{p}": {"enabled": _social_aktiv(conn, p)} for p in _SOCIAL_PLATTFORMEN}}
 
 
 def _mgmt_sicht(request: web.Request, conn: "ServerConnection") -> Any:
@@ -46322,6 +46343,724 @@ async def post_discord_mgmt_honeypot_repost(request: web.Request) -> web.Respons
     if not ok_:
         return err(fehler_text, 502)
     return ok(_honeypot_payload(conn))
+
+
+# ══════════════════════════════════════════════════════════════
+#  Discord Management: Social-Benachrichtigungen (YouTube, Instagram, TikTok, X)
+# ══════════════════════════════════════════════════════════════
+# Der Bot liest ausschliesslich FEEDS (Atom/RSS): bei YouTube den offiziellen Kanal-Feed
+# (https://www.youtube.com/feeds/videos.xml?channel_id=UC...), bei Instagram, TikTok und X eine Feed-Adresse, die der
+# Kunde selbst besorgt (Feed-Dienst oder eigene RSSHub-Instanz). Es wird KEINE Webseite ausgelesen, kein Login benutzt und
+# kein Schutz umgangen (Grundlage: die Analyse in analyse_social/Analyse_Social.md). YouTube Live, TikTok Live und die
+# Suche gibt es bewusst nicht - dafuer gibt es keine verlaessliche, erlaubte Quelle ohne Schluessel.
+#
+# Speicher: je Guild eine Liste in conn.get("social_feeds"). Jeder Eintrag (Abo) traegt seinen Zustand ("state") selbst:
+# gesehene Beitrags-IDs, letzte Pruefung, Fehlercode. Die erste Pruefung merkt sich nur den Ausgangsstand und postet nichts.
+# Feed-Adressen koennen Zugangsschluessel enthalten: sie werden nie an das Dashboard zurueckgegeben und nie nach config.json
+# gespiegelt. Adressen vom Kunden sind ein SSRF-Risiko (siehe KI-Helfer): nur https, Port 443, nur Domainnamen, DNS-Antworten
+# ausschliesslich auf oeffentliche Adressen (_KiResolver), Weiterleitungen nur manuell und jedes Mal neu geprueft.
+_SOCIAL_PLATTFORMEN: Dict[str, Dict[str, str]] = {
+    "youtube": {"label": "YouTube", "emoji": "▶️"},
+    "instagram": {"label": "Instagram", "emoji": "📸"},
+    "tiktok": {"label": "TikTok", "emoji": "🎵"},
+    "x": {"label": "X (Twitter)", "emoji": "🐦"},
+}
+_SOCIAL_VORLAGEN: Dict[str, Dict[str, str]] = {
+    "youtube": {"de": "📺 **{autor}** hat ein neues Video hochgeladen: **{titel}**\n{link}",
+                "en": "📺 **{autor}** uploaded a new video: **{titel}**\n{link}"},
+    "instagram": {"de": "📸 Neuer Instagram-Beitrag von **{autor}**: {titel}\n{link}",
+                  "en": "📸 New Instagram post by **{autor}**: {titel}\n{link}"},
+    "tiktok": {"de": "🎵 Neues TikTok von **{autor}**: {titel}\n{link}",
+               "en": "🎵 New TikTok by **{autor}**: {titel}\n{link}"},
+    "x": {"de": "🐦 Neuer Beitrag von **{autor}**: {titel}\n{link}",
+          "en": "🐦 New post by **{autor}**: {titel}\n{link}"},
+}
+_SOCIAL_MAX_JE_PLATTFORM = 5
+_SOCIAL_INTERVALL = 900                  # Sekunden zwischen zwei Pruefungen einer Quelle (15 Min., wie die Cache-Dauer des YouTube-Feeds)
+_SOCIAL_FEHLER_MAX_WARTEN = 21600        # Nach Fehlern: Wartezeit verdoppelt sich bis hoechstens 6 Stunden
+_SOCIAL_MAX_BYTES = 1_500_000
+_SOCIAL_TIMEOUT = 20
+_SOCIAL_MAX_UMLEITUNGEN = 3
+_SOCIAL_POSTS_JE_LAUF = 3                # hoechstens so viele neue Beitraege je Pruefung; aeltere gelten danach als gesehen
+_SOCIAL_SEEN_MAX = 150
+_SOCIAL_EINTRAEGE_MAX = 30
+_SOCIAL_VORLAGE_MAX = 500
+_SOCIAL_NAME_MAX = 60
+_SOCIAL_ABRUFE_JE_LAUF = 25
+_SOCIAL_UA = "DayZDashboardBot/1.0"
+_SOCIAL_KOPF = {"User-Agent": _SOCIAL_UA,
+                "Accept": "application/atom+xml,application/rss+xml,application/xml;q=0.9,text/xml;q=0.9,*/*;q=0.5"}
+_SOCIAL_KANAL_ID_RE = re.compile(r"UC[0-9A-Za-z_-]{22}")
+_SOCIAL_VIDEO_ID_RE = re.compile(r"[0-9A-Za-z_-]{11}")
+_SOCIAL_TAG_RE = re.compile(r"<[^>]{0,500}>")
+_SOCIAL_PLATZHALTER_RE = re.compile(r"\{(titel|link|autor|plattform)\}")
+_SOCIAL_ID_RE = re.compile(r"[0-9a-f]{8}")
+_SOCIAL_FEHLER_CODES = frozenset({
+    "ungueltig_url", "nicht_erreichbar", "blockiert", "nicht_gefunden", "serverfehler", "zu_gross", "kein_feed",
+    "kanal_fehlt", "kanal_fremd", "kein_zugriff", "senden_fehlgeschlagen"})
+# url -> {"ts", "fehler", "warten", "titel", "eintraege"}: Abonnenten derselben Adresse teilen sich einen Abruf
+_SOCIAL_CACHE: Dict[str, Dict[str, Any]] = {}
+_SOCIAL_CACHE_MAX = 300
+
+
+class SocialFehler(Exception):
+    """Fehler beim Abruf/Lesen eines Feeds. `art` ist ein fester Code (siehe _SOCIAL_FEHLER_CODES) - nie Antwortinhalt."""
+
+    def __init__(self, art: str, warten: float = 0.0):
+        super().__init__(art)
+        self.art = art
+        self.warten = float(warten)
+
+
+def _social_youtube_kanal_id(text: Any) -> Optional[str]:
+    """Kanal-ID (UC + 22 Zeichen) aus der ID selbst, einem /channel/UC...-Link oder der Feed-Adresse. @Handles, /c/- und
+    /user/-Namen lassen sich NICHT aus dem Namen berechnen und werden hier nicht aufgeloest (None)."""
+    t = str(text or "").strip()
+    if _SOCIAL_KANAL_ID_RE.fullmatch(t):
+        return t
+    try:
+        teile = urllib.parse.urlsplit(t)
+    except ValueError:
+        return None
+    host = (teile.hostname or "").lower()
+    if teile.scheme.lower() not in ("http", "https") or not (host == "youtube.com" or host.endswith(".youtube.com")):
+        return None
+    m = re.fullmatch(r"/channel/(UC[0-9A-Za-z_-]{22})/?", teile.path)
+    if m:
+        return m.group(1)
+    if teile.path.rstrip("/") in ("/feeds/videos.xml", "/xml/feeds/videos.xml"):
+        werte = urllib.parse.parse_qs(teile.query).get("channel_id", [])
+        if len(werte) == 1 and _SOCIAL_KANAL_ID_RE.fullmatch(werte[0]):
+            return werte[0]
+    return None
+
+
+def _social_url_pruefen(url: Any) -> str:
+    """Prueft eine vom Kunden eingetragene Feed-Adresse und gibt sie normalisiert zurueck (ValueError mit deutschem Text)."""
+    url = str(url or "").strip()
+    if not url:
+        raise ValueError("Bitte eine Feed-Adresse eintragen.")
+    if len(url) > 500 or any(ord(c) <= 32 or ord(c) > 126 for c in url):
+        raise ValueError("Die Feed-Adresse ist ungültig.")
+    try:
+        teile = urllib.parse.urlsplit(url)
+    except ValueError:
+        raise ValueError("Die Feed-Adresse ist ungültig.") from None
+    if teile.scheme.lower() != "https":
+        raise ValueError("Die Feed-Adresse muss mit https:// beginnen.")
+    if "@" in teile.netloc or teile.username is not None or teile.password is not None:
+        raise ValueError("Die Feed-Adresse darf keine Zugangsdaten vor dem Servernamen enthalten.")
+    host = (teile.hostname or "").lower()
+    if not _KI_HOST_RE.match(host):
+        raise ValueError("Bitte einen öffentlichen Domainnamen verwenden (keine IP-Adresse, kein localhost).")
+    try:
+        port = teile.port
+    except ValueError:
+        raise ValueError("Die Feed-Adresse hat einen ungültigen Port.") from None
+    if port not in (None, 443):
+        raise ValueError("Bei der Feed-Adresse ist nur Port 443 erlaubt.")
+    return f"https://{host}{teile.path or '/'}" + (f"?{teile.query}" if teile.query else "")
+
+
+def _social_feed_url(abo: Dict[str, Any]) -> str:
+    """Die Adresse, die der Bot fuer dieses Abo abruft ('' wenn die Quelle ungueltig ist)."""
+    if abo.get("platform") == "youtube":
+        kid = _social_youtube_kanal_id(abo.get("source"))
+        return f"https://www.youtube.com/feeds/videos.xml?channel_id={kid}" if kid else ""
+    try:
+        return _social_url_pruefen(abo.get("source"))
+    except ValueError:
+        return ""
+
+
+def _social_quelle_anzeige(abo: Dict[str, Any]) -> str:
+    """Quelle fuers Dashboard OHNE Parameter der Adresse (dort koennen Zugangsschluessel stehen)."""
+    if abo.get("platform") == "youtube":
+        return str(abo.get("source") or "")
+    try:
+        teile = urllib.parse.urlsplit(str(abo.get("source") or ""))
+    except ValueError:
+        return ""
+    pfad = teile.path or "/"
+    return (teile.hostname or "") + (pfad if len(pfad) <= 40 else pfad[:39] + "…") + ("?…" if teile.query else "")
+
+
+def _social_text(wert: Any, grenze: int) -> str:
+    """Kurzer, reiner Text aus einem Feld des Feeds: ohne HTML-Tags und Steuerzeichen, einzeilig, gekuerzt."""
+    s = _html.unescape(_SOCIAL_TAG_RE.sub(" ", str(wert or "")))
+    s = "".join(ch if (ch >= " " and ch != "\x7f") else " " for ch in s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > grenze:
+        s = s[:grenze - 1].rstrip() + "…"
+    return s
+
+
+def _social_zeit(text: Any) -> Optional[float]:
+    t = str(text or "").strip()
+    if not t:
+        return None
+    try:
+        return _email_utils.parsedate_to_datetime(t).timestamp()
+    except (TypeError, ValueError, IndexError):
+        pass
+    try:
+        return datetime.fromisoformat(t.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _social_link_ok(link: str) -> bool:
+    if not link or len(link) > 500 or any(ord(c) <= 32 or ord(c) > 126 for c in link):
+        return False
+    try:
+        teile = urllib.parse.urlsplit(link)
+    except ValueError:
+        return False
+    return teile.scheme.lower() in ("http", "https") and bool(teile.hostname)
+
+
+def _social_feed_parsen(roh: bytes, plattform: str = "") -> Tuple[str, List[Dict[str, Any]]]:
+    """Atom/RSS -> (Feed-Titel, Eintraege). Ein Eintrag: id, titel, link, autor, zeit (Sekunden oder None). Wirft SocialFehler.
+    Eine Seite statt eines Feeds (HTML, Anmelde-/Schutzseite) ist ein Fehler ("kein_feed"), nie "keine neuen Beitraege"."""
+    if not roh or len(roh) > _SOCIAL_MAX_BYTES:
+        raise SocialFehler("kein_feed" if not roh else "zu_gross")
+    kopf = roh[:2048].lower()
+    if b"<!doctype html" in kopf or b"<html" in kopf:
+        raise SocialFehler("kein_feed")
+    if b"<!entity" in roh.lower():
+        raise SocialFehler("kein_feed")            # keine eigenen Entities (Schutz vor Entity-Expansion)
+    try:
+        wurzel = ET.fromstring(roh)
+    except (ET.ParseError, ValueError):
+        raise SocialFehler("kein_feed") from None
+
+    def lokal(tag: Any) -> str:
+        return tag.rsplit("}", 1)[-1] if isinstance(tag, str) else ""
+
+    def kind(el: ET.Element, name: str) -> Optional[ET.Element]:
+        for k in el:
+            if lokal(k.tag) == name:
+                return k
+        return None
+
+    def kind_text(el: ET.Element, *namen: str) -> str:
+        for n in namen:
+            k = kind(el, n)
+            if k is not None and (k.text or "").strip():
+                return k.text.strip()
+        return ""
+
+    typ = lokal(wurzel.tag)
+    if typ == "feed":
+        items, feed_titel = [k for k in wurzel if lokal(k.tag) == "entry"], kind_text(wurzel, "title")
+    elif typ == "rss":
+        kanal = kind(wurzel, "channel")
+        if kanal is None:
+            raise SocialFehler("kein_feed")
+        items, feed_titel = [k for k in kanal if lokal(k.tag) == "item"], kind_text(kanal, "title")
+    elif typ == "RDF":
+        items = [k for k in wurzel if lokal(k.tag) == "item"]
+        kanal = kind(wurzel, "channel")
+        feed_titel = kind_text(kanal, "title") if kanal is not None else ""
+    else:
+        raise SocialFehler("kein_feed")
+    eintraege: List[Dict[str, Any]] = []
+    for el in items[:_SOCIAL_EINTRAEGE_MAX]:
+        titel = _social_text(kind_text(el, "title"), 200)
+        autor_el = kind(el, "author")
+        autor = kind_text(autor_el, "name") if autor_el is not None and len(autor_el) else ""
+        if not autor:
+            autor = (autor_el.text or "").strip() if autor_el is not None else ""
+        autor = _social_text(autor or kind_text(el, "creator"), 100)
+        link = ""
+        for k in el:
+            if lokal(k.tag) != "link":
+                continue
+            href = (k.get("href") or "").strip()
+            if href and k.get("rel", "alternate") == "alternate":
+                link = href
+                break
+            if not href and (k.text or "").strip():
+                link = k.text.strip()
+                break
+        video = kind_text(el, "videoId")
+        if plattform == "youtube":
+            if not _SOCIAL_VIDEO_ID_RE.fullmatch(video):
+                continue                            # im YouTube-Feed zaehlt nur ein echtes Video
+            eid, link = f"yt:video:{video}", f"https://www.youtube.com/watch?v={video}"
+        else:
+            eid = kind_text(el, "id", "guid") or link or titel
+            if not _social_link_ok(link):
+                continue
+        if not eid or len(eid) > 500:
+            continue
+        zeit = _social_zeit(kind_text(el, "published", "pubDate", "date", "updated"))
+        eintraege.append({"id": eid, "titel": titel, "link": link, "autor": autor, "zeit": zeit})
+    return _social_text(feed_titel, 100), eintraege
+
+
+def _social_status_fehler(status: int, retry_after: Optional[str]) -> SocialFehler:
+    """HTTP-Status -> Fehlercode. Ein Retry-After (Sekunden, hoechstens 24 Std.) verlaengert die Wartezeit."""
+    try:
+        warten = min(max(float(retry_after or 0), 0.0), 86400.0)
+    except ValueError:
+        warten = 0.0
+    if status in (401, 403, 429):
+        return SocialFehler("blockiert", warten)
+    if status in (404, 410):
+        return SocialFehler("nicht_gefunden")
+    return SocialFehler("serverfehler", warten)
+
+
+async def _social_lesen(r: "aiohttp.ClientResponse") -> bytes:
+    teile: List[bytes] = []
+    gesamt = 0
+    async for stueck in r.content.iter_chunked(65536):
+        gesamt += len(stueck)
+        if gesamt > _SOCIAL_MAX_BYTES:
+            raise SocialFehler("zu_gross")
+        teile.append(stueck)
+    return b"".join(teile)
+
+
+async def _social_abrufen(url: str) -> bytes:
+    """GET einer Feed-Adresse mit allen Schutzmassnahmen. Wirft nur SocialFehler."""
+    aktuell = url
+    connector = aiohttp.TCPConnector(resolver=_KiResolver(), use_dns_cache=False, force_close=True)
+    try:
+        async with aiohttp.ClientSession(connector=connector, trust_env=False,
+                                         timeout=aiohttp.ClientTimeout(total=_SOCIAL_TIMEOUT)) as sitzung:
+            for _ in range(_SOCIAL_MAX_UMLEITUNGEN + 1):
+                async with sitzung.get(aktuell, headers=_SOCIAL_KOPF, allow_redirects=False) as r:
+                    status = r.status
+                    if status in (301, 302, 303, 307, 308):
+                        try:
+                            aktuell = _social_url_pruefen(urllib.parse.urljoin(aktuell, r.headers.get("Location", "")))
+                        except ValueError:
+                            raise SocialFehler("blockiert") from None
+                        if "consent." in aktuell.lower() or "/sorry/" in aktuell.lower():
+                            raise SocialFehler("blockiert")            # Zustimmungs-/Schutzseite: nicht umgehen
+                        continue
+                    if status != 200:
+                        raise _social_status_fehler(status, r.headers.get("Retry-After"))
+                    return await _social_lesen(r)
+            raise SocialFehler("blockiert")                            # zu viele Weiterleitungen
+    except SocialFehler:
+        raise
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError, ValueError, UnicodeError):
+        raise SocialFehler("nicht_erreichbar") from None
+
+
+async def _social_feed_holen(url: str, plattform: str, jetzt: float, max_alter: float = _SOCIAL_INTERVALL * 0.8) -> Dict[str, Any]:
+    """Feed holen, aber Abonnenten derselben Adresse teilen sich einen Abruf (Cache)."""
+    c = _SOCIAL_CACHE.get(url)
+    if c is not None and jetzt - float(c.get("ts", 0)) < max_alter:
+        return c
+    try:
+        titel, eintraege = _social_feed_parsen(await _social_abrufen(url), plattform)
+        c = {"ts": jetzt, "fehler": "", "warten": 0.0, "titel": titel, "eintraege": eintraege}
+    except SocialFehler as ex:
+        c = {"ts": jetzt, "fehler": ex.art, "warten": ex.warten, "titel": "", "eintraege": []}
+    _SOCIAL_CACHE[url] = c
+    if len(_SOCIAL_CACHE) > _SOCIAL_CACHE_MAX:
+        for alt in sorted(_SOCIAL_CACHE, key=lambda k: _SOCIAL_CACHE[k].get("ts", 0))[:len(_SOCIAL_CACHE) - _SOCIAL_CACHE_MAX]:
+            _SOCIAL_CACHE.pop(alt, None)
+    return c
+
+
+def _social_vorlage_pruefen(text: Any) -> Optional[str]:
+    """Fehlertext oder None. Leer = Standardvorlage der Plattform."""
+    t = str(text or "").strip()
+    if not t:
+        return None
+    if len(t) > _SOCIAL_VORLAGE_MAX:
+        return f"Die Vorlage darf höchstens {_SOCIAL_VORLAGE_MAX} Zeichen lang sein."
+    for m in re.findall(r"\{[^{}]*\}", t):
+        if not _SOCIAL_PLATZHALTER_RE.fullmatch(m):
+            return "Die Vorlage enthält einen unbekannten Platzhalter. Erlaubt sind {titel}, {link}, {autor} und {plattform}."
+    if "{link}" not in t:
+        return "Die Vorlage braucht den Platzhalter {link}."
+    return None
+
+
+def _social_text_bauen(abo: Dict[str, Any], eintrag: Dict[str, Any]) -> str:
+    """Die Discord-Nachricht zu einem Beitrag. Titel/Autor aus fremden Feeds werden von Markdown und Erwaehnungen befreit; es
+    werden nur die Platzhalter ersetzt (in einem Durchgang - ein '{link}' im Titel bleibt Text)."""
+    plattform = abo.get("platform") if abo.get("platform") in _SOCIAL_PLATTFORMEN else "youtube"
+    sprache = abo.get("language") if abo.get("language") in _DISCORD_MGMT_SPRACHEN else "de"
+    vorlage = str(abo.get("template") or "").strip() or _SOCIAL_VORLAGEN[plattform][sprache]
+
+    def sauber(s: str) -> str:
+        return discord.utils.escape_mentions(discord.utils.escape_markdown(s))
+    werte = {"{titel}": sauber(_social_text(eintrag.get("titel"), 200)) or "–",
+             "{autor}": sauber(_social_text(eintrag.get("autor"), 100)) or sauber(_social_text(abo.get("name"), _SOCIAL_NAME_MAX)),
+             "{plattform}": _SOCIAL_PLATTFORMEN[plattform]["label"], "{link}": str(eintrag.get("link") or "")}
+    text = _SOCIAL_PLATZHALTER_RE.sub(lambda m: werte[m.group(0)], vorlage)
+    if abo.get("role_id"):
+        text = f"<@&{int(abo['role_id'])}> " + text
+    return text[:1990]
+
+
+async def _social_posten(gid: int, abo: Dict[str, Any], eintrag: Dict[str, Any], test: bool = False) -> str:
+    """Postet einen Beitrag. Gibt '' bei Erfolg zurueck, sonst einen Fehlercode. Der Channel muss in DIESER Guild liegen."""
+    try:
+        kanal = bot.get_channel(int(abo.get("channel_id"))) if bot is not None else None
+    except (TypeError, ValueError):
+        kanal = None
+    if kanal is None:
+        return "kanal_fehlt"
+    if getattr(getattr(kanal, "guild", None), "id", None) != int(gid):
+        return "kanal_fremd"
+    text = _social_text_bauen(abo, eintrag)
+    if test:
+        text = "🧪 " + text
+    rolle = abo.get("role_id")
+    erlaubt = discord.AllowedMentions(everyone=False, users=False,
+                                      roles=[discord.Object(id=int(rolle))] if rolle else False)
+    try:
+        await kanal.send(text, allowed_mentions=erlaubt)
+    except discord.Forbidden:
+        return "kein_zugriff"
+    except discord.NotFound:
+        return "kanal_fehlt"
+    except discord.HTTPException:
+        return "senden_fehlgeschlagen"
+    return ""
+
+
+def _social_abos(conn: Any) -> List[Dict[str, Any]]:
+    roh = conn.get("social_feeds")
+    return roh if isinstance(roh, list) else []
+
+
+def _social_stand(abo: Dict[str, Any]) -> Dict[str, Any]:
+    st = abo.get("state")
+    if not isinstance(st, dict):
+        st = {}
+        abo["state"] = st
+    return st
+
+
+def _social_aktiv(conn: Any, plattform: str) -> bool:
+    return any(isinstance(a, dict) and a.get("enabled") and a.get("platform") == plattform for a in _social_abos(conn))
+
+
+def _social_feeds_verwerfen(conn: "ServerConnection") -> None:
+    """Loescht alle Social-Abos (mit Feed-Adressen, die Zugangsschluessel enthalten koennen) am Server UND in allen Guild-Daten.
+    Beim Eigentuemerwechsel: die Adressen des Vorbesitzers duerfen nicht an den neuen Eigentuemer uebergehen."""
+    conn.data.pop("social_feeds", None)
+    for daten in (conn.data.get("guild_daten") or {}).values():
+        if isinstance(daten, dict):
+            daten.pop("social_feeds", None)
+
+
+def _social_backoff(st: Dict[str, Any], jetzt: float, warten: float = 0.0) -> None:
+    st["errors"] = int(st.get("errors") or 0) + 1
+    abstand = min(_SOCIAL_INTERVALL * (2 ** (st["errors"] - 1)), _SOCIAL_FEHLER_MAX_WARTEN)
+    st["next_try"] = jetzt + max(abstand, float(warten or 0)) + random.uniform(0, 120)
+
+
+async def _social_abo_pruefen(gid: int, abo: Dict[str, Any], jetzt: float) -> bool:
+    """Eine Pruefung eines Abos. True, wenn sich etwas Dauerhaftes geaendert hat (-> speichern)."""
+    st = _social_stand(abo)
+    vorher = (st.get("last_error"), bool(st.get("baseline")), tuple(st.get("seen") or ()), st.get("last_post"))
+    url = _social_feed_url(abo)
+    st["last_check"] = jetzt
+    if not url:
+        st["last_error"] = "ungueltig_url"
+        _social_backoff(st, jetzt, _SOCIAL_FEHLER_MAX_WARTEN)
+        return vorher[0] != "ungueltig_url"
+    c = await _social_feed_holen(url, str(abo.get("platform")), jetzt)
+    if not abo.get("enabled"):
+        return False                                # waehrend des Abrufs ausgeschaltet oder geloescht: nichts mehr posten
+    if c["fehler"]:
+        st["last_error"] = c["fehler"]
+        _social_backoff(st, jetzt, float(c.get("warten") or 0))
+        return vorher[0] != st["last_error"]
+    st["errors"] = 0
+    st["last_ok"] = jetzt
+    st["next_try"] = jetzt + _SOCIAL_INTERVALL + random.uniform(0, 120)
+    eintraege = c["eintraege"]
+    ids = [e["id"] for e in eintraege]
+    seen = [x for x in (st.get("seen") or []) if isinstance(x, str)]
+    if not st.get("baseline"):
+        st["baseline"] = True                      # Ausgangsstand merken, nichts posten
+        st["seen"] = ids[:_SOCIAL_SEEN_MAX]
+        st["last_error"] = ""
+        return True
+    bekannt = set(seen)
+    neu = [e for e in eintraege if e["id"] not in bekannt]
+    if not neu:
+        st["last_error"] = ""
+        return vorher[0] != ""
+    neu.reverse()                                  # aelteste zuerst
+    uebersprungen = neu[:-_SOCIAL_POSTS_JE_LAUF] if len(neu) > _SOCIAL_POSTS_JE_LAUF else []
+    zu_posten = neu[len(uebersprungen):]
+    erledigt = {e["id"] for e in uebersprungen}
+    fehler = ""
+    for e in zu_posten:
+        fehler = await _social_posten(gid, abo, e)
+        if fehler:
+            break
+        erledigt.add(e["id"])
+        st["last_post"] = jetzt
+        st["last_title"] = e["titel"]
+        await asyncio.sleep(1)
+    if fehler:
+        st["last_error"] = fehler
+        _social_backoff(st, jetzt)
+    else:
+        st["last_error"] = ""
+    neue_seen = [x for x in ids if x in bekannt or x in erledigt] + [x for x in seen if x not in ids]
+    st["seen"] = neue_seen[:_SOCIAL_SEEN_MAX]
+    return True
+
+
+async def _social_lauf(jetzt: Optional[float] = None) -> int:
+    """Ein Durchlauf ueber alle Server und Guilds: prueft jedes aktive, faellige Abo. Gibt die Zahl der Pruefungen zurueck."""
+    if bot is None or not bot.is_ready():
+        return 0
+    jetzt = time.time() if jetzt is None else float(jetzt)
+    geprueft, geaendert = 0, False
+    for conn in connections.all():
+        for gid in list(conn.guild_ids):
+            for abo in _social_abos(GuildSicht(conn, gid)):
+                if not isinstance(abo, dict) or not abo.get("enabled"):
+                    continue
+                if jetzt < float(_social_stand(abo).get("next_try") or 0):
+                    continue
+                if geprueft >= _SOCIAL_ABRUFE_JE_LAUF:
+                    break
+                geprueft += 1
+                try:
+                    geaendert = await _social_abo_pruefen(int(gid), abo, jetzt) or geaendert
+                except Exception as exc:  # noqa: BLE001 - ein defektes Abo darf die anderen nicht stoppen
+                    log.warning(f"[SOCIAL] Abo {abo.get('id')} ({conn.service_id}): {type(exc).__name__}")
+                    _social_backoff(_social_stand(abo), jetzt)
+    if geaendert:
+        connections.save()
+    return geprueft
+
+
+def _social_abo_view(abo: Dict[str, Any]) -> Dict[str, Any]:
+    st = _social_stand(abo)
+    fehler = str(st.get("last_error") or "")
+    return {"id": abo.get("id"), "platform": abo.get("platform"), "name": abo.get("name"),
+            "quelle": _social_quelle_anzeige(abo), "channel_id": str(abo["channel_id"]) if abo.get("channel_id") else None,
+            "role_id": str(abo["role_id"]) if abo.get("role_id") else None, "language": abo.get("language") or "de",
+            "template": abo.get("template") or "", "enabled": bool(abo.get("enabled")),
+            "status": {"baseline": bool(st.get("baseline")), "letzte_pruefung": st.get("last_check"),
+                       "letzter_erfolg": st.get("last_ok"), "letzter_beitrag": st.get("last_post"),
+                       "letzter_titel": st.get("last_title") or "",
+                       "fehler": fehler if fehler in _SOCIAL_FEHLER_CODES else ("" if not fehler else "serverfehler")}}
+
+
+def _social_payload(conn: Any) -> Dict[str, Any]:
+    return {"abos": [_social_abo_view(a) for a in _social_abos(conn) if isinstance(a, dict)],
+            "plattformen": _SOCIAL_PLATTFORMEN, "vorlagen": _SOCIAL_VORLAGEN, "max_je_plattform": _SOCIAL_MAX_JE_PLATTFORM,
+            "intervall_minuten": _SOCIAL_INTERVALL // 60}
+
+
+async def _social_gate(request: web.Request, recht: str):
+    conn, denied = _session_conn(request, "discord_mgmt")
+    if denied is not None:
+        return None, denied
+    denied = await _modul_pruefen("discord_mgmt", request, conn)
+    if denied is not None:
+        return None, denied
+    denied = await _dash_gate(request, conn, "discord_mgmt", recht)
+    if denied is not None:
+        return None, denied
+    return _mgmt_sicht(request, conn), None
+
+
+async def get_discord_mgmt_social(request: web.Request) -> web.Response:
+    conn, denied = await _social_gate(request, "view")
+    if denied is not None:
+        return denied
+    return ok(_social_payload(conn))
+
+
+def _social_id_aus(wert: Any) -> Optional[int]:
+    if wert in (None, "", "0"):
+        return None
+    try:
+        return int(wert)
+    except (TypeError, ValueError):
+        return -1
+
+
+async def post_discord_mgmt_social(request: web.Request) -> web.Response:
+    """Abo anlegen (ohne 'id') oder aendern (mit 'id': Plattform und Quelle bleiben, der Rest wird ersetzt)."""
+    conn, denied = await _social_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.social", 3)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    if not isinstance(data, dict):
+        return err("Ungültige Anfrage.")
+    abos = [a for a in _social_abos(conn) if isinstance(a, dict)]
+    abo_id = str(data.get("id") or "").strip()
+    bestehend = None
+    if abo_id:
+        bestehend = next((a for a in abos if a.get("id") == abo_id), None)
+        if bestehend is None:
+            return err("Dieses Abo gibt es nicht.", 404)
+        plattform = bestehend["platform"]
+    else:
+        plattform = str(data.get("platform") or "").strip().lower()
+        if plattform not in _SOCIAL_PLATTFORMEN:
+            return err("Unbekannte Plattform.")
+    sprache = str(data.get("language") or "de").strip().lower()
+    if sprache not in _DISCORD_MGMT_SPRACHEN:
+        return err("Unbekannte Sprache.")
+    fehler_text = _social_vorlage_pruefen(data.get("template"))
+    if fehler_text:
+        return err(fehler_text)
+    name = _social_text(data.get("name"), _SOCIAL_NAME_MAX)
+    kanal_id, rolle_id = _social_id_aus(data.get("channel_id")), _social_id_aus(data.get("role_id"))
+    if -1 in (kanal_id, rolle_id):
+        return err("Ungültige Channel- oder Rollen-ID.")
+    if not kanal_id:
+        return err("Bitte einen Discord-Channel wählen.")
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    if not gid:
+        return err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
+    fehler = _kanal_gehoert_guild(gid, kanal_id, "Channel")
+    if fehler is None and rolle_id:
+        fehler = _rolle_gehoert_guild(gid, rolle_id)
+    if fehler is not None:
+        return fehler
+    if bestehend is None:
+        quelle = str(data.get("source") or "").strip()
+        if plattform == "youtube":
+            quelle = _social_youtube_kanal_id(quelle) or ""
+            if not quelle:
+                return err("Bitte die Kanal-ID des YouTube-Kanals eintragen (beginnt mit UC). Ein @Handle reicht nicht – "
+                           "die Anleitung zeigt, wo du die Kanal-ID findest.")
+        else:
+            try:
+                quelle = _social_url_pruefen(quelle)
+            except ValueError as exc:
+                return err(str(exc))
+        if sum(1 for a in abos if a.get("platform") == plattform) >= _SOCIAL_MAX_JE_PLATTFORM:
+            return err(f"Pro Plattform sind höchstens {_SOCIAL_MAX_JE_PLATTFORM} Quellen erlaubt – bitte erst eine löschen.")
+        if any(a.get("platform") == plattform and a.get("source") == quelle for a in abos):
+            return err("Diese Quelle gibt es schon.")
+        bestehend = {"id": secrets.token_hex(4), "platform": plattform, "source": quelle, "created": time.time(), "state": {}}
+        abos.append(bestehend)
+        wurde_aktiv = bool(data.get("enabled", True))
+    else:
+        wurde_aktiv = bool(data.get("enabled", True)) and not bestehend.get("enabled")
+    if not name:
+        name = (bestehend["source"][:12] if plattform == "youtube" else _social_quelle_anzeige(bestehend).split("/", 1)[0])
+        name = f"{_SOCIAL_PLATTFORMEN[plattform]['label']} {name}"[:_SOCIAL_NAME_MAX]
+    bestehend.update({"name": name, "channel_id": str(kanal_id), "role_id": str(rolle_id) if rolle_id else None,
+                      "language": sprache, "template": str(data.get("template") or "").strip(),
+                      "enabled": bool(data.get("enabled", True))})
+    if wurde_aktiv:
+        st = _social_stand(bestehend)
+        st.update({"baseline": False, "seen": [], "next_try": 0, "errors": 0, "last_error": ""})     # frischer Ausgangsstand
+    _conn_store(conn, "social_feeds", abos)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Discord-Management aktualisiert",
+               f"social_{plattform} · {conn.name}")
+    return ok(_social_payload(conn))
+
+
+async def delete_discord_mgmt_social(request: web.Request) -> web.Response:
+    conn, denied = await _social_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.social.loeschen", 2)
+    if denied is not None:
+        return denied
+    abo_id = str(request.match_info.get("id", "")).strip()
+    abos = [a for a in _social_abos(conn) if isinstance(a, dict)]
+    rest = [a for a in abos if a.get("id") != abo_id]
+    if len(rest) == len(abos):
+        return err("Dieses Abo gibt es nicht.", 404)
+    for a in abos:
+        if a.get("id") == abo_id:
+            a["enabled"] = False                    # ein gerade laufender Abruf postet dann nicht mehr
+    _conn_store(conn, "social_feeds", rest)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Discord-Management aktualisiert", f"social gelöscht · {conn.name}")
+    return ok(_social_payload(conn))
+
+
+def _social_eintrag_view(e: Dict[str, Any]) -> Dict[str, Any]:
+    return {"titel": e["titel"], "link": e["link"], "autor": e["autor"], "zeit": e["zeit"]}
+
+
+async def post_discord_mgmt_social_pruefen(request: web.Request) -> web.Response:
+    """'Feed prüfen': ruft die Quelle jetzt ab und zeigt die neuesten Beitraege - speichert und postet nichts."""
+    conn, denied = await _social_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.social.pruefen", 4)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    if not isinstance(data, dict):
+        return err("Ungültige Anfrage.")
+    plattform = str(data.get("platform") or "").strip().lower()
+    if plattform not in _SOCIAL_PLATTFORMEN:
+        return err("Unbekannte Plattform.")
+    quelle = str(data.get("source") or "").strip()
+    abo_id = str(data.get("id") or "").strip()
+    if not quelle and abo_id:                       # gespeichertes Abo erneut pruefen: die Adresse bleibt auf dem Server
+        abo = next((a for a in _social_abos(conn) if isinstance(a, dict) and a.get("id") == abo_id), None)
+        if abo is None:
+            return err("Dieses Abo gibt es nicht.", 404)
+        plattform, quelle = abo["platform"], str(abo.get("source") or "")
+    if plattform == "youtube":
+        kid = _social_youtube_kanal_id(quelle)
+        if not kid:
+            return err("Bitte die Kanal-ID des YouTube-Kanals eintragen (beginnt mit UC). Ein @Handle reicht nicht – "
+                       "die Anleitung zeigt, wo du die Kanal-ID findest.")
+        url = f"https://www.youtube.com/feeds/videos.xml?channel_id={kid}"
+    else:
+        try:
+            url = _social_url_pruefen(quelle)
+        except ValueError as exc:
+            return err(str(exc))
+    try:
+        titel, eintraege = _social_feed_parsen(await _social_abrufen(url), plattform)
+    except SocialFehler as ex:
+        return ok({"ok": False, "fehler": ex.art, "eintraege": []})
+    return ok({"ok": True, "fehler": "", "feed_titel": titel, "anzahl": len(eintraege),
+               "eintraege": [_social_eintrag_view(e) for e in eintraege[:3]]})
+
+
+async def post_discord_mgmt_social_test(request: web.Request) -> web.Response:
+    """Testnachricht: postet den neuesten Beitrag (oder ein Beispiel) mit '🧪' in den Channel des Abos. Aendert den Zustand nicht."""
+    conn, denied = await _social_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.social.test", 10)
+    if denied is not None:
+        return denied
+    abo_id = str(request.match_info.get("id", "")).strip()
+    abo = next((a for a in _social_abos(conn) if isinstance(a, dict) and a.get("id") == abo_id), None)
+    if abo is None:
+        return err("Dieses Abo gibt es nicht.", 404)
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    if not gid:
+        return err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
+    eintrag = {"titel": "Beispiel-Beitrag", "link": "https://example.com/", "autor": "", "zeit": None}
+    url = _social_feed_url(abo)
+    if url:
+        try:
+            _titel, eintraege = _social_feed_parsen(await _social_abrufen(url), str(abo.get("platform")))
+            if eintraege:
+                eintrag = eintraege[0]
+        except SocialFehler:
+            pass                                    # Der Test prueft Channel und Vorlage - ein Feed-Fehler soll ihn nicht verhindern
+    fehler = await _social_posten(gid, abo, eintrag, test=True)
+    if fehler:
+        return ok({"ok": False, "fehler": fehler})
+    return ok({"ok": True, "fehler": ""})
 
 
 # ══════════════════════════════════════════════════════════════
@@ -53296,6 +54035,11 @@ def build_app() -> web.Application:
     r.add_get("/api/discord-management/honeypot", get_discord_mgmt_honeypot)
     r.add_post("/api/discord-management/honeypot", post_discord_mgmt_honeypot)
     r.add_post("/api/discord-management/honeypot/repost", post_discord_mgmt_honeypot_repost)
+    r.add_get("/api/discord-management/social", get_discord_mgmt_social)
+    r.add_post("/api/discord-management/social", post_discord_mgmt_social)
+    r.add_post("/api/discord-management/social/pruefen", post_discord_mgmt_social_pruefen)
+    r.add_post("/api/discord-management/social/{id}/test", post_discord_mgmt_social_test)
+    r.add_delete("/api/discord-management/social/{id}", delete_discord_mgmt_social)
     r.add_get("/api/discord-management/ki-helfer", get_discord_mgmt_ki)
     r.add_post("/api/discord-management/ki-helfer", post_discord_mgmt_ki)
     r.add_post("/api/discord-management/ki-helfer/test", post_discord_mgmt_ki_test)
@@ -54479,6 +55223,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "5637c672cad474cdb597fe89bbbaafeab825fc5cc39b21ffb67df9d1f3a97420",
         "344b3f7f5fbaa1864865f6132dcff8aac90121d2abbfb346d3fa27e2441e05bf",
         "8a18e52c1f964038aff6323288fbf841c4de9dccdd4da39136d0ada97f9950f1",
+        "3fbcd5a397d42ffa7408ccae2a6067765efd4d41b13cf56627634e638b9fa31f",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
