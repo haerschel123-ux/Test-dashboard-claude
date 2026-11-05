@@ -186,7 +186,7 @@ def test_mehrere_boxen_ergeben_die_objekte_in_der_reihenfolge_der_boxen(monkeypa
     st, j = _vorschau(monkeypatch, conn, None, boxen=boxen)
     objekte = _objekte_aus(j)
     assert st == 200 and len(objekte) == 22 and objekte[0]["pos"][0] == 100 and objekte[-1]["pos"] == [300, 21.25, 30]
-    assert len(json.loads(next(g["content"] for g in j["data"]["generated"] if "/pra/" in g["filename"]))["PRABoxes"]) == 3
+    assert len(json.loads(next(g["content"] for g in j["data"]["generated"] if g["filename"] == "custom/Gate_A.json"))["PRABoxes"]) == 3
 
 
 @pytest.mark.parametrize("verweis", [{"quelle": "standard", "name": "Gibt_Es_Nicht"}, {"quelle": "premade", "name": "Nichts"},

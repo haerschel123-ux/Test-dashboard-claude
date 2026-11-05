@@ -109,14 +109,14 @@ def test_preview_has_no_writes(monkeypatch, servers):
 def test_commit_format_registration_and_persistence(monkeypatch, servers):
     conn, _ = servers
     result = deploy(monkeypatch, conn)
-    pra = json.loads(conn.ftp.files["/mission/custom/pra/Gate_A.json"])
+    pra = json.loads(conn.ftp.files["/mission/custom/Gate_A.json"])
     assert pra == {"areaName": "Gate_A", "PRABoxes": [[[3, 4, 5], [90, 0, 0], [5000, 220, 6000]]],
                    "safePositions3D": [[7000, 210, 8000]]}
     objects = json.loads(conn.ftp.files["/mission/custom/Gate_A_objects.json"])
     assert objects["Objects"] == [{"name": "Land_Mil_GuardShed", "pos": [5000, 221.25, 6000], "ypr": [90, 0, 0], "scale": 1.0,
                                    "enableCEPersistency": 0, "customString": ""}]
     gameplay = json.loads(conn.ftp.files["/mission/cfggameplay.json"])
-    assert gameplay["WorldsData"]["playerRestrictedAreaFiles"].pop() == "custom/pra/Gate_A.json"
+    assert gameplay["WorldsData"]["playerRestrictedAreaFiles"].pop() == "custom/Gate_A.json"
     assert gameplay["WorldsData"]["objectSpawnersArr"].pop() == "custom/Gate_A_objects.json"
     assert gameplay == json.loads(GAMEPLAY)
     with open("connections.json", encoding="utf-8") as stream:
@@ -130,7 +130,7 @@ def test_duplicate_and_normalized_registration_conflict(monkeypatch, servers):
     deploy(monkeypatch, conn)
     assert call(monkeypatch, conn, payload())[0] == 409
     assert call(monkeypatch, conn, payload("gate_a"))[0] == 409
-    conn.ftp.files["/mission/cfggameplay.json"] = '{"WorldsData":{"playerRestrictedAreaFiles":["./custom/pra/Other.json"]}}'
+    conn.ftp.files["/mission/cfggameplay.json"] = '{"WorldsData":{"playerRestrictedAreaFiles":["./custom/Other.json"]}}'
     assert call(monkeypatch, conn, payload("Other"))[0] == 409
 
 
@@ -144,7 +144,7 @@ def test_invalid_input_is_400(monkeypatch, servers, field, value):
     assert not conn.ftp.mutations
 
 
-@pytest.mark.parametrize("filename", ["custom/pra/Gate_A.json", "custom/Gate_A_objects.json", "cfggameplay.json"])
+@pytest.mark.parametrize("filename", ["custom/Gate_A.json", "custom/Gate_A_objects.json", "cfggameplay.json"])
 def test_partial_write_rolls_back_all_files(monkeypatch, servers, filename):
     conn, _ = servers
     conn.ftp.fail = "/mission/" + filename
@@ -246,7 +246,7 @@ def test_concurrent_custom_import_preserves_both_registrations(monkeypatch, serv
     results = asyncio.run(run())
     assert [r.status for r in results] == [200, 200]
     worlds = json.loads(conn.ftp.files["/mission/cfggameplay.json"])["WorldsData"]
-    assert "custom/pra/Gate_A.json" in worlds["playerRestrictedAreaFiles"]
+    assert "custom/Gate_A.json" in worlds["playerRestrictedAreaFiles"]
     assert set(worlds["objectSpawnersArr"]) == {"./custom/base.json", "custom/Gate_A_objects.json", "custom/other.json"}
 
 
@@ -265,3 +265,58 @@ def test_new_pra_list_is_placed_after_object_spawners(monkeypatch, servers):
                     if g["filename"] == "cfggameplay.json")
     assert list(json.loads(vorschau)["WorldsData"]) == [
         "lightingConfig", "objectSpawnersArr", "playerRestrictedAreaFiles", "environmentMinTemps"]
+
+
+def test_pra_file_lies_directly_in_custom_not_in_a_subfolder(monkeypatch, servers):
+    """Brigarde: der Server laedt PRA-Dateien nur direkt aus custom/ - kein Unterordner."""
+    conn, _ = servers
+    item = deploy(monkeypatch, conn)
+    assert [g["filename"] for g in item["generated"]] == ["custom/Gate_A.json", "custom/Gate_A_objects.json", "cfggameplay.json"]
+    assert not any("/pra/" in path for path in conn.ftp.files)
+    assert [m for m in conn.ftp.mutations if m[0] == "mkdir"] == [("mkdir", "/mission/custom")]
+    worlds = json.loads(conn.ftp.files["/mission/cfggameplay.json"])["WorldsData"]
+    assert worlds["playerRestrictedAreaFiles"] == ["pra/warheadstorage.json", "custom/Gate_A.json"]
+    assert worlds["objectSpawnersArr"] == ["./custom/base.json", "custom/Gate_A_objects.json"]
+
+
+@pytest.mark.parametrize("name", ["Gate_objects", "Gate_OBJECTS", "_objects"])
+def test_name_ending_in_objects_is_reserved(monkeypatch, servers, name):
+    conn, _ = servers
+    assert call(monkeypatch, conn, payload(name))[0] == 400
+    assert not conn.ftp.mutations
+
+
+def test_existing_custom_file_with_same_name_is_not_overwritten(monkeypatch, servers):
+    conn, _ = servers
+    conn.ftp.files["/mission/custom/Gate_A.json"] = "{}"
+    assert call(monkeypatch, conn, payload())[0] == 409
+    assert conn.ftp.files["/mission/custom/Gate_A.json"] == "{}"
+    assert not conn.ftp.mutations
+
+
+def test_old_teleport_in_pra_folder_can_still_be_removed(monkeypatch, servers):
+    """Teleports, die frueher unter custom/pra/ angelegt wurden, muessen weiter entfernbar bleiben."""
+    conn, _ = servers
+    gameplay = json.loads(GAMEPLAY)
+    gameplay["WorldsData"]["playerRestrictedAreaFiles"].append("custom/pra/Old.json")
+    gameplay["WorldsData"]["objectSpawnersArr"].append("custom/Old_objects.json")
+    conn.ftp.files["/mission/cfggameplay.json"] = json.dumps(gameplay)
+    conn.ftp.files["/mission/custom/pra/Old.json"] = "{}"
+    conn.ftp.files["/mission/custom/Old_objects.json"] = '{"Objects": []}'
+    conn.data["teleports"] = [{"id": "alt", "name": "Old", "created": 1,
+                               "files": ["custom/pra/Old.json", "custom/Old_objects.json"],
+                               "gameplay_before": GAMEPLAY, "gameplay_after": "x",
+                               "keys_created": [], "worlds_created": False}]
+    assert call(monkeypatch, conn, {"id": "alt"}, remove=True)[0] == 200
+    assert "/mission/custom/pra/Old.json" not in conn.ftp.files
+    assert "/mission/custom/Old_objects.json" not in conn.ftp.files
+    worlds = json.loads(conn.ftp.files["/mission/cfggameplay.json"])["WorldsData"]
+    assert worlds["playerRestrictedAreaFiles"] == ["pra/warheadstorage.json"]
+    assert worlds["objectSpawnersArr"] == ["./custom/base.json"]
+
+
+@pytest.mark.parametrize("path,key", [("custom/Gate_A.json", "playerRestrictedAreaFiles"),
+                                      ("custom/pra/Gate_A.json", "playerRestrictedAreaFiles"),
+                                      ("custom/Gate_A_objects.json", "objectSpawnersArr")])
+def test_teleport_key_classification(path, key):
+    assert bot._teleport_key(path) == key

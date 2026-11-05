@@ -21014,6 +21014,9 @@ def _teleport_files(data: Dict[str, Any], conn: ServerConnection):
     name = data.get("name")
     if not isinstance(name, str) or not _TELEPORT_NAME.fullmatch(name):
         raise ValueError("Zonenname: 1–64 Buchstaben, Ziffern oder _ verwenden.")
+    if name.lower().endswith("_objects"):
+        # Beide Dateien liegen in custom/: "<Name>_objects.json" ist fuer die Objekte reserviert.
+        raise ValueError("Der Zonenname darf nicht auf „_objects“ enden.")
     map_name = _canonical_map_name(str(conn.data.get("map_name") or ""))
     world_size = DEFAULT_MAP_SIZES.get(map_name)
     if world_size is None:
@@ -21061,7 +21064,8 @@ def _teleport_files(data: Dict[str, Any], conn: ServerConnection):
             raise ValueError(f"Zu viele Objekte (höchstens {_TPO_MAX_OBJEKTE_GESAMT} in einer Datei).")
     pra = {"areaName": name, "PRABoxes": pra_boxes,
            "safePositions3D": [position(p) for p in targets]}
-    files = [(f"custom/pra/{name}.json", pra)]
+    # PRA-Datei direkt in custom/ (nicht in einem Unterordner) - der Server laedt sie sonst nicht.
+    files = [(f"custom/{name}.json", pra)]
     if objects:
         files.append((f"custom/{name}_objects.json", {"Objects": objects}))
     return name, [(path, json.dumps(content, indent=4, ensure_ascii=False) + "\n")
@@ -21173,7 +21177,9 @@ async def _teleport_gameplay(conn, loop):
 
 
 def _teleport_key(path):
-    return "playerRestrictedAreaFiles" if path.startswith("custom/pra/") else "objectSpawnersArr"
+    # Objekt-Dateien enden auf _objects.json; alles andere ist eine PRA-Datei
+    # (auch die frueheren Teleports unter custom/pra/).
+    return "objectSpawnersArr" if path.endswith("_objects.json") else "playerRestrictedAreaFiles"
 
 
 async def _teleport_transaction(conn, changes, manifest, loop):
@@ -21250,7 +21256,7 @@ async def api_tools_teleports_post(request: web.Request) -> web.Response:
         keys_created = [key for key in ("playerRestrictedAreaFiles", "objectSpawnersArr")
                         if key not in worlds and any(_teleport_key(p) == key for p, _ in files)]
         # Reserve both names, even if this deployment has no visible objects.
-        for path in (f"custom/pra/{name}.json", f"custom/{name}_objects.json"):
+        for path in (f"custom/{name}.json", f"custom/{name}_objects.json"):
             _, status = await _tools_datei_lesen(conn, path, loop)
             if status not in ("ok", "missing"):
                 return err("Vorhandene Teleport-Dateien konnten nicht geprüft werden.", 502)
@@ -21276,10 +21282,9 @@ async def api_tools_teleports_post(request: web.Request) -> web.Response:
         if not commit:
             return ok({"name": name, "generated": generated})
         # FTP does not create missing parent directories on STOR.
-        for folder in ("custom", "custom/pra"):
-            if not await loop.run_in_executor(None, conn.ftp.mkdir,
-                                             f"{_mission_dir_of(conn).rstrip('/')}/{folder}"):
-                return err("Der Teleport-Ordner konnte nicht angelegt werden.", 502)
+        if not await loop.run_in_executor(None, conn.ftp.mkdir,
+                                         f"{_mission_dir_of(conn).rstrip('/')}/custom"):
+            return err("Der Teleport-Ordner konnte nicht angelegt werden.", 502)
         entry = {"id": uuid.uuid4().hex, "name": name, "files": [p for p, _ in files],
                  "created": time.time(), "gameplay_before": raw, "gameplay_after": updated,
                  "keys_created": keys_created, "worlds_created": worlds_created}
@@ -55224,6 +55229,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "344b3f7f5fbaa1864865f6132dcff8aac90121d2abbfb346d3fa27e2441e05bf",
         "8a18e52c1f964038aff6323288fbf841c4de9dccdd4da39136d0ada97f9950f1",
         "3fbcd5a397d42ffa7408ccae2a6067765efd4d41b13cf56627634e638b9fa31f",
+        "54dc3e3f8499df3a59f4e0b98538298dc8d8425d8077dfc3a5a4d6403e4a656a",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
