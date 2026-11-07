@@ -58,6 +58,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from collections import deque
 import collections
 import itertools
+import unicodedata
 from collections.abc import Sequence
 from datetime import datetime, timezone, timedelta, date
 from typing import Optional, Dict, List, Tuple, Any, Deque, Set, Iterable, Union
@@ -3995,7 +3996,7 @@ class ServerConnection:
         "map_name", "auto_restart_schedule", "auto_restart_after_purchase",
         "welcome_message", "leave_message", "reaction_roles",
         "ticket_categories", "ticket_open", "ticket_language", "ticket_transcript_channel",
-        "level_system", "honeypot", "guild_daten",
+        "level_system", "honeypot", "wortfilter", "guild_daten",
         # Social-Benachrichtigungen: Feed-Adressen (koennen Zugangsschluessel enthalten) gehoeren genau einer Guild.
         "social_feeds",
         # KI-Helfer: Einstellungen je Guild inkl. eigenem API-Schluessel; der
@@ -4511,7 +4512,7 @@ class ConnectionRegistry:
 _GUILD_SCHLUESSEL_GRUPPEN: Tuple[Tuple[str, ...], ...] = (
     ("welcome_message",), ("leave_message",), ("reaction_roles",),
     ("ticket_categories", "ticket_open", "ticket_language", "ticket_transcript_channel"),
-    ("level_system",), ("honeypot",), ("ki_helfer",), ("social_feeds",),
+    ("level_system",), ("honeypot",), ("wortfilter",), ("ki_helfer",), ("social_feeds",),
     ("giveaways", "giveaway_farbe", "giveaway_required_role_id"),
     ("ban_immune_role_ids",), ("link_add_role_ids", "link_remove_role_ids"),
     ("log_ban_temp_channel_id", "log_ban_perm_channel_id", "log_unban_channel_id"),
@@ -5643,6 +5644,12 @@ class DayZBot(discord.Client):
         except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
             log.debug(f"[HONEYPOT] on_message: {e}")
         try:
+            # Wortfilter: ein Verstoss bekommt weder XP noch eine KI-Antwort.
+            if await _wortfilter_nachricht_verarbeiten(message):
+                return
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[WORTFILTER] on_message: {type(e).__name__}: {e}")
+        try:
             await _level_nachricht_verarbeiten(message)
         except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
             log.debug(f"[LEVEL] on_message: {e}")
@@ -5650,6 +5657,15 @@ class DayZBot(discord.Client):
             await _ticket_ki_nachricht(message)
         except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
             log.debug(f"[KI] on_message: {type(e).__name__}")
+
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        """Wortfilter: auch nachtraeglich bearbeitete Nachrichten pruefen, sonst liesse sich der Filter durch Bearbeiten
+        umgehen (gilt fuer Nachrichten im Cache des Bots)."""
+        try:
+            if getattr(before, "content", None) != getattr(after, "content", None):
+                await _wortfilter_nachricht_verarbeiten(after)
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[WORTFILTER] on_message_edit: {type(e).__name__}: {e}")
 
     async def on_ready(self):
         log.info(f"[BOT] ✅ Eingeloggt als {self.user} (ID: {self.user.id})")
@@ -8902,7 +8918,8 @@ def _conn_store(conn: ServerConnection, key: str, value: Any, *, strict: bool = 
     # New tenant-only data has no legacy config consumers to mirror to.
     # ki_helfer enthaelt den API-Schluessel des Kunden - nie nach config.json spiegeln.
     # social_feeds: Feed-Adressen koennen Zugangsschluessel enthalten - ebenfalls nie nach config.json spiegeln.
-    if key in ("eigene_npcs", "airstrikes", "ki_helfer", "airdrop_json", "social_feeds"):
+    # wortfilter: Regeln mit Mitglieds-IDs gehoeren genau einer Guild - ebenfalls nie nach config.json spiegeln.
+    if key in ("eigene_npcs", "airstrikes", "ki_helfer", "airdrop_json", "social_feeds", "wortfilter"):
         return
     if connections.primary() is conn:
         cfg.config[key] = value
@@ -39770,6 +39787,34 @@ def _ev_summary(ev: Dict[str, Any], etype: str) -> str:
     return str(g("raw", etype))[:180]
 
 
+_EV_META_MAX_FELDER = 24
+
+
+def _ev_meta(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """Die geparsten Felder eines Ereignisses fuer die Detailansicht der Karte (Metadaten): nur einfache Werte, Texte
+    gekuerzt, ohne die Rohzeile (die steht schon als ``raw`` am Ereignis). Dazu ``player_location`` mit der Hoehe, wenn die
+    Position drei Zahlen hat."""
+    meta: Dict[str, Any] = {}
+    for k, v in ev.items():
+        if len(meta) >= _EV_META_MAX_FELDER:
+            break
+        if not isinstance(k, str) or not k or len(k) > 40 or k == "raw":
+            continue
+        if v is None or isinstance(v, (bool, int, float)):
+            meta[k] = v
+        elif isinstance(v, str):
+            meta[k] = v[:200]
+    zahlen = _EV_POS_RE.findall(str(ev.get("pos") or ev.get("position") or ""))
+    if len(zahlen) >= 3:
+        # ADM-Reihenfolge ist <Ost, Nord, Hoehe>; die Metadaten nennen sie wie DayZ++ x, z und y (= Hoehe).
+        try:
+            meta["player_location"] = {"x": round(float(zahlen[0]), 1), "y": round(float(zahlen[2]), 1),
+                                       "z": round(float(zahlen[1]), 1)}
+        except ValueError:
+            pass
+    return meta
+
+
 def _ev_record(ev: Dict[str, Any], player_positions: Optional[Dict[str, Any]] = None,
                service_id: Optional[str] = None) -> None:
     """Ein geparstes Event in den Ringpuffer aufnehmen (aus ``_dispatch``).
@@ -39797,6 +39842,7 @@ def _ev_record(ev: Dict[str, Any], player_positions: Optional[Dict[str, Any]] = 
             "player": ev.get("victim") or ev.get("player") or ev.get("killer") or ev.get("admin"),
             "raw": str(ev.get("raw", ""))[:400],
             "service_id": str(service_id or ""),
+            "meta": _ev_meta(ev),
         }
         if xz:
             rec["x"], rec["z"] = xz[0], xz[1]
@@ -45404,6 +45450,7 @@ def _discord_mgmt_payload(conn: "ServerConnection") -> Dict[str, Any]:
             "leave_message": _eintrag("leave_message"),
             "level_system": {"enabled": bool(_level_einstellungen(conn)["enabled"])},
             "honeypot": {"enabled": bool(_honeypot_einstellungen(conn)["enabled"])},
+            "wortfilter": {"enabled": bool(_wortfilter_einstellungen(conn)["enabled"])},
             "ki_helfer": {"enabled": bool(_ki_einstellungen(conn)["befehl_aktiv"]
                                           or _ki_einstellungen(conn)["ticket_aktiv"])},
             **{f"social_{p}": {"enabled": _social_aktiv(conn, p)} for p in _SOCIAL_PLATTFORMEN}}
@@ -46348,6 +46395,513 @@ async def post_discord_mgmt_honeypot_repost(request: web.Request) -> web.Respons
     if not ok_:
         return err(fehler_text, 502)
     return ok(_honeypot_payload(conn))
+
+
+# ══════════════════════════════════════════════════════════════
+#  Discord Management: Wortfilter
+# ══════════════════════════════════════════════════════════════
+# Je Guild eine Liste von Regeln in conn.data["wortfilter"]: welche Woerter, fuer wen (alle / bestimmte Rollen / bestimmte
+# Mitglieder) und welche Folge (nur loeschen, verwarnen, Timeout, Kick, Bann), optional mit Eskalation bei Wiederholung.
+# Immer ausgenommen: der Server-Eigentuemer, wer "Administrator", "Server verwalten" oder "Nachrichten verwalten" hat,
+# und die im Dashboard gewaehlten Rollen. Geprueft wird der Text einer Nachricht (message_content-Intent) beim Senden und
+# beim Bearbeiten (nur Nachrichten im Cache des Bots). Die Erkennung ist bewusst einfach und ohne verschachtelte
+# Quantifizierer gebaut (kein ReDoS): Gross-/Kleinschreibung, Akzente, unsichtbare Zeichen, Ziffern-Tricks (p00 = poo) und
+# gestreckte Buchstaben (pooooo) zaehlen als dasselbe Wort. Verstoss-Zaehler fuer die Eskalation liegen nur im Speicher
+# (24-Stunden-Fenster) und beginnen nach einem Neustart des Bots neu.
+_WORTFILTER_AKTIONEN = ("delete", "warn", "timeout", "kick", "ban")
+_WORTFILTER_STUFE = {a: i for i, a in enumerate(_WORTFILTER_AKTIONEN)}
+_WORTFILTER_ESKALATION_AKTIONEN = ("timeout", "kick", "ban")
+_WORTFILTER_GELTUNG = ("all", "roles", "members")
+_WORTFILTER_MATCH = ("word", "part")
+_WORTFILTER_MAX_REGELN = 40
+_WORTFILTER_MAX_WOERTER = 40
+_WORTFILTER_WORT_MAX = 40
+_WORTFILTER_MAX_ZIELE = 15                 # Rollen bzw. Mitglieder je Regel
+_WORTFILTER_MAX_MITGLIEDER_GESAMT = 60
+_WORTFILTER_MAX_AUSNAHMEN = 25
+_WORTFILTER_NAME_MAX = 40
+_WORTFILTER_TIMEOUT_MAX = 40320            # Minuten = 28 Tage, die Obergrenze von Discord
+_WORTFILTER_TIMEOUT_STANDARD = 10
+_WORTFILTER_FENSTER = 86400.0
+_WORTFILTER_STRIKES_MAX = 5000
+_WORTFILTER_TEXT_MAX = 4000
+_WORTFILTER_TEST_MAX = 500
+_WORTFILTER_ID_RE = re.compile(r"[0-9a-f]{8}")
+_WORTFILTER_SNOWFLAKE_RE = re.compile(r"[0-9]{1,20}")
+_WORTFILTER_LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t"})
+_WORTFILTER_UNSICHTBAR = {ord(c): None for c in "​‌‍⁠﻿­"}
+_WORTFILTER_STRIKES: Dict[Tuple[int, str, int], List[float]] = {}     # (guild, regel, nutzer) -> Zeitstempel
+_WORTFILTER_REGEX: Dict[Tuple[Tuple[str, ...], str], Any] = {}
+_WORTFILTER_REGEX_MAX = 400
+
+
+def _wortfilter_normal(text: Any) -> str:
+    """Vergleichsform: ohne Akzente und unsichtbare Zeichen, kleingeschrieben, Ziffern-Tricks aufgeloest."""
+    t = unicodedata.normalize("NFKD", str(text or "")).translate(_WORTFILTER_UNSICHTBAR).casefold()
+    return "".join(c for c in t if not unicodedata.combining(c)).translate(_WORTFILTER_LEET)
+
+
+def _wortfilter_muster(woerter: List[str], modus: str) -> Any:
+    """Ein Muster je Regel. Jede Buchstabenfolge darf gestreckt sein (poo -> p+o{2,}), Leerzeichen im Wort passen auf
+    beliebig viele Leerzeichen. Im Modus "word" muss das Wort allein stehen (nicht in "spoon")."""
+    schluessel = (tuple(woerter), modus)
+    muster = _WORTFILTER_REGEX.get(schluessel)
+    if muster is None:
+        teile = []
+        for wort in woerter:
+            tokens = _wortfilter_normal(wort).split()
+            if tokens:
+                teile.append(r"\s+".join("".join(f"{re.escape(zeichen)}{{{len(list(gruppe))},}}"
+                                                 for zeichen, gruppe in itertools.groupby(token)) for token in tokens))
+        koerper = "|".join(teile) if teile else r"(?!)"
+        muster = re.compile(rf"(?<!\w)(?:{koerper})(?!\w)" if modus == "word" else f"(?:{koerper})")
+        if len(_WORTFILTER_REGEX) >= _WORTFILTER_REGEX_MAX:
+            _WORTFILTER_REGEX.clear()
+        _WORTFILTER_REGEX[schluessel] = muster
+    return muster
+
+
+def _wortfilter_finde(regel: Dict[str, Any], text_normal: str) -> Optional[str]:
+    """Der gefundene Treffer (in Vergleichsform) oder None."""
+    m = _wortfilter_muster(regel["words"], regel["match"]).search(text_normal)
+    return m.group(0) if m else None
+
+
+def _wortfilter_zahl(wert: Any, niedrig: int, hoch: int) -> int:
+    if isinstance(wert, bool) or not isinstance(wert, (int, float)) or wert != int(wert) or not niedrig <= int(wert) <= hoch:
+        raise ValueError(f"Ungültiger Zahlenwert – erlaubt sind ganze Zahlen von {niedrig} bis {hoch}.")
+    return int(wert)
+
+
+def _wortfilter_ids(werte: Any, maximum: int) -> List[str]:
+    if werte is None:
+        werte = []
+    if not isinstance(werte, list) or len(werte) > maximum:
+        raise ValueError(f"Höchstens {maximum} Einträge je Liste.")
+    ergebnis: List[str] = []
+    for wert in werte:
+        if isinstance(wert, bool) or not isinstance(wert, (str, int)):
+            raise ValueError("Ungültige ID – es sind nur Ziffern erlaubt.")
+        text = str(wert).strip()
+        if not _WORTFILTER_SNOWFLAKE_RE.fullmatch(text) or int(text) <= 0:
+            raise ValueError("Ungültige ID – es sind nur Ziffern erlaubt.")
+        if text not in ergebnis:
+            ergebnis.append(text)
+    return ergebnis
+
+
+def _wortfilter_regel_pruefen(roh: Any, id_erzeugen: bool = False) -> Dict[str, Any]:
+    """Prueft EINE Regel und gibt sie in fester Form zurueck (ValueError mit deutschem Text). Wird auch beim Laden benutzt:
+    eine kaputte gespeicherte Regel wird dort einfach uebersprungen."""
+    if not isinstance(roh, dict):
+        raise ValueError("Ungültige Regel.")
+    rid = roh.get("id")
+    if rid in (None, ""):
+        if not id_erzeugen:
+            raise ValueError("Regel ohne Kennung.")
+        rid = uuid.uuid4().hex[:8]
+    if not isinstance(rid, str) or not _WORTFILTER_ID_RE.fullmatch(rid):
+        raise ValueError("Ungültige Regel-Kennung.")
+    modus = roh.get("match", "word")
+    if modus not in _WORTFILTER_MATCH:
+        raise ValueError("Unbekannte Suchart.")
+    woerter_roh = roh.get("words")
+    if not isinstance(woerter_roh, list) or not 1 <= len(woerter_roh) <= _WORTFILTER_MAX_WOERTER:
+        raise ValueError(f"Jede Regel braucht 1 bis {_WORTFILTER_MAX_WOERTER} Wörter.")
+    woerter: List[str] = []
+    gesehen: Set[str] = set()
+    for wort in woerter_roh:
+        if not isinstance(wort, str):
+            raise ValueError("Die Wörter müssen Text sein.")
+        wort = " ".join(wort.split())
+        if not wort or len(wort) > _WORTFILTER_WORT_MAX:
+            raise ValueError(f"Jedes Wort darf 1 bis {_WORTFILTER_WORT_MAX} Zeichen lang sein.")
+        if any(unicodedata.category(c).startswith("C") for c in wort):
+            raise ValueError("Wörter dürfen keine Steuer- oder unsichtbaren Zeichen enthalten.")
+        normal = _wortfilter_normal(wort)
+        if not any(c.isalnum() for c in normal):
+            raise ValueError(f"„{wort}“ enthält keinen Buchstaben und keine Ziffer.")
+        if len(normal.replace(" ", "")) < (3 if modus == "part" else 2):
+            raise ValueError(f"„{wort}“ ist zu kurz: mindestens 2 Zeichen, bei „Teil eines Wortes“ mindestens 3.")
+        if normal not in gesehen:
+            gesehen.add(normal)
+            woerter.append(wort)
+    name_roh = roh.get("name")
+    if name_roh is not None and not isinstance(name_roh, str):
+        raise ValueError("Der Regelname muss Text sein.")
+    name = " ".join(str(name_roh or "").split())[:_WORTFILTER_NAME_MAX] or woerter[0][:_WORTFILTER_NAME_MAX]
+    if any(unicodedata.category(c).startswith("C") for c in name):
+        raise ValueError("Der Regelname darf keine Steuerzeichen enthalten.")
+    geltung = roh.get("scope", "all")
+    if geltung not in _WORTFILTER_GELTUNG:
+        raise ValueError("Unbekannte Geltung.")
+    rollen = _wortfilter_ids(roh.get("role_ids"), _WORTFILTER_MAX_ZIELE)
+    mitglieder = _wortfilter_ids(roh.get("member_ids"), _WORTFILTER_MAX_ZIELE)
+    if geltung == "roles" and not rollen:
+        raise ValueError(f"Regel „{name}“: bitte mindestens eine Rolle wählen.")
+    if geltung == "members" and not mitglieder:
+        raise ValueError(f"Regel „{name}“: bitte mindestens ein Mitglied angeben.")
+    aktion = roh.get("action", "warn")
+    if aktion not in _WORTFILTER_AKTIONEN:
+        raise ValueError("Unbekannte Folge.")
+    minuten = _wortfilter_zahl(roh.get("timeout_minutes", _WORTFILTER_TIMEOUT_STANDARD), 1, _WORTFILTER_TIMEOUT_MAX)
+    esk_roh = roh.get("escalation")
+    eskalation = None
+    if esk_roh not in (None, False, {}):
+        if not isinstance(esk_roh, dict):
+            raise ValueError("Ungültige Eskalation.")
+        e_aktion = esk_roh.get("action")
+        if e_aktion not in _WORTFILTER_ESKALATION_AKTIONEN:
+            raise ValueError("Die Eskalation kann nur Timeout, Kick oder Bann sein.")
+        if _WORTFILTER_STUFE[e_aktion] < _WORTFILTER_STUFE[aktion]:
+            raise ValueError("Die Eskalation muss mindestens so streng sein wie die normale Folge.")
+        eskalation = {"after": _wortfilter_zahl(esk_roh.get("after"), 2, 10),
+                      "action": e_aktion,
+                      "timeout_minutes": _wortfilter_zahl(esk_roh.get("timeout_minutes", _WORTFILTER_TIMEOUT_STANDARD), 1,
+                                                          _WORTFILTER_TIMEOUT_MAX)}
+    return {"id": rid, "name": name, "enabled": bool(roh.get("enabled", True)), "words": woerter, "match": modus,
+            "scope": geltung, "role_ids": rollen if geltung == "roles" else [],
+            "member_ids": mitglieder if geltung == "members" else [],
+            "action": aktion, "timeout_minutes": minuten, "escalation": eskalation}
+
+
+def _wortfilter_einstellungen(conn: "ServerConnection") -> Dict[str, Any]:
+    roh = conn.get("wortfilter")
+    roh = roh if isinstance(roh, dict) else {}
+    regeln: List[Dict[str, Any]] = []
+    gespeichert = roh.get("rules")
+    for r in (gespeichert if isinstance(gespeichert, list) else [])[:_WORTFILTER_MAX_REGELN]:
+        try:
+            regeln.append(_wortfilter_regel_pruefen(r))
+        except ValueError:
+            continue
+    ausnahmen = roh.get("exempt_roles")
+    ausnahmen = ausnahmen if isinstance(ausnahmen, list) else []
+    return {"enabled": bool(roh.get("enabled", False)), "language": _feed_sprache(conn),
+            "log_channel_id": str(roh["log_channel_id"]) if roh.get("log_channel_id") else None,
+            "exempt_roles": [str(x) for x in ausnahmen if x][:_WORTFILTER_MAX_AUSNAHMEN],
+            "rules": regeln}
+
+
+def _wortfilter_ausgenommen(member: Any, guild: Any, e: Dict[str, Any]) -> bool:
+    """Eigentuemer, Administratoren und Moderatoren (Server/Nachrichten verwalten) und gewaehlte Rollen sind nie betroffen."""
+    if getattr(guild, "owner_id", None) == getattr(member, "id", None):
+        return True
+    rechte = getattr(member, "guild_permissions", None)
+    if rechte is not None and (rechte.administrator or rechte.manage_guild or rechte.manage_messages):
+        return True
+    frei = set(e["exempt_roles"])
+    return any(str(getattr(r, "id", "")) in frei for r in (getattr(member, "roles", None) or []))
+
+
+def _wortfilter_gilt_fuer(regel: Dict[str, Any], member: Any) -> bool:
+    if regel["scope"] == "all":
+        return True
+    if regel["scope"] == "roles":
+        ziele = set(regel["role_ids"])
+        return any(str(getattr(r, "id", "")) in ziele for r in (getattr(member, "roles", None) or []))
+    return str(getattr(member, "id", "")) in set(regel["member_ids"])
+
+
+def _wortfilter_verstoss_zaehlen(guild_id: int, regel_id: str, nutzer_id: int, jetzt: float) -> int:
+    """Verstoesse dieses Nutzers gegen diese Regel in den letzten 24 Stunden (der aktuelle eingerechnet)."""
+    schluessel = (int(guild_id), regel_id, int(nutzer_id))
+    zeiten = [t for t in _WORTFILTER_STRIKES.get(schluessel, []) if jetzt - t < _WORTFILTER_FENSTER]
+    zeiten.append(jetzt)
+    _WORTFILTER_STRIKES[schluessel] = zeiten
+    if len(_WORTFILTER_STRIKES) > _WORTFILTER_STRIKES_MAX:
+        for alt in sorted(_WORTFILTER_STRIKES, key=lambda k: _WORTFILTER_STRIKES[k][-1])[:_WORTFILTER_STRIKES_MAX // 4]:
+            _WORTFILTER_STRIKES.pop(alt, None)
+    return len(zeiten)
+
+
+def _wortfilter_entscheiden(e: Dict[str, Any], member: Any, guild_id: int, text: str,
+                            jetzt: Optional[float] = None) -> Optional[Dict[str, Any]]:
+    """Welche Regel greift und mit welcher Folge? Treffen mehrere Regeln zu, gewinnt die strengste Folge."""
+    jetzt = time.time() if jetzt is None else jetzt
+    normal = _wortfilter_normal(text[:_WORTFILTER_TEXT_MAX])
+    beste: Optional[Dict[str, Any]] = None
+    for regel in e["rules"]:
+        if not regel["enabled"] or not _wortfilter_gilt_fuer(regel, member):
+            continue
+        treffer = _wortfilter_finde(regel, normal)
+        if treffer is None:
+            continue
+        anzahl = _wortfilter_verstoss_zaehlen(guild_id, regel["id"], getattr(member, "id", 0), jetzt)
+        aktion, minuten, eskaliert = regel["action"], regel["timeout_minutes"], False
+        esk = regel["escalation"]
+        if esk and anzahl >= esk["after"]:
+            aktion, minuten, eskaliert = esk["action"], esk["timeout_minutes"], True
+        if beste is None or _WORTFILTER_STUFE[aktion] > _WORTFILTER_STUFE[beste["action"]]:
+            beste = {"regel": regel, "treffer": treffer, "action": aktion, "minutes": minuten, "anzahl": anzahl,
+                     "eskaliert": eskaliert}
+    return beste
+
+
+_WORTFILTER_AKTION_TEXTE = {
+    "delete": ("Nachricht gelöscht", "Message deleted"),
+    "warn": ("Verwarnung", "Warning"),
+    "timeout": ("Timeout", "Timeout"),
+    "kick": ("Kick", "Kick"),
+    "ban": ("Bann", "Ban"),
+}
+
+
+def _wortfilter_hinweis_text(sprache: str, erwaehnung: str) -> str:
+    if sprache == "en":
+        return f"{erwaehnung} please watch your language – that word is not allowed on this server."
+    return f"{erwaehnung} bitte achte auf deine Wortwahl – dieses Wort ist auf diesem Server nicht erlaubt."
+
+
+def _wortfilter_dm_embed(guild_name: str, sprache: str, aktion: str, minuten: int) -> discord.Embed:
+    if sprache == "en":
+        titel = {"timeout": f"⏳ Timeout on {guild_name}", "kick": f"🚪 You were kicked from {guild_name}",
+                 "ban": f"🚫 You were banned from {guild_name}"}[aktion]
+        text = "You used a word that is not allowed on this server."
+        if aktion == "timeout":
+            text += f" You cannot write or speak for {minuten} minute(s)."
+        text += "\nIf you think this was a mistake, contact the server team."
+    else:
+        titel = {"timeout": f"⏳ Timeout auf {guild_name}", "kick": f"🚪 Du wurdest von {guild_name} gekickt",
+                 "ban": f"🚫 Du wurdest von {guild_name} gebannt"}[aktion]
+        text = "Du hast ein Wort benutzt, das auf diesem Server nicht erlaubt ist."
+        if aktion == "timeout":
+            text += f" Du kannst {minuten} Minute(n) lang nicht schreiben oder sprechen."
+        text += "\nFalls du glaubst, dass das ein Versehen war, wende dich an das Server-Team."
+    return discord.Embed(title=titel, description=text, colour=0xE74C3C)
+
+
+def _wortfilter_log_embed(member: Any, kanal: Any, entscheidung: Dict[str, Any], text: str, geloescht: bool,
+                          problem: str, sprache: str) -> discord.Embed:
+    regel = entscheidung["regel"]
+    aktion = entscheidung["action"]
+    de, en = _WORTFILTER_AKTION_TEXTE[aktion]
+    aktion_text = en if sprache == "en" else de
+    if aktion == "timeout":
+        aktion_text += f" ({entscheidung['minutes']} min)"
+    if entscheidung["eskaliert"]:
+        aktion_text += " ⬆️"
+    erwaehnung = getattr(member, "mention", None) or f"@{getattr(member, 'display_name', '?')}"
+    kanal_text = getattr(kanal, "mention", None) or f"#{getattr(kanal, 'name', '?')}"
+    auszug = discord.utils.escape_mentions(discord.utils.escape_markdown(text.strip()))[:300]
+    if sprache == "en":
+        titel = f"🚫 Word filter – {aktion_text}"
+        felder = (("User", f"{erwaehnung} (`{getattr(member, 'id', '?')}`)"), ("Channel", kanal_text),
+                  ("Rule", regel["name"]), ("Violations (24 h)", str(entscheidung["anzahl"])),
+                  ("Message", auszug or "–"))
+        nachtrag = "The message could not be deleted (bot permission missing)." if not geloescht else ""
+        problem_titel = "Problem"
+    else:
+        titel = f"🚫 Wortfilter – {aktion_text}"
+        felder = (("Nutzer", f"{erwaehnung} (`{getattr(member, 'id', '?')}`)"), ("Channel", kanal_text),
+                  ("Regel", regel["name"]), ("Verstöße (24 Std.)", str(entscheidung["anzahl"])),
+                  ("Nachricht", auszug or "–"))
+        nachtrag = "Die Nachricht ließ sich nicht löschen (Recht „Nachrichten verwalten“ fehlt dem Bot)." if not geloescht else ""
+        problem_titel = "Problem"
+    embed = discord.Embed(title=titel, colour=0xE67E22, timestamp=discord.utils.utcnow())
+    for n, v in felder:
+        embed.add_field(name=n, value=v[:1000], inline=n not in ("Message", "Nachricht"))
+    if nachtrag or problem:
+        embed.add_field(name=problem_titel, value=(nachtrag + (" " if nachtrag and problem else "") + problem)[:1000], inline=False)
+    return embed
+
+
+async def _wortfilter_log_senden(e: Dict[str, Any], embed: discord.Embed) -> None:
+    if not e["log_channel_id"]:
+        return
+    try:
+        kanal = bot.get_channel(int(e["log_channel_id"])) if bot else None
+        if kanal is not None:
+            await kanal.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as exc:  # noqa: BLE001
+        log.debug(f"[WORTFILTER] Log posten fehlgeschlagen: {exc}")
+
+
+async def _wortfilter_ausfuehren(message: Any, guild: Any, autor: Any, kanal: Any, conn: Any, e: Dict[str, Any],
+                                 entscheidung: Dict[str, Any]) -> None:
+    sprache = e["language"]
+    aktion = entscheidung["action"]
+    regel = entscheidung["regel"]
+    geloescht = True
+    problem = ""
+    try:
+        await message.delete()
+    except Exception as exc:  # noqa: BLE001 – Recht fehlt oder schon weg
+        geloescht = False
+        log.debug(f"[WORTFILTER] Nachricht löschen fehlgeschlagen: {exc}")
+    grund = f"Wortfilter: Regel „{regel['name']}“"[:200]
+    if aktion == "warn":
+        try:
+            await kanal.send(_wortfilter_hinweis_text(sprache, getattr(autor, "mention", "")), delete_after=15,
+                             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=[autor]))
+        except Exception as exc:  # noqa: BLE001
+            problem = f"Hinweis posten fehlgeschlagen: {type(exc).__name__}"
+    elif aktion in ("timeout", "kick", "ban"):
+        if aktion in ("kick", "ban"):       # danach ist keine DM mehr moeglich
+            try:
+                await autor.send(embed=_wortfilter_dm_embed(getattr(guild, "name", "Discord"), sprache, aktion, 0))
+            except Exception as exc:  # noqa: BLE001 – DMs geschlossen
+                log.debug(f"[WORTFILTER] DM fehlgeschlagen: {exc}")
+        try:
+            if aktion == "timeout":
+                await autor.timeout(timedelta(minutes=entscheidung["minutes"]), reason=grund)
+                try:
+                    await autor.send(embed=_wortfilter_dm_embed(getattr(guild, "name", "Discord"), sprache, aktion,
+                                                                entscheidung["minutes"]))
+                except Exception as exc:  # noqa: BLE001
+                    log.debug(f"[WORTFILTER] DM fehlgeschlagen: {exc}")
+            elif aktion == "kick":
+                await autor.kick(reason=grund)
+            else:
+                try:
+                    await guild.ban(autor, reason=grund, delete_message_seconds=0)
+                except TypeError:  # ältere discord.py
+                    await guild.ban(autor, reason=grund, delete_message_days=0)
+        except Exception as exc:  # noqa: BLE001 – Recht fehlt oder die Rolle des Nutzers steht über der des Bots
+            log.warning(f"[WORTFILTER] {aktion} von {getattr(autor, 'id', '?')} fehlgeschlagen ({conn.service_id}): {exc}")
+            problem = ("the bot lacks the permission or its role is below the user's" if sprache == "en"
+                       else "dem Bot fehlt das Recht oder seine Rolle steht unter der des Nutzers")
+        else:
+            try:
+                _audit_add("discord", str(autor), f"Wortfilter: {_WORTFILTER_AKTION_TEXTE[aktion][0]}",
+                           f"{conn.name} · Regel {regel['name']}")
+            except Exception:  # noqa: BLE001
+                pass
+    log.info(f"[WORTFILTER] {getattr(autor, 'id', '?')} {aktion} in {getattr(guild, 'name', '?')} ({conn.service_id})")
+    await _wortfilter_log_senden(e, _wortfilter_log_embed(autor, kanal, entscheidung, getattr(message, "content", ""),
+                                                          geloescht, problem, sprache))
+
+
+async def _wortfilter_nachricht_verarbeiten(message: Any) -> bool:
+    """True, wenn die Nachricht gegen eine Regel verstoesst (dann auch kein XP, keine KI-Antwort)."""
+    autor = getattr(message, "author", None)
+    guild = getattr(message, "guild", None)
+    kanal = getattr(message, "channel", None)
+    if guild is None or autor is None or kanal is None or getattr(autor, "bot", False) or getattr(message, "webhook_id", None):
+        return False
+    text = getattr(message, "content", "")
+    if not isinstance(text, str) or not text.strip() or getattr(autor, "roles", None) is None:
+        return False
+    conn = e = None
+    for kandidat in connections.all_for_guild(int(guild.id)):
+        kandidat = guild_sicht(kandidat, guild.id)
+        if kandidat is None:
+            continue
+        roh = kandidat.get("wortfilter")
+        if not (isinstance(roh, dict) and roh.get("enabled") and roh.get("rules")):
+            continue
+        einst = _wortfilter_einstellungen(kandidat)
+        if einst["enabled"] and einst["rules"]:
+            conn, e = kandidat, einst
+            break
+    if conn is None or e is None or _wortfilter_ausgenommen(autor, guild, e):
+        return False
+    entscheidung = _wortfilter_entscheiden(e, autor, int(guild.id), text)
+    if entscheidung is None:
+        return False
+    await _wortfilter_ausfuehren(message, guild, autor, kanal, conn, e, entscheidung)
+    return True
+
+
+def _wortfilter_payload(conn: "ServerConnection") -> Dict[str, Any]:
+    e = _wortfilter_einstellungen(conn)
+    guild = bot.get_guild(int(conn.guild_id)) if (bot and conn.guild_id) else None
+    namen: Dict[str, Optional[str]] = {}
+    for regel in e["rules"]:
+        for mid in regel["member_ids"]:
+            mitglied = guild.get_member(int(mid)) if guild is not None else None
+            namen[mid] = getattr(mitglied, "display_name", None) if mitglied is not None else None
+    e["member_names"] = namen
+    e["inhalt_ok"] = bool(getattr(getattr(bot, "intents", None), "message_content", True))
+    e["limits"] = {"regeln": _WORTFILTER_MAX_REGELN, "woerter": _WORTFILTER_MAX_WOERTER, "ziele": _WORTFILTER_MAX_ZIELE,
+                   "timeout_max": _WORTFILTER_TIMEOUT_MAX}
+    return e
+
+
+async def get_discord_mgmt_wortfilter(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "view")
+    if denied is not None:
+        return denied
+    return ok(_wortfilter_payload(conn))
+
+
+async def post_discord_mgmt_wortfilter(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.wortfilter", 3)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    if not isinstance(data, dict):
+        return err("Ungültige Anfrage.")
+    regeln_roh = data.get("rules")
+    if not isinstance(regeln_roh, list) or len(regeln_roh) > _WORTFILTER_MAX_REGELN:
+        return err(f"Höchstens {_WORTFILTER_MAX_REGELN} Regeln.")
+    try:
+        regeln = [_wortfilter_regel_pruefen(r, id_erzeugen=True) for r in regeln_roh]
+        ausnahmen = _wortfilter_ids(data.get("exempt_roles"), _WORTFILTER_MAX_AUSNAHMEN)
+        log_ids = _wortfilter_ids([data["log_channel_id"]] if data.get("log_channel_id") else [], 1)
+    except ValueError as exc:
+        return err(str(exc))
+    if len({r["id"] for r in regeln}) != len(regeln):
+        return err("Doppelte Regel-Kennung.")
+    log_id = log_ids[0] if log_ids else None
+    mitglieder = sorted({m for r in regeln for m in r["member_ids"]})
+    if len(mitglieder) > _WORTFILTER_MAX_MITGLIEDER_GESAMT:
+        return err(f"Höchstens {_WORTFILTER_MAX_MITGLIEDER_GESAMT} verschiedene Mitglieder in allen Regeln zusammen.")
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    rollen_ids = sorted({x for r in regeln for x in r["role_ids"]} | set(ausnahmen))
+    if (log_id or rollen_ids or mitglieder) and not gid:
+        return err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
+    if log_id:
+        fehler = _kanal_gehoert_guild(gid, int(log_id), "Log-Channel")
+        if fehler is not None:
+            return fehler
+    for rid in rollen_ids:
+        fehler = _rolle_gehoert_guild(gid, int(rid))
+        if fehler is not None:
+            return fehler
+    if mitglieder:
+        guild = bot.get_guild(gid) if bot else None
+        if guild is None:
+            return err("Der Bot erreicht diesen Discord-Server nicht – die Mitglieder lassen sich nicht prüfen.", 409)
+        for mid in mitglieder:
+            if guild.get_member(int(mid)) is not None:
+                continue
+            try:
+                await guild.fetch_member(int(mid))
+            except discord.NotFound:
+                return err(f"Das Mitglied {mid} gibt es auf diesem Discord-Server nicht.")
+            except discord.HTTPException:
+                return err("Die Mitglieder konnten gerade nicht geprüft werden – bitte später erneut versuchen.", 502)
+    _conn_store(conn, "wortfilter", {"enabled": bool(data.get("enabled", False)), "log_channel_id": log_id,
+                                     "exempt_roles": ausnahmen, "rules": regeln})
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Discord-Management aktualisiert",
+               f"wortfilter · {len(regeln)} Regel(n) · {conn.name}")
+    return ok(_wortfilter_payload(conn))
+
+
+async def post_discord_mgmt_wortfilter_test(request: web.Request) -> web.Response:
+    """Prueft einen Text gegen die GESPEICHERTEN Regeln (ohne Geltung/Ausnahmen) - nichts wird bestraft oder gezaehlt."""
+    conn, denied = await _honeypot_gate(request, "view")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.wortfilter.test", 2)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    text = data.get("text") if isinstance(data, dict) else None
+    if not isinstance(text, str) or not text.strip() or len(text) > _WORTFILTER_TEST_MAX:
+        return err(f"Bitte einen Text mit 1 bis {_WORTFILTER_TEST_MAX} Zeichen eingeben.")
+    normal = _wortfilter_normal(text)
+    treffer = []
+    for regel in _wortfilter_einstellungen(conn)["rules"]:
+        gefunden = _wortfilter_finde(regel, normal)
+        if gefunden is not None:
+            treffer.append({"id": regel["id"], "name": regel["name"], "treffer": gefunden, "action": regel["action"],
+                            "scope": regel["scope"], "enabled": regel["enabled"]})
+    return ok({"treffer": treffer})
 
 
 # ══════════════════════════════════════════════════════════════
@@ -52545,6 +53099,10 @@ def _map_meta_daten(conn: ServerConnection) -> Dict[str, Any]:
         "tile_url": _tile_url(map_name, stil),      # XYZ-Template ({z}/{x}/{y}), Browser lädt es
         "tile_style": stil,
         "tile_max_native_zoom": _MAP_MAX_NATIVE_ZOOM.get(map_name, {}).get(stil, TILE_MAX_NATIVE_ZOOM),
+        # Beide Stile fuer den Umschalter auf der Karte (Satellit/Papier); gleiche Adresse = kein Umschalter.
+        "tile_varianten": {k: {"url": _tile_url(map_name, k),
+                               "max_native": _MAP_MAX_NATIVE_ZOOM.get(map_name, {}).get(k, TILE_MAX_NATIVE_ZOOM)}
+                           for k in _MAP_IMAGE_STYLES},
         "image": f"/maps/{map_name}.jpg",     # optionales eigenes Bild (ImageOverlay), falls vorhanden
         "locations": _locations(map_name),
         "izurvive": ("https://www.izurvive.com/nasdaraSat/" if map_name == "Nasdara"
@@ -52606,8 +53164,82 @@ async def api_map_players(request: web.Request) -> web.Response:
             except Exception:
                 near = None
         out.append({"name": name, "x": x, "z": z,
-                    "last_seen": entry.get("last_seen"), "near": near})
+                    "last_seen": entry.get("last_seen"), "near": near,
+                    "trail_points": len((getattr(parser, "positions_verlauf", {}) or {}).get(name, ()))})
+    if out:
+        stats = await _dash_run(_karten_spielerstats, _c.service_id, [p["name"] for p in out])
+        for p in out:
+            st = stats.get(p["name"]) or {}
+            p["kills"], p["deaths"], p["kd"] = st.get("kills", 0), st.get("deaths", 0), st.get("kd", 0.0)
     return ok({"players": out, "map_name": map_name})
+
+
+_KARTE_STATS_CACHE: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+_KARTE_STATS_TTL = 60.0
+_KARTE_STATS_MAX = 600
+
+
+def _karten_spielerstats(service_id: str, namen: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Kills/Tode/K-D der Spieler fuer die Karte. Je Spieler kurz zwischengespeichert, damit die Abfrage alle paar Sekunden
+    (Karte offen) die Datenbank nicht belastet."""
+    jetzt = time.time()
+    ergebnis: Dict[str, Dict[str, Any]] = {}
+    for name in namen[:200]:
+        schluessel = (str(service_id), name.lower())
+        treffer = _KARTE_STATS_CACHE.get(schluessel)
+        if treffer is not None and jetzt - treffer[0] < _KARTE_STATS_TTL:
+            ergebnis[name] = treffer[1]
+            continue
+        roh = db.player_stats(service_id, name) or {}
+        wert = {"kills": int(roh.get("kills", 0)), "deaths": int(roh.get("deaths", 0)),
+                "kd": round(float(roh.get("kd", 0.0)), 2)}
+        if len(_KARTE_STATS_CACHE) >= _KARTE_STATS_MAX:
+            _KARTE_STATS_CACHE.clear()
+        _KARTE_STATS_CACHE[schluessel] = (jetzt, wert)
+        ergebnis[name] = wert
+    return ergebnis
+
+
+_KARTE_SPUR_MAX_PUNKTE = 500
+
+
+async def api_map_trail(request: web.Request) -> web.Response:
+    """Spur eines Spielers auf der Karte: seine letzten Positionen (Verlauf des Log-Parsers plus Ereignisse mit Ort),
+    nur dieses Servers. Location Privacy gilt wie bei der Spielerliste."""
+    _c, denied = _session_conn(request)
+    if denied is not None:
+        return denied
+    denied = await _dash_gate(request, _c, "map", "view")
+    if denied is not None:
+        return denied
+    name = str(request.query.get("player") or "").strip()
+    if not name or len(name) > 64:
+        return err("Bitte einen Spielernamen angeben.")
+    try:
+        minuten = int(request.query.get("minutes", 360))
+    except ValueError:
+        minuten = 360
+    minuten = max(5, min(minuten, 1440))
+    if _position_privat(_c, name):
+        return ok({"player": name, "points": [], "minutes": minuten})
+    grenze = time.time() - minuten * 60
+    key = name.lower()
+    roh: List[Tuple[float, float, float]] = []
+    parser = _c.parser
+    for pname, verlauf in list((getattr(parser, "positions_verlauf", {}) or {}).items()):
+        if str(pname).lower() == key:
+            roh.extend(p for p in list(verlauf) if p[0] >= grenze)
+    for e in _ev_snapshot(service_id=_c.service_id, limit=EV_MAX_EVENTS)["events"]:
+        if str(e.get("player") or "").lower() == key and isinstance(e.get("x"), (int, float)) \
+                and isinstance(e.get("z"), (int, float)) and float(e.get("ts") or 0) >= grenze:
+            roh.append((float(e["ts"]), float(e["x"]), float(e["z"])))
+    roh.sort(key=lambda p: p[0])
+    punkte: List[Dict[str, float]] = []
+    for ts, x, z in roh:
+        if punkte and punkte[-1]["x"] == x and punkte[-1]["z"] == z:
+            continue
+        punkte.append({"t": round(ts, 1), "x": x, "z": z})
+    return ok({"player": name, "points": punkte[-_KARTE_SPUR_MAX_PUNKTE:], "minutes": minuten})
 
 
 async def api_events(request: web.Request) -> web.Response:
@@ -54040,6 +54672,9 @@ def build_app() -> web.Application:
     r.add_get("/api/discord-management/honeypot", get_discord_mgmt_honeypot)
     r.add_post("/api/discord-management/honeypot", post_discord_mgmt_honeypot)
     r.add_post("/api/discord-management/honeypot/repost", post_discord_mgmt_honeypot_repost)
+    r.add_get("/api/discord-management/wortfilter", get_discord_mgmt_wortfilter)
+    r.add_post("/api/discord-management/wortfilter", post_discord_mgmt_wortfilter)
+    r.add_post("/api/discord-management/wortfilter/test", post_discord_mgmt_wortfilter_test)
     r.add_get("/api/discord-management/social", get_discord_mgmt_social)
     r.add_post("/api/discord-management/social", post_discord_mgmt_social)
     r.add_post("/api/discord-management/social/pruefen", post_discord_mgmt_social_pruefen)
@@ -54251,6 +54886,7 @@ def build_app() -> web.Application:
     # ── Karte / Events ──
     r.add_get("/api/map/meta", api_map_meta)
     r.add_get("/api/map/players", api_map_players)
+    r.add_get("/api/map/trail", api_map_trail)
     r.add_get("/api/heatmap/points", api_heatmap_points)
     r.add_post("/api/heatmap/reset", api_heatmap_reset)
     r.add_get("/api/events", api_events)
@@ -54904,6 +55540,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "ab087186d659ce9b2cdecf427fcfb124c5f300d561da09ce84d41216e99a1046",
         "c6f1f2a97b2185323eefd64119d57d6d6a83bbde6ed5191e4b4cb409bdd846bd",
         "574533c53b9f4971092e57c7fcea6dab414c24de9d59d24a6b173933777824ce",
+        "30159111e37bb5ca7b80386c11af4987c99b48be5e04b376bdc2cb4306237c0a",
     ),
     "styles.css": (
         "854cd5c0116ef9230d2534c486b88c6dff38df66194defb0c429309ea4add035",
@@ -54959,6 +55596,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "79f46aad545b12f32060e5c6298a4238ad413a83497a34c86100cd409fe04aba",
         "37fb98a556892255577f628f40cc14a2126d6cb25186a8cbb2c089ed479c0115",
         "bce3178c72a3e1685b47378cb3f70ddb75d8424ca3b76241466c0ac262d857ce",
+        "4d5214accd1d96cbdcd5ffbb82930f3accf21ccfbb8bb3d96a75262d37bbe072",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -55230,6 +55868,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "8a18e52c1f964038aff6323288fbf841c4de9dccdd4da39136d0ada97f9950f1",
         "3fbcd5a397d42ffa7408ccae2a6067765efd4d41b13cf56627634e638b9fa31f",
         "54dc3e3f8499df3a59f4e0b98538298dc8d8425d8077dfc3a5a4d6403e4a656a",
+        "d2783e9c3afbab1fbf6582e06566dc89bdb71461f4d6860db2048e5e80d52073",
+        "dd733fa9a2e9751aeba30c4e5062465a05586d67ce60ed0f5110445128025855",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
@@ -55253,6 +55893,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "348ef6ec03933c640b7a2c90543530e9a0881c17e807fdc066c7ea9436c7f1a2",
         "014c591a3cd6aa6862e1583939b437c8b2c2b2d23c009d10f61107a470f84e99",
         "a71f69bc408ce4ea832f4593e005298c884eef31fefd2b08f8e3e17f30d71b00",
+        "3cc04281ef841e20ef2ab5400964e0202772cdfafdd5d8c96fc2722164232aac",
     ),
     "vendor/leaflet.css": (
         "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",

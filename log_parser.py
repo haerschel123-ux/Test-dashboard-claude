@@ -7,8 +7,9 @@ Quelle: Nitrado DayZ Konsolen-Server .ADM Logs.
 """
 import re
 from collections import deque
+import time
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Deque
+from typing import Optional, List, Dict, Deque, Tuple
 
 
 class DayZLogParser:
@@ -20,8 +21,14 @@ class DayZLogParser:
     falschen Discord ausgeloest wurden.
     """
 
+    # Spur auf der Karte: je Spieler die letzten Positionen (Zeitstempel, x, z). Reiner Arbeitsspeicher, nach einem
+    # Neustart des Bots leer; begrenzt in Punkten je Spieler und in der Zahl der Spieler.
+    POSITIONS_VERLAUF_MAX = 240
+    POSITIONS_VERLAUF_SPIELER_MAX = 400
+
     def __init__(self):
         self.player_positions: Dict[str, Dict] = {}
+        self.positions_verlauf: Dict[str, Deque[Tuple[float, float, float]]] = {}
         # Diagnose (reiner Arbeitsspeicher, nichts davon wird gespeichert):
         # wie viele Zeilen kamen an, wie viele wurden zu einem Ereignis, und
         # die letzten paar, die KEIN Muster getroffen haben – im Original,
@@ -294,8 +301,29 @@ class DayZLogParser:
             treffer = re.findall(self.PLAYER_LOSE, line, re.IGNORECASE)
         return [{"name": name, "id": pid or None} for name, pid in treffer]
 
+    def _verlauf_merken(self, name: str, pos: str) -> None:
+        """Position in den Verlauf (Spur) aufnehmen; gleiche Position wie zuletzt zaehlt nicht doppelt."""
+        zahlen = re.findall(r'-?\d+(?:\.\d+)?', str(pos or ""))
+        if len(zahlen) < 2 or not name:
+            return
+        try:
+            x, z = round(float(zahlen[0]), 1), round(float(zahlen[1]), 1)
+        except ValueError:
+            return
+        verlauf = self.positions_verlauf.get(name)
+        if verlauf is None:
+            if len(self.positions_verlauf) >= self.POSITIONS_VERLAUF_SPIELER_MAX:
+                aelteste = min(self.positions_verlauf, key=lambda n: (self.positions_verlauf[n][-1][0]
+                                                                     if self.positions_verlauf[n] else 0.0))
+                self.positions_verlauf.pop(aelteste, None)
+            verlauf = self.positions_verlauf[name] = deque(maxlen=self.POSITIONS_VERLAUF_MAX)
+        if verlauf and verlauf[-1][1] == x and verlauf[-1][2] == z:
+            return
+        verlauf.append((time.time(), x, z))
+
     def _set_position(self, name: str, player_id: Optional[str], pos: str,
                       quelle: str = "position"):
+        self._verlauf_merken(name, pos)
         self.player_positions[name] = {
             "id": player_id,
             "position": pos.strip(),
