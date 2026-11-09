@@ -3996,7 +3996,7 @@ class ServerConnection:
         "map_name", "auto_restart_schedule", "auto_restart_after_purchase",
         "welcome_message", "leave_message", "reaction_roles",
         "ticket_categories", "ticket_open", "ticket_language", "ticket_transcript_channel",
-        "level_system", "honeypot", "wortfilter", "guild_daten",
+        "level_system", "honeypot", "wortfilter", "gluecksrad", "live_karte", "kredite", "guild_daten",
         # Social-Benachrichtigungen: Feed-Adressen (koennen Zugangsschluessel enthalten) gehoeren genau einer Guild.
         "social_feeds",
         # KI-Helfer: Einstellungen je Guild inkl. eigenem API-Schluessel; der
@@ -4512,7 +4512,7 @@ class ConnectionRegistry:
 _GUILD_SCHLUESSEL_GRUPPEN: Tuple[Tuple[str, ...], ...] = (
     ("welcome_message",), ("leave_message",), ("reaction_roles",),
     ("ticket_categories", "ticket_open", "ticket_language", "ticket_transcript_channel"),
-    ("level_system",), ("honeypot",), ("wortfilter",), ("ki_helfer",), ("social_feeds",),
+    ("level_system",), ("honeypot",), ("wortfilter",), ("gluecksrad",), ("live_karte",), ("kredite",), ("ki_helfer",), ("social_feeds",),
     ("giveaways", "giveaway_farbe", "giveaway_required_role_id"),
     ("ban_immune_role_ids",), ("link_add_role_ids", "link_remove_role_ids"),
     ("log_ban_temp_channel_id", "log_ban_perm_channel_id", "log_unban_channel_id"),
@@ -5754,6 +5754,8 @@ class DayZBot(discord.Client):
             self.giveaways_loop.start()
         if not self.social_feeds_loop.is_running():
             self.social_feeds_loop.start()
+        if not self.kredit_loop.is_running():
+            self.kredit_loop.start()
         if not self.temp_unban_loop.is_running():
             self.temp_unban_loop.start()
         if not self.rollen_ablauf_loop.is_running():
@@ -7486,6 +7488,18 @@ class DayZBot(discord.Client):
         await self.wait_until_ready()
 
     @tasks.loop(minutes=5)
+    async def kredit_loop(self):
+        """Ueberfaellige Kredite: Strafen nach der Gnadenfrist (nur, was der Betreiber eingestellt und der Spieler bestaetigt hat)."""
+        try:
+            await _kredit_lauf()
+        except Exception as e:  # noqa: BLE001 - darf den Bot nie stoppen
+            log.error(f"[KREDIT] Fehler: {type(e).__name__}: {e}")
+
+    @kredit_loop.before_loop
+    async def _before_kredit_loop(self):
+        await self.wait_until_ready()
+
+    @tasks.loop(minutes=5)
     async def temp_unban_loop(self):
         """Zeitlich begrenzte Bans (Zonen-Auto-Ban mit ``temp_ban``) wieder
         aufheben, sobald ``expires_at`` erreicht ist. Laeuft nur, solange der
@@ -8919,7 +8933,8 @@ def _conn_store(conn: ServerConnection, key: str, value: Any, *, strict: bool = 
     # ki_helfer enthaelt den API-Schluessel des Kunden - nie nach config.json spiegeln.
     # social_feeds: Feed-Adressen koennen Zugangsschluessel enthalten - ebenfalls nie nach config.json spiegeln.
     # wortfilter: Regeln mit Mitglieds-IDs gehoeren genau einer Guild - ebenfalls nie nach config.json spiegeln.
-    if key in ("eigene_npcs", "airstrikes", "ki_helfer", "airdrop_json", "social_feeds", "wortfilter"):
+    # gluecksrad: Preise mit Rollen-IDs einer Guild - ebenfalls nie nach config.json spiegeln.
+    if key in ("eigene_npcs", "airstrikes", "ki_helfer", "airdrop_json", "social_feeds", "wortfilter", "gluecksrad", "live_karte", "kredite"):
         return
     if connections.primary() is conn:
         cfg.config[key] = value
@@ -24215,8 +24230,9 @@ def _spt_teile_pruefen(name: str, teile: Any) -> List[Dict[str, Any]]:
         elif art in _SPT_GRUPPEN:
             chance = _spt_wert_pruefen(_spt_zahl(t.get("chance")), "Chance", name)
             preset = _spt_zahl(t.get("preset")) or None
-            if preset is not None and not _SPT_PRESET_RE.match(preset):
-                raise ValueError(f"Eintrag „{name}“: Preset „{preset[:30]}“ ist ungültig.")
+            if preset and not _SPT_PRESET_RE.match(preset):
+                kurz = str(preset)[:30]
+                raise ValueError(f"Eintrag „{name}“: Preset „{kurz}“ ist ungültig.")
             items = []
             for it in t.get("items") or []:
                 iname = _spt_zahl(it.get("name")) if isinstance(it, dict) else None
@@ -30576,6 +30592,12 @@ bot.tree.add_command(gsettings_group)
 # ══════════════════════════════════════════════════════════════
 ECON_DB_FILE = "economy.db"
 
+# Spielzeit je Kalendertag (UTC) wird so lange aufbewahrt; eine offene Sitzung zaehlt nur, solange der Server sie kuerzlich bestaetigt hat.
+_SPIELZEIT_TAGE_BEHALTEN = 400
+_SPIELZEIT_SITZUNG_MAX_ALTER = 900
+_SPIELZEIT_SITZUNG_MAX_DAUER = 86400
+
+
 class EconomyDB:
     """Persistenz für Salden (Wallet/Bank), Cooldowns, Käufe und Casino-Historie.
     Die Verbindung wird lazy beim ersten Zugriff geöffnet – erst dann ist
@@ -30914,6 +30936,53 @@ class EconomyDB:
                 last_login   REAL,
                 total_playtime_seconds INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (guild_id, service_id, ingame_name))""")
+            # Spielzeit je Kalendertag (UTC): daraus entstehen "heute", "7 Tage", "30 Tage" und der Verlauf im Spielerbereich.
+            c.execute("""CREATE TABLE IF NOT EXISTS playtime_days (
+                guild_id     INTEGER NOT NULL,
+                service_id   TEXT    NOT NULL DEFAULT '',
+                ingame_name  TEXT    NOT NULL COLLATE NOCASE,
+                day          TEXT    NOT NULL,
+                seconds      INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, service_id, ingame_name, day))""")
+            # Gluecksrad: Zustand je Spieler (gespeicherte Drehungen, letzte Gratis-Drehung, Spielzeit-Ausgangsstand) und Verlauf.
+            c.execute("""CREATE TABLE IF NOT EXISTS rad_spieler (
+                guild_id        INTEGER NOT NULL,
+                user_id         INTEGER NOT NULL,
+                drehungen       INTEGER NOT NULL DEFAULT 0,
+                letzter_gratis  REAL    NOT NULL DEFAULT 0,
+                spielzeit_basis INTEGER,
+                PRIMARY KEY (guild_id, user_id))""")
+            c.execute("""CREATE TABLE IF NOT EXISTS rad_log (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id   INTEGER NOT NULL,
+                user_id    INTEGER NOT NULL,
+                preis_id   TEXT    NOT NULL DEFAULT '',
+                preis_name TEXT    NOT NULL DEFAULT '',
+                typ        TEXT    NOT NULL DEFAULT '',
+                wert       TEXT    NOT NULL DEFAULT '',
+                quelle     TEXT    NOT NULL DEFAULT '',
+                kosten     INTEGER NOT NULL DEFAULT 0,
+                ts         REAL    NOT NULL)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_rad_log_user ON rad_log (guild_id, user_id, id)")
+            # Kredite (experimentell): je Kredit ein Schnappschuss der angenommenen Bedingungen (Strafen, Belohnung, Pfand-Ort).
+            c.execute("""CREATE TABLE IF NOT EXISTS kredite (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id    INTEGER NOT NULL,
+                user_id     INTEGER NOT NULL,
+                service_id  TEXT    NOT NULL DEFAULT '',
+                betrag      INTEGER NOT NULL,
+                zins        INTEGER NOT NULL,
+                bezahlt     INTEGER NOT NULL DEFAULT 0,
+                status      TEXT    NOT NULL DEFAULT 'offen',
+                faellig     REAL    NOT NULL,
+                gnade_bis   REAL    NOT NULL,
+                bedingungen TEXT    NOT NULL DEFAULT '{}',
+                ban_namen   TEXT    NOT NULL DEFAULT '[]',
+                stufen      TEXT    NOT NULL DEFAULT '[]',
+                puenktlich  INTEGER NOT NULL DEFAULT 0,
+                erstellt    REAL    NOT NULL,
+                geschlossen REAL)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_kredite_user ON kredite (guild_id, user_id, status)")
             self._migriere_serverspalten(c)
             c.commit()
 
@@ -32353,7 +32422,287 @@ class EconomyDB:
                 "ON CONFLICT(guild_id, service_id, ingame_name) "
                 "DO UPDATE SET total_playtime_seconds = total_playtime_seconds + excluded.total_playtime_seconds",
                 (guild_id, sid, ingame_name, time.time(), time.time(), int(seconds)))
+            for tag, sek in self._tage_aufteilen(int(seconds), time.time()):
+                self._conn.execute(
+                    "INSERT INTO playtime_days (guild_id, service_id, ingame_name, day, seconds) VALUES (?,?,?,?,?) "
+                    "ON CONFLICT(guild_id, service_id, ingame_name, day) DO UPDATE SET seconds = seconds + excluded.seconds",
+                    (guild_id, sid, ingame_name, tag, sek))
+            self._conn.execute("DELETE FROM playtime_days WHERE day < ?",
+                               (time.strftime("%Y-%m-%d", time.gmtime(time.time() - _SPIELZEIT_TAGE_BEHALTEN * 86400)),))
             self._conn.commit()
+
+    @staticmethod
+    def _tage_aufteilen(sekunden: int, ende: float) -> List[Tuple[str, int]]:
+        """Eine Sitzung, die bei `ende` aufhoerte, auf Kalendertage (UTC) verteilen: erst der Teil seit Mitternacht, der Rest
+        auf die Vortage (neueste zuerst). Endet sie genau um Mitternacht, gehoert dieser Zeitpunkt zum Vortag. Hoechstens 15 Tage."""
+        teile: List[Tuple[str, int]] = []
+        rest = int(sekunden)
+        bis = float(ende)
+        for _ in range(15):
+            if rest <= 0:
+                break
+            tag = math.ceil(bis / 86400) - 1
+            beginn = tag * 86400
+            teil = min(rest, int(round(bis - beginn)))
+            if teil <= 0:
+                break
+            teile.append((time.strftime("%Y-%m-%d", time.gmtime(beginn)), teil))
+            rest -= teil
+            bis = beginn
+        return teile
+
+    def playtime_summary(self, guild_id: int, service_id: str, namen: List[str], jetzt: Optional[float] = None,
+                         tage: int = 14) -> Dict[str, Any]:
+        """Spielzeit eines Spielers (alle seine verknuepften Namen zusammen) auf EINEM Server: gesamt, heute, 7 und 30 Tage,
+        Tagesverlauf, laufende Sitzung und Rang unter allen Spielern dieses Servers dieser Guild."""
+        jetzt = time.time() if jetzt is None else jetzt
+        sid = str(service_id or "")
+        namen = [n for n in dict.fromkeys(str(n) for n in namen) if n][:20]
+        heute = time.strftime("%Y-%m-%d", time.gmtime(jetzt))
+        je_tag: Dict[str, int] = {}
+        total, online_seit, besser, spieler = 0, None, 0, 0
+        if namen:
+            marken = ",".join("?" * len(namen))
+            seit = time.strftime("%Y-%m-%d", time.gmtime(jetzt - (max(30, int(tage)) - 1) * 86400))
+            with self._lock:
+                total = int(self._conn.execute(
+                    f"SELECT COALESCE(SUM(total_playtime_seconds),0) AS s FROM player_roster WHERE guild_id=? AND service_id=? "
+                    f"AND ingame_name IN ({marken})", (guild_id, sid, *namen)).fetchone()["s"])
+                for r in self._conn.execute(
+                        f"SELECT day, SUM(seconds) AS s FROM playtime_days WHERE guild_id=? AND service_id=? AND day>=? "
+                        f"AND ingame_name IN ({marken}) GROUP BY day", (guild_id, sid, seit, *namen)).fetchall():
+                    je_tag[str(r["day"])] = int(r["s"])
+                sitzungen = self._conn.execute(
+                    f"SELECT connect_ts, last_seen_ts FROM sessions WHERE service_id=? AND ingame_name IN ({marken})",
+                    (sid, *namen)).fetchall()
+                andere = self._conn.execute(
+                    f"SELECT total_playtime_seconds AS s FROM player_roster WHERE guild_id=? AND service_id=? "
+                    f"AND total_playtime_seconds > 0 AND ingame_name NOT IN ({marken})", (guild_id, sid, *namen)).fetchall()
+            for s in sitzungen:
+                dauer = jetzt - float(s["connect_ts"])
+                if jetzt - float(s["last_seen_ts"]) > _SPIELZEIT_SITZUNG_MAX_ALTER or not 0 <= dauer <= _SPIELZEIT_SITZUNG_MAX_DAUER:
+                    continue                                    # haengende Sitzung eines abgestuerzten Servers/Bots: nicht mitzaehlen
+                total += int(dauer)
+                online_seit = float(s["connect_ts"]) if online_seit is None else min(online_seit, float(s["connect_ts"]))
+                for tag, sek in self._tage_aufteilen(int(dauer), jetzt):
+                    je_tag[tag] = je_tag.get(tag, 0) + sek
+            besser = sum(1 for r in andere if int(r["s"]) > total)
+            spieler = len(andere) + (1 if total > 0 else 0)
+        verlauf = []
+        for i in range(int(tage) - 1, -1, -1):
+            tag = time.strftime("%Y-%m-%d", time.gmtime(jetzt - i * 86400))
+            verlauf.append({"day": tag, "seconds": je_tag.get(tag, 0)})
+        woche = sum(je_tag.get(time.strftime("%Y-%m-%d", time.gmtime(jetzt - i * 86400)), 0) for i in range(7))
+        return {"total": total, "heute": je_tag.get(heute, 0), "woche": woche, "monat": sum(je_tag.values()), "tage": verlauf,
+                "online_seit": online_seit, "rang": (besser + 1) if total > 0 else None, "spieler": spieler}
+
+    # ── Kredite (experimentell) ──
+    def kredit_anlegen(self, guild_id: int, user_id: int, service_id: str, betrag: int, zins: int, faellig: float, gnade_bis: float,
+                       bedingungen: Dict[str, Any], max_offen: int, jetzt: float) -> Optional[int]:
+        """Legt einen Kredit an - nur, wenn der Spieler in dieser Guild noch weniger als `max_offen` offene Kredite hat (atomar)."""
+        with self._lock:
+            offen = self._conn.execute("SELECT COUNT(*) AS n FROM kredite WHERE guild_id=? AND user_id=? AND status='offen'",
+                                       (guild_id, user_id)).fetchone()["n"]
+            if offen >= int(max_offen):
+                return None
+            cur = self._conn.execute(
+                "INSERT INTO kredite (guild_id, user_id, service_id, betrag, zins, faellig, gnade_bis, bedingungen, erstellt) VALUES (?,?,?,?,?,?,?,?,?)",
+                (guild_id, user_id, str(service_id or ""), int(betrag), int(zins), float(faellig), float(gnade_bis),
+                 json.dumps(bedingungen, ensure_ascii=True, sort_keys=True), float(jetzt)))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def kredit_loeschen(self, kredit_id: int) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM kredite WHERE id=?", (int(kredit_id),))
+            self._conn.commit()
+
+    @staticmethod
+    def _kredit_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        d = dict(row)
+        for k, leer in (("bedingungen", {}), ("ban_namen", []), ("stufen", [])):
+            try:
+                d[k] = json.loads(d.get(k) or "")
+            except ValueError:
+                d[k] = leer
+        d["rest"] = max(0, int(d["betrag"]) + int(d["zins"]) - int(d["bezahlt"]))
+        return d
+
+    def kredit_holen(self, kredit_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return self._kredit_dict(self._conn.execute("SELECT * FROM kredite WHERE id=?", (int(kredit_id),)).fetchone())
+
+    def kredit_liste(self, guild_id: int, user_id: Optional[int] = None, nur_offen: bool = False, limit: int = 50) -> List[Dict[str, Any]]:
+        sql, par = "SELECT * FROM kredite WHERE guild_id=?", [guild_id]
+        if user_id is not None:
+            sql += " AND user_id=?"
+            par.append(user_id)
+        if nur_offen:
+            sql += " AND status='offen'"
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY id DESC LIMIT ?", par + [int(limit)]).fetchall()
+        return [self._kredit_dict(r) for r in rows]
+
+    def kredit_alle_offen(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return [self._kredit_dict(r) for r in self._conn.execute("SELECT * FROM kredite WHERE status='offen' ORDER BY id").fetchall()]
+
+    def kredit_zahlung(self, kredit_id: int, betrag: int, jetzt: float) -> Dict[str, Any]:
+        """Zahlung auf einen offenen Kredit (hoechstens der Rest). Gibt {angewendet, rest, komplett, puenktlich} zurueck."""
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM kredite WHERE id=? AND status='offen'", (int(kredit_id),)).fetchone()
+            if row is None:
+                return {"angewendet": 0, "rest": 0, "komplett": False, "puenktlich": False}
+            rest = max(0, int(row["betrag"]) + int(row["zins"]) - int(row["bezahlt"]))
+            anw = max(0, min(int(betrag), rest))
+            komplett = anw > 0 and anw == rest
+            punkt = komplett and float(jetzt) <= float(row["faellig"])
+            if komplett:
+                self._conn.execute("UPDATE kredite SET bezahlt = bezahlt + ?, status='bezahlt', geschlossen=?, puenktlich=? WHERE id=?",
+                                   (anw, float(jetzt), 1 if punkt else 0, int(kredit_id)))
+            elif anw:
+                self._conn.execute("UPDATE kredite SET bezahlt = bezahlt + ? WHERE id=?", (anw, int(kredit_id)))
+            self._conn.commit()
+            return {"angewendet": anw, "rest": rest - anw, "komplett": komplett, "puenktlich": punkt}
+
+    def kredit_stufe_markieren(self, kredit_id: int, stufe: str) -> bool:
+        """Eine Strafstufe als erledigt vermerken. True nur beim ersten Mal (atomar)."""
+        with self._lock:
+            row = self._conn.execute("SELECT stufen FROM kredite WHERE id=? AND status='offen'", (int(kredit_id),)).fetchone()
+            if row is None:
+                return False
+            try:
+                stufen = json.loads(row["stufen"] or "[]")
+            except ValueError:
+                stufen = []
+            if stufe in stufen:
+                return False
+            stufen.append(stufe)
+            self._conn.execute("UPDATE kredite SET stufen=? WHERE id=?", (json.dumps(stufen), int(kredit_id)))
+            self._conn.commit()
+            return True
+
+    def kredit_zins_erhoehen(self, kredit_id: int, betrag: int) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE kredite SET zins = zins + ? WHERE id=? AND status='offen'", (int(betrag), int(kredit_id)))
+            self._conn.commit()
+
+    def kredit_ban_namen_setzen(self, kredit_id: int, namen: List[str]) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE kredite SET ban_namen=? WHERE id=?", (json.dumps(list(namen)), int(kredit_id)))
+            self._conn.commit()
+
+    def kredit_erlassen(self, kredit_id: int, jetzt: float) -> bool:
+        with self._lock:
+            cur = self._conn.execute("UPDATE kredite SET status='erlassen', geschlossen=? WHERE id=? AND status='offen'",
+                                     (float(jetzt), int(kredit_id)))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def kredit_pfaenden(self, guild_id: int, user_id: int, maximal: int) -> int:
+        """Nimmt bis zu `maximal` vom Guthaben des Spielers (erst Wallet, dann Bank, atomar). Gibt den genommenen Betrag zurueck."""
+        self.ensure_user(guild_id, user_id)
+        with self._lock:
+            row = self._conn.execute("SELECT wallet, bank FROM balances WHERE guild_id=? AND user_id=?", (guild_id, user_id)).fetchone()
+            wallet, bank = int(row["wallet"]), int(row["bank"])
+            aus_wallet = max(0, min(wallet, int(maximal)))
+            aus_bank = max(0, min(bank, int(maximal) - aus_wallet))
+            if aus_wallet + aus_bank <= 0:
+                return 0
+            self._conn.execute("UPDATE balances SET wallet = wallet - ?, bank = bank - ? WHERE guild_id=? AND user_id=?",
+                               (aus_wallet, aus_bank, guild_id, user_id))
+            self._conn.commit()
+            return aus_wallet + aus_bank
+
+    # ── Gluecksrad: Zustand je Spieler ──
+    def rad_spieler(self, guild_id: int, user_id: int) -> Dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute("SELECT drehungen, letzter_gratis, spielzeit_basis FROM rad_spieler WHERE guild_id=? AND user_id=?",
+                                     (guild_id, user_id)).fetchone()
+        if row is None:
+            return {"drehungen": 0, "letzter_gratis": 0.0, "spielzeit_basis": None}
+        return {"drehungen": int(row["drehungen"]), "letzter_gratis": float(row["letzter_gratis"]),
+                "spielzeit_basis": None if row["spielzeit_basis"] is None else int(row["spielzeit_basis"])}
+
+    def rad_drehungen_aendern(self, guild_id: int, user_id: int, delta: int, maximum: int) -> int:
+        """Gespeicherte Drehungen um delta aendern (nie unter 0, nie ueber maximum). Gibt den neuen Stand zurueck."""
+        with self._lock:
+            self._conn.execute("INSERT OR IGNORE INTO rad_spieler (guild_id, user_id) VALUES (?,?)", (guild_id, user_id))
+            self._conn.execute("UPDATE rad_spieler SET drehungen = MIN(?, MAX(0, drehungen + ?)) WHERE guild_id=? AND user_id=?",
+                               (int(maximum), int(delta), guild_id, user_id))
+            self._conn.commit()
+            return int(self._conn.execute("SELECT drehungen FROM rad_spieler WHERE guild_id=? AND user_id=?",
+                                          (guild_id, user_id)).fetchone()["drehungen"])
+
+    def rad_verbrauche(self, guild_id: int, user_id: int) -> bool:
+        """Eine gespeicherte Drehung atomar verbrauchen. False, wenn keine da ist."""
+        with self._lock:
+            cur = self._conn.execute("UPDATE rad_spieler SET drehungen = drehungen - 1 WHERE guild_id=? AND user_id=? AND drehungen > 0",
+                                     (guild_id, user_id))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def rad_gratis_beanspruchen(self, guild_id: int, user_id: int, stunden: int, jetzt: float) -> Optional[float]:
+        """Gratis-Drehung atomar beanspruchen. Gibt den vorherigen Zeitpunkt zurueck (zum Zurueckgeben bei Fehlern) oder None,
+        wenn sie noch nicht wieder bereit ist."""
+        with self._lock:
+            self._conn.execute("INSERT OR IGNORE INTO rad_spieler (guild_id, user_id) VALUES (?,?)", (guild_id, user_id))
+            vorher = float(self._conn.execute("SELECT letzter_gratis FROM rad_spieler WHERE guild_id=? AND user_id=?",
+                                              (guild_id, user_id)).fetchone()["letzter_gratis"])
+            cur = self._conn.execute("UPDATE rad_spieler SET letzter_gratis=? WHERE guild_id=? AND user_id=? AND letzter_gratis + ? <= ?",
+                                     (float(jetzt), guild_id, user_id, int(stunden) * 3600, float(jetzt)))
+            self._conn.commit()
+            return vorher if cur.rowcount > 0 else None
+
+    def rad_gratis_zuruecksetzen(self, guild_id: int, user_id: int, vorher: float) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE rad_spieler SET letzter_gratis=? WHERE guild_id=? AND user_id=?", (float(vorher), guild_id, user_id))
+            self._conn.commit()
+
+    def rad_spielzeit_gutschreiben(self, guild_id: int, user_id: int, gesamt: int, stunden: int, maximum: int) -> int:
+        """Je voller `stunden` Spielzeit seit dem Ausgangsstand eine Drehung gutschreiben (hoechstens bis `maximum`; was darueber
+        hinausgeht, verfaellt). Der erste Aufruf legt nur den Ausgangsstand fest - frueher gespielte Zeit zaehlt nicht. Sinkt die
+        Gesamtzeit (z. B. anderer Ingame-Name verknuepft), wird der Ausgangsstand neu gesetzt. Gibt die gutgeschriebenen Drehungen zurueck."""
+        schritt = int(stunden) * 3600
+        gesamt = int(gesamt)
+        if schritt <= 0:
+            return 0
+        with self._lock:
+            self._conn.execute("INSERT OR IGNORE INTO rad_spieler (guild_id, user_id) VALUES (?,?)", (guild_id, user_id))
+            row = self._conn.execute("SELECT drehungen, spielzeit_basis FROM rad_spieler WHERE guild_id=? AND user_id=?",
+                                     (guild_id, user_id)).fetchone()
+            basis = row["spielzeit_basis"]
+            if basis is None or gesamt < int(basis):
+                self._conn.execute("UPDATE rad_spieler SET spielzeit_basis=? WHERE guild_id=? AND user_id=?", (gesamt, guild_id, user_id))
+                self._conn.commit()
+                return 0
+            n = (gesamt - int(basis)) // schritt
+            if n <= 0:
+                return 0
+            gutschrift = max(0, min(n, int(maximum) - int(row["drehungen"])))
+            self._conn.execute("UPDATE rad_spieler SET drehungen = drehungen + ?, spielzeit_basis = ? WHERE guild_id=? AND user_id=?",
+                               (gutschrift, int(basis) + n * schritt, guild_id, user_id))
+            self._conn.commit()
+            return gutschrift
+
+    def rad_log_add(self, guild_id: int, user_id: int, preis_id: str, preis_name: str, typ: str, wert: str, quelle: str,
+                    kosten: int) -> None:
+        with self._lock:
+            self._conn.execute("INSERT INTO rad_log (guild_id, user_id, preis_id, preis_name, typ, wert, quelle, kosten, ts) "
+                               "VALUES (?,?,?,?,?,?,?,?,?)",
+                               (guild_id, user_id, preis_id, preis_name, typ, wert, quelle, int(kosten), time.time()))
+            self._conn.execute("DELETE FROM rad_log WHERE guild_id=? AND user_id=? AND id NOT IN "
+                               "(SELECT id FROM rad_log WHERE guild_id=? AND user_id=? ORDER BY id DESC LIMIT 200)",
+                               (guild_id, user_id, guild_id, user_id))
+            self._conn.commit()
+
+    def rad_log(self, guild_id: int, user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute("SELECT preis_name, typ, wert, quelle, kosten, ts FROM rad_log WHERE guild_id=? AND user_id=? "
+                                      "ORDER BY id DESC LIMIT ?", (guild_id, user_id, int(limit))).fetchall()
+        return [dict(r) for r in rows]
 
     def roster_hat_namen(self, guild_id: int, service_id: str, ingame_name: str) -> bool:
         """True, wenn dieser Ingame-Name schon einmal auf DIESEM Server (in
@@ -45451,6 +45800,9 @@ def _discord_mgmt_payload(conn: "ServerConnection") -> Dict[str, Any]:
             "level_system": {"enabled": bool(_level_einstellungen(conn)["enabled"])},
             "honeypot": {"enabled": bool(_honeypot_einstellungen(conn)["enabled"])},
             "wortfilter": {"enabled": bool(_wortfilter_einstellungen(conn)["enabled"])},
+            "gluecksrad": {"enabled": bool(_rad_einstellungen(conn)["enabled"])},
+            "livekarte": {"enabled": _livekarte_einstellungen(conn)["modus"] != "team"},
+            "kredite": {"enabled": bool(_kredit_einstellungen(conn)["enabled"])},
             "ki_helfer": {"enabled": bool(_ki_einstellungen(conn)["befehl_aktiv"]
                                           or _ki_einstellungen(conn)["ticket_aktiv"])},
             **{f"social_{p}": {"enabled": _social_aktiv(conn, p)} for p in _SOCIAL_PLATTFORMEN}}
@@ -46429,7 +46781,7 @@ _WORTFILTER_TEST_MAX = 500
 _WORTFILTER_ID_RE = re.compile(r"[0-9a-f]{8}")
 _WORTFILTER_SNOWFLAKE_RE = re.compile(r"[0-9]{1,20}")
 _WORTFILTER_LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t"})
-_WORTFILTER_UNSICHTBAR = {ord(c): None for c in "​‌‍⁠﻿­"}
+_WORTFILTER_UNSICHTBAR = {ord(c): None for c in "\u200b\u200c\u200d\u2060\ufeff\u00ad"}
 _WORTFILTER_STRIKES: Dict[Tuple[int, str, int], List[float]] = {}     # (guild, regel, nutzer) -> Zeitstempel
 _WORTFILTER_REGEX: Dict[Tuple[Tuple[str, ...], str], Any] = {}
 _WORTFILTER_REGEX_MAX = 400
@@ -46621,6 +46973,7 @@ def _wortfilter_entscheiden(e: Dict[str, Any], member: Any, guild_id: int, text:
     jetzt = time.time() if jetzt is None else jetzt
     normal = _wortfilter_normal(text[:_WORTFILTER_TEXT_MAX])
     beste: Optional[Dict[str, Any]] = None
+    beste_stufe = -1
     for regel in e["rules"]:
         if not regel["enabled"] or not _wortfilter_gilt_fuer(regel, member):
             continue
@@ -46632,7 +46985,8 @@ def _wortfilter_entscheiden(e: Dict[str, Any], member: Any, guild_id: int, text:
         esk = regel["escalation"]
         if esk and anzahl >= esk["after"]:
             aktion, minuten, eskaliert = esk["action"], esk["timeout_minutes"], True
-        if beste is None or _WORTFILTER_STUFE[aktion] > _WORTFILTER_STUFE[beste["action"]]:
+        if _WORTFILTER_STUFE[aktion] > beste_stufe:
+            beste_stufe = _WORTFILTER_STUFE[aktion]
             beste = {"regel": regel, "treffer": treffer, "action": aktion, "minutes": minuten, "anzahl": anzahl,
                      "eskaliert": eskaliert}
     return beste
@@ -46905,6 +47259,1251 @@ async def post_discord_mgmt_wortfilter_test(request: web.Request) -> web.Respons
 
 
 # ══════════════════════════════════════════════════════════════
+#  Gluecksrad (Discord Management einstellbar, /wheel und Spielerbereich)
+# ══════════════════════════════════════════════════════════════
+# Je Guild in conn.data["gluecksrad"]: welche Preise (mit Gewicht), wie man an Drehungen kommt (bezahlen, gratis alle X
+# Stunden, je X Stunden Spielzeit, vom Team verschenkt) und wie viele Drehungen man hoechstens sparen darf. Zustand je
+# Spieler in der Datenbank (rad_spieler, rad_log). Ein Spieler dreht nie zweimal gleichzeitig (Sperre je Guild und Nutzer);
+# schlaegt die Auszahlung des Preises fehl, bekommt er die Drehung bzw. sein Geld zurueck.
+_RAD_TYPEN = ("geld", "item", "rolle", "drehung", "niete")
+_RAD_MAX_PREISE = 20
+_RAD_MAX_GEWICHT = 1000
+_RAD_MAX_BETRAG = 1_000_000_000
+_RAD_MAX_MENGE = 50
+_RAD_MAX_DREHUNGEN = 10
+_RAD_NAME_MAX = 40
+_RAD_MAX_SPAREN = 100
+_RAD_MAX_STUNDEN = 24 * 30
+_RAD_QUELLEN = ("gespeichert", "gratis", "bezahlt")
+_RAD_ID_RE = re.compile(r"[0-9a-f]{8}")
+_RAD_LOCKS: Dict[Tuple[int, int], asyncio.Lock] = {}
+
+
+def _rad_zahl(wert: Any, niedrig: int, hoch: int) -> int:
+    if isinstance(wert, bool) or not isinstance(wert, (int, float)) or wert != int(wert) or not niedrig <= int(wert) <= hoch:
+        raise ValueError(f"Ungültiger Zahlenwert – erlaubt sind ganze Zahlen von {niedrig} bis {hoch}.")
+    return int(wert)
+
+
+def _rad_preis_pruefen(roh: Any, id_erzeugen: bool = False) -> Dict[str, Any]:
+    """Prueft EINEN Preis und gibt ihn in fester Form zurueck (ValueError mit deutschem Text). Beim Laden wird ein
+    kaputter gespeicherter Preis einfach uebersprungen."""
+    if not isinstance(roh, dict):
+        raise ValueError("Ungültiger Preis.")
+    pid = roh.get("id")
+    if pid in (None, ""):
+        if not id_erzeugen:
+            raise ValueError("Preis ohne Kennung.")
+        pid = uuid.uuid4().hex[:8]
+    if not isinstance(pid, str) or not _RAD_ID_RE.fullmatch(pid):
+        raise ValueError("Ungültige Preis-Kennung.")
+    typ = roh.get("typ")
+    if typ not in _RAD_TYPEN:
+        raise ValueError("Unbekannter Preis-Typ.")
+    name = roh.get("name")
+    if not isinstance(name, str):
+        raise ValueError("Jeder Preis braucht einen Namen.")
+    name = " ".join(name.split())
+    if not name or len(name) > _RAD_NAME_MAX or any(unicodedata.category(c).startswith("C") for c in name):
+        raise ValueError(f"Der Name eines Preises darf 1 bis {_RAD_NAME_MAX} Zeichen lang sein und keine Steuerzeichen enthalten.")
+    preis: Dict[str, Any] = {"id": pid, "name": name, "typ": typ, "gewicht": _rad_zahl(roh.get("gewicht"), 1, _RAD_MAX_GEWICHT)}
+    if typ == "geld":
+        preis["betrag"] = _rad_zahl(roh.get("betrag"), 1, _RAD_MAX_BETRAG)
+    elif typ == "item":
+        item = roh.get("item")
+        if not isinstance(item, str) or not item.strip() or len(item) > 80:
+            raise ValueError("Bitte ein Item aus dem Shop-Katalog wählen.")
+        preis["item"] = item.strip()
+        preis["menge"] = _rad_zahl(roh.get("menge", 1), 1, _RAD_MAX_MENGE)
+    elif typ == "rolle":
+        rid = roh.get("role_id")
+        text = str(rid).strip() if isinstance(rid, (str, int)) and not isinstance(rid, bool) else ""
+        if not re.fullmatch(r"[0-9]{1,20}", text) or int(text) <= 0:
+            raise ValueError("Bitte eine Rolle wählen.")
+        preis["role_id"] = text
+    elif typ == "drehung":
+        preis["drehungen"] = _rad_zahl(roh.get("drehungen", 1), 1, _RAD_MAX_DREHUNGEN)
+    return preis
+
+
+def _rad_einstellungen(sicht: Any) -> Dict[str, Any]:
+    roh = sicht.get("gluecksrad")
+    roh = roh if isinstance(roh, dict) else {}
+
+    def zahl(key: str, vorgabe: int, niedrig: int, hoch: int) -> int:
+        try:
+            return _rad_zahl(roh.get(key, vorgabe), niedrig, hoch)
+        except ValueError:
+            return vorgabe
+    preise: List[Dict[str, Any]] = []
+    gespeichert = roh.get("preise")
+    for p in (gespeichert if isinstance(gespeichert, list) else [])[:_RAD_MAX_PREISE]:
+        try:
+            preise.append(_rad_preis_pruefen(p))
+        except ValueError:
+            continue
+    return {"enabled": bool(roh.get("enabled", False)), "kosten": zahl("kosten", 0, 0, _RAD_MAX_BETRAG),
+            "gratis_stunden": zahl("gratis_stunden", 0, 0, _RAD_MAX_STUNDEN),
+            "spielzeit_stunden": zahl("spielzeit_stunden", 0, 0, _RAD_MAX_STUNDEN),
+            "max_gespeichert": zahl("max_gespeichert", 10, 1, _RAD_MAX_SPAREN), "preise": preise}
+
+
+def _rad_chancen(preise: List[Dict[str, Any]]) -> List[float]:
+    summe = sum(p["gewicht"] for p in preise)
+    return [round(p["gewicht"] * 100.0 / summe, 2) if summe else 0.0 for p in preise]
+
+
+def _rad_ziehen(preise: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Gewichtete Ziehung mit dem Zufallsgenerator des Betriebssystems."""
+    summe = sum(p["gewicht"] for p in preise)
+    wurf = secrets.randbelow(summe)
+    for p in preise:
+        wurf -= p["gewicht"]
+        if wurf < 0:
+            return p
+    return preise[-1]
+
+
+def _rad_preis_text(p: Dict[str, Any], conn: Any, en: bool, guild: Any = None) -> str:
+    if p["typ"] == "geld":
+        return f"💰 {_fmt_money(p['betrag'], conn)}"
+    if p["typ"] == "item":
+        return f"🎁 {p['menge']}× {p['item']}"
+    if p["typ"] == "rolle":
+        rolle = guild.get_role(int(p["role_id"])) if guild is not None else None
+        return f"🎭 {'Role' if en else 'Rolle'} {rolle.name if rolle is not None else p['role_id']}"
+    if p["typ"] == "drehung":
+        return f"🔄 +{p['drehungen']} {'spin(s)' if en else 'Drehung(en)'}"
+    return "💨 " + ("Nothing" if en else "Niete")
+
+
+def _rad_spielzeit_pruefen(conn: Any, e: Dict[str, Any], gid: int, uid: int) -> None:
+    """Schreibt verdiente Drehungen aus der Spielzeit gut (je X Stunden eine). Die erste Pruefung eines Spielers legt nur den
+    Ausgangsstand fest - frueher gespielte Zeit zaehlt nicht nachtraeglich."""
+    if not e["spielzeit_stunden"]:
+        return
+    namen = [str(r["ingame_name"]) for r in db.get_links_by_user(gid, uid)]
+    if not namen:
+        return
+    gesamt = db.playtime_summary(gid, conn.service_id, namen)["total"]
+    db.rad_spielzeit_gutschreiben(gid, uid, int(gesamt), e["spielzeit_stunden"], e["max_gespeichert"])
+
+
+def _rad_status(conn: Any, sicht: Any, guild: Any, gid: int, uid: int, en: bool, jetzt: Optional[float] = None) -> Dict[str, Any]:
+    jetzt = time.time() if jetzt is None else jetzt
+    e = _rad_einstellungen(sicht)
+    _rad_spielzeit_pruefen(conn, e, gid, uid)
+    s = db.rad_spieler(gid, uid)
+    in_s = 0
+    if e["gratis_stunden"]:
+        in_s = max(0, int(s["letzter_gratis"] + e["gratis_stunden"] * 3600 - jetzt))
+    fortschritt = None
+    if e["spielzeit_stunden"] and db.get_links_by_user(gid, uid):
+        namen = [str(r["ingame_name"]) for r in db.get_links_by_user(gid, uid)]
+        gesamt = int(db.playtime_summary(gid, conn.service_id, namen)["total"])
+        basis = s["spielzeit_basis"] if s["spielzeit_basis"] is not None else gesamt
+        fortschritt = max(0, gesamt - int(basis))
+    chancen = _rad_chancen(e["preise"])
+    wallet, _bank = db.get_balance(gid, uid)
+    return {"aktiv": bool(e["enabled"] and e["preise"]), "drehungen": s["drehungen"], "max_gespeichert": e["max_gespeichert"],
+            "gratis": {"stunden": e["gratis_stunden"], "bereit": bool(e["gratis_stunden"] and in_s == 0), "in_sekunden": in_s},
+            "kosten": e["kosten"], "kosten_text": _fmt_money(e["kosten"], conn), "wallet": wallet,
+            "spielzeit": {"stunden": e["spielzeit_stunden"], "fortschritt": fortschritt,
+                          "verknuepft": bool(db.get_links_by_user(gid, uid))},
+            "preise": [{"id": p["id"], "name": p["name"], "typ": p["typ"], "chance": c, "text": _rad_preis_text(p, conn, en, guild)}
+                       for p, c in zip(e["preise"], chancen)]}
+
+
+def _rad_ergebnis_fehler(code: str, de: str, en: str) -> Dict[str, Any]:
+    return {"ok": False, "code": code, "de": de, "en": en}
+
+
+async def _rad_preis_auszahlen(conn: Any, sicht: Any, guild: Any, gid: int, uid: int, user_name: str, p: Dict[str, Any],
+                               e: Dict[str, Any]) -> Tuple[bool, str, str, str]:
+    """Zahlt einen gezogenen Preis aus. (ok, deutsch, englisch, kurzer Wert fuers Protokoll)"""
+    typ = p["typ"]
+    if typ == "niete":
+        return True, "Diesmal leider nichts.", "Nothing this time.", ""
+    if typ == "geld":
+        db.add_wallet(gid, uid, p["betrag"])
+        return True, f"Du bekommst {_fmt_money(p['betrag'], conn)}!", f"You get {_fmt_money(p['betrag'], conn)}!", str(p["betrag"])
+    if typ == "drehung":
+        db.rad_drehungen_aendern(gid, uid, p["drehungen"], e["max_gespeichert"])
+        return (True, f"Du bekommst {p['drehungen']} zusätzliche Drehung(en)!", f"You get {p['drehungen']} extra spin(s)!",
+                str(p["drehungen"]))
+    if typ == "rolle":
+        problem = await _rolle_geben(guild, uid, int(p["role_id"]), "Glücksrad")
+        if problem is not None:
+            return False, problem[0], problem[1], ""
+        return True, f"Du bekommst die Rolle „{p['name']}“!", f"You get the role “{p['name']}”!", p["role_id"]
+    # item: wird am letzten bekannten Ort des Spielers geliefert (wie ein Kauf zum Preis 0)
+    katalog = conn.catalog
+    it = katalog.find(p["item"]) if katalog is not None else None
+    cls_list = _item_classnames(it) if it else []
+    if not it or not cls_list:
+        return (False, "Das Item gibt es im Shop-Katalog nicht (mehr) – bitte das Team informieren.",
+                "The item no longer exists in the shop catalog – please tell the team.", "")
+    ort = _ort_letzter_bekannter(conn, gid, uid)
+    if ort is None:
+        wert = int(it.get("price", 0)) * int(p["menge"])
+        if wert <= 0:
+            return (False, "Dein letzter Ort ist unbekannt – verknüpfe dich mit /link und spiele auf dem Server.",
+                    "Your last location is unknown – link with /link and play on the server.", "")
+        db.add_wallet(gid, uid, wert)
+        return (True, f"Dein Ort ist unbekannt – du bekommst stattdessen den Wert: {_fmt_money(wert, conn)}.",
+                f"Your location is unknown – you get the value instead: {_fmt_money(wert, conn)}.", f"ersatz:{wert}")
+    wallet, _bank = db.get_balance(gid, uid)
+    y_val = float(conn.get("default_pos_y", 0.0) or 0.0)
+    plan = _KaufPlan(it, cls_list, int(p["menge"]), float(ort["x"]), y_val, float(ort["z"]), None, 0, wallet, None, None)
+    res = await _kauf_ausfuehren(conn, gid, uid, user_name, plan)
+    if not res.ok:
+        return False, res.de or "Die Lieferung ist fehlgeschlagen.", res.en or "Delivery failed.", ""
+    return (True, f"Dein Gewinn ({p['menge']}× {p['item']}) spawnt nach dem nächsten Neustart an deinem letzten Ort.",
+            f"Your prize ({p['menge']}× {p['item']}) spawns at your last location after the next restart.", f"{p['menge']}x {p['item']}")
+
+
+async def _rad_drehen(conn: Any, sicht: Any, guild: Any, gid: int, uid: int, user_name: str, quelle: str) -> Dict[str, Any]:
+    """Eine Drehung ausfuehren. Gibt {ok, code, de, en, preis, ...} zurueck; bei Fehlern wird nichts verbraucht."""
+    if quelle not in _RAD_QUELLEN:
+        return _rad_ergebnis_fehler("quelle", "Ungültige Art der Drehung.", "Invalid kind of spin.")
+    async with _RAD_LOCKS.setdefault((gid, uid), asyncio.Lock()):
+        e = _rad_einstellungen(sicht)
+        if not e["enabled"] or not e["preise"]:
+            return _rad_ergebnis_fehler("aus", "Das Glücksrad ist auf diesem Server nicht aktiv.", "The wheel of fortune is not active on this server.")
+        _rad_spielzeit_pruefen(conn, e, gid, uid)
+        rueckgabe: Any = None
+        if quelle == "gespeichert":
+            if not db.rad_verbrauche(gid, uid):
+                return _rad_ergebnis_fehler("keine", "Du hast keine gespeicherte Drehung.", "You have no saved spin.")
+        elif quelle == "gratis":
+            if not e["gratis_stunden"]:
+                return _rad_ergebnis_fehler("keine", "Gratis-Drehungen sind hier nicht eingestellt.", "Free spins are not set up here.")
+            rueckgabe = db.rad_gratis_beanspruchen(gid, uid, e["gratis_stunden"], time.time())
+            if rueckgabe is None:
+                return _rad_ergebnis_fehler("warten", "Deine Gratis-Drehung ist noch nicht wieder bereit.", "Your free spin is not ready yet.")
+        else:
+            if not e["kosten"]:
+                return _rad_ergebnis_fehler("keine", "Bezahlte Drehungen sind hier nicht eingestellt.", "Paid spins are not set up here.")
+            if not db.try_spend_wallet(gid, uid, e["kosten"]):
+                wallet, _bank = db.get_balance(gid, uid)
+                return _rad_ergebnis_fehler("guthaben", f"Du brauchst {_fmt_money(e['kosten'], conn)}, dein Wallet hat nur {_fmt_money(wallet, conn)}.",
+                                            f"You need {_fmt_money(e['kosten'], conn)} but your wallet only has {_fmt_money(wallet, conn)}.")
+
+        def zurueck() -> None:
+            if quelle == "gespeichert":
+                db.rad_drehungen_aendern(gid, uid, 1, e["max_gespeichert"])
+            elif quelle == "gratis":
+                db.rad_gratis_zuruecksetzen(gid, uid, float(rueckgabe or 0.0))
+            else:
+                db.add_wallet(gid, uid, e["kosten"])
+        p = _rad_ziehen(e["preise"])
+        try:
+            ok_, de, en, wert = await _rad_preis_auszahlen(conn, sicht, guild, gid, uid, user_name, p, e)
+        except Exception as exc:  # noqa: BLE001 - nie eine Drehung verlieren
+            log.warning(f"[RAD] Auszahlung fehlgeschlagen ({conn.service_id}): {type(exc).__name__}: {exc}")
+            ok_, de, en, wert = False, "Die Auszahlung ist fehlgeschlagen.", "The payout failed.", ""
+        if not ok_:
+            zurueck()
+            return _rad_ergebnis_fehler("auszahlung", f"{de} Deine Drehung wurde zurückgegeben.", f"{en} Your spin was returned.")
+        db.rad_log_add(gid, uid, p["id"], p["name"], p["typ"], wert, quelle, e["kosten"] if quelle == "bezahlt" else 0)
+        if p["typ"] != "niete":
+            try:
+                embed = discord.Embed(title=_ft(conn, "🎡 GLÜCKSRAD", "🎡 WHEEL OF FORTUNE"), color=0xF1C40F,
+                                      description=_ft(conn, f"<@{uid}> hat **{p['name']}** gewonnen ({_rad_preis_text(p, conn, False, guild)})",
+                                                      f"<@{uid}> won **{p['name']}** ({_rad_preis_text(p, conn, True, guild)})"))
+                await _post_feed(gid, "economy_log", embed, service_id=conn.service_id)
+            except Exception as exc:  # noqa: BLE001
+                log.debug(f"[RAD] Feed fehlgeschlagen: {exc}")
+        wallet, _bank = db.get_balance(gid, uid)
+        return {"ok": True, "de": de, "en": en, "wallet": wallet, "drehungen": db.rad_spieler(gid, uid)["drehungen"],
+                "preis": {"id": p["id"], "name": p["name"], "typ": p["typ"], "text_de": _rad_preis_text(p, conn, False, guild),
+                          "text_en": _rad_preis_text(p, conn, True, guild)}}
+
+
+# ── Dashboard: Einstellungen (Discord Management) ──
+def _rad_payload(sicht: Any) -> Dict[str, Any]:
+    e = _rad_einstellungen(sicht)
+    chancen = _rad_chancen(e["preise"])
+    e["preise"] = [dict(p, chance=c) for p, c in zip(e["preise"], chancen)]
+    e["limits"] = {"preise": _RAD_MAX_PREISE, "gewicht": _RAD_MAX_GEWICHT, "stunden": _RAD_MAX_STUNDEN, "sparen": _RAD_MAX_SPAREN,
+                   "betrag": _RAD_MAX_BETRAG, "menge": _RAD_MAX_MENGE, "drehungen": _RAD_MAX_DREHUNGEN}
+    return e
+
+
+async def get_discord_mgmt_rad(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "view")
+    if denied is not None:
+        return denied
+    return ok(_rad_payload(conn))
+
+
+async def get_discord_mgmt_rad_items(request: web.Request) -> web.Response:
+    """Suche im Shop-Katalog fuer die Preis-Auswahl (hoechstens 20 Treffer)."""
+    conn, denied = await _honeypot_gate(request, "view")
+    if denied is not None:
+        return denied
+    q = str(request.query.get("q") or "").strip().lower()[:60]
+    katalog = conn.catalog
+    if katalog is None or len(q) < 2:
+        return ok({"items": []})
+    treffer = [str(it.get("name")) for it in katalog.items if it.get("enabled", True) and q in str(it.get("name", "")).lower()]
+    return ok({"items": sorted(treffer, key=lambda n: (not n.lower().startswith(q), n.lower()))[:20]})
+
+
+async def post_discord_mgmt_rad(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.gluecksrad", 3)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    if not isinstance(data, dict):
+        return err("Ungültige Anfrage.")
+    preise_roh = data.get("preise")
+    if not isinstance(preise_roh, list) or len(preise_roh) > _RAD_MAX_PREISE:
+        return err(f"Höchstens {_RAD_MAX_PREISE} Preise.")
+    try:
+        preise = [_rad_preis_pruefen(p, id_erzeugen=True) for p in preise_roh]
+        kosten = _rad_zahl(data.get("kosten", 0), 0, _RAD_MAX_BETRAG)
+        gratis = _rad_zahl(data.get("gratis_stunden", 0), 0, _RAD_MAX_STUNDEN)
+        spielzeit = _rad_zahl(data.get("spielzeit_stunden", 0), 0, _RAD_MAX_STUNDEN)
+        sparen = _rad_zahl(data.get("max_gespeichert", 10), 1, _RAD_MAX_SPAREN)
+    except ValueError as exc:
+        return err(str(exc))
+    if len({p["id"] for p in preise}) != len(preise):
+        return err("Doppelte Preis-Kennung.")
+    aktiv = bool(data.get("enabled", False))
+    if aktiv and not preise:
+        return err("Bitte zuerst mindestens einen Preis anlegen.")
+    if aktiv and not (kosten or gratis or spielzeit):
+        return err("Bitte mindestens einen Weg zu Drehungen einstellen (bezahlen, gratis oder Spielzeit) – vom Team verschenkte Drehungen gehen immer.")
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    rollen = [p["role_id"] for p in preise if p["typ"] == "rolle"]
+    if rollen and not gid:
+        return err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
+    guild = bot.get_guild(gid) if (bot and gid) else None
+    for rid in rollen:
+        fehler = _rolle_gehoert_guild(gid, int(rid))
+        if fehler is not None:
+            return fehler
+        problem = _rolle_vergebbar(guild, guild.get_role(int(rid))) if guild is not None else None
+        if problem is not None:
+            return err(problem[0])
+    katalog = conn.catalog
+    for p in preise:
+        if p["typ"] == "item" and (katalog is None or katalog.find(p["item"]) is None):
+            return err(f"Das Item „{p['item']}“ gibt es im Shop-Katalog nicht.")
+    _conn_store(conn, "gluecksrad", {"enabled": aktiv, "kosten": kosten, "gratis_stunden": gratis, "spielzeit_stunden": spielzeit,
+                                     "max_gespeichert": sparen, "preise": preise})
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Discord-Management aktualisiert",
+               f"gluecksrad · {len(preise)} Preis(e) · {conn.name}")
+    return ok(_rad_payload(conn))
+
+
+async def post_discord_mgmt_rad_geben(request: web.Request) -> web.Response:
+    """Dem Mitglied (Discord-ID) gespeicherte Drehungen schenken."""
+    conn, denied = await _honeypot_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.gluecksrad.geben", 2)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    if not isinstance(data, dict):
+        return err("Ungültige Anfrage.")
+    try:
+        anzahl = _rad_zahl(data.get("anzahl"), 1, _RAD_MAX_SPAREN)
+    except ValueError as exc:
+        return err(str(exc))
+    uid_text = str(data.get("user_id") or "").strip()
+    if not re.fullmatch(r"[0-9]{1,20}", uid_text) or int(uid_text) <= 0:
+        return err("Bitte die Discord-ID des Mitglieds angeben.")
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    guild = bot.get_guild(gid) if (bot and gid) else None
+    if guild is None:
+        return err("Der Bot erreicht diesen Discord-Server nicht.", 409)
+    if await _member_von(guild, int(uid_text)) is None:
+        return err("Dieses Mitglied gibt es auf dem Discord-Server nicht.")
+    e = _rad_einstellungen(conn)
+    neu = db.rad_drehungen_aendern(gid, int(uid_text), anzahl, e["max_gespeichert"])
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Glücksrad: Drehungen verschenkt", f"{anzahl}× an {uid_text} · {conn.name}")
+    return ok({"drehungen": neu})
+
+
+# ── Spielerbereich ──
+async def api_me_rad(request: web.Request) -> web.Response:
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    conn, gid, uid, en = ctx["conn"], ctx["gid"], ctx["uid"], ctx["en"]
+    sicht = guild_sicht(conn, gid)
+    if sicht is None:
+        return err("Dieser Discord-Server gehört nicht zu diesem Server.", 409)
+    status = _rad_status(conn, sicht, bot.get_guild(gid), gid, uid, en)
+    status["verlauf"] = [{"name": r["preis_name"], "typ": r["typ"], "quelle": r["quelle"], "ts": r["ts"]} for r in db.rad_log(gid, uid, 10)]
+    return ok(status)
+
+
+async def post_me_rad_drehen(request: web.Request) -> web.Response:
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "me.rad", 2)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    quelle = data.get("quelle") if isinstance(data, dict) else None
+    conn, gid, uid, en = ctx["conn"], ctx["gid"], ctx["uid"], ctx["en"]
+    sicht = guild_sicht(conn, gid)
+    if sicht is None:
+        return err("Dieser Discord-Server gehört nicht zu diesem Server.", 409)
+    erg = await _rad_drehen(conn, sicht, bot.get_guild(gid), gid, uid, str(ctx["name"]), str(quelle))
+    if not erg["ok"]:
+        status = 400 if erg["code"] == "quelle" else 409 if erg["code"] in ("warten", "keine", "guthaben", "aus") else 502
+        return err(erg["en"] if en else erg["de"], status, code=erg["code"])
+    erg["text"] = erg["en"] if en else erg["de"]
+    erg["status"] = _rad_status(conn, sicht, bot.get_guild(gid), gid, uid, en)
+    return ok(erg)
+
+
+# ── Discord: /wheel ──
+wheel_group = app_commands.Group(name="wheel", description="🎡 Wheel of fortune – spin for prizes")
+
+
+def _rad_dauer(sekunden: int, en: bool) -> str:
+    std, rest = divmod(int(sekunden), 3600)
+    minuten = rest // 60
+    if std:
+        return f"{std} h {minuten} min" if en else f"{std} Std. {minuten} Min."
+    return f"{max(1, minuten)} min" if en else f"{max(1, minuten)} Min."
+
+
+@wheel_group.command(name="info", description="🎡 Show the prizes, your spins and when your next free spin is ready")
+async def wheel_info(interaction: discord.Interaction):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conn = _conn_of(interaction)
+    sicht = guild_sicht(conn, interaction.guild_id) if conn is not None else None
+    if sicht is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    en = _sprache(interaction) == "en"
+    s = _rad_status(conn, sicht, interaction.guild, interaction.guild_id, interaction.user.id, en)
+    if not s["aktiv"]:
+        return await interaction.response.send_message(_t(interaction, "❌ Das Glücksrad ist auf diesem Server nicht aktiv.",
+                                                           "❌ The wheel of fortune is not active on this server."), ephemeral=True)
+    zeilen = [f"{p['text']} – {p['chance']:g} %" for p in s["preise"]]
+    wege = []
+    if s["gratis"]["stunden"]:
+        wege.append(_t(interaction, "🆓 Gratis: bereit" if s["gratis"]["bereit"] else f"🆓 Gratis: in {_rad_dauer(s['gratis']['in_sekunden'], False)}",
+                       "🆓 Free: ready" if s["gratis"]["bereit"] else f"🆓 Free: in {_rad_dauer(s['gratis']['in_sekunden'], True)}"))
+    if s["kosten"]:
+        wege.append(_t(interaction, f"💳 Bezahlt: {s['kosten_text']} pro Drehung (`/wheel spin pay:True`)",
+                       f"💳 Paid: {s['kosten_text']} per spin (`/wheel spin pay:True`)"))
+    if s["spielzeit"]["stunden"]:
+        wege.append(_t(interaction, f"⏱️ Je {s['spielzeit']['stunden']} Std. Spielzeit eine Drehung (`/link` nötig)",
+                       f"⏱️ One spin per {s['spielzeit']['stunden']} h of playtime (`/link` required)"))
+    e = discord.Embed(title=_t(interaction, "🎡 Glücksrad", "🎡 Wheel of fortune"), description="\n".join(zeilen)[:3500], color=0xF1C40F)
+    e.add_field(name=_t(interaction, "Deine gespeicherten Drehungen", "Your saved spins"), value=str(s["drehungen"]), inline=True)
+    if wege:
+        e.add_field(name=_t(interaction, "So kommst du an Drehungen", "How to get spins"), value="\n".join(wege), inline=False)
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@wheel_group.command(name="spin", description="🎡 Spin the wheel (saved spin first, then your free spin; pay:True pays for a spin)")
+@app_commands.describe(pay="Pay for this spin from your wallet (only if the server allows it)")
+async def wheel_spin(interaction: discord.Interaction, pay: bool = False):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conn = _conn_of(interaction)
+    sicht = guild_sicht(conn, interaction.guild_id) if conn is not None else None
+    if sicht is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    en = _sprache(interaction) == "en"
+    gid, uid = interaction.guild_id, interaction.user.id
+    s = _rad_status(conn, sicht, interaction.guild, gid, uid, en)
+    if pay:
+        quelle = "bezahlt"
+    elif s["drehungen"] > 0:
+        quelle = "gespeichert"
+    elif s["gratis"]["bereit"]:
+        quelle = "gratis"
+    else:
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Du hast gerade keine Drehung. `/wheel info` zeigt, wie du an welche kommst (bezahlt: `/wheel spin pay:True`).",
+            "❌ You have no spin right now. `/wheel info` shows how to get some (paid: `/wheel spin pay:True`)."), ephemeral=True)
+    await interaction.response.defer()
+    erg = await _rad_drehen(conn, sicht, interaction.guild, gid, uid, str(interaction.user), quelle)
+    if not erg["ok"]:
+        return await interaction.followup.send("❌ " + (erg["en"] if en else erg["de"]), ephemeral=True)
+    e = discord.Embed(title=_t(interaction, "🎡 Glücksrad", "🎡 Wheel of fortune"), color=0xF1C40F,
+                      description=f"**{erg['preis']['text_en' if en else 'text_de']}**\n{erg['en'] if en else erg['de']}")
+    e.set_footer(text=_t(interaction, f"Gespeicherte Drehungen: {erg['drehungen']}", f"Saved spins: {erg['drehungen']}"))
+    await interaction.followup.send(embed=e)
+
+
+@wheel_group.command(name="give", description="🎡 Give a member saved spins (admin)")
+@app_commands.describe(user="Member who receives the spins", amount="How many spins")
+async def wheel_give(interaction: discord.Interaction, user: discord.Member, amount: app_commands.Range[int, 1, 100]):
+    if not _is_economy_admin(interaction):
+        return await _deny(interaction)
+    conn = _conn_of(interaction)
+    sicht = guild_sicht(conn, interaction.guild_id) if conn is not None else None
+    if sicht is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    e = _rad_einstellungen(sicht)
+    neu = db.rad_drehungen_aendern(interaction.guild_id, user.id, int(amount), e["max_gespeichert"])
+    await interaction.response.send_message(_t(interaction, f"🎡 {user.mention} hat jetzt **{neu}** gespeicherte Drehung(en).",
+                                               f"🎡 {user.mention} now has **{neu}** saved spin(s)."))
+
+
+bot.tree.add_command(wheel_group)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Live-Karte fuer Spieler (Discord Management einstellbar, Spielerbereich "Live-Karte")
+# ══════════════════════════════════════════════════════════════
+# Je Guild in conn.data["live_karte"]: wer die Positionen der Spieler auf der Webseite sehen darf. Standard ist "team":
+# nur das Dashboard-Team (Karte im Dashboard), Spieler sehen nichts. "rollen" = nur Mitglieder mit einer der gewaehlten Rollen,
+# "alle" = jedes Mitglied dieses Discord-Servers. Optional nur fuer Spieler mit /link und mit Verzoegerung (gegen "Ghosting":
+# der Spieler sieht die Position von vor X Sekunden). Wer "Location Privacy" eingeschaltet hat, erscheint nie bei anderen.
+_LIVEKARTE_MODI = ("team", "rollen", "alle")
+_LIVEKARTE_VERZOEGERUNGEN = (0, 30, 60, 120, 300)
+_LIVEKARTE_MAX_ROLLEN = 25
+_LIVEKARTE_MAX_SPIELER = 300
+
+
+def _livekarte_einstellungen(sicht: Any) -> Dict[str, Any]:
+    roh = sicht.get("live_karte")
+    roh = roh if isinstance(roh, dict) else {}
+    modus = roh.get("modus") if roh.get("modus") in _LIVEKARTE_MODI else "team"
+    rollen: List[str] = []
+    gespeichert = roh.get("role_ids")
+    for r in (gespeichert if isinstance(gespeichert, list) else [])[:_LIVEKARTE_MAX_ROLLEN]:
+        text = str(r).strip() if isinstance(r, (str, int)) and not isinstance(r, bool) else ""
+        if re.fullmatch(r"[0-9]{1,20}", text) and int(text) > 0 and text not in rollen:
+            rollen.append(text)
+    verz = roh.get("verzoegerung")
+    verz = verz if isinstance(verz, int) and not isinstance(verz, bool) and verz in _LIVEKARTE_VERZOEGERUNGEN else 0
+    return {"modus": modus, "role_ids": rollen, "verzoegerung": verz, "nur_verknuepft": bool(roh.get("nur_verknuepft", True))}
+
+
+def _livekarte_erlaubt(e: Dict[str, Any], gid: int, uid: int, rollen: Set[int]) -> Tuple[bool, str]:
+    """(darf sehen, Grund bei Nein): "team" | "rolle" | "verknuepfung"."""
+    if e["modus"] == "team":
+        return False, "team"
+    if e["modus"] == "rollen" and not ({int(r) for r in e["role_ids"]} & set(rollen)):
+        return False, "rolle"
+    if e["nur_verknuepft"] and not db.get_links_by_user(gid, uid):
+        return False, "verknuepfung"
+    return True, ""
+
+
+def _livekarte_spieler(conn: Any, verzoegerung: int, eigene: Set[str], jetzt: float) -> List[Dict[str, Any]]:
+    """Die Spieler fuer die Karte: nur Name, Position und naechster Ort - weder K/D noch Spur. Mit Verzoegerung zaehlt die
+    Position, an der der Spieler vor `verzoegerung` Sekunden war (noch keine so alte -> nicht gezeigt)."""
+    parser = conn.parser
+    positionen = getattr(parser, "player_positions", None) or {}
+    verlaeufe = getattr(parser, "positions_verlauf", None) or {}
+    map_name = conn.get("map_name", "ChernarusPlus")
+    out: List[Dict[str, Any]] = []
+    for name, eintrag in list(positionen.items()):
+        if not isinstance(eintrag, dict):
+            continue
+        name = str(name)
+        ich = name.lower() in eigene
+        if not ich and _position_privat(conn, name):
+            continue
+        xz: Optional[Tuple[float, float]]
+        if verzoegerung > 0 and not ich:
+            xz = None
+            for ts, x, z in reversed(list(verlaeufe.get(name, ()))):
+                if ts <= jetzt - verzoegerung:
+                    xz = (x, z)
+                    break
+        else:
+            zahlen = _MAP_POS_RE.findall(str(eintrag.get("position", "")))
+            try:
+                xz = (round(float(zahlen[0]), 1), round(float(zahlen[1]), 1)) if len(zahlen) >= 2 else None
+            except ValueError:
+                xz = None
+        if xz is None:
+            continue
+        try:
+            nahe = _nearest_location(xz[0], xz[1], map_name)
+        except Exception:  # noqa: BLE001
+            nahe = None
+        out.append({"name": name, "x": xz[0], "z": xz[1], "near": nahe, "ich": ich})
+    out.sort(key=lambda p: (not p["ich"], p["name"].lower()))
+    return out[:_LIVEKARTE_MAX_SPIELER]
+
+
+def _livekarte_payload(sicht: Any) -> Dict[str, Any]:
+    e = _livekarte_einstellungen(sicht)
+    e["limits"] = {"rollen": _LIVEKARTE_MAX_ROLLEN, "verzoegerungen": list(_LIVEKARTE_VERZOEGERUNGEN)}
+    return e
+
+
+async def get_discord_mgmt_livekarte(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "view")
+    if denied is not None:
+        return denied
+    return ok(_livekarte_payload(conn))
+
+
+async def post_discord_mgmt_livekarte(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.livekarte", 3)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    if not isinstance(data, dict):
+        return err("Ungültige Anfrage.")
+    modus = data.get("modus")
+    if modus not in _LIVEKARTE_MODI:
+        return err("Ungültige Sichtbarkeit.")
+    verz = data.get("verzoegerung", 0)
+    if isinstance(verz, bool) or not isinstance(verz, int) or verz not in _LIVEKARTE_VERZOEGERUNGEN:
+        return err("Ungültige Verzögerung.")
+    roh_rollen = data.get("role_ids", [])
+    if not isinstance(roh_rollen, list) or len(roh_rollen) > _LIVEKARTE_MAX_ROLLEN:
+        return err(f"Höchstens {_LIVEKARTE_MAX_ROLLEN} Rollen.")
+    rollen: List[str] = []
+    for r in roh_rollen:
+        text = str(r).strip() if isinstance(r, (str, int)) and not isinstance(r, bool) else ""
+        if not re.fullmatch(r"[0-9]{1,20}", text) or int(text) <= 0:
+            return err("Ungültige Rollen-ID.")
+        if text not in rollen:
+            rollen.append(text)
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    if modus == "rollen":
+        if not rollen:
+            return err("Bitte mindestens eine Rolle wählen.")
+        if not gid:
+            return err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
+        for rid in rollen:
+            fehler = _rolle_gehoert_guild(gid, int(rid))
+            if fehler is not None:
+                return fehler
+    _conn_store(conn, "live_karte", {"modus": modus, "role_ids": rollen if modus == "rollen" else [], "verzoegerung": verz,
+                                     "nur_verknuepft": bool(data.get("nur_verknuepft", True))})
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Discord-Management aktualisiert", f"live_karte · {modus} · {conn.name}")
+    return ok(_livekarte_payload(conn))
+
+
+async def api_me_livekarte(request: web.Request) -> web.Response:
+    """Positionen fuer die Live-Karte im Spielerbereich - nur, wenn der Betreiber sie fuer diesen Spieler freigegeben hat."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    conn, gid, uid = ctx["conn"], ctx["gid"], ctx["uid"]
+    sicht = guild_sicht(conn, gid)
+    if sicht is None:
+        return err("Dieser Discord-Server gehört nicht zu diesem Server.", 409)
+    e = _livekarte_einstellungen(sicht)
+    erlaubt, grund = _livekarte_erlaubt(e, gid, uid, ctx["rollen"])
+    if not erlaubt:
+        return ok({"erlaubt": False, "grund": grund})
+    eigene = {str(r["ingame_name"]).lower() for r in db.get_links_by_user(gid, uid)}
+    return ok({"erlaubt": True, "players": _livekarte_spieler(conn, e["verzoegerung"], eigene, time.time()),
+               "verzoegerung": e["verzoegerung"], "map_name": conn.get("map_name", "ChernarusPlus")})
+
+
+# ══════════════════════════════════════════════════════════════
+#  Kredite (EXPERIMENTELL): Vertrag per Bestaetigung, Raten, Belohnung, vom Betreiber waehlbare Strafen
+# ══════════════════════════════════════════════════════════════
+# Je Guild in conn.data["kredite"] (standardmaessig AUS, jede Strafe standardmaessig aus). Der Spieler sieht vor der Annahme genau
+# die Bedingungen DIESES Servers und bestaetigt sie ausdruecklich (Knopf auf Discord bzw. Webseite); die Bedingungen werden als
+# Schnappschuss am Kredit gespeichert - spaetere Aenderungen der Einstellungen treffen bestehende Kredite nicht. Strafen:
+#   pfaendung   - nach Ablauf der Gnadenfrist: einmalig Verzugsgebuehr, dann laufend Pfaendung von Wallet und Bank
+#   nitrado_ban - Bann der verknuepften Spielernamen ueber die Nitrado-Banliste, bis der Kredit zurueckgezahlt ist
+#   explosion   - Explosion am vom Spieler beim Vertrag gewaehlten, gespeicherten Pfand-Ort (ueber das Airstrike-Werkzeug)
+# Belohnung: wer puenktlich (bis zum Faelligkeitstag) komplett zurueckzahlt, bekommt einen Teil der Zinsen zurueck.
+_KREDIT_STRAFEN = ("pfaendung", "nitrado_ban", "explosion")
+_KREDIT_MAX_BETRAG = 1_000_000_000
+_KREDIT_EXPLOSION_VERSUCHE_MAX = 3
+_KREDIT_EXPLOSION_VERSUCHE: Dict[int, int] = {}
+_KREDIT_LOCKS: Dict[Tuple[int, int], asyncio.Lock] = {}
+
+
+def _kredit_einstellungen(sicht: Any) -> Dict[str, Any]:
+    roh = sicht.get("kredite")
+    roh = roh if isinstance(roh, dict) else {}
+
+    def zahl(key: str, vorgabe: int, niedrig: int, hoch: int) -> int:
+        try:
+            return _rad_zahl(roh.get(key, vorgabe), niedrig, hoch)
+        except ValueError:
+            return vorgabe
+    sroh = roh.get("strafen") if isinstance(roh.get("strafen"), dict) else {}
+    strafen = {k: sroh.get(k) is True for k in _KREDIT_STRAFEN}
+    klasse = roh.get("explosion_klasse")
+    klasse = klasse if isinstance(klasse, str) and _AIRSTRIKE_CLASS_RE.fullmatch(klasse) else ""
+    strafen["explosion"] = strafen["explosion"] and bool(klasse)          # ohne Klasse gibt es keine Explosion
+    return {"enabled": roh.get("enabled") is True, "max_betrag": zahl("max_betrag", 10000, 1, _KREDIT_MAX_BETRAG),
+            "zins_prozent": zahl("zins_prozent", 10, 0, 100), "laufzeit_tage": zahl("laufzeit_tage", 7, 1, 90),
+            "gnade_tage": zahl("gnade_tage", 1, 0, 30), "max_offen": zahl("max_offen", 1, 1, 5),
+            "belohnung_prozent": zahl("belohnung_prozent", 0, 0, 100), "verzug_prozent": zahl("verzug_prozent", 5, 0, 50),
+            "strafen": strafen, "explosion_klasse": klasse}
+
+
+def _kredit_aufrunden(betrag: int, prozent: int) -> int:
+    return -(-int(betrag) * int(prozent) // 100)
+
+
+def _kredit_vertrag_bauen(e: Dict[str, Any], betrag: int, ort: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    zins = _kredit_aufrunden(betrag, e["zins_prozent"])
+    strafen = dict(e["strafen"])
+    v: Dict[str, Any] = {"betrag": int(betrag), "zins": zins, "gesamt": int(betrag) + zins, "laufzeit_tage": e["laufzeit_tage"],
+                         "gnade_tage": e["gnade_tage"], "belohnung": zins * e["belohnung_prozent"] // 100,
+                         "verzug": _kredit_aufrunden(betrag, e["verzug_prozent"]) if strafen["pfaendung"] else 0,
+                         "strafen": strafen, "explosion": None}
+    if strafen["explosion"] and ort is not None:
+        v["explosion"] = {"klasse": e["explosion_klasse"], "ort": str(ort["name"]), "x": round(float(ort["x"]), 1), "z": round(float(ort["z"]), 1)}
+    v["hash"] = hashlib.sha256(json.dumps(v, sort_keys=True, ensure_ascii=True).encode()).hexdigest()[:16]
+    return v
+
+
+def _kredit_fehler(code: str, de: str, en: str) -> Dict[str, Any]:
+    return {"ok": False, "code": code, "de": de, "en": en}
+
+
+def _kredit_vertrag_pruefen(conn: Any, sicht: Any, gid: int, uid: int, betrag: Any, ort_name: Any) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """(Vertrag, None) oder (None, Fehler). Veraendert nichts."""
+    e = _kredit_einstellungen(sicht)
+    if not e["enabled"]:
+        return None, _kredit_fehler("aus", "Kredite sind auf diesem Server nicht aktiv.", "Loans are not active on this server.")
+    if isinstance(betrag, bool) or not isinstance(betrag, int) or not 1 <= betrag <= e["max_betrag"]:
+        return None, _kredit_fehler("betrag", f"Der Betrag muss eine ganze Zahl von 1 bis {e['max_betrag']} sein.",
+                                    f"The amount must be a whole number from 1 to {e['max_betrag']}.")
+    if len(db.kredit_liste(gid, uid, nur_offen=True)) >= e["max_offen"]:
+        return None, _kredit_fehler("offen", f"Du hast schon {e['max_offen']} offene(n) Kredit(e) – zahle zuerst zurück.",
+                                    f"You already have {e['max_offen']} open loan(s) – repay first.")
+    if (e["strafen"]["nitrado_ban"] or e["strafen"]["explosion"]) and not db.get_links_by_user(gid, uid):
+        return None, _kredit_fehler("verknuepfung", "Für Kredite auf diesem Server musst du dich mit /link mit deinem Spielernamen verknüpfen.",
+                                    "To take a loan on this server you must link your in-game name with /link.")
+    ort = None
+    if e["strafen"]["explosion"]:
+        name = str(ort_name or "").strip()
+        zeile = dict(db.ort_nach_name(gid, conn.service_id, uid, name) or {}) if name else {}
+        if not zeile:
+            return None, _kredit_fehler("ort", "Dieser Server verlangt einen Pfand-Ort: wähle einen deiner gespeicherten Lieferorte (Webseite → Lieferorte).",
+                                        "This server requires a collateral location: choose one of your saved delivery locations (website → Delivery locations).")
+        ort = {"name": zeile["name"], "x": zeile["x"], "z": zeile["z"]}
+    return _kredit_vertrag_bauen(e, betrag, ort), None
+
+
+def _kredit_lock(gid: int, uid: int) -> asyncio.Lock:
+    return _KREDIT_LOCKS.setdefault((gid, uid), asyncio.Lock())
+
+
+async def _kredit_feed(conn: Any, gid: int, titel_de: str, titel_en: str, text_de: str, text_en: str, farbe: int = 0xE67E22) -> None:
+    try:
+        embed = discord.Embed(title=_ft(conn, titel_de, titel_en), description=_ft(conn, text_de, text_en), color=farbe)
+        await _post_feed(gid, "economy_log", embed, service_id=conn.service_id)
+    except Exception as exc:  # noqa: BLE001
+        log.debug(f"[KREDIT] Feed fehlgeschlagen: {exc}")
+
+
+async def _kredit_annehmen(conn: Any, sicht: Any, gid: int, uid: int, betrag: Any, ort_name: Any, vertrag_hash: Any) -> Dict[str, Any]:
+    """Der Spieler hat den Vertrag bestaetigt: Kredit anlegen und auszahlen. Stimmt der Vertrag nicht mehr mit dem ueberein, den er
+    gesehen hat (Einstellungen geaendert), wird nichts angelegt."""
+    async with _kredit_lock(gid, uid):
+        vertrag, fehler = _kredit_vertrag_pruefen(conn, sicht, gid, uid, betrag, ort_name)
+        if fehler is not None:
+            return fehler
+        if vertrag["hash"] != vertrag_hash:
+            return _kredit_fehler("geaendert", "Die Bedingungen haben sich geändert – bitte den Vertrag neu ansehen und bestätigen.",
+                                  "The terms have changed – please review and confirm the contract again.")
+        e = _kredit_einstellungen(sicht)
+        jetzt = time.time()
+        faellig = jetzt + vertrag["laufzeit_tage"] * 86400
+        gnade = faellig + vertrag["gnade_tage"] * 86400
+        kid = db.kredit_anlegen(gid, uid, conn.service_id, vertrag["betrag"], vertrag["zins"], faellig, gnade,
+                                {k: vertrag[k] for k in ("strafen", "belohnung", "verzug", "explosion", "laufzeit_tage", "gnade_tage")},
+                                e["max_offen"], jetzt)
+        if kid is None:
+            return _kredit_fehler("offen", "Du hast schon zu viele offene Kredite.", "You already have too many open loans.")
+        vorher, _bank = db.get_balance(gid, uid)
+        nachher, _bank = db.add_wallet(gid, uid, vertrag["betrag"])
+        if nachher - vorher != vertrag["betrag"]:                     # Wallet-Obergrenze: nichts Halbes auszahlen
+            db.add_wallet(gid, uid, -(nachher - vorher))
+            db.kredit_loeschen(kid)
+            return _kredit_fehler("limit", "Dein Wallet kann den Betrag nicht aufnehmen (Obergrenze) – zahle zuerst Geld auf die Bank ein.",
+                                  "Your wallet cannot hold the amount (limit) – deposit money to the bank first.")
+    await _kredit_feed(conn, gid, "💸 KREDIT", "💸 LOAN",
+                       f"<@{uid}> hat **{_fmt_money(vertrag['betrag'], conn)}** aufgenommen (zurück: {_fmt_money(vertrag['gesamt'], conn)}, {vertrag['laufzeit_tage']} Tage).",
+                       f"<@{uid}> took **{_fmt_money(vertrag['betrag'], conn)}** (repay: {_fmt_money(vertrag['gesamt'], conn)}, {vertrag['laufzeit_tage']} days).", 0x3498DB)
+    return {"ok": True, "kredit": _kredit_view(db.kredit_holen(kid), conn), "wallet": db.get_balance(gid, uid)[0]}
+
+
+def _kredit_view(k: Dict[str, Any], conn: Any) -> Dict[str, Any]:
+    jetzt = time.time()
+    b = k.get("bedingungen") or {}
+    status = k["status"]
+    if status == "offen":
+        status = "ueberfaellig" if jetzt > k["gnade_bis"] else "verzug" if jetzt > k["faellig"] else "offen"
+    return {"id": k["id"], "betrag": k["betrag"], "zins": k["zins"], "gesamt": k["betrag"] + k["zins"], "bezahlt": k["bezahlt"], "rest": k["rest"],
+            "gesamt_text": _fmt_money(k["betrag"] + k["zins"], conn), "rest_text": _fmt_money(k["rest"], conn), "status": status,
+            "faellig": k["faellig"], "gnade_bis": k["gnade_bis"], "strafen": b.get("strafen") or {}, "belohnung": b.get("belohnung", 0),
+            "explosion_ort": (b.get("explosion") or {}).get("ort"), "puenktlich": bool(k.get("puenktlich")), "erstellt": k["erstellt"]}
+
+
+async def _kredit_abschliessen(conn: Any, k: Dict[str, Any], puenktlich: bool) -> str:
+    """Nach der letzten Zahlung: Belohnung auszahlen, Bann aufheben. Gibt einen Hinweistext zurueck."""
+    b = k.get("bedingungen") or {}
+    notiz = []
+    if puenktlich and int(b.get("belohnung") or 0) > 0:
+        db.add_wallet(k["guild_id"], k["user_id"], int(b["belohnung"]))
+        notiz.append(f"🎁 +{_fmt_money(int(b['belohnung']), conn)} " + _ft(conn, "Belohnung für pünktliche Zahlung", "reward for paying on time"))
+    namen = [str(n) for n in (k.get("ban_namen") or [])]
+    if namen:
+        try:
+            entfernt, _nf, fehler = await _ban_namen_entfernen(conn, namen, von="Kredit-System", grund="Kredit zurückgezahlt")
+            notiz.append("🔓 " + _ft(conn, "Bann aufgehoben", "ban lifted") if not fehler else "⚠️ " + _ft(conn, "Bann konnte nicht aufgehoben werden – bitte das Team informieren", "ban could not be lifted – please tell the team"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"[KREDIT] Entbannen fehlgeschlagen: {exc}")
+            notiz.append("⚠️ " + _ft(conn, "Bann konnte nicht aufgehoben werden – bitte das Team informieren", "ban could not be lifted – please tell the team"))
+    await _kredit_feed(conn, k["guild_id"], "✅ KREDIT ZURÜCKGEZAHLT", "✅ LOAN REPAID",
+                       f"<@{k['user_id']}> hat den Kredit komplett zurückgezahlt" + (" (pünktlich)." if puenktlich else "."),
+                       f"<@{k['user_id']}> repaid the loan in full" + (" (on time)." if puenktlich else "."), 0x2ECC71)
+    return " ".join(notiz)
+
+
+async def _kredit_zahlen(conn: Any, gid: int, uid: int, kredit_id: Any, betrag: Any) -> Dict[str, Any]:
+    async with _kredit_lock(gid, uid):
+        k = db.kredit_holen(kredit_id) if isinstance(kredit_id, int) and not isinstance(kredit_id, bool) else None
+        if k is None or k["guild_id"] != gid or k["user_id"] != uid or k["service_id"] != str(conn.service_id):
+            return _kredit_fehler("kredit", "Diesen Kredit gibt es nicht.", "This loan does not exist.")
+        if k["status"] != "offen":
+            return _kredit_fehler("geschlossen", "Dieser Kredit ist schon abgeschlossen.", "This loan is already closed.")
+        if isinstance(betrag, bool) or not isinstance(betrag, int) or betrag < 1:
+            return _kredit_fehler("betrag", "Bitte einen Betrag von mindestens 1 angeben.", "Please enter an amount of at least 1.")
+        summe = min(betrag, k["rest"])
+        if not db.try_spend_wallet(gid, uid, summe):
+            wallet, _bank = db.get_balance(gid, uid)
+            return _kredit_fehler("guthaben", f"Dein Wallet hat nur {_fmt_money(wallet, conn)} (nötig: {_fmt_money(summe, conn)}).",
+                                  f"Your wallet only has {_fmt_money(wallet, conn)} (needed: {_fmt_money(summe, conn)}).")
+        res = db.kredit_zahlung(k["id"], summe, time.time())
+        if res["angewendet"] < summe:
+            db.add_wallet(gid, uid, summe - res["angewendet"])
+        notiz = ""
+        if res["komplett"]:
+            notiz = await _kredit_abschliessen(conn, db.kredit_holen(k["id"]) or k, res["puenktlich"])
+        return {"ok": True, "bezahlt": res["angewendet"], "rest": res["rest"], "komplett": res["komplett"], "puenktlich": res["puenktlich"],
+                "notiz": notiz, "wallet": db.get_balance(gid, uid)[0]}
+
+
+async def _kredit_explosion(conn: Any, klasse: str, x: float, z: float, kid: int) -> Tuple[bool, str]:
+    """Explosion am Pfand-Ort: ein Airstrike-Event (wie das Werkzeug) mit EINEM Einschlagpunkt. Idempotent je Kredit."""
+    if not _mission_dir_of(conn):
+        return False, "Mission-Ordner unbekannt"
+    groesse = DEFAULT_MAP_SIZES.get(_canonical_map_name(str(conn.data.get("map_name") or "")))
+    if groesse is None or not (0 <= x <= groesse and 0 <= z <= groesse):
+        return False, "Ort liegt außerhalb der Karte"
+    name = f"Airstrike_Kredit{kid}"
+    parameter = {"nominal": 1, "min": 1, "max": 1, "lifetime": 60, "restock": 300, "saferadius": 0, "distanceradius": 0,
+                 "cleanupradius": 0, "child_min": 1, "child_max": 1, "lootmin": 0, "lootmax": 0,
+                 "flags": {"deletable": 0, "init_random": 1, "remove_damaged": 1}}
+    async with _schaden_lock(conn.service_id):
+        loop = asyncio.get_running_loop()
+        try:
+            dateien = await _airstrike_files(conn, loop)
+        except ValueError as exc:
+            return False, str(exc)
+        eintraege = _airstrikes(conn)
+        if any(e.get("event_name") == name for e in eintraege):
+            return True, name
+        types, status = await _tools_xml_lesen(conn, "db/types.xml", loop)
+        if status != "ok" or types.tag != "types" or not any(t.get("name") == klasse for t in types.findall("type")):
+            return False, "Die Explosionsklasse fehlt in der types.xml"
+        dep_id = f"as_{uuid.uuid4().hex[:12]}"
+        punkte = [{"x": round(x, 1), "z": round(z, 1), "a": 0}]
+        blocke = [_dayzcode_event_xml(name, klasse, 1, parameters=parameter), _dayzcode_spawn_xml(name, punkte)]
+        aenderungen = []
+        try:
+            for (datei, root_tag, roh), block in zip(dateien, blocke):
+                neu = _dayzcode_einfuegen(roh, root_tag, dep_id, block)
+                ET.fromstring(neu)
+                _dayzcode_segmente(neu)
+                aenderungen.append((datei, roh, neu))
+        except (ET.ParseError, ValueError) as exc:
+            return False, str(exc)
+        eintrag = {"id": dep_id, "event_name": name, "klasse": klasse, "punkte": punkte, "parameters": parameter, "erstellt": time.time()}
+        fehler = await _airstrike_transaction(conn, aenderungen, eintraege + [eintrag], loop)
+        if fehler is not None:
+            return False, "Schreiben fehlgeschlagen"
+        return True, name
+
+
+async def _kredit_strafen(conn: Any, k: Dict[str, Any], jetzt: float) -> None:
+    """Strafstufen eines ueberfaelligen Kredits (nach der Gnadenfrist). Bedingungen kommen aus dem Schnappschuss des Kredits."""
+    b = k.get("bedingungen") or {}
+    strafen = b.get("strafen") or {}
+    gid, uid, kid = k["guild_id"], k["user_id"], k["id"]
+    if strafen.get("pfaendung"):
+        if int(b.get("verzug") or 0) > 0 and db.kredit_stufe_markieren(kid, "verzug"):
+            db.kredit_zins_erhoehen(kid, int(b["verzug"]))
+            await _kredit_feed(conn, gid, "⚠️ KREDIT ÜBERFÄLLIG", "⚠️ LOAN OVERDUE",
+                               f"<@{uid}>: Verzugsgebühr {_fmt_money(int(b['verzug']), conn)} aufgeschlagen.",
+                               f"<@{uid}>: late fee {_fmt_money(int(b['verzug']), conn)} added.")
+        aktuell = db.kredit_holen(kid)
+        if aktuell and aktuell["status"] == "offen" and aktuell["rest"] > 0:
+            genommen = db.kredit_pfaenden(gid, uid, aktuell["rest"])
+            if genommen > 0:
+                res = db.kredit_zahlung(kid, genommen, jetzt)
+                await _kredit_feed(conn, gid, "🔒 PFÄNDUNG", "🔒 SEIZURE",
+                                   f"<@{uid}>: {_fmt_money(genommen, conn)} gepfändet (Rest: {_fmt_money(res['rest'], conn)}).",
+                                   f"<@{uid}>: {_fmt_money(genommen, conn)} seized (remaining: {_fmt_money(res['rest'], conn)}).")
+                if res["komplett"]:
+                    await _kredit_abschliessen(conn, db.kredit_holen(kid) or aktuell, False)
+                    return
+    aktuell = db.kredit_holen(kid)
+    if aktuell is None or aktuell["status"] != "offen":
+        return
+    if strafen.get("nitrado_ban") and "ban" not in aktuell["stufen"]:
+        namen = [str(r["ingame_name"]) for r in db.get_links_by_user(gid, uid)]
+        if namen and conn.api is not None:
+            hinzu, _schon, fehler = await _ban_namen_hinzufuegen(conn, namen, "Kredit überfällig", "Kredit-System")
+            if fehler is None and db.kredit_stufe_markieren(kid, "ban"):
+                db.kredit_ban_namen_setzen(kid, hinzu)
+                await _kredit_feed(conn, gid, "🔨 KREDIT: BANN", "🔨 LOAN: BAN",
+                                   f"<@{uid}> wurde wegen eines überfälligen Kredits gebannt (bis zur Rückzahlung).",
+                                   f"<@{uid}> was banned because of an overdue loan (until repaid).")
+            elif fehler is not None:
+                log.warning(f"[KREDIT] Bann fehlgeschlagen ({kid}): {fehler}")
+    ex = b.get("explosion") or {}                 # nur im Vertrag gesetzt, wenn die Strafe vereinbart war
+    aktuell = db.kredit_holen(kid)
+    if ex and aktuell and aktuell["status"] == "offen" and "explosion" not in aktuell["stufen"] \
+            and _KREDIT_EXPLOSION_VERSUCHE.get(kid, 0) < _KREDIT_EXPLOSION_VERSUCHE_MAX:
+        _KREDIT_EXPLOSION_VERSUCHE[kid] = _KREDIT_EXPLOSION_VERSUCHE.get(kid, 0) + 1
+        ok_, info = await _kredit_explosion(conn, str(ex.get("klasse")), float(ex.get("x", -1)), float(ex.get("z", -1)), kid)
+        if ok_ and db.kredit_stufe_markieren(kid, "explosion"):
+            await _kredit_feed(conn, gid, "💥 KREDIT: EXPLOSION", "💥 LOAN: EXPLOSION",
+                               f"Wegen des überfälligen Kredits von <@{uid}> wird am Pfand-Ort „{ex.get('ort')}“ nach dem nächsten Neustart eine Explosion ausgelöst.",
+                               f"Because of <@{uid}>’s overdue loan an explosion is triggered at the collateral location “{ex.get('ort')}” after the next restart.")
+        elif not ok_:
+            log.warning(f"[KREDIT] Explosion fehlgeschlagen ({kid}, Versuch {_KREDIT_EXPLOSION_VERSUCHE[kid]}): {info}")
+
+
+async def _kredit_lauf(jetzt: Optional[float] = None) -> int:
+    """Prueft alle offenen Kredite; gibt die Zahl der bearbeiteten (ueberfaelligen) zurueck."""
+    jetzt = time.time() if jetzt is None else jetzt
+    bearbeitet = 0
+    for k in db.kredit_alle_offen():
+        if jetzt <= k["gnade_bis"]:
+            continue
+        conn = next((c for c in connections.all_for_guild(str(k["guild_id"])) if c.service_id == k["service_id"]), None)
+        if conn is None:
+            continue
+        async with _kredit_lock(k["guild_id"], k["user_id"]):
+            frisch = db.kredit_holen(k["id"])
+            if frisch is None or frisch["status"] != "offen":
+                continue
+            try:
+                await _kredit_strafen(conn, frisch, jetzt)
+                bearbeitet += 1
+            except Exception as exc:  # noqa: BLE001 - ein Kredit darf die anderen nicht aufhalten
+                log.warning(f"[KREDIT] {k['id']}: {type(exc).__name__}: {exc}")
+    return bearbeitet
+
+
+# ── Dashboard: Einstellungen (Discord Management) ──
+def _kredit_payload(sicht: Any) -> Dict[str, Any]:
+    e = _kredit_einstellungen(sicht)
+    gid = int(sicht.guild_id) if getattr(sicht, "guild_id", None) else 0
+    e["limits"] = {"betrag": _KREDIT_MAX_BETRAG}
+    e["kredite"] = [dict(_kredit_view(k, sicht), user_id=str(k["user_id"])) for k in (db.kredit_liste(gid, nur_offen=True, limit=50) if gid else [])]
+    return e
+
+
+async def get_discord_mgmt_kredite(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "view")
+    if denied is not None:
+        return denied
+    return ok(_kredit_payload(conn))
+
+
+async def post_discord_mgmt_kredite(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.kredite", 3)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    try:
+        werte = {"max_betrag": _rad_zahl(data.get("max_betrag"), 1, _KREDIT_MAX_BETRAG), "zins_prozent": _rad_zahl(data.get("zins_prozent"), 0, 100),
+                 "laufzeit_tage": _rad_zahl(data.get("laufzeit_tage"), 1, 90), "gnade_tage": _rad_zahl(data.get("gnade_tage"), 0, 30),
+                 "max_offen": _rad_zahl(data.get("max_offen"), 1, 5), "belohnung_prozent": _rad_zahl(data.get("belohnung_prozent"), 0, 100),
+                 "verzug_prozent": _rad_zahl(data.get("verzug_prozent"), 0, 50)}
+    except ValueError as exc:
+        return err(str(exc))
+    sroh = data.get("strafen")
+    if not isinstance(sroh, dict) or any(type(sroh.get(k)) is not bool for k in _KREDIT_STRAFEN) or set(sroh) - set(_KREDIT_STRAFEN):
+        return err("Ungültige Strafen.")
+    klasse = str(data.get("explosion_klasse") or "").strip()
+    if klasse and not _AIRSTRIKE_CLASS_RE.fullmatch(klasse):
+        return err("Explosionsklasse: 1–64 Buchstaben, Ziffern oder _ verwenden.")
+    if sroh["explosion"] and not klasse:
+        return err("Für die Strafe „Explosion“ bitte eine Explosionsklasse angeben.")
+    _conn_store(conn, "kredite", dict(werte, enabled=data.get("enabled") is True, strafen={k: sroh[k] is True for k in _KREDIT_STRAFEN}, explosion_klasse=klasse))
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Discord-Management aktualisiert", f"kredite · {conn.name}")
+    return ok(_kredit_payload(conn))
+
+
+async def post_discord_mgmt_kredite_erlassen(request: web.Request) -> web.Response:
+    """Einen offenen Kredit erlassen (die Schuld entfaellt, ein von der Strafe gesetzter Bann wird aufgehoben)."""
+    conn, denied = await _honeypot_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.kredite.erlassen", 2)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    kid = data.get("id")
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    k = db.kredit_holen(kid) if isinstance(kid, int) and not isinstance(kid, bool) else None
+    if k is None or k["guild_id"] != gid or k["service_id"] != str(conn.service_id):
+        return err("Diesen Kredit gibt es nicht.", 404)
+    if not db.kredit_erlassen(k["id"], time.time()):
+        return err("Dieser Kredit ist schon abgeschlossen.", 409)
+    namen = [str(n) for n in k["ban_namen"]]
+    if namen:
+        try:
+            await _ban_namen_entfernen(conn.basis if isinstance(conn, GuildSicht) else conn, namen, von="Kredit-System", grund="Kredit erlassen")
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"[KREDIT] Entbannen beim Erlass fehlgeschlagen: {exc}")
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "Kredit erlassen", f"#{k['id']} · {conn.name}")
+    return ok(_kredit_payload(conn))
+
+
+# ── Spielerbereich ──
+def _kredit_spieler_status(ctx: Dict[str, Any], sicht: Any) -> Dict[str, Any]:
+    conn, gid, uid = ctx["conn"], ctx["gid"], ctx["uid"]
+    e = _kredit_einstellungen(sicht)
+    orte = [{"name": str(r["name"]), "x": r["x"], "z": r["z"]} for r in db.orte_liste(gid, conn.service_id, uid, "gespeichert")]
+    wallet, _bank = db.get_balance(gid, uid)
+    return {"aktiv": e["enabled"], "max_betrag": e["max_betrag"], "zins_prozent": e["zins_prozent"], "laufzeit_tage": e["laufzeit_tage"],
+            "gnade_tage": e["gnade_tage"], "belohnung_prozent": e["belohnung_prozent"], "verzug_prozent": e["verzug_prozent"],
+            "strafen": e["strafen"], "max_offen": e["max_offen"], "wallet": wallet, "orte": orte,
+            "verknuepft": bool(db.get_links_by_user(gid, uid)),
+            "kredite": [_kredit_view(k, conn) for k in db.kredit_liste(gid, uid, limit=10)]}
+
+
+async def api_me_kredit(request: web.Request) -> web.Response:
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    sicht = guild_sicht(ctx["conn"], ctx["gid"])
+    if sicht is None:
+        return err("Dieser Discord-Server gehört nicht zu diesem Server.", 409)
+    return ok(_kredit_spieler_status(ctx, sicht))
+
+
+def _kredit_antwort(erg: Dict[str, Any], en: bool) -> web.Response:
+    status = 409 if erg["code"] in ("aus", "offen", "geaendert", "geschlossen", "limit") else 402 if erg["code"] == "guthaben" else 400
+    return err(erg["en"] if en else erg["de"], status, code=erg["code"])
+
+
+async def post_me_kredit_vertrag(request: web.Request) -> web.Response:
+    """Der Vertrag zum Ansehen (Bedingungen dieses Servers) - legt nichts an."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    sicht = guild_sicht(ctx["conn"], ctx["gid"])
+    if sicht is None:
+        return err("Dieser Discord-Server gehört nicht zu diesem Server.", 409)
+    data = await body(request)
+    vertrag, fehler = _kredit_vertrag_pruefen(ctx["conn"], sicht, ctx["gid"], ctx["uid"], data.get("betrag"), data.get("ort"))
+    if fehler is not None:
+        return _kredit_antwort(fehler, ctx["en"])
+    return ok(dict(vertrag, gesamt_text=_fmt_money(vertrag["gesamt"], ctx["conn"]), betrag_text=_fmt_money(vertrag["betrag"], ctx["conn"])))
+
+
+async def post_me_kredit_annehmen(request: web.Request) -> web.Response:
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "me.kredit", 3)
+    if denied is not None:
+        return denied
+    sicht = guild_sicht(ctx["conn"], ctx["gid"])
+    if sicht is None:
+        return err("Dieser Discord-Server gehört nicht zu diesem Server.", 409)
+    data = await body(request)
+    erg = await _kredit_annehmen(ctx["conn"], sicht, ctx["gid"], ctx["uid"], data.get("betrag"), data.get("ort"), data.get("hash"))
+    if not erg["ok"]:
+        return _kredit_antwort(erg, ctx["en"])
+    return ok(dict(erg, status=_kredit_spieler_status(ctx, sicht)))
+
+
+async def post_me_kredit_zahlen(request: web.Request) -> web.Response:
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "me.kredit.zahlen", 2)
+    if denied is not None:
+        return denied
+    sicht = guild_sicht(ctx["conn"], ctx["gid"])
+    if sicht is None:
+        return err("Dieser Discord-Server gehört nicht zu diesem Server.", 409)
+    data = await body(request)
+    erg = await _kredit_zahlen(ctx["conn"], ctx["gid"], ctx["uid"], data.get("id"), data.get("betrag"))
+    if not erg["ok"]:
+        return _kredit_antwort(erg, ctx["en"])
+    return ok(dict(erg, status=_kredit_spieler_status(ctx, sicht)))
+
+
+# ── Discord: /loan ──
+loan_group = app_commands.Group(name="loan", description="💸 Loans (experimental) – borrow money and repay it")
+
+
+class _KreditBestaetigung(discord.ui.View):
+    """Zwei Knoepfe unter dem Vertrag: nur der Antragsteller kann sie druecken."""
+
+    def __init__(self, interaction: discord.Interaction, conn: Any, sicht: Any, vertrag: Dict[str, Any], ort: Optional[str]):
+        super().__init__(timeout=300)
+        self.inter, self.conn, self.sicht, self.vertrag, self.ort = interaction, conn, sicht, vertrag, ort
+        self.en = _sprache(interaction) == "en"
+        self.erledigt = False
+        self.annehmen.label = "Accept" if self.en else "Annehmen"
+        self.ablehnen.label = "Decline" if self.en else "Ablehnen"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.inter.user.id:
+            await interaction.response.send_message("❌", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(style=discord.ButtonStyle.success)
+    async def annehmen(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if self.erledigt:
+            return await interaction.response.send_message("❌", ephemeral=True)
+        self.erledigt = True
+        self.stop()
+        erg = await _kredit_annehmen(self.conn, self.sicht, interaction.guild_id, interaction.user.id, self.vertrag["betrag"], self.ort, self.vertrag["hash"])
+        text = ("✅ " + (f"Loan #{erg['kredit']['id']} paid out: {_fmt_money(self.vertrag['betrag'], self.conn)}. Repay with `/loan pay`."
+                         if self.en else f"Kredit #{erg['kredit']['id']} ausgezahlt: {_fmt_money(self.vertrag['betrag'], self.conn)}. Zurückzahlen mit `/loan pay`.")
+                ) if erg["ok"] else "❌ " + (erg["en"] if self.en else erg["de"])
+        await interaction.response.edit_message(content=text, embed=None, view=None)
+
+    @discord.ui.button(style=discord.ButtonStyle.secondary)
+    async def ablehnen(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.erledigt = True
+        self.stop()
+        await interaction.response.edit_message(content="❎ " + ("Declined – nothing was booked." if self.en else "Abgelehnt – nichts wurde gebucht."), embed=None, view=None)
+
+
+def _kredit_vertrag_text(v: Dict[str, Any], conn: Any, en: bool) -> str:
+    z = [f"{'Amount' if en else 'Betrag'}: **{_fmt_money(v['betrag'], conn)}**",
+         f"{'Interest' if en else 'Zinsen'}: {_fmt_money(v['zins'], conn)} · {'Repay in total' if en else 'Zurückzuzahlen insgesamt'}: **{_fmt_money(v['gesamt'], conn)}**",
+         f"{'Due in' if en else 'Fällig in'}: {v['laufzeit_tage']} {'days' if en else 'Tagen'} (+ {v['gnade_tage']} {'days grace' if en else 'Tage Gnadenfrist'})"]
+    if v["belohnung"]:
+        z.append(f"🎁 {'Reward for paying on time' if en else 'Belohnung bei pünktlicher Zahlung'}: {_fmt_money(v['belohnung'], conn)}")
+    s = v["strafen"]
+    if s.get("pfaendung"):
+        z.append(f"🔒 {'If overdue: late fee' if en else 'Bei Verzug: Verzugsgebühr'} {_fmt_money(v['verzug'], conn)} + {'seizure of your wallet and bank' if en else 'Pfändung von Wallet und Bank'}")
+    if s.get("nitrado_ban"):
+        z.append("🔨 " + ("If overdue: ban from the game server until repaid" if en else "Bei Verzug: Bann vom Spielserver bis zur Rückzahlung"))
+    if v.get("explosion"):
+        z.append(f"💥 {'If overdue: explosion at your collateral location' if en else 'Bei Verzug: Explosion an deinem Pfand-Ort'} „{v['explosion']['ort']}“")
+    return "\n".join(z)
+
+
+@loan_group.command(name="request", description="💸 Ask for a loan – you see the terms first and confirm with a button")
+@app_commands.describe(amount="How much you want to borrow", collateral="Saved delivery location as collateral (only if this server requires it)")
+async def loan_request(interaction: discord.Interaction, amount: app_commands.Range[int, 1, _KREDIT_MAX_BETRAG], collateral: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conn = _conn_of(interaction)
+    sicht = guild_sicht(conn, interaction.guild_id) if conn is not None else None
+    if sicht is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    en = _sprache(interaction) == "en"
+    vertrag, fehler = _kredit_vertrag_pruefen(conn, sicht, interaction.guild_id, interaction.user.id, int(amount), collateral)
+    if fehler is not None:
+        return await interaction.response.send_message("❌ " + (fehler["en"] if en else fehler["de"]), ephemeral=True)
+    embed = discord.Embed(title="💸 " + ("Loan contract (experimental)" if en else "Kreditvertrag (experimentell)"),
+                          description=_kredit_vertrag_text(vertrag, conn, en), color=0xE67E22)
+    embed.set_footer(text="Press “Accept” only if you agree to ALL terms above." if en else "Drücke „Annehmen“ nur, wenn du ALLEN Bedingungen oben zustimmst.")
+    await interaction.response.send_message(embed=embed, view=_KreditBestaetigung(interaction, conn, sicht, vertrag, collateral), ephemeral=True)
+
+
+@loan_group.command(name="pay", description="💸 Repay your loan from your wallet")
+@app_commands.describe(amount="How much to repay (at most the remaining debt)")
+async def loan_pay(interaction: discord.Interaction, amount: app_commands.Range[int, 1, _KREDIT_MAX_BETRAG]):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None or guild_sicht(conn, interaction.guild_id) is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    en = _sprache(interaction) == "en"
+    offene = db.kredit_liste(interaction.guild_id, interaction.user.id, nur_offen=True)
+    if not offene:
+        return await interaction.response.send_message("❌ " + ("You have no open loan." if en else "Du hast keinen offenen Kredit."), ephemeral=True)
+    erg = await _kredit_zahlen(conn, interaction.guild_id, interaction.user.id, offene[-1]["id"], int(amount))
+    if not erg["ok"]:
+        return await interaction.response.send_message("❌ " + (erg["en"] if en else erg["de"]), ephemeral=True)
+    text = f"✅ {_fmt_money(erg['bezahlt'], conn)} " + ("repaid." if en else "zurückgezahlt.") + " " + (
+        ("Loan repaid in full! " if en else "Kredit komplett zurückgezahlt! ") + erg["notiz"] if erg["komplett"]
+        else (f"Remaining: {_fmt_money(erg['rest'], conn)}" if en else f"Rest: {_fmt_money(erg['rest'], conn)}"))
+    await interaction.response.send_message(text.strip(), ephemeral=True)
+
+
+@loan_group.command(name="status", description="💸 Show your loans")
+async def loan_status(interaction: discord.Interaction):
+    if not await _require_guild(interaction):
+        return
+    conn = _conn_of(interaction)
+    if conn is None or guild_sicht(conn, interaction.guild_id) is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    en = _sprache(interaction) == "en"
+    ks = db.kredit_liste(interaction.guild_id, interaction.user.id, limit=5)
+    if not ks:
+        return await interaction.response.send_message("ℹ️ " + ("You have no loans." if en else "Du hast keine Kredite."), ephemeral=True)
+    zeilen = []
+    for k in ks:
+        v = _kredit_view(k, conn)
+        zeilen.append(f"**#{v['id']}** · {v['status']} · {'remaining' if en else 'Rest'} {v['rest_text']} / {v['gesamt_text']} · "
+                      f"{'due' if en else 'fällig'} <t:{int(v['faellig'])}:R>")
+    await interaction.response.send_message("\n".join(zeilen), ephemeral=True)
+
+
+@loan_group.command(name="forgive", description="💸 Forgive a member's open loans (admin)")
+@app_commands.describe(user="Member whose open loans are forgiven")
+async def loan_forgive(interaction: discord.Interaction, user: discord.Member):
+    if not _is_economy_admin(interaction):
+        return await _deny(interaction)
+    conn = _conn_of(interaction)
+    if conn is None or guild_sicht(conn, interaction.guild_id) is None:
+        return await interaction.response.send_message(_premium_missing_text(interaction), ephemeral=True)
+    n = 0
+    for k in db.kredit_liste(interaction.guild_id, user.id, nur_offen=True):
+        if k["service_id"] == str(conn.service_id) and db.kredit_erlassen(k["id"], time.time()):
+            n += 1
+            if k["ban_namen"]:
+                try:
+                    await _ban_namen_entfernen(conn, [str(x) for x in k["ban_namen"]], von="Kredit-System", grund="Kredit erlassen")
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(f"[KREDIT] Entbannen beim Erlass fehlgeschlagen: {exc}")
+    await interaction.response.send_message(_t(interaction, f"💸 {n} Kredit(e) von {user.mention} erlassen.", f"💸 Forgave {n} loan(s) of {user.mention}."))
+
+
+bot.tree.add_command(loan_group)
+
+
+# ══════════════════════════════════════════════════════════════
 #  Discord Management: Social-Benachrichtigungen (YouTube, Instagram, TikTok, X)
 # ══════════════════════════════════════════════════════════════
 # Der Bot liest ausschliesslich FEEDS (Atom/RSS): bei YouTube den offiziellen Kanal-Feed
@@ -46923,7 +48522,13 @@ _SOCIAL_PLATTFORMEN: Dict[str, Dict[str, str]] = {
     "instagram": {"label": "Instagram", "emoji": "📸"},
     "tiktok": {"label": "TikTok", "emoji": "🎵"},
     "x": {"label": "X (Twitter)", "emoji": "🐦"},
+    # Live-Updates: dieselbe Feed-Technik, aber fuer Spiel- und Hoster-Meldungen (DayZ-Neuigkeiten/Patchnotes, Nitrado-Stoerungen).
+    "dayz_news": {"label": "DayZ-News", "emoji": "🧟"},
+    "nitrado_status": {"label": "Nitrado-Status", "emoji": "🛠️"},
 }
+# Vorgeschlagene Feed-Adresse je Plattform (oeffentlich, ohne Schluessel); der Betreiber kann sie aendern. Fuer den Nitrado-Status
+# gibt es bewusst keinen Vorschlag: die Feed-Adresse der Statusseite muss der Betreiber dort selbst nachsehen.
+_SOCIAL_VORSCHLAEGE: Dict[str, str] = {"dayz_news": "https://store.steampowered.com/feeds/news/app/221100/"}
 _SOCIAL_VORLAGEN: Dict[str, Dict[str, str]] = {
     "youtube": {"de": "📺 **{autor}** hat ein neues Video hochgeladen: **{titel}**\n{link}",
                 "en": "📺 **{autor}** uploaded a new video: **{titel}**\n{link}"},
@@ -46933,6 +48538,8 @@ _SOCIAL_VORLAGEN: Dict[str, Dict[str, str]] = {
                "en": "🎵 New TikTok by **{autor}**: {titel}\n{link}"},
     "x": {"de": "🐦 Neuer Beitrag von **{autor}**: {titel}\n{link}",
           "en": "🐦 New post by **{autor}**: {titel}\n{link}"},
+    "dayz_news": {"de": "🧟 **DayZ-News:** **{titel}**\n{link}", "en": "🧟 **DayZ news:** **{titel}**\n{link}"},
+    "nitrado_status": {"de": "🛠️ **Nitrado-Status:** **{titel}**\n{link}", "en": "🛠️ **Nitrado status:** **{titel}**\n{link}"},
 }
 _SOCIAL_MAX_JE_PLATTFORM = 5
 _SOCIAL_INTERVALL = 900                  # Sekunden zwischen zwei Pruefungen einer Quelle (15 Min., wie die Cache-Dauer des YouTube-Feeds)
@@ -47416,7 +49023,8 @@ def _social_abo_view(abo: Dict[str, Any]) -> Dict[str, Any]:
 
 def _social_payload(conn: Any) -> Dict[str, Any]:
     return {"abos": [_social_abo_view(a) for a in _social_abos(conn) if isinstance(a, dict)],
-            "plattformen": _SOCIAL_PLATTFORMEN, "vorlagen": _SOCIAL_VORLAGEN, "max_je_plattform": _SOCIAL_MAX_JE_PLATTFORM,
+            "plattformen": _SOCIAL_PLATTFORMEN, "vorlagen": _SOCIAL_VORLAGEN, "vorschlaege": _SOCIAL_VORSCHLAEGE,
+            "max_je_plattform": _SOCIAL_MAX_JE_PLATTFORM,
             "intervall_minuten": _SOCIAL_INTERVALL // 60}
 
 
@@ -47514,8 +49122,11 @@ async def post_discord_mgmt_social(request: web.Request) -> web.Response:
     else:
         wurde_aktiv = bool(data.get("enabled", True)) and not bestehend.get("enabled")
     if not name:
-        name = (bestehend["source"][:12] if plattform == "youtube" else _social_quelle_anzeige(bestehend).split("/", 1)[0])
-        name = f"{_SOCIAL_PLATTFORMEN[plattform]['label']} {name}"[:_SOCIAL_NAME_MAX]
+        if plattform in _SOCIAL_VORSCHLAEGE or plattform == "nitrado_status":
+            name = _SOCIAL_PLATTFORMEN[plattform]["label"]            # Hostname im Namen waere hier nur Rauschen
+        else:
+            name = (bestehend["source"][:12] if plattform == "youtube" else _social_quelle_anzeige(bestehend).split("/", 1)[0])
+            name = f"{_SOCIAL_PLATTFORMEN[plattform]['label']} {name}"[:_SOCIAL_NAME_MAX]
     bestehend.update({"name": name, "channel_id": str(kanal_id), "role_id": str(rolle_id) if rolle_id else None,
                       "language": sprache, "template": str(data.get("template") or "").strip(),
                       "enabled": bool(data.get("enabled", True))})
@@ -50822,6 +52433,226 @@ def _rental_restarts_klemmen(data: dict, vorgabe_min: int = 1,
     return mn, mx
 
 
+# ── Miet-Setup: Fahrzeug suchen -> fertige Event-Vorlage (kein XML von Hand) ─────────────────
+# Der Betreiber sucht ein Fahrzeug (Vorlage oder Classname aus dem Katalog) und bekommt das fertige <event>-Element fuers
+# Miet-Item plus eine events.xml-Datei zum Kopieren/Herunterladen. Der Name beginnt bewusst NICHT mit RENT_: so heissen nur die
+# vom Bot beim Mieten erzeugten Instanzen.
+_RENTAL_VORLAGEN: Tuple[Tuple[str, str], ...] = (       # Namen bewusst sprachneutral: sie werden als Name des Miet-Items vorbelegt
+    ("Olga 24", "CivilianSedan"), ("Olga 24 Black", "CivilianSedan_Black"), ("Olga 24 Wine", "CivilianSedan_Wine"),
+    ("Gunter 2", "Hatchback_02"), ("Gunter 2 Black", "Hatchback_02_Black"), ("Gunter 2 Blue", "Hatchback_02_Blue"),
+    ("Sarka 120", "Sedan_02"), ("Sarka 120 Red", "Sedan_02_Red"), ("Sarka 120 Grey", "Sedan_02_Grey"),
+    ("Offroad Hatchback", "OffroadHatchback"), ("Offroad Hatchback Blue", "OffroadHatchback_Blue"),
+    ("Offroad Hatchback White", "OffroadHatchback_White"),
+    ("M3S Truck", "Truck_01_Covered"), ("M3S Truck Blue", "Truck_01_Covered_Blue"), ("M3S Truck Orange", "Truck_01_Covered_Orange"),
+)
+_RENTAL_KLASSE_RE = re.compile(r"[A-Za-z0-9_]{1,80}")
+_RENTAL_STANDARD_LIFETIME = 3_888_000
+_RENTAL_LIFETIME_MAX = 31_536_000
+
+
+def _rental_vorlage_bauen(klasse: Any, lifetime: Any = _RENTAL_STANDARD_LIFETIME, praefix: str = "Vehicle") -> Dict[str, str]:
+    """Fertiges Miet-Event fuer EIN Fahrzeug. ValueError mit deutschem Text bei ungueltigen Eingaben.
+    Gibt name, event_xml (kompakt, passt ins Miet-Formular), events_datei (vollstaendige events.xml zum Kopieren) zurueck."""
+    if not isinstance(klasse, str) or not _RENTAL_KLASSE_RE.fullmatch(klasse.strip()):
+        raise ValueError("Ungültiger Classname – erlaubt sind Buchstaben, Ziffern und _ (höchstens 80 Zeichen).")
+    klasse = klasse.strip()
+    if not isinstance(lifetime, int) or not 60 <= lifetime <= _RENTAL_LIFETIME_MAX:      # bool (0/1) faellt durch die Untergrenze
+        raise ValueError(f"Die Haltbarkeit muss eine ganze Zahl von 60 bis {_RENTAL_LIFETIME_MAX} Sekunden sein.")
+    if praefix not in ("Vehicle", "Npc"):
+        raise ValueError("Ungültige Vorlagenart.")
+    name = praefix + re.sub(r"[^A-Za-z0-9]", "", klasse)
+    schoen = (f'<event name="{name}">\n'
+              f'    <nominal>1</nominal>\n    <min>1</min>\n    <max>1</max>\n'
+              f'    <lifetime>{lifetime}</lifetime>\n    <restock>0</restock>\n'
+              f'    <saferadius>1</saferadius>\n    <distanceradius>1</distanceradius>\n    <cleanupradius>100</cleanupradius>\n'
+              f'    <flags deletable="0" init_random="0" remove_damaged="1"/>\n'
+              f'    <position>fixed</position>\n    <limit>child</limit>\n    <active>1</active>\n'
+              f'    <children>\n        <child lootmax="0" lootmin="0" max="1" min="1" type="{klasse}"/>\n    </children>\n'
+              f'</event>')
+    kompakt = re.sub(r">\s+<", "><", schoen)
+    geprueft, fehler = _tool_rental_xml_validieren(kompakt, "event")
+    if geprueft is None:
+        raise ValueError(fehler or "Ungültiges Event.")
+    datei = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<events>\n'
+             + "\n".join("    " + z for z in schoen.split("\n")) + "\n</events>\n")
+    return {"name": name, "klasse": klasse, "event_xml": geprueft, "events_datei": datei}
+
+
+def _rental_vorlagen_suche(conn: Any, q: str, limit: int = 30) -> List[Dict[str, Any]]:
+    q = q.strip().lower()
+    treffer: List[Dict[str, Any]] = []
+    gesehen: set = set()
+    for name, klasse in _RENTAL_VORLAGEN:
+        if not q or q in name.lower() or q in klasse.lower():
+            treffer.append({"name": name, "classname": klasse, "vorlage": True})
+            gesehen.add(klasse.lower())
+    if q:
+        for e in _shop_autofill_treffer([list(conn.data.get("shop_autofill_classnames") or []), _shop_eingebaute_classnames()], q, 60):
+            if e["classname"].lower() not in gesehen and _RENTAL_KLASSE_RE.fullmatch(e["classname"]):
+                gesehen.add(e["classname"].lower())
+                treffer.append({"name": e["name"], "classname": e["classname"], "vorlage": False})
+    return treffer[:limit]
+
+
+async def _rental_setup_gate(request: web.Request):
+    conn, fehler = _session_conn(request, "shop.catalog_admin")
+    if fehler is not None:
+        return None, fehler
+    fehler = await _modul_pruefen("shop.catalog_admin", request, conn)
+    if fehler is not None:
+        return None, fehler
+    fehler = await _dash_gate(request, conn, "shop", "view")
+    if fehler is not None:
+        return None, fehler
+    return conn, None
+
+
+async def api_shop_rentals_vorlagen(request: web.Request) -> web.Response:
+    conn, fehler = await _rental_setup_gate(request)
+    if fehler is not None:
+        return fehler
+    return ok({"vorlagen": _rental_vorlagen_suche(conn, str(request.query.get("q") or ""))})
+
+
+async def api_shop_rentals_vorlage(request: web.Request) -> web.Response:
+    """Baut die Event-Vorlage fuer EIN Fahrzeug - speichert nichts (das Miet-Item wird erst mit 'Anlegen' erstellt)."""
+    conn, fehler = await _rental_setup_gate(request)
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "shop.rental.vorlage", 1)
+    if fehler is not None:
+        return fehler
+    data = await body(request)        # body() liefert immer ein dict
+    try:
+        vorlage = _rental_vorlage_bauen(data.get("classname"), data.get("lifetime", _RENTAL_STANDARD_LIFETIME))
+    except ValueError as exc:
+        return err(str(exc))
+    bekannt = next((n for n, k in _RENTAL_VORLAGEN if k == vorlage["klasse"]), None)
+    vorlage["vorschlag_name"] = bekannt or re.sub(r"[_]+", " ", re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", vorlage["klasse"])).strip()
+    return ok(vorlage)
+
+
+# ── NPC-Miete: ein NPC mit Outfit als Miet-Item ─────────────────────────────────────────────
+# Wie beim Fahrzeug bekommt der Betreiber ein fertiges Miet-Event (Kind = Koerperklasse, z. B. SurvivorM_Boris). Das Outfit steht in
+# der cfgspawnabletypes.xml je Koerperklasse EINMAL - deshalb gibt es "Outfit auf den Server schreiben" als eigenen Schritt, der nur
+# einen noch freien Koerper nimmt (gleiche Regel wie beim NPC-Einsatz: nie ein zweiter <type> derselben Klasse) und nur in den
+# eigenen Marker-Block "rn_<Koerper>" schreibt.
+def _npc_outfit_finden(conn: ServerConnection, key: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(key, str):
+        return None
+    if key in TOOL_DEPLOY_NPCS:
+        v = TOOL_DEPLOY_NPCS[key]
+        return {"key": key, "label": v["label"], "items": [list(p) for p in v["items"]],
+                "zufall": [[a, list(alt)] for a, alt in (v.get("zufall") or [])], "eigener": False}
+    v = _eigene_npcs(conn).get(key)
+    if v is None:
+        return None
+    return {"key": key, "label": str(v.get("label") or key), "items": [list(p) for p in v.get("items", [])],
+            "zufall": [[a, list(alt)] for a, alt in v.get("zufall", [])], "eigener": True}
+
+
+def _rental_koerper_belegung(conn: ServerConnection) -> Dict[str, str]:
+    """Koerperklasse -> Name des Miet-Items, dessen Event sie benutzt."""
+    belegt: Dict[str, str] = {}
+    for it in conn.rentals_catalog.items:
+        for m in re.finditer(r'<child\b[^>]*\btype="(Survivor[MF]_[A-Za-z0-9]+)"', str(it.get("event_xml") or "")):
+            belegt.setdefault(m.group(1), str(it.get("name") or "?"))
+    return belegt
+
+
+async def api_shop_rentals_npc(request: web.Request) -> web.Response:
+    conn, fehler = await _rental_setup_gate(request)
+    if fehler is not None:
+        return fehler
+    outfits = []
+    for k, v in list(TOOL_DEPLOY_NPCS.items()) + list(_eigene_npcs(conn).items()):
+        outfit = _npc_outfit_finden(conn, k)
+        if outfit is not None:
+            outfits.append({"key": k, "label": outfit["label"], "teile": len(outfit["items"]) + sum(len(z[1]) for z in outfit["zufall"]),
+                            "eigener": outfit["eigener"]})
+    st_text = None
+    if _mission_dir_of(conn):
+        st_text, st_s = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", asyncio.get_running_loop())
+        st_text = st_text if st_s == "ok" else None
+    frei = set(_deploy_freie_koerper(conn, st_text))
+    miete = _rental_koerper_belegung(conn)
+    koerper = [{"name": k, "frei": (k in frei) if st_text is not None else None, "miet_item": miete.get(k)} for k in TOOL_DEPLOY_SURVIVORS]
+    return ok({"outfits": outfits, "koerper": koerper, "lesbar": st_text is not None})
+
+
+async def api_shop_rentals_npc_vorlage(request: web.Request) -> web.Response:
+    """Fertiges Miet-Event fuer einen NPC mit Outfit - speichert nichts."""
+    conn, fehler = await _rental_setup_gate(request)
+    if fehler is not None:
+        return fehler
+    fehler = _dash_rate_limited(request, "shop.rental.vorlage", 1)
+    if fehler is not None:
+        return fehler
+    data = await body(request)
+    outfit = _npc_outfit_finden(conn, data.get("preset"))
+    if outfit is None:
+        return err("Dieses Outfit gibt es nicht.")
+    koerper = data.get("koerper")
+    if koerper not in TOOL_DEPLOY_SURVIVORS:
+        return err("Bitte einen gültigen Körper auswählen.")
+    try:
+        vorlage = _rental_vorlage_bauen(koerper, praefix="Npc")
+    except ValueError as exc:
+        return err(str(exc))
+    vorlage["vorschlag_name"] = f"NPC {outfit['label']}"[:100]
+    vorlage["outfit_xml"] = _dayzcode_type_xml(koerper, outfit["items"], outfit["zufall"])
+    return ok(vorlage)
+
+
+@_gameplay_tool_locked
+async def api_shop_rentals_npc_outfit(request: web.Request) -> web.Response:
+    """Schreibt das Outfit in die cfgspawnabletypes.xml (nur in den eigenen Marker-Block, nur fuer einen freien Koerper)."""
+    conn, fehler = await _deploy_vorbereiten(request, "edit")
+    if fehler is not None:
+        return fehler
+    if not _mission_dir_of(conn):
+        return err(_TOOL_KEIN_MISSION_ORDNER, 409)
+    data = await body(request)
+    outfit = _npc_outfit_finden(conn, data.get("preset"))
+    if outfit is None:
+        return err("Dieses Outfit gibt es nicht.")
+    koerper = data.get("koerper")
+    if koerper not in TOOL_DEPLOY_SURVIVORS:
+        return err("Bitte einen gültigen Körper auswählen.")
+    fehler = _dash_rate_limited(request, "shop.rental.npc", 5)
+    if fehler is not None:
+        return fehler
+    loop = asyncio.get_running_loop()
+    st_text, st_s = await _tools_datei_lesen(conn, "cfgspawnabletypes.xml", loop)
+    if st_s != "ok" or st_text is None:
+        return err("cfgspawnabletypes.xml nicht lesbar.", 502)
+    block = _dayzcode_type_xml(koerper, outfit["items"], outfit["zufall"])
+    dep_id = f"rn_{koerper}"
+    try:
+        eigene = {s["id"]: s for s in _dayzcode_segmente(st_text)}
+    except ValueError as exc:
+        return err(str(exc))
+    if dep_id in eigene:
+        vorhanden = st_text[eigene[dep_id]["start"]:eigene[dep_id]["end"]]
+        if re.sub(r"\s+", "", block) in re.sub(r"\s+", "", vorhanden):
+            return ok({"geschrieben": False, "koerper": koerper, "bereits": True})
+        return err(f"Der Körper „{koerper}“ trägt schon ein anderes Outfit – bitte einen anderen wählen.", 409)
+    if koerper not in _deploy_freie_koerper(conn, st_text):
+        return err(f"Der Körper „{koerper}“ ist schon belegt – bitte einen anderen wählen.", 409)
+    try:
+        neu = _dayzcode_einfuegen(st_text, "spawnabletypes", dep_id, block)
+        _dayzcode_segmente(neu)
+        ET.fromstring(neu)
+    except ET.ParseError as exc:
+        return err(f"Die Server-Datei ist danach kein gültiges XML ({exc}) – nichts geschrieben.")
+    except ValueError as exc:
+        return err(str(exc))
+    if not await _tools_datei_schreiben(conn, "cfgspawnabletypes.xml", neu, loop):
+        return err("cfgspawnabletypes.xml konnte nicht gespeichert werden.", 502)
+    _audit_add("dashboard", _audit_actor(_sess_get(request)), "NPC-Miete: Outfit geschrieben", f"{outfit['label']} → {koerper} · {conn.name}")
+    return ok({"geschrieben": True, "koerper": koerper, "bereits": False})
+
+
 async def api_shop_rentals_list(request: web.Request) -> web.Response:
     conn, fehler = _session_conn(request, "shop.catalog_admin")
     if fehler is not None:
@@ -52731,6 +54562,19 @@ async def api_me_overview(request: web.Request) -> web.Response:
     })
 
 
+async def api_me_playtime(request: web.Request) -> web.Response:
+    """Spielzeit des angemeldeten Spielers auf seinem Server: nur seine EIGENEN verknuepften Namen (/link), nie die anderer."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    conn, gid, uid = ctx["conn"], ctx["gid"], ctx["uid"]
+    namen = [str(r["ingame_name"]) for r in db.get_links_by_user(gid, uid)]
+    if not namen:
+        return ok({"verknuepft": False, "namen": []})
+    daten = await _dash_run(db.playtime_summary, gid, conn.service_id, namen, time.time())
+    return ok({"verknuepft": True, "namen": namen, **daten})
+
+
 async def api_me_orders(request: web.Request) -> web.Response:
     ctx, denied = await _spieler_ctx(request)
     if denied is not None:
@@ -54592,6 +56436,14 @@ def build_app() -> web.Application:
     r.add_post("/api/me/servers/select", post_me_servers_select)
     r.add_get("/api/me/overview", api_me_overview)
     r.add_get("/api/me/orders", api_me_orders)
+    r.add_get("/api/me/playtime", api_me_playtime)
+    r.add_get("/api/me/rad", api_me_rad)
+    r.add_post("/api/me/rad/drehen", post_me_rad_drehen)
+    r.add_get("/api/me/livekarte", api_me_livekarte)
+    r.add_get("/api/me/kredit", api_me_kredit)
+    r.add_post("/api/me/kredit/vertrag", post_me_kredit_vertrag)
+    r.add_post("/api/me/kredit/annehmen", post_me_kredit_annehmen)
+    r.add_post("/api/me/kredit/zahlen", post_me_kredit_zahlen)
     r.add_get("/api/me/shop", api_me_shop)
     r.add_post("/api/me/shop/buy", post_me_shop_buy)
     r.add_post("/api/me/quote", post_me_quote)
@@ -54675,6 +56527,15 @@ def build_app() -> web.Application:
     r.add_get("/api/discord-management/wortfilter", get_discord_mgmt_wortfilter)
     r.add_post("/api/discord-management/wortfilter", post_discord_mgmt_wortfilter)
     r.add_post("/api/discord-management/wortfilter/test", post_discord_mgmt_wortfilter_test)
+    r.add_get("/api/discord-management/gluecksrad", get_discord_mgmt_rad)
+    r.add_post("/api/discord-management/gluecksrad", post_discord_mgmt_rad)
+    r.add_get("/api/discord-management/gluecksrad/items", get_discord_mgmt_rad_items)
+    r.add_post("/api/discord-management/gluecksrad/geben", post_discord_mgmt_rad_geben)
+    r.add_get("/api/discord-management/livekarte", get_discord_mgmt_livekarte)
+    r.add_post("/api/discord-management/livekarte", post_discord_mgmt_livekarte)
+    r.add_get("/api/discord-management/kredite", get_discord_mgmt_kredite)
+    r.add_post("/api/discord-management/kredite", post_discord_mgmt_kredite)
+    r.add_post("/api/discord-management/kredite/erlassen", post_discord_mgmt_kredite_erlassen)
     r.add_get("/api/discord-management/social", get_discord_mgmt_social)
     r.add_post("/api/discord-management/social", post_discord_mgmt_social)
     r.add_post("/api/discord-management/social/pruefen", post_discord_mgmt_social_pruefen)
@@ -54727,6 +56588,11 @@ def build_app() -> web.Application:
     r.add_delete("/api/shop/items/{name}", delete_item)
     r.add_post("/api/shop/categories", add_category)
     r.add_get("/api/shop/rentals", api_shop_rentals_list)
+    r.add_get("/api/shop/rentals/vorlagen", api_shop_rentals_vorlagen)
+    r.add_post("/api/shop/rentals/vorlage", api_shop_rentals_vorlage)
+    r.add_get("/api/shop/rentals/npc", api_shop_rentals_npc)
+    r.add_post("/api/shop/rentals/npc-vorlage", api_shop_rentals_npc_vorlage)
+    r.add_post("/api/shop/rentals/npc-outfit", api_shop_rentals_npc_outfit)
     r.add_post("/api/shop/rentals", api_shop_rentals_create)
     r.add_put("/api/shop/rentals/{name}", api_shop_rentals_update)
     r.add_delete("/api/shop/rentals/{name}", api_shop_rentals_delete)
@@ -55541,6 +57407,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "c6f1f2a97b2185323eefd64119d57d6d6a83bbde6ed5191e4b4cb409bdd846bd",
         "574533c53b9f4971092e57c7fcea6dab414c24de9d59d24a6b173933777824ce",
         "30159111e37bb5ca7b80386c11af4987c99b48be5e04b376bdc2cb4306237c0a",
+        "7669dcb4c7cef2b712482e6d94f94e4a3498a23f60d9bc68d046728b9b420267",
     ),
     "styles.css": (
         "854cd5c0116ef9230d2534c486b88c6dff38df66194defb0c429309ea4add035",
@@ -55597,6 +57464,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "37fb98a556892255577f628f40cc14a2126d6cb25186a8cbb2c089ed479c0115",
         "bce3178c72a3e1685b47378cb3f70ddb75d8424ca3b76241466c0ac262d857ce",
         "4d5214accd1d96cbdcd5ffbb82930f3accf21ccfbb8bb3d96a75262d37bbe072",
+        "b101383fe831787443d1c174caed70a31ec0dbc659b3b98fd7544c8fff677de9",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -55870,6 +57738,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "54dc3e3f8499df3a59f4e0b98538298dc8d8425d8077dfc3a5a4d6403e4a656a",
         "d2783e9c3afbab1fbf6582e06566dc89bdb71461f4d6860db2048e5e80d52073",
         "dd733fa9a2e9751aeba30c4e5062465a05586d67ce60ed0f5110445128025855",
+        "fdcd8576a6891955017b5d5f1a03d0f1f4b6600dbd242666c29eb3aa6c19a55e",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
@@ -55894,6 +57763,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "014c591a3cd6aa6862e1583939b437c8b2c2b2d23c009d10f61107a470f84e99",
         "a71f69bc408ce4ea832f4593e005298c884eef31fefd2b08f8e3e17f30d71b00",
         "3cc04281ef841e20ef2ab5400964e0202772cdfafdd5d8c96fc2722164232aac",
+        "66a7d40b5cd1fdc8f8f0a785edd765714a0a3e726ee7a4d1ccb95895b2df2fc4",
     ),
     "vendor/leaflet.css": (
         "a7837102824184820dfa198d1ebcd109ff6d0ff9a2672a074b9a1b4d147d04c6",

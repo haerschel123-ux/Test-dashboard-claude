@@ -470,14 +470,15 @@ def test_ungueltige_vorlagen(text):
     assert bot._social_vorlage_pruefen(text)
 
 
-@pytest.mark.parametrize("plattform", ["youtube", "instagram", "tiktok", "x"])
+@pytest.mark.parametrize("plattform", ["youtube", "instagram", "tiktok", "x", "dayz_news", "nitrado_status"])
 @pytest.mark.parametrize("sprache", ["de", "en"])
 def test_standardvorlagen_sind_gueltig_und_ersetzen_alles(plattform, sprache):
     vorlage = bot._SOCIAL_VORLAGEN[plattform][sprache]
     assert bot._social_vorlage_pruefen(vorlage) is None
     text = bot._social_text_bauen({"platform": plattform, "language": sprache, "name": "N"},
                                   {"titel": "Mein Titel", "autor": "Dora", "link": "https://example.org/1"})
-    assert "{" not in text and "Mein Titel" in text and "Dora" in text and text.endswith("https://example.org/1")
+    assert "{" not in text and "Mein Titel" in text and text.endswith("https://example.org/1")
+    assert ("Dora" in text) == ("{autor}" in vorlage)                 # News-/Status-Vorlagen kommen ohne Autor aus
 
 
 def test_nachricht_ist_gegen_markdown_und_erwaehnungen_aus_fremden_feeds_gesichert():
@@ -504,7 +505,7 @@ def test_anlegen_und_lesen(monkeypatch, welt):
     assert abo["status"]["baseline"] is False and abo["status"]["fehler"] == ""
     st, j = _api(monkeypatch, welt.a, bot.get_discord_mgmt_social, None, "GET")
     assert st == 200 and len(j["data"]["abos"]) == 1 and j["data"]["max_je_plattform"] == 5 and j["data"]["intervall_minuten"] == 15
-    assert set(j["data"]["plattformen"]) == {"youtube", "instagram", "tiktok", "x"}
+    assert set(j["data"]["plattformen"]) == {"youtube", "instagram", "tiktok", "x", "dayz_news", "nitrado_status"}
     assert [a["action"] for a in bot._audit_log] == ["Discord-Management aktualisiert"]
 
 
@@ -957,3 +958,71 @@ def test_status_im_dashboard_zeigt_fehlercodes_aber_nie_rohtext(monkeypatch, wel
     abo["state"]["last_error"] = "<script>alert(1)</script>"
     st, j = _api(monkeypatch, welt.a, bot.get_discord_mgmt_social, None, "GET")
     assert j["data"]["abos"][0]["status"]["fehler"] == "serverfehler" and "<script>" not in json.dumps(j)
+
+
+# ═══ Live-Updates: DayZ-News und Nitrado-Status ═════════════════════════════
+DAYZ_FEED = "https://store.steampowered.com/feeds/news/app/221100/"
+NITRADO_FEED = "https://status.example.net/history.rss"
+
+
+def test_live_updates_vorschlag_nur_fuer_dayz_und_ohne_schluessel(monkeypatch, welt):
+    st, j = _api(monkeypatch, welt.a, bot.get_discord_mgmt_social, None, "GET")
+    assert st == 200 and j["data"]["vorschlaege"] == {"dayz_news": DAYZ_FEED}
+    assert bot._social_url_pruefen(DAYZ_FEED) == DAYZ_FEED
+    assert j["data"]["plattformen"]["dayz_news"]["label"] == "DayZ-News" and j["data"]["plattformen"]["nitrado_status"]["label"] == "Nitrado-Status"
+
+
+@pytest.mark.parametrize("plattform,quelle,label", [("dayz_news", DAYZ_FEED, "DayZ-News"), ("nitrado_status", NITRADO_FEED, "Nitrado-Status")])
+def test_live_updates_anlegen_mit_sauberem_namen(monkeypatch, welt, plattform, quelle, label):
+    st, j = _anlegen(monkeypatch, welt.a, platform=plattform, source=quelle)
+    assert st == 200, j
+    abo = j["data"]["abos"][0]
+    assert abo["platform"] == plattform and abo["name"] == label and abo["enabled"] is True and abo["channel_id"] == str(K1)
+    assert abo["status"]["baseline"] is False
+    assert [z["detail"] for z in bot._audit_log if z["action"] == "Discord-Management aktualisiert"][-1] == f"social_{plattform} · Server 1000"
+
+
+@pytest.mark.parametrize("plattform", ["dayz_news", "nitrado_status"])
+@pytest.mark.parametrize("quelle", ["", "http://store.steampowered.com/feeds/news/app/221100/", "https://127.0.0.1/feed", "https://localhost/feed",
+                                    "https://user:pw@example.org/feed", "ftp://example.org/feed", "UCBR8-60-B28hp2BmDPdntcQ", "https://example.org:8443/feed"])
+def test_live_updates_nur_oeffentliche_https_feeds(monkeypatch, welt, plattform, quelle):
+    st, j = _anlegen(monkeypatch, welt.a, platform=plattform, source=quelle)
+    assert st == 400 and _abos(welt.a) == []
+
+
+def test_live_updates_dayz_news_erste_pruefung_dann_neue_meldung(welt):
+    abo = _mit_abo(welt, plattform="dayz_news", quelle=DAYZ_FEED, name="DayZ-News")
+    welt.antworten[DAYZ_FEED] = _rss([("1", "Update 1.28", "https://store.steampowered.com/news/app/221100/view/1")])
+    _lauf(1000.0)
+    assert welt.k[K1].sent == [] and abo["state"]["baseline"] is True                         # nichts Altes wird gepostet
+    welt.antworten[DAYZ_FEED] = _rss([("2", "Update 1.29 **Patchnotes** @everyone", "https://store.steampowered.com/news/app/221100/view/2"),
+                                       ("1", "Update 1.28", "https://store.steampowered.com/news/app/221100/view/1")])
+    _lauf(3000.0)
+    gesendet = [m["content"] for m in welt.k[K1].sent]
+    assert len(gesendet) == 1 and gesendet[0].startswith("🧟 **DayZ-News:**") and "1.29" in gesendet[0]
+    assert "@everyone" not in gesendet[0].replace("@\u200beveryone", "") and gesendet[0].endswith("view/2")
+
+
+def test_live_updates_nitrado_stoerung_wird_gepostet_mit_rolle(welt):
+    abo = _mit_abo(welt, plattform="nitrado_status", quelle=NITRADO_FEED, name="Nitrado-Status", role_id=str(R1))
+    welt.antworten[NITRADO_FEED] = _rss([("a", "Alles in Ordnung", "https://status.example.net/a")])
+    _lauf(1000.0)
+    welt.antworten[NITRADO_FEED] = _rss([("b", "Störung: Gameserver Frankfurt", "https://status.example.net/b"), ("a", "Alles in Ordnung", "https://status.example.net/a")])
+    _lauf(3000.0)
+    gesendet = [m["content"] for m in welt.k[K1].sent]
+    assert gesendet == [f"<@&{R1}> 🛠️ **Nitrado-Status:** **Störung: Gameserver Frankfurt**\nhttps://status.example.net/b"]
+
+
+def test_live_updates_feed_ausfall_postet_nichts_und_meldet_fehler(welt):
+    abo = _mit_abo(welt, plattform="nitrado_status", quelle=NITRADO_FEED, name="Nitrado-Status")
+    welt.antworten[NITRADO_FEED] = b"<html><body>Wartungsseite</body></html>"
+    _lauf(1000.0)
+    assert welt.k[K1].sent == [] and abo["state"]["last_error"] == "kein_feed"
+
+
+def test_live_updates_je_plattform_hoechstens_fuenf(monkeypatch, welt):
+    for i in range(5):
+        assert _anlegen(monkeypatch, welt.a, platform="nitrado_status", source=f"https://status.example.net/f{i}.rss")[0] == 200
+    st, j = _anlegen(monkeypatch, welt.a, platform="nitrado_status", source="https://status.example.net/f6.rss")
+    assert st == 400 and "höchstens 5" in j["error"]
+    assert _anlegen(monkeypatch, welt.a, platform="dayz_news", source=DAYZ_FEED)[0] == 200                    # andere Plattform hat ihr eigenes Limit
