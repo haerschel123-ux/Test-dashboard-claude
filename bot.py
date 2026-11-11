@@ -30964,6 +30964,33 @@ class EconomyDB:
                 kosten     INTEGER NOT NULL DEFAULT 0,
                 ts         REAL    NOT NULL)""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_rad_log_user ON rad_log (guild_id, user_id, id)")
+            # Gluecksrad-Gewinn "Shop-Item": Gratis-Kaeufe je Spieler und Item (ablauf 0 = verfaellt nie).
+            c.execute("""CREATE TABLE IF NOT EXISTS rad_gratis (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id   INTEGER NOT NULL,
+                service_id TEXT    NOT NULL,
+                user_id    INTEGER NOT NULL,
+                item_name  TEXT    NOT NULL,
+                menge      INTEGER NOT NULL,
+                ablauf     REAL    NOT NULL DEFAULT 0,
+                ts         REAL    NOT NULL)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_rad_gratis_user ON rad_gratis (guild_id, service_id, user_id)")
+            # Gluecksrad-Gewinne zum Einloesen (/claim wheel prize): Klassennamen oder ein events.xml-Eintrag.
+            c.execute("""CREATE TABLE IF NOT EXISTS rad_gewinne (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id      INTEGER NOT NULL,
+                service_id    TEXT    NOT NULL,
+                user_id       INTEGER NOT NULL,
+                typ           TEXT    NOT NULL,
+                name          TEXT    NOT NULL,
+                daten         TEXT    NOT NULL,
+                ts            REAL    NOT NULL,
+                status        TEXT    NOT NULL DEFAULT 'offen',
+                eingeloest_ts REAL,
+                x             REAL,
+                z             REAL,
+                verweis       TEXT    NOT NULL DEFAULT '')""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_rad_gewinne_user ON rad_gewinne (guild_id, service_id, user_id, status)")
             # Kredite (experimentell): je Kredit ein Schnappschuss der angenommenen Bedingungen (Strafen, Belohnung, Pfand-Ort).
             c.execute("""CREATE TABLE IF NOT EXISTS kredite (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32703,6 +32730,129 @@ class EconomyDB:
             rows = self._conn.execute("SELECT preis_name, typ, wert, quelle, kosten, ts FROM rad_log WHERE guild_id=? AND user_id=? "
                                       "ORDER BY id DESC LIMIT ?", (guild_id, user_id, int(limit))).fetchall()
         return [dict(r) for r in rows]
+
+    def rad_log_anzahl_seit(self, guild_id: int, user_id: int, seit: float) -> int:
+        """Wie viele Drehungen dieses Spielers seit `seit` verbucht wurden (fuer das Tageslimit)."""
+        with self._lock:
+            return int(self._conn.execute("SELECT COUNT(*) AS n FROM rad_log WHERE guild_id=? AND user_id=? AND ts>=?",
+                                          (guild_id, user_id, float(seit))).fetchone()["n"])
+
+    # ── Gluecksrad: Gratis-Kaeufe im Shop (Gewinn "Shop-Item") ──
+    def rad_gratis_add(self, guild_id: int, service_id: str, user_id: int, item_name: str, menge: int, ablauf: float) -> None:
+        """Schreibt `menge` Gratis-Kaeufe von `item_name` gut (ablauf 0 = verfaellt nie). Abgelaufene Zeilen dieses Spielers
+        werden dabei aufgeraeumt."""
+        jetzt = time.time()
+        with self._lock:
+            self._conn.execute("DELETE FROM rad_gratis WHERE guild_id=? AND service_id=? AND user_id=? AND ablauf>0 AND ablauf<=?",
+                               (guild_id, str(service_id), user_id, jetzt))
+            self._conn.execute("INSERT INTO rad_gratis (guild_id, service_id, user_id, item_name, menge, ablauf, ts) VALUES (?,?,?,?,?,?,?)",
+                               (guild_id, str(service_id), user_id, str(item_name), int(menge), float(ablauf), jetzt))
+            self._conn.commit()
+
+    def rad_gratis_stand(self, guild_id: int, service_id: str, user_id: int, jetzt: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+        """Noch gueltige Gratis-Kaeufe des Spielers je Item (Schluessel = Item-Name klein): {name, menge, ablauf}. `ablauf` ist
+        der frueheste Verfall unter den Zeilen des Items (0 = keine verfaellt)."""
+        jetzt = time.time() if jetzt is None else jetzt
+        with self._lock:
+            rows = self._conn.execute("SELECT item_name, menge, ablauf FROM rad_gratis WHERE guild_id=? AND service_id=? AND user_id=? "
+                                      "AND menge>0 AND (ablauf=0 OR ablauf>?) ORDER BY id",
+                                      (guild_id, str(service_id), user_id, float(jetzt))).fetchall()
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            e = out.setdefault(str(r["item_name"]).lower(), {"name": str(r["item_name"]), "menge": 0, "ablauf": 0.0})
+            e["menge"] += int(r["menge"])
+            if float(r["ablauf"]) > 0 and (e["ablauf"] == 0 or float(r["ablauf"]) < e["ablauf"]):
+                e["ablauf"] = float(r["ablauf"])
+        return out
+
+    def rad_gratis_verbrauchen(self, guild_id: int, service_id: str, user_id: int, item_name: str, menge: int,
+                               jetzt: Optional[float] = None) -> Optional[List[Dict[str, Any]]]:
+        """Nimmt atomar `menge` Gratis-Kaeufe dieses Items (zuerst die, die am fruehesten verfallen). Gibt zurueck, was aus
+        welcher Zeile genommen wurde (zum Zurueckgeben bei einem abgebrochenen Kauf) - oder None, wenn nicht genug da ist;
+        dann wurde nichts veraendert."""
+        jetzt = time.time() if jetzt is None else jetzt
+        menge = int(menge)
+        if menge <= 0:
+            return []
+        with self._lock:
+            rows = self._conn.execute("SELECT id, item_name, menge, ablauf, ts FROM rad_gratis WHERE guild_id=? AND service_id=? AND user_id=? "
+                                      "AND item_name=? COLLATE NOCASE AND menge>0 AND (ablauf=0 OR ablauf>?) "
+                                      "ORDER BY (ablauf=0), ablauf, id",
+                                      (guild_id, str(service_id), user_id, str(item_name), float(jetzt))).fetchall()
+            if sum(int(r["menge"]) for r in rows) < menge:
+                return None
+            genommen: List[Dict[str, Any]] = []
+            rest = menge
+            for r in rows:
+                if rest <= 0:
+                    break
+                n = min(rest, int(r["menge"]))
+                rest -= n
+                genommen.append({"id": int(r["id"]), "item_name": str(r["item_name"]), "menge": n, "ablauf": float(r["ablauf"]),
+                                 "ts": float(r["ts"])})
+                if n == int(r["menge"]):
+                    self._conn.execute("DELETE FROM rad_gratis WHERE id=?", (int(r["id"]),))
+                else:
+                    self._conn.execute("UPDATE rad_gratis SET menge = menge - ? WHERE id=?", (n, int(r["id"])))
+            self._conn.commit()
+            return genommen
+
+    def rad_gratis_zurueck(self, guild_id: int, service_id: str, user_id: int, genommen: List[Dict[str, Any]]) -> None:
+        """Gibt verbrauchte Gratis-Kaeufe zurueck (abgebrochener Kauf) - mit ihrem urspruenglichen Verfall."""
+        with self._lock:
+            for g in genommen:
+                cur = self._conn.execute("UPDATE rad_gratis SET menge = menge + ? WHERE id=? AND guild_id=? AND service_id=? AND user_id=?",
+                                         (int(g["menge"]), int(g["id"]), guild_id, str(service_id), user_id))
+                if cur.rowcount == 0:
+                    self._conn.execute("INSERT INTO rad_gratis (guild_id, service_id, user_id, item_name, menge, ablauf, ts) "
+                                       "VALUES (?,?,?,?,?,?,?)",
+                                       (guild_id, str(service_id), user_id, str(g["item_name"]), int(g["menge"]), float(g["ablauf"]),
+                                        float(g["ts"])))
+            self._conn.commit()
+
+    # ── Gluecksrad: Gewinne zum Einloesen (/claim wheel prize) ──
+    def rad_gewinn_add(self, guild_id: int, service_id: str, user_id: int, typ: str, name: str, daten: Dict[str, Any]) -> int:
+        with self._lock:
+            cur = self._conn.execute("INSERT INTO rad_gewinne (guild_id, service_id, user_id, typ, name, daten, ts) VALUES (?,?,?,?,?,?,?)",
+                                     (guild_id, str(service_id), user_id, str(typ), str(name), json.dumps(daten), time.time()))
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def rad_gewinne_offen(self, guild_id: int, service_id: str, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        """Offene Gewinne NUR dieses Spielers auf diesem Server, aelteste zuerst."""
+        with self._lock:
+            rows = self._conn.execute("SELECT id, typ, name, daten, ts FROM rad_gewinne WHERE guild_id=? AND service_id=? AND user_id=? "
+                                      "AND status='offen' ORDER BY id LIMIT ?",
+                                      (guild_id, str(service_id), user_id, int(limit))).fetchall()
+        return [dict(r) for r in rows]
+
+    def rad_gewinne_offen_anzahl(self, guild_id: int, service_id: str, user_id: int) -> int:
+        with self._lock:
+            return int(self._conn.execute("SELECT COUNT(*) AS n FROM rad_gewinne WHERE guild_id=? AND service_id=? AND user_id=? "
+                                          "AND status='offen'", (guild_id, str(service_id), user_id)).fetchone()["n"])
+
+    def rad_gewinn_beanspruchen(self, gewinn_id: int, guild_id: int, service_id: str, user_id: int, x: float, z: float) -> bool:
+        """Markiert den offenen Gewinn atomar als eingeloest. False, wenn er nicht (mehr) offen ist oder nicht diesem Spieler
+        auf diesem Server gehoert."""
+        with self._lock:
+            cur = self._conn.execute("UPDATE rad_gewinne SET status='eingeloest', eingeloest_ts=?, x=?, z=? "
+                                     "WHERE id=? AND guild_id=? AND service_id=? AND user_id=? AND status='offen'",
+                                     (time.time(), float(x), float(z), int(gewinn_id), guild_id, str(service_id), user_id))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def rad_gewinn_freigeben(self, gewinn_id: int, guild_id: int, service_id: str, user_id: int) -> None:
+        """Macht das Beanspruchen rueckgaengig (die Lieferung ist fehlgeschlagen) - der Gewinn ist wieder offen."""
+        with self._lock:
+            self._conn.execute("UPDATE rad_gewinne SET status='offen', eingeloest_ts=NULL, x=NULL, z=NULL "
+                               "WHERE id=? AND guild_id=? AND service_id=? AND user_id=? AND status='eingeloest'",
+                               (int(gewinn_id), guild_id, str(service_id), user_id))
+            self._conn.commit()
+
+    def rad_gewinn_verweis(self, gewinn_id: int, verweis: str) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE rad_gewinne SET verweis=? WHERE id=?", (str(verweis)[:120], int(gewinn_id)))
+            self._conn.commit()
 
     def roster_hat_namen(self, guild_id: int, service_id: str, ingame_name: str) -> bool:
         """True, wenn dieser Ingame-Name schon einmal auf DIESEM Server (in
@@ -36192,6 +36342,8 @@ class _Preis:
     gutschein: Optional[str] = None
     gutschein_abzug: int = 0
     total: int = 0
+    gratis_menge: int = 0        # so viele Stueck sind ein Gratis-Kauf aus dem Gluecksrad ...
+    gratis_wert: int = 0         # ... und so viel ziehen sie vom Listenpreis ab (vor Rabatt und Gutschein)
 
 
 def _bester_rabatt(gid: int, rollen_ids: Set[int], preis: int,
@@ -36262,14 +36414,20 @@ def _gutschein_fehlversuch(uid: Optional[int]) -> None:
 
 def _preis_berechnen(gid: int, rollen_ids: Optional[Set[int]], liste: int, gutschein: Optional[str],
                      en: bool, uid: Optional[int] = None,
-                     item_regeln: Optional[List[Dict[str, Any]]] = None) -> Union[_Preis, "_KaufFehler"]:
+                     item_regeln: Optional[List[Dict[str, Any]]] = None,
+                     gratis_menge: int = 0, gratis_wert: int = 0) -> Union[_Preis, "_KaufFehler"]:
     """Endpreis fuer einen Listenpreis: Rollen-Rabatt, dann optional ein Gutschein. Ein unbrauchbarer Gutschein
     ist ein Fehler (der Kaeufer soll nicht stillschweigend ohne Rabatt zahlen). ``uid`` (der Kaeufer) dient nur
-    dem Schutz vor dem Durchprobieren von Codes. ``item_regeln`` sind die Rabatte, die am Item selbst stehen."""
+    dem Schutz vor dem Durchprobieren von Codes. ``item_regeln`` sind die Rabatte, die am Item selbst stehen.
+    ``gratis_menge``/``gratis_wert``: Gratis-Kaeufe aus dem Gluecksrad - ihr Wert geht zuerst vom Listenpreis ab, Rabatt und
+    Gutschein gelten nur fuer den Rest. Ist der Kauf dadurch schon kostenlos, wird ein Gutschein nicht angefasst."""
     p = _Preis(liste=int(liste))
-    p.rabatt, p.rabatt_regel = _bester_rabatt(gid, rollen_ids or set(), p.liste, item_regeln)
-    rest = p.liste - p.rabatt
-    if gutschein:
+    if gratis_menge > 0:
+        p.gratis_menge, p.gratis_wert = int(gratis_menge), max(0, min(p.liste, int(gratis_wert)))
+    basis = p.liste - p.gratis_wert
+    p.rabatt, p.rabatt_regel = _bester_rabatt(gid, rollen_ids or set(), basis, item_regeln)
+    rest = basis - p.rabatt
+    if gutschein and not (p.gratis_menge > 0 and rest <= 0):
         if _gutschein_gesperrt(uid):
             return _KaufFehler("gutschein", "❌ Zu viele ungültige Gutscheincodes – bitte versuche es in ein paar Minuten erneut.",
                                "❌ Too many invalid coupon codes – please try again in a few minutes.")
@@ -36291,9 +36449,11 @@ def _preis_berechnen(gid: int, rollen_ids: Optional[Set[int]], liste: int, gutsc
 
 def _preis_zeile(p: Optional[_Preis], conn: "ServerConnection", en: bool) -> Optional[str]:
     """Einzeiler fuer Bestaetigung und Feed: Listenpreis, Rabatt, Gutschein - None, wenn es nichts abzuziehen gab."""
-    if p is None or (p.rabatt <= 0 and p.gutschein_abzug <= 0):
+    if p is None or (p.rabatt <= 0 and p.gutschein_abzug <= 0 and p.gratis_menge <= 0):
         return None
     teile = [f"{'List price' if en else 'Listenpreis'} {_fmt_money(p.liste, conn)}"]
+    if p.gratis_menge > 0:
+        teile.append(f"🎡 {p.gratis_menge}× {'free (wheel of fortune)' if en else 'gratis (Glücksrad)'} −{_fmt_money(p.gratis_wert, conn)}")
     if p.rabatt > 0:
         teile.append(f"{'Role discount' if en else 'Rollen-Rabatt'} −{_fmt_money(p.rabatt, conn)}")
     if p.gutschein and p.gutschein_abzug > 0:
@@ -38822,6 +38982,7 @@ class _KaufPlan:
     wallet: int
     preis: Optional[_Preis] = None
     rollen_ids: Optional[Set[int]] = None        # fuer die Wiederholung der Limit-Pruefung beim Ausliefern
+    gratis: int = 0                              # so viele Stueck laufen ueber einen Gratis-Kauf aus dem Gluecksrad
 
 
 @dataclasses.dataclass
@@ -39006,9 +39167,10 @@ def _kauf_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, amoun
         return _KaufFehler("hoehe", "❌ Höhe `y` außerhalb des Bereichs (−100 … 1000). Leer lassen für Bodenhöhe.",
                            "❌ Height `y` out of range (−100 … 1000). Leave it empty for ground level.")
 
-    # Preis pruefen (Vorpruefung, Abbuchung erst nach FTP-Erfolg): Rollen-Rabatt, dann Gutschein
+    # Preis pruefen (Vorpruefung, Abbuchung erst nach FTP-Erfolg): Gratis-Kaeufe aus dem Gluecksrad, Rollen-Rabatt, dann Gutschein
+    gratis = _rad_gratis_fuer(conn, gid, uid, it, int(amount), rollen_ids)
     preis = _preis_berechnen(gid, rollen_ids, int(it.get("price", 0)) * int(amount), gutschein, en, uid,
-                             item_regeln=_item_rabatte(it))
+                             item_regeln=_item_rabatte(it), gratis_menge=gratis, gratis_wert=int(it.get("price", 0)) * gratis)
     if isinstance(preis, _KaufFehler):
         return preis
     total = preis.total
@@ -39020,7 +39182,7 @@ def _kauf_pruefen(conn: "ServerConnection", gid: int, uid: int, item: str, amoun
             f"❌ You need **{_fmt_money(total, conn)}** but your wallet only has **{_fmt_money(wallet, conn)}**.",
             wallet=wallet, total=total)
     return _KaufPlan(it, cls_list, int(amount), float(x), y_val, float(z), ort_label, total, wallet, preis,
-                     rollen_ids=set(rollen_ids) if rollen_ids is not None else None)
+                     rollen_ids=set(rollen_ids) if rollen_ids is not None else None, gratis=gratis)
 
 
 def _kauf_ort_info(conn: "ServerConnection", x: float, z: float) -> Tuple[str, Optional[str]]:
@@ -39069,9 +39231,16 @@ async def _kauf_ausfuehren_innen(conn: "ServerConnection", gid: int, uid: int, u
     # 2. ... dann den Gutschein reservieren und Geld abbuchen (beides atomar). Bei Fehlschlag: Rollback
     code = plan.preis.gutschein if plan.preis else None
     gutschein_ok = db.gutschein_einloesen(gid, code, uid, "shop") if code else True
-    if not gutschein_ok or not db.try_spend_wallet(gid, uid, total):
+    # Gratis-Kaeufe aus dem Gluecksrad: atomar verbrauchen. Reicht es nicht mehr (zweiter Kauf zur selben Zeit), wird der
+    # Kauf abgebrochen statt stillschweigend zum vollen Preis berechnet.
+    genommen = (db.rad_gratis_verbrauchen(gid, conn.service_id, uid, str(it.get("name") or ""), plan.gratis)
+                if (plan.gratis and gutschein_ok) else [])
+    gratis_ok = genommen is not None
+    if not gutschein_ok or not gratis_ok or not db.try_spend_wallet(gid, uid, total):
         if code and gutschein_ok:
             db.gutschein_freigeben(gid, code, uid)
+        if genommen:
+            db.rad_gratis_zurueck(gid, conn.service_id, uid, genommen)
         rollback_ok = await conn.shop.remove_area_entries(area_names)   # Einträge zurückrollen
         if not rollback_ok:
             # Verwaiste Einträge würden bei jedem Neustart gratis spawnen → Admins warnen
@@ -39091,6 +39260,11 @@ async def _kauf_ausfuehren_innen(conn: "ServerConnection", gid: int, uid: int, u
         if not gutschein_ok:
             return _KaufErgebnis(False, "gutschein", f"❌ Der Gutschein `{code}` gilt nicht mehr.",
                                  f"❌ The coupon `{code}` is no longer valid.", wallet=wallet)
+        if not gratis_ok:
+            return _KaufErgebnis(False, "gratis", "❌ Dein Gratis-Kauf aus dem Glücksrad ist nicht mehr verfügbar – nichts wurde "
+                                 "abgebucht. Bitte den Kauf noch einmal starten.",
+                                 "❌ Your free purchase from the wheel of fortune is no longer available – nothing was charged. "
+                                 "Please start the purchase again.", wallet=wallet)
         return _KaufErgebnis(False, "guthaben", wallet=wallet)
 
     # 3. Kauf als pending speichern
@@ -46820,7 +46994,8 @@ def _wortfilter_finde(regel: Dict[str, Any], text_normal: str) -> Optional[str]:
 
 
 def _wortfilter_zahl(wert: Any, niedrig: int, hoch: int) -> int:
-    if isinstance(wert, bool) or not isinstance(wert, (int, float)) or wert != int(wert) or not niedrig <= int(wert) <= hoch:
+    if (isinstance(wert, bool) or not isinstance(wert, (int, float)) or not math.isfinite(wert) or wert != int(wert)
+            or not niedrig <= int(wert) <= hoch):
         raise ValueError(f"Ungültiger Zahlenwert – erlaubt sind ganze Zahlen von {niedrig} bis {hoch}.")
     return int(wert)
 
@@ -47265,8 +47440,27 @@ async def post_discord_mgmt_wortfilter_test(request: web.Request) -> web.Respons
 # Stunden, je X Stunden Spielzeit, vom Team verschenkt) und wie viele Drehungen man hoechstens sparen darf. Zustand je
 # Spieler in der Datenbank (rad_spieler, rad_log). Ein Spieler dreht nie zweimal gleichzeitig (Sperre je Guild und Nutzer);
 # schlaegt die Auszahlung des Preises fehl, bekommt er die Drehung bzw. sein Geld zurueck.
-_RAD_TYPEN = ("geld", "item", "rolle", "drehung", "niete")
-_RAD_MAX_PREISE = 20
+#
+# Die Segmente ("preise") und was der Spieler bekommt:
+#   geld     - sofort aufs Wallet
+#   item     - ein Shop-Item: der Spieler darf es `menge`-mal GRATIS im Shop kaufen (rad_gratis; /buy und Webseite ziehen den
+#              Wert ab und zeigen es als gratis an). Verfall einstellbar (gratis_kauf_tage, 0 = nie).
+#   klassen  - freie DayZ-Klassennamen: offener Gewinn (rad_gewinne), eingeloest mit /claim wheel prize oder im Spielerbereich;
+#              der Spieler waehlt den Ort, geliefert wird wie ein Kauf (cfgEffectArea.json).
+#   event    - ein events.xml-Eintrag (z. B. dauerhafter Fahrzeug-Spawn): offener Gewinn; beim Einloesen wird der Eintrag mit
+#              der gewaehlten Position geschrieben und steht danach unter /events list bzw. /events remove.
+#   rolle, drehung, niete - Discord-Rolle, zusaetzliche Drehungen, nichts.
+_RAD_TYPEN = ("geld", "item", "klassen", "event", "rolle", "drehung", "niete")
+_RAD_MAX_PREISE = 12
+_RAD_MIN_PREISE = 2
+_RAD_FARBEN = 12                 # Palette der Oberflaeche; gespeichert wird nur die Nummer
+_RAD_MAX_KLASSEN = 10
+_RAD_MAX_PRO_TAG = 100           # der Verlauf (rad_log) haelt 200 Eintraege je Spieler - das Tageslimit bleibt darunter
+_RAD_MAX_TAGE = 365
+_RAD_MAX_OFFEN = 50              # offene Gewinne je Spieler; darueber gibt es die Drehung zurueck
+_RAD_KLASSE_RE = re.compile(r"[A-Za-z0-9_]{1,80}")
+_RAD_EVENT_NAME_RE = re.compile(r'<event\b[^>]*\bname=(["\'])([^"\']*)\1')
+_RAD_EVENT_KIND_RE = re.compile(r'<child\b[^>]*\btype=(["\'])([^"\']*)\1')
 _RAD_MAX_GEWICHT = 1000
 _RAD_MAX_BETRAG = 1_000_000_000
 _RAD_MAX_MENGE = 50
@@ -47280,9 +47474,22 @@ _RAD_LOCKS: Dict[Tuple[int, int], asyncio.Lock] = {}
 
 
 def _rad_zahl(wert: Any, niedrig: int, hoch: int) -> int:
-    if isinstance(wert, bool) or not isinstance(wert, (int, float)) or wert != int(wert) or not niedrig <= int(wert) <= hoch:
+    # math.isfinite zuerst: int(inf) wirft OverflowError (JSON "Infinity"/1e999) - das waere ein 500 statt einer Fehlermeldung.
+    if (isinstance(wert, bool) or not isinstance(wert, (int, float)) or not math.isfinite(wert) or wert != int(wert)
+            or not niedrig <= int(wert) <= hoch):
         raise ValueError(f"Ungültiger Zahlenwert – erlaubt sind ganze Zahlen von {niedrig} bis {hoch}.")
     return int(wert)
+
+
+def _rad_text(wert: Any, was: str) -> str:
+    """Kurzer freier Text (Name des Rads, Beschriftung eines Segments): darf leer sein, hoechstens _RAD_NAME_MAX Zeichen,
+    keine Steuerzeichen. Mehrfache Leerzeichen werden zusammengezogen."""
+    if not isinstance(wert, str):
+        raise ValueError(f"{was} muss Text sein.")
+    text = " ".join(wert.split())
+    if len(text) > _RAD_NAME_MAX or any(unicodedata.category(c).startswith("C") for c in text):
+        raise ValueError(f"{was} darf höchstens {_RAD_NAME_MAX} Zeichen lang sein und keine Steuerzeichen enthalten.")
+    return text
 
 
 def _rad_preis_pruefen(roh: Any, id_erzeugen: bool = False) -> Dict[str, Any]:
@@ -47300,13 +47507,10 @@ def _rad_preis_pruefen(roh: Any, id_erzeugen: bool = False) -> Dict[str, Any]:
     typ = roh.get("typ")
     if typ not in _RAD_TYPEN:
         raise ValueError("Unbekannter Preis-Typ.")
-    name = roh.get("name")
-    if not isinstance(name, str):
-        raise ValueError("Jeder Preis braucht einen Namen.")
-    name = " ".join(name.split())
-    if not name or len(name) > _RAD_NAME_MAX or any(unicodedata.category(c).startswith("C") for c in name):
-        raise ValueError(f"Der Name eines Preises darf 1 bis {_RAD_NAME_MAX} Zeichen lang sein und keine Steuerzeichen enthalten.")
+    name = _rad_text(roh.get("name", ""), "Die Beschriftung eines Segments")       # optional: leer = automatisch
     preis: Dict[str, Any] = {"id": pid, "name": name, "typ": typ, "gewicht": _rad_zahl(roh.get("gewicht"), 1, _RAD_MAX_GEWICHT)}
+    if roh.get("farbe") is not None:
+        preis["farbe"] = _rad_zahl(roh.get("farbe"), 0, _RAD_FARBEN - 1)
     if typ == "geld":
         preis["betrag"] = _rad_zahl(roh.get("betrag"), 1, _RAD_MAX_BETRAG)
     elif typ == "item":
@@ -47315,6 +47519,31 @@ def _rad_preis_pruefen(roh: Any, id_erzeugen: bool = False) -> Dict[str, Any]:
             raise ValueError("Bitte ein Item aus dem Shop-Katalog wählen.")
         preis["item"] = item.strip()
         preis["menge"] = _rad_zahl(roh.get("menge", 1), 1, _RAD_MAX_MENGE)
+    elif typ == "klassen":
+        klassen = roh.get("klassen")
+        if not isinstance(klassen, list) or not 1 <= len(klassen) <= _RAD_MAX_KLASSEN:
+            raise ValueError(f"Bitte 1 bis {_RAD_MAX_KLASSEN} Klassennamen angeben.")
+        sauber: List[str] = []
+        for k in klassen:
+            if not isinstance(k, str) or not _RAD_KLASSE_RE.fullmatch(k.strip()):
+                raise ValueError("Ungültiger Klassenname – erlaubt sind Buchstaben, Ziffern und _ (höchstens 80 Zeichen).")
+            sauber.append(k.strip())
+        preis["klassen"] = sauber
+        preis["menge"] = _rad_zahl(roh.get("menge", 1), 1, _RAD_MAX_MENGE)
+    elif typ == "event":
+        xml = roh.get("event_xml")
+        geprueft, fehler = _tool_rental_xml_validieren(xml if isinstance(xml, str) else "", "event")
+        if geprueft is None:
+            raise ValueError(f"events.xml-Eintrag: {fehler}")
+        name_m = _RAD_EVENT_NAME_RE.search(geprueft)
+        if not name_m or not _RAD_EVENT_KIND_RE.search(geprueft):
+            raise ValueError('events.xml-Eintrag: <event name="…"> braucht einen Namen und mindestens ein <child type="…"/>.')
+        # Der Name wird beim Einloesen per Muster umgeschrieben. Trifft das Muster etwas anderes als das echte name-Attribut
+        # (z. B. ein "name=" in einem anderen Attributwert), bliebe der alte Name stehen und /events remove faende den Block nicht.
+        wurzel = ET.fromstring(geprueft)
+        if wurzel.get("name") != name_m.group(2) or not _EVENT_NAME_RE.match(name_m.group(2)) or wurzel.find("children/child[@type]") is None:
+            raise ValueError('events.xml-Eintrag: <event name="…"> braucht einen Namen und mindestens ein <child type="…"/>.')
+        preis["event_xml"] = geprueft
     elif typ == "rolle":
         rid = roh.get("role_id")
         text = str(rid).strip() if isinstance(rid, (str, int)) and not isinstance(rid, bool) else ""
@@ -47337,15 +47566,23 @@ def _rad_einstellungen(sicht: Any) -> Dict[str, Any]:
             return vorgabe
     preise: List[Dict[str, Any]] = []
     gespeichert = roh.get("preise")
-    for p in (gespeichert if isinstance(gespeichert, list) else [])[:_RAD_MAX_PREISE]:
+    for i, p in enumerate((gespeichert if isinstance(gespeichert, list) else [])[:_RAD_MAX_PREISE]):
         try:
-            preise.append(_rad_preis_pruefen(p))
+            preis = _rad_preis_pruefen(p)
         except ValueError:
             continue
-    return {"enabled": bool(roh.get("enabled", False)), "kosten": zahl("kosten", 0, 0, _RAD_MAX_BETRAG),
+        preis.setdefault("farbe", i % _RAD_FARBEN)
+        preise.append(preis)
+    try:
+        name = _rad_text(roh.get("name", ""), "Der Name des Rads")
+    except ValueError:
+        name = ""
+    return {"enabled": bool(roh.get("enabled", False)), "name": name, "kosten": zahl("kosten", 0, 0, _RAD_MAX_BETRAG),
+            "max_pro_tag": zahl("max_pro_tag", 0, 0, _RAD_MAX_PRO_TAG),
             "gratis_stunden": zahl("gratis_stunden", 0, 0, _RAD_MAX_STUNDEN),
             "spielzeit_stunden": zahl("spielzeit_stunden", 0, 0, _RAD_MAX_STUNDEN),
-            "max_gespeichert": zahl("max_gespeichert", 10, 1, _RAD_MAX_SPAREN), "preise": preise}
+            "max_gespeichert": zahl("max_gespeichert", 10, 1, _RAD_MAX_SPAREN),
+            "gratis_kauf_tage": zahl("gratis_kauf_tage", 0, 0, _RAD_MAX_TAGE), "preise": preise}
 
 
 def _rad_chancen(preise: List[Dict[str, Any]]) -> List[float]:
@@ -47364,11 +47601,46 @@ def _rad_ziehen(preise: List[Dict[str, Any]]) -> Dict[str, Any]:
     return preise[-1]
 
 
+def _rad_event_klasse(event_xml: str) -> str:
+    m = _RAD_EVENT_KIND_RE.search(event_xml or "")
+    return m.group(2) if m else "Event"
+
+
+def _rad_klassen_text(p: Dict[str, Any]) -> str:
+    mehr = f" +{len(p['klassen']) - 1}" if len(p["klassen"]) > 1 else ""
+    return f"{p['menge']}× {p['klassen'][0]}{mehr}" if p["menge"] > 1 else f"{p['klassen'][0]}{mehr}"
+
+
+def _rad_preis_name(p: Dict[str, Any], conn: Any, en: bool, guild: Any = None) -> str:
+    """Beschriftung des Segments: die eigene, sonst automatisch aus dem Inhalt (Betrag, Shop-Item, Klassenname ...)."""
+    if p.get("name"):
+        return str(p["name"])
+    typ = p["typ"]
+    if typ == "geld":
+        return _fmt_money(p["betrag"], conn)
+    if typ == "item":
+        return f"{p['menge']}× {p['item']}" if p["menge"] > 1 else str(p["item"])
+    if typ == "klassen":
+        return _rad_klassen_text(p)
+    if typ == "event":
+        return _rad_event_klasse(p["event_xml"])
+    if typ == "rolle":
+        rolle = guild.get_role(int(p["role_id"])) if guild is not None else None
+        return rolle.name if rolle is not None else ("Role" if en else "Rolle")
+    if typ == "drehung":
+        return f"+{p['drehungen']} " + ("spin(s)" if en else "Drehung(en)")
+    return "Nothing" if en else "Niete"
+
+
 def _rad_preis_text(p: Dict[str, Any], conn: Any, en: bool, guild: Any = None) -> str:
     if p["typ"] == "geld":
         return f"💰 {_fmt_money(p['betrag'], conn)}"
     if p["typ"] == "item":
-        return f"🎁 {p['menge']}× {p['item']}"
+        return f"🛒 {p['menge']}× {p['item']} " + ("free in the shop" if en else "gratis im Shop")
+    if p["typ"] == "klassen":
+        return "📦 " + (f"{p['menge']}× " if p["menge"] > 1 else "") + " + ".join(p["klassen"])
+    if p["typ"] == "event":
+        return ("🚗 Permanent spawn: " if en else "🚗 Dauer-Spawn: ") + _rad_event_klasse(p["event_xml"])
     if p["typ"] == "rolle":
         rolle = guild.get_role(int(p["role_id"])) if guild is not None else None
         return f"🎭 {'Role' if en else 'Rolle'} {rolle.name if rolle is not None else p['role_id']}"
@@ -47405,13 +47677,61 @@ def _rad_status(conn: Any, sicht: Any, guild: Any, gid: int, uid: int, en: bool,
         fortschritt = max(0, gesamt - int(basis))
     chancen = _rad_chancen(e["preise"])
     wallet, _bank = db.get_balance(gid, uid)
-    return {"aktiv": bool(e["enabled"] and e["preise"]), "drehungen": s["drehungen"], "max_gespeichert": e["max_gespeichert"],
+    heute = db.rad_log_anzahl_seit(gid, uid, _rad_tag_beginn(jetzt)) if e["max_pro_tag"] else 0
+    return {"aktiv": bool(e["enabled"] and e["preise"]), "name": e["name"], "drehungen": s["drehungen"],
+            "max_gespeichert": e["max_gespeichert"],
             "gratis": {"stunden": e["gratis_stunden"], "bereit": bool(e["gratis_stunden"] and in_s == 0), "in_sekunden": in_s},
             "kosten": e["kosten"], "kosten_text": _fmt_money(e["kosten"], conn), "wallet": wallet,
+            "tag": {"max": e["max_pro_tag"], "heute": heute, "rest": max(0, e["max_pro_tag"] - heute) if e["max_pro_tag"] else None,
+                    "neu_in_sekunden": int(_rad_tag_beginn(jetzt) + 86400 - jetzt)},
             "spielzeit": {"stunden": e["spielzeit_stunden"], "fortschritt": fortschritt,
                           "verknuepft": bool(db.get_links_by_user(gid, uid))},
-            "preise": [{"id": p["id"], "name": p["name"], "typ": p["typ"], "chance": c, "text": _rad_preis_text(p, conn, en, guild)}
+            "preise": [{"id": p["id"], "name": _rad_preis_name(p, conn, en, guild), "typ": p["typ"], "farbe": p["farbe"],
+                        "chance": c, "text": _rad_preis_text(p, conn, en, guild)}
                        for p, c in zip(e["preise"], chancen)]}
+
+
+def _rad_tag_beginn(jetzt: float) -> float:
+    """Beginn des laufenden Tages (00:00 UTC) - das Tageslimit zaehlt wie die Spielzeit nach UTC-Tagen."""
+    return float(int(jetzt) - int(jetzt) % 86400)
+
+
+def _rad_gratis_fuer(conn: Any, gid: int, uid: int, it: Dict[str, Any], menge: int, rollen_ids: Optional[Set[int]] = None) -> int:
+    """Wie viele von `menge` Stueck dieses Shop-Items der Spieler als Gratis-Kauf aus dem Gluecksrad bekommt. Kostet der Kauf
+    ohnehin nichts (Preis 0 oder ein Rabatt ueber den ganzen Preis), wird kein Gratis-Kauf angesetzt - er waere verschenkt."""
+    stueck = int(it.get("price", 0))
+    if stueck <= 0:
+        return 0
+    stand = db.rad_gratis_stand(gid, conn.service_id, uid).get(str(it.get("name") or "").lower())
+    if not stand:
+        return 0
+    liste = stueck * int(menge)
+    if _bester_rabatt(gid, rollen_ids or set(), liste, _item_rabatte(it))[0] >= liste:
+        return 0
+    return max(0, min(int(menge), int(stand["menge"])))
+
+
+def _rad_gewinn_view(r: Dict[str, Any], en: bool) -> Dict[str, Any]:
+    """Ein offener Gewinn fuer Spielerbereich und /claim: was er enthaelt, ohne das rohe XML."""
+    try:
+        daten = json.loads(r["daten"])
+    except (TypeError, ValueError):
+        daten = {}
+    if r["typ"] == "klassen":
+        klassen = [str(k) for k in (daten.get("klassen") or [])]
+        menge = int(daten.get("menge") or 1)
+        inhalt = (f"{menge}× " if menge > 1 else "") + " + ".join(klassen)
+    else:
+        inhalt = ("Permanent spawn: " if en else "Dauer-Spawn: ") + _rad_event_klasse(str(daten.get("event_xml") or ""))
+    return {"id": int(r["id"]), "typ": str(r["typ"]), "name": str(r["name"]), "inhalt": inhalt, "ts": float(r["ts"])}
+
+
+def _rad_spieler_extras(conn: Any, gid: int, uid: int, en: bool) -> Dict[str, Any]:
+    """Offene Gewinne und Gratis-Kaeufe NUR dieses Spielers auf diesem Server."""
+    return {"gewinne": [_rad_gewinn_view(r, en) for r in db.rad_gewinne_offen(gid, conn.service_id, uid)],
+            "gratis_kaeufe": sorted(({"item": v["name"], "menge": v["menge"], "ablauf": v["ablauf"] or None}
+                                     for v in db.rad_gratis_stand(gid, conn.service_id, uid).values()),
+                                    key=lambda v: str(v["item"]).lower())}
 
 
 def _rad_ergebnis_fehler(code: str, de: str, en: str) -> Dict[str, Any]:
@@ -47435,31 +47755,34 @@ async def _rad_preis_auszahlen(conn: Any, sicht: Any, guild: Any, gid: int, uid:
         problem = await _rolle_geben(guild, uid, int(p["role_id"]), "Glücksrad")
         if problem is not None:
             return False, problem[0], problem[1], ""
-        return True, f"Du bekommst die Rolle „{p['name']}“!", f"You get the role “{p['name']}”!", p["role_id"]
-    # item: wird am letzten bekannten Ort des Spielers geliefert (wie ein Kauf zum Preis 0)
-    katalog = conn.catalog
-    it = katalog.find(p["item"]) if katalog is not None else None
-    cls_list = _item_classnames(it) if it else []
-    if not it or not cls_list:
-        return (False, "Das Item gibt es im Shop-Katalog nicht (mehr) – bitte das Team informieren.",
-                "The item no longer exists in the shop catalog – please tell the team.", "")
-    ort = _ort_letzter_bekannter(conn, gid, uid)
-    if ort is None:
-        wert = int(it.get("price", 0)) * int(p["menge"])
-        if wert <= 0:
-            return (False, "Dein letzter Ort ist unbekannt – verknüpfe dich mit /link und spiele auf dem Server.",
-                    "Your last location is unknown – link with /link and play on the server.", "")
-        db.add_wallet(gid, uid, wert)
-        return (True, f"Dein Ort ist unbekannt – du bekommst stattdessen den Wert: {_fmt_money(wert, conn)}.",
-                f"Your location is unknown – you get the value instead: {_fmt_money(wert, conn)}.", f"ersatz:{wert}")
-    wallet, _bank = db.get_balance(gid, uid)
-    y_val = float(conn.get("default_pos_y", 0.0) or 0.0)
-    plan = _KaufPlan(it, cls_list, int(p["menge"]), float(ort["x"]), y_val, float(ort["z"]), None, 0, wallet, None, None)
-    res = await _kauf_ausfuehren(conn, gid, uid, user_name, plan)
-    if not res.ok:
-        return False, res.de or "Die Lieferung ist fehlgeschlagen.", res.en or "Delivery failed.", ""
-    return (True, f"Dein Gewinn ({p['menge']}× {p['item']}) spawnt nach dem nächsten Neustart an deinem letzten Ort.",
-            f"Your prize ({p['menge']}× {p['item']}) spawns at your last location after the next restart.", f"{p['menge']}x {p['item']}")
+        rolle = guild.get_role(int(p["role_id"])) if guild is not None else None
+        rname = rolle.name if rolle is not None else str(p["role_id"])
+        return True, f"Du bekommst die Rolle „{rname}“!", f"You get the role “{rname}”!", p["role_id"]
+    if typ == "item":
+        # Shop-Item: `menge` Gratis-Kaeufe dieses Items. Der Spieler loest sie im Shop ein (Webseite oder /buy) - dort waehlt
+        # er wie bei jedem Kauf den Ort; nur der Preis dieser Stueckzahl entfaellt.
+        katalog = conn.catalog
+        it = katalog.find(p["item"]) if katalog is not None else None
+        if not it or not it.get("enabled", True) or not _item_classnames(it):
+            return (False, "Das Item gibt es im Shop nicht (mehr) – bitte das Team informieren.",
+                    "The item no longer exists in the shop – please tell the team.", "")
+        name = str(it.get("name") or p["item"])
+        tage = int(e["gratis_kauf_tage"])
+        db.rad_gratis_add(gid, conn.service_id, uid, name, int(p["menge"]), time.time() + tage * 86400 if tage else 0.0)
+        frist_de = f" Gültig {tage} Tag(e)." if tage else ""
+        frist_en = f" Valid for {tage} day(s)." if tage else ""
+        return (True, f"Du kannst {p['menge']}× {name} gratis im Shop kaufen (Webseite oder /buy).{frist_de}",
+                f"You can buy {p['menge']}× {name} for free in the shop (website or /buy).{frist_en}", f"gratis:{p['menge']}x {name}")
+    # klassen / event: offener Gewinn, den der Spieler mit /claim wheel prize oder im Spielerbereich an einem Ort seiner Wahl einloest
+    if db.rad_gewinne_offen_anzahl(gid, conn.service_id, uid) >= _RAD_MAX_OFFEN:
+        return (False, f"Du hast schon {_RAD_MAX_OFFEN} offene Gewinne – löse zuerst welche ein (/claim wheel prize).",
+                f"You already have {_RAD_MAX_OFFEN} unclaimed prizes – claim some first (/claim wheel prize).", "")
+    daten = {"klassen": list(p["klassen"]), "menge": int(p["menge"])} if typ == "klassen" else {"event_xml": p["event_xml"]}
+    gewinn_id = db.rad_gewinn_add(gid, conn.service_id, uid, typ, _rad_preis_name(p, conn, False, guild), daten)
+    return (True, "Dein Gewinn wartet auf dich: Löse ihn mit /claim wheel prize oder im Spielerbereich der Webseite ein – "
+            "du wählst dabei, wo er spawnt.",
+            "Your prize is waiting: claim it with /claim wheel prize or in the player area of the website – "
+            "you choose where it spawns.", f"gewinn:{gewinn_id}")
 
 
 async def _rad_drehen(conn: Any, sicht: Any, guild: Any, gid: int, uid: int, user_name: str, quelle: str) -> Dict[str, Any]:
@@ -47471,6 +47794,11 @@ async def _rad_drehen(conn: Any, sicht: Any, guild: Any, gid: int, uid: int, use
         if not e["enabled"] or not e["preise"]:
             return _rad_ergebnis_fehler("aus", "Das Glücksrad ist auf diesem Server nicht aktiv.", "The wheel of fortune is not active on this server.")
         _rad_spielzeit_pruefen(conn, e, gid, uid)
+        # Tageslimit: zaehlt JEDE Drehung (bezahlt, gratis, gespeichert) seit 00:00 UTC. Die Sperre je Spieler oben sorgt
+        # dafuer, dass zwei gleichzeitige Drehungen das Limit nicht beide passieren.
+        if e["max_pro_tag"] and db.rad_log_anzahl_seit(gid, uid, _rad_tag_beginn(time.time())) >= e["max_pro_tag"]:
+            return _rad_ergebnis_fehler("tageslimit", f"Du hast heute schon {e['max_pro_tag']}× gedreht – morgen (00:00 UTC) geht es weiter.",
+                                        f"You already spun {e['max_pro_tag']}× today – come back tomorrow (00:00 UTC).")
         rueckgabe: Any = None
         if quelle == "gespeichert":
             if not db.rad_verbrauche(gid, uid):
@@ -47505,19 +47833,186 @@ async def _rad_drehen(conn: Any, sicht: Any, guild: Any, gid: int, uid: int, use
         if not ok_:
             zurueck()
             return _rad_ergebnis_fehler("auszahlung", f"{de} Deine Drehung wurde zurückgegeben.", f"{en} Your spin was returned.")
-        db.rad_log_add(gid, uid, p["id"], p["name"], p["typ"], wert, quelle, e["kosten"] if quelle == "bezahlt" else 0)
+        name_de, name_en = _rad_preis_name(p, conn, False, guild), _rad_preis_name(p, conn, True, guild)
+        db.rad_log_add(gid, uid, p["id"], name_de, p["typ"], wert, quelle, e["kosten"] if quelle == "bezahlt" else 0)
         if p["typ"] != "niete":
             try:
                 embed = discord.Embed(title=_ft(conn, "🎡 GLÜCKSRAD", "🎡 WHEEL OF FORTUNE"), color=0xF1C40F,
-                                      description=_ft(conn, f"<@{uid}> hat **{p['name']}** gewonnen ({_rad_preis_text(p, conn, False, guild)})",
-                                                      f"<@{uid}> won **{p['name']}** ({_rad_preis_text(p, conn, True, guild)})"))
+                                      description=_ft(conn, f"<@{uid}> hat **{name_de}** gewonnen ({_rad_preis_text(p, conn, False, guild)})",
+                                                      f"<@{uid}> won **{name_en}** ({_rad_preis_text(p, conn, True, guild)})"))
                 await _post_feed(gid, "economy_log", embed, service_id=conn.service_id)
             except Exception as exc:  # noqa: BLE001
                 log.debug(f"[RAD] Feed fehlgeschlagen: {exc}")
         wallet, _bank = db.get_balance(gid, uid)
         return {"ok": True, "de": de, "en": en, "wallet": wallet, "drehungen": db.rad_spieler(gid, uid)["drehungen"],
-                "preis": {"id": p["id"], "name": p["name"], "typ": p["typ"], "text_de": _rad_preis_text(p, conn, False, guild),
-                          "text_en": _rad_preis_text(p, conn, True, guild)}}
+                "preis": {"id": p["id"], "name": name_de, "name_en": name_en, "typ": p["typ"],
+                          "text_de": _rad_preis_text(p, conn, False, guild), "text_en": _rad_preis_text(p, conn, True, guild)}}
+
+
+# ── Gewinn einloesen (/claim wheel prize und Spielerbereich) ──
+def _rad_ort_pruefen(conn: Any, gid: int, uid: int, ort: Optional[str], x: Optional[float], z: Optional[float],
+                     en: bool) -> Tuple[Optional[Tuple[float, float, Optional[str]]], str, str]:
+    """Ort wie beim Kauf: eine Auswahl (letzter bekannter, gemerkter oder gespeicherter Ort) ODER x/z - nur eigene Orte auf
+    diesem Server. Gibt ((x, z, Bezeichnung), "", "") oder (None, Fehler deutsch, Fehler englisch) zurueck."""
+    label: Optional[str] = None
+    if ort and (x is not None or z is not None):
+        return None, "Entweder einen Ort wählen ODER x und z angeben – nicht beides.", "Pick a location OR enter x and z – not both."
+    if ort:
+        aufgeloest, ort_fehler = _ort_aufloesen(conn, gid, uid, ort, en)
+        if aufgeloest is None:
+            ort_fehler = str(ort_fehler or "").removeprefix("❌").strip()        # das ❌ setzt der Aufrufer selbst davor
+            return None, ort_fehler, ort_fehler
+        x, z, label = aufgeloest
+    elif x is None or z is None:
+        return (None, "Bitte einen Ort wählen (letzter bekannter Ort, deine letzten Platzierungen oder ein gespeicherter Ort) "
+                "oder x und z angeben.",
+                "Please pick a location (last known location, your last placements or a saved location) or enter x and z.")
+    if not (math.isfinite(x) and math.isfinite(z) and 0.0 <= x <= 20000.0 and 0.0 <= z <= 20000.0):
+        return (None, "Koordinaten außerhalb der Map. Gib die beiden iZurvive-Zahlen als x (Ost) und z (Nord) an.",
+                "Coordinates out of range. Enter the two iZurvive numbers as x (East) and z (North).")
+    return (float(x), float(z), label), "", ""
+
+
+def _rad_event_name(event_xml: str, vorhanden: str) -> str:
+    """Name der neuen Event-Instanz: der Name aus dem Eintrag (sein Anfang, z. B. "Vehicle", entscheidet in DayZ ueber die
+    Art des Events) plus eine zufaellige Endung, damit mehrere Gewinne desselben Segments nebeneinander bestehen."""
+    m = _RAD_EVENT_NAME_RE.search(event_xml)
+    basis = re.sub(r"[^A-Za-z0-9_]", "", m.group(2) if m else "")[:40] or "Vehicle"
+    while True:
+        name = f"{basis}_W{uuid.uuid4().hex[:8]}"
+        if _tool_finde_benannten_block(vorhanden, "event", name) is None:
+            return name
+
+
+async def _rad_gewinn_einloesen(conn: Any, gid: int, uid: int, user_name: str, gewinn_id: Any, ort: Optional[str],
+                                x: Optional[float], z: Optional[float], en: bool) -> Dict[str, Any]:
+    """Loest EINEN offenen Gewinn dieses Spielers am gewaehlten Ort ein. Der Gewinn wird zuerst atomar als eingeloest markiert
+    und bei jedem Fehler der Lieferung wieder freigegeben - er kann also weder doppelt eingeloest werden noch verloren gehen."""
+    if isinstance(gewinn_id, bool) or not isinstance(gewinn_id, int) or gewinn_id <= 0:
+        return _rad_ergebnis_fehler("gewinn", "Ungültiger Gewinn.", "Invalid prize.")
+    async with _RAD_LOCKS.setdefault((gid, uid), asyncio.Lock()):
+        zeile = next((r for r in db.rad_gewinne_offen(gid, conn.service_id, uid, _RAD_MAX_OFFEN + 10) if int(r["id"]) == gewinn_id), None)
+        if zeile is None:
+            return _rad_ergebnis_fehler("gewinn", "Diesen offenen Gewinn gibt es nicht (mehr).", "This unclaimed prize does not exist (any more).")
+        wo, fehler_de, fehler_en = _rad_ort_pruefen(conn, gid, uid, ort, x, z, en)
+        if wo is None:
+            return _rad_ergebnis_fehler("ort", fehler_de, fehler_en)
+        px, pz, ort_label = wo
+        if conn.api is None or conn.ftp is None:
+            return _rad_ergebnis_fehler("kein_ftp", "Für diesen Server fehlt der FTP-Zugang – ohne ihn kann nichts geliefert werden.",
+                                        "This server is missing FTP access – without it nothing can be delivered.")
+        try:
+            daten = json.loads(zeile["daten"])
+        except (TypeError, ValueError):
+            daten = {}
+        typ, name = str(zeile["typ"]), str(zeile["name"])
+        if typ == "klassen":
+            if not conn.shop:
+                return _rad_ergebnis_fehler("shop_start", "Das Shop-System startet noch – bitte gleich noch einmal versuchen.",
+                                            "The shop system is still starting up – try again in a moment.")
+        elif not _mission_dir_of(conn):
+            return _rad_ergebnis_fehler("shop_start", "Es ist noch kein Mission-Ordner bekannt – bitte gleich noch einmal versuchen.",
+                                        "No mission folder is known yet – try again in a moment.")
+        if not db.rad_gewinn_beanspruchen(gewinn_id, gid, conn.service_id, uid, px, pz):
+            return _rad_ergebnis_fehler("gewinn", "Diesen offenen Gewinn gibt es nicht (mehr).", "This unclaimed prize does not exist (any more).")
+        try:
+            if typ == "klassen":
+                fehler = await _rad_klassen_liefern(conn, gid, uid, user_name, gewinn_id, name, daten, px, pz)
+            else:
+                fehler = await _rad_event_liefern(conn, gid, uid, gewinn_id, name, daten, px, pz)
+        except Exception as exc:  # noqa: BLE001 - nie einen Gewinn verlieren
+            log.warning(f"[RAD] Einlösen fehlgeschlagen ({conn.service_id}): {type(exc).__name__}: {exc}")
+            fehler = ("Die Lieferung ist fehlgeschlagen.", "The delivery failed.")
+        if fehler is not None:
+            db.rad_gewinn_freigeben(gewinn_id, gid, conn.service_id, uid)
+            return _rad_ergebnis_fehler("lieferung", f"{fehler[0].rstrip('. ')}. Dein Gewinn bleibt offen.",
+                                        f"{fehler[1].rstrip('. ')}. Your prize stays unclaimed.")
+        loc_url, near = _kauf_ort_info(conn, px, pz)
+        auto_restart = bool(conn.get("auto_restart_after_purchase", False) and conn.shop)
+        if auto_restart:
+            conn.shop.schedule_auto_restart()
+        try:
+            near_feed = (f"\n*({_ft(conn, 'Nahe', 'Near')} {near})*") if near else ""
+            feed = discord.Embed(title=_ft(conn, "🎡 GEWINN EINGELÖST", "🎡 PRIZE CLAIMED"), color=0xF1C40F,
+                                 description=_ft(conn, f"<@{uid}> hat **{name}** eingelöst", f"<@{uid}> claimed **{name}**"))
+            feed.add_field(name=_ft(conn, "Ort", "Location"), value=f"[{px:.1f} / {pz:.1f}]({loc_url}){near_feed}", inline=True)
+            await _post_feed(gid, "shop_log", feed, service_id=conn.service_id)
+        except Exception as exc:  # noqa: BLE001
+            log.debug(f"[RAD] Feed fehlgeschlagen: {exc}")
+        wann_de = ("Ein Server-Neustart wurde geplant – danach ist dein Gewinn da." if auto_restart
+                   else "Dein Gewinn spawnt nach dem nächsten Server-Neustart.")
+        wann_en = ("A server restart has been scheduled – your prize will be there afterwards." if auto_restart
+                   else "Your prize spawns after the next server restart.")
+        return {"ok": True, "de": f"„{name}“ eingelöst. {wann_de}", "en": f"“{name}” claimed. {wann_en}", "name": name, "typ": typ,
+                "x": round(px, 1), "z": round(pz, 1), "ort_label": ort_label, "link": loc_url, "near": near, "auto_restart": auto_restart}
+
+
+async def _rad_klassen_liefern(conn: Any, gid: int, uid: int, user_name: str, gewinn_id: int, name: str, daten: Dict[str, Any],
+                               x: float, z: float) -> Optional[Tuple[str, str]]:
+    """Klassennamen wie einen Kauf zum Preis 0 liefern (cfgEffectArea.json + Bestellung "ausstehend"). None = geliefert."""
+    klassen = [str(k) for k in (daten.get("klassen") or []) if isinstance(k, str) and _RAD_KLASSE_RE.fullmatch(k)]
+    menge = daten.get("menge")
+    if not klassen or isinstance(menge, bool) or not isinstance(menge, int) or not 1 <= menge <= _RAD_MAX_MENGE:
+        return "Der Gewinn ist beschädigt – bitte das Team informieren.", "The prize is damaged – please tell the team."
+    y_val = float(conn.get("default_pos_y", 0.0) or 0.0)
+    ok_, fehler, area_names = await conn.shop.add_purchase_entries(klassen, menge, x, y_val, z)
+    if not ok_:
+        return "Die Lieferung per FTP ist fehlgeschlagen.", "The delivery via FTP failed."
+    try:
+        kauf_id = db.create_purchase(conn.service_id, gid, uid, user_name, f"🎡 {name}"[:100], "+".join(klassen), menge, 0, x, y_val, z, area_names)
+    except Exception as exc:  # noqa: BLE001
+        # Die Area-Eintraege stehen schon in der Datei. Ohne Bestellung wuerde sie niemand mehr entfernen und der Gewinn waere
+        # nach dem Freigeben ein zweites Mal einloesbar - deshalb die Eintraege zuruecknehmen, bevor der Gewinn wieder offen ist.
+        log.error(f"[RAD] Bestellung zum Gewinn #{gewinn_id} nicht speicherbar ({conn.service_id}): {type(exc).__name__}: {exc}")
+        if not await conn.shop.remove_area_entries(area_names):
+            log.error(f"[RAD] Rollback fehlgeschlagen – verwaiste Areas: {area_names}")
+        return "Die Lieferung konnte nicht gespeichert werden.", "The delivery could not be saved."
+    try:
+        db.rad_gewinn_verweis(gewinn_id, f"kauf:{kauf_id}")
+    except Exception as exc:  # noqa: BLE001 - geliefert ist geliefert: der Verweis ist nur eine Notiz
+        log.warning(f"[RAD] Verweis zum Gewinn #{gewinn_id} nicht speicherbar: {exc}")
+    return None
+
+
+async def _rad_event_liefern(conn: Any, gid: int, uid: int, gewinn_id: int, name: str, daten: Dict[str, Any],
+                             x: float, z: float) -> Optional[Tuple[str, str]]:
+    """events.xml-Eintrag samt Position schreiben (unter dem Event-Lock, wie /events add). Der Eintrag bleibt dauerhaft und
+    wird als Event-Instanz gefuehrt - der Betreiber entfernt ihn mit /events remove. None = geschrieben."""
+    geprueft, fehler = _tool_rental_xml_validieren(str(daten.get("event_xml") or ""), "event")
+    if geprueft is None:
+        return f"Der Gewinn ist beschädigt ({fehler}) – bitte das Team informieren.", "The prize is damaged – please tell the team."
+    loop = asyncio.get_running_loop()
+    async with conn.events_lock:
+        ev_text, ev_status = await loop.run_in_executor(None, _tool_datei_lesen_sync, conn, "db/events.xml")
+        sp_text, sp_status = await loop.run_in_executor(None, _tool_datei_lesen_sync, conn, "cfgeventspawns.xml")
+        if ev_status != "ok" or sp_status != "ok":
+            return ("db/events.xml oder cfgeventspawns.xml sind per FTP nicht lesbar.",
+                    "db/events.xml or cfgeventspawns.xml could not be read via FTP.")
+        event_name = _rad_event_name(geprueft, ev_text)
+        try:
+            neu_ev = _tool_rental_event_einfuegen(ev_text, event_name, _tool_rental_event_umbenennen(geprueft, event_name))
+        except ValueError as exc:
+            return str(exc), str(exc)
+        neu_sp = _tool_rental_pos_schreiben(sp_text, event_name, x, z)
+        if not await loop.run_in_executor(None, _tool_datei_schreiben_sync, conn, "db/events.xml", neu_ev):
+            return "db/events.xml konnte nicht gespeichert werden.", "db/events.xml could not be saved."
+        if not await loop.run_in_executor(None, _tool_datei_schreiben_sync, conn, "cfgeventspawns.xml", neu_sp):
+            # Event wurde geschrieben, Position nicht - zurueckrollen, sonst bleibt ein Event ohne Position uebrig.
+            zurueck, _ = _tool_delete_event(neu_ev, event_name)
+            await loop.run_in_executor(None, _tool_datei_schreiben_sync, conn, "db/events.xml", zurueck)
+            return "cfgeventspawns.xml konnte nicht gespeichert werden.", "cfgeventspawns.xml could not be saved."
+    # Ab hier ist der Eintrag auf dem Server: Schlaegt die Buchfuehrung fehl, bleibt der Gewinn trotzdem eingeloest (sonst
+    # koennte der Spieler ihn ein zweites Mal einloesen). Der Fehler steht im Log samt Event-Name.
+    try:
+        instanzen = list(_event_instances(conn))
+        instanzen.append({"template": f"🎡 {name}"[:80], "event_name": event_name, "x": x, "y": None, "z": z,
+                          "created_at": time.time(), "created_by": uid})
+        _conn_store(conn, "event_instances", instanzen)
+        db.rad_gewinn_verweis(gewinn_id, f"event:{event_name}")
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"[RAD] Event {event_name} (Gewinn #{gewinn_id}, {conn.service_id}) geschrieben, aber nicht als Instanz "
+                  f"gespeichert – /events remove kennt es nicht: {type(exc).__name__}: {exc}")
+    return None
 
 
 # ── Dashboard: Einstellungen (Discord Management) ──
@@ -47525,8 +48020,10 @@ def _rad_payload(sicht: Any) -> Dict[str, Any]:
     e = _rad_einstellungen(sicht)
     chancen = _rad_chancen(e["preise"])
     e["preise"] = [dict(p, chance=c) for p, c in zip(e["preise"], chancen)]
-    e["limits"] = {"preise": _RAD_MAX_PREISE, "gewicht": _RAD_MAX_GEWICHT, "stunden": _RAD_MAX_STUNDEN, "sparen": _RAD_MAX_SPAREN,
-                   "betrag": _RAD_MAX_BETRAG, "menge": _RAD_MAX_MENGE, "drehungen": _RAD_MAX_DREHUNGEN}
+    e["limits"] = {"preise": _RAD_MAX_PREISE, "min_preise": _RAD_MIN_PREISE, "gewicht": _RAD_MAX_GEWICHT, "stunden": _RAD_MAX_STUNDEN,
+                   "sparen": _RAD_MAX_SPAREN, "betrag": _RAD_MAX_BETRAG, "menge": _RAD_MAX_MENGE, "drehungen": _RAD_MAX_DREHUNGEN,
+                   "pro_tag": _RAD_MAX_PRO_TAG, "tage": _RAD_MAX_TAGE, "klassen": _RAD_MAX_KLASSEN, "farben": _RAD_FARBEN,
+                   "name": _RAD_NAME_MAX, "event_xml": _RENTAL_MAX_EVENT_XML}
     return e
 
 
@@ -47550,6 +48047,36 @@ async def get_discord_mgmt_rad_items(request: web.Request) -> web.Response:
     return ok({"items": sorted(treffer, key=lambda n: (not n.lower().startswith(q), n.lower()))[:20]})
 
 
+async def get_discord_mgmt_rad_klassen(request: web.Request) -> web.Response:
+    """Suche nach DayZ-Klassennamen fuer die Segment-Arten „Klassenname“ und „events.xml-Eintrag“ (hoechstens 20 Treffer):
+    die fuer diesen Server hinterlegten Klassen und der mitgelieferte Katalog."""
+    conn, denied = await _honeypot_gate(request, "view")
+    if denied is not None:
+        return denied
+    q = str(request.query.get("q") or "").strip()[:60]
+    if len(q) < 2:
+        return ok({"klassen": []})
+    quellen = [list(conn.data.get("shop_autofill_classnames") or []), _shop_eingebaute_classnames()]
+    return ok({"klassen": [{"classname": e["classname"], "name": e["name"]} for e in _shop_autofill_treffer(quellen, q, 60)
+                           if _RAD_KLASSE_RE.fullmatch(e["classname"])][:20]})
+
+
+async def post_discord_mgmt_rad_event_vorlage(request: web.Request) -> web.Response:
+    """Baut den events.xml-Eintrag fuer EIN Fahrzeug/Objekt (dieselbe Vorlage wie beim Miet-Setup) - speichert nichts."""
+    _conn, denied = await _honeypot_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.gluecksrad.vorlage", 1)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    try:
+        vorlage = _rental_vorlage_bauen(data.get("classname"))
+    except ValueError as exc:
+        return err(str(exc))
+    return ok({"event_xml": vorlage["event_xml"], "klasse": vorlage["klasse"]})
+
+
 async def post_discord_mgmt_rad(request: web.Request) -> web.Response:
     conn, denied = await _honeypot_gate(request, "edit")
     if denied is not None:
@@ -47562,20 +48089,25 @@ async def post_discord_mgmt_rad(request: web.Request) -> web.Response:
         return err("Ungültige Anfrage.")
     preise_roh = data.get("preise")
     if not isinstance(preise_roh, list) or len(preise_roh) > _RAD_MAX_PREISE:
-        return err(f"Höchstens {_RAD_MAX_PREISE} Preise.")
+        return err(f"Höchstens {_RAD_MAX_PREISE} Segmente.")
     try:
         preise = [_rad_preis_pruefen(p, id_erzeugen=True) for p in preise_roh]
         kosten = _rad_zahl(data.get("kosten", 0), 0, _RAD_MAX_BETRAG)
         gratis = _rad_zahl(data.get("gratis_stunden", 0), 0, _RAD_MAX_STUNDEN)
         spielzeit = _rad_zahl(data.get("spielzeit_stunden", 0), 0, _RAD_MAX_STUNDEN)
         sparen = _rad_zahl(data.get("max_gespeichert", 10), 1, _RAD_MAX_SPAREN)
+        pro_tag = _rad_zahl(data.get("max_pro_tag", 0), 0, _RAD_MAX_PRO_TAG)
+        kauf_tage = _rad_zahl(data.get("gratis_kauf_tage", 0), 0, _RAD_MAX_TAGE)
+        rad_name = _rad_text(data.get("name", ""), "Der Name des Rads")
     except ValueError as exc:
         return err(str(exc))
     if len({p["id"] for p in preise}) != len(preise):
         return err("Doppelte Preis-Kennung.")
+    for i, p in enumerate(preise):
+        p.setdefault("farbe", i % _RAD_FARBEN)
     aktiv = bool(data.get("enabled", False))
-    if aktiv and not preise:
-        return err("Bitte zuerst mindestens einen Preis anlegen.")
+    if aktiv and len(preise) < _RAD_MIN_PREISE:
+        return err(f"Ein aktives Rad braucht {_RAD_MIN_PREISE} bis {_RAD_MAX_PREISE} Segmente.")
     if aktiv and not (kosten or gratis or spielzeit):
         return err("Bitte mindestens einen Weg zu Drehungen einstellen (bezahlen, gratis oder Spielzeit) – vom Team verschenkte Drehungen gehen immer.")
     gid = int(conn.guild_id) if conn.guild_id else 0
@@ -47594,10 +48126,11 @@ async def post_discord_mgmt_rad(request: web.Request) -> web.Response:
     for p in preise:
         if p["typ"] == "item" and (katalog is None or katalog.find(p["item"]) is None):
             return err(f"Das Item „{p['item']}“ gibt es im Shop-Katalog nicht.")
-    _conn_store(conn, "gluecksrad", {"enabled": aktiv, "kosten": kosten, "gratis_stunden": gratis, "spielzeit_stunden": spielzeit,
-                                     "max_gespeichert": sparen, "preise": preise})
+    _conn_store(conn, "gluecksrad", {"enabled": aktiv, "name": rad_name, "kosten": kosten, "max_pro_tag": pro_tag,
+                                     "gratis_stunden": gratis, "spielzeit_stunden": spielzeit, "max_gespeichert": sparen,
+                                     "gratis_kauf_tage": kauf_tage, "preise": preise})
     _audit_add("dashboard", _audit_actor(_sess_get(request)), "Discord-Management aktualisiert",
-               f"gluecksrad · {len(preise)} Preis(e) · {conn.name}")
+               f"gluecksrad · {len(preise)} Segment(e) · {conn.name}")
     return ok(_rad_payload(conn))
 
 
@@ -47642,7 +48175,34 @@ async def api_me_rad(request: web.Request) -> web.Response:
         return err("Dieser Discord-Server gehört nicht zu diesem Server.", 409)
     status = _rad_status(conn, sicht, bot.get_guild(gid), gid, uid, en)
     status["verlauf"] = [{"name": r["preis_name"], "typ": r["typ"], "quelle": r["quelle"], "ts": r["ts"]} for r in db.rad_log(gid, uid, 10)]
+    status.update(_rad_spieler_extras(conn, gid, uid, en))
     return ok(status)
+
+
+async def post_me_rad_einloesen(request: web.Request) -> web.Response:
+    """Offenen Gewinn (Klassennamen oder events.xml-Eintrag) an einem Ort einloesen - dieselbe Logik wie /claim wheel prize."""
+    ctx, denied = await _spieler_ctx(request)
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "me.rad.einloesen", 3)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    conn, gid, uid, en = ctx["conn"], ctx["gid"], ctx["uid"], ctx["en"]
+    if guild_sicht(conn, gid) is None:
+        return err("Dieser Discord-Server gehört nicht zu diesem Server.", 409)
+    ort = str(data.get("ort") or "").strip() or None
+    x, z = _anzahl_oder_none(data.get("x")), _anzahl_oder_none(data.get("z"))
+    if any(v is not None and not math.isfinite(v) for v in (x, z)):
+        return err("Invalid coordinates." if en else "Ungültige Koordinaten.", 400)
+    erg = await _rad_gewinn_einloesen(conn, gid, uid, str(ctx["name"]), data.get("id"), ort, x, z, en)
+    if not erg["ok"]:
+        status = 400 if erg["code"] == "ort" else 404 if erg["code"] == "gewinn" else 503 if erg["code"] in ("kein_ftp", "shop_start") else 502
+        return err(_klartext(erg["en"] if en else erg["de"]), status, code=erg["code"])
+    erg["text"] = erg["en"] if en else erg["de"]
+    erg["ort_label"] = _klartext(erg["ort_label"] or "")
+    erg.update(_rad_spieler_extras(conn, gid, uid, en))
+    return ok(erg)
 
 
 async def post_me_rad_drehen(request: web.Request) -> web.Response:
@@ -47660,10 +48220,11 @@ async def post_me_rad_drehen(request: web.Request) -> web.Response:
         return err("Dieser Discord-Server gehört nicht zu diesem Server.", 409)
     erg = await _rad_drehen(conn, sicht, bot.get_guild(gid), gid, uid, str(ctx["name"]), str(quelle))
     if not erg["ok"]:
-        status = 400 if erg["code"] == "quelle" else 409 if erg["code"] in ("warten", "keine", "guthaben", "aus") else 502
+        status = 400 if erg["code"] == "quelle" else 409 if erg["code"] in ("warten", "keine", "guthaben", "aus", "tageslimit") else 502
         return err(erg["en"] if en else erg["de"], status, code=erg["code"])
     erg["text"] = erg["en"] if en else erg["de"]
     erg["status"] = _rad_status(conn, sicht, bot.get_guild(gid), gid, uid, en)
+    erg["status"].update(_rad_spieler_extras(conn, gid, uid, en))
     return ok(erg)
 
 
@@ -47705,10 +48266,21 @@ async def wheel_info(interaction: discord.Interaction):
     if s["spielzeit"]["stunden"]:
         wege.append(_t(interaction, f"⏱️ Je {s['spielzeit']['stunden']} Std. Spielzeit eine Drehung (`/link` nötig)",
                        f"⏱️ One spin per {s['spielzeit']['stunden']} h of playtime (`/link` required)"))
-    e = discord.Embed(title=_t(interaction, "🎡 Glücksrad", "🎡 Wheel of fortune"), description="\n".join(zeilen)[:3500], color=0xF1C40F)
+    e = discord.Embed(title="🎡 " + (s["name"] or _t(interaction, "Glücksrad", "Wheel of fortune")), description="\n".join(zeilen)[:3500],
+                      color=0xF1C40F)
     e.add_field(name=_t(interaction, "Deine gespeicherten Drehungen", "Your saved spins"), value=str(s["drehungen"]), inline=True)
+    if s["tag"]["max"]:
+        e.add_field(name=_t(interaction, "Heute gedreht", "Spins today"), value=f"{s['tag']['heute']}/{s['tag']['max']}", inline=True)
     if wege:
         e.add_field(name=_t(interaction, "So kommst du an Drehungen", "How to get spins"), value="\n".join(wege), inline=False)
+    extras = _rad_spieler_extras(conn, interaction.guild_id, interaction.user.id, en)
+    if extras["gewinne"]:
+        e.add_field(name=_t(interaction, "Offene Gewinne (`/claim wheel prize`)", "Unclaimed prizes (`/claim wheel prize`)"),
+                    value="\n".join(f"• {g['name']} – {g['inhalt']}" for g in extras["gewinne"][:10])[:1000], inline=False)
+    if extras["gratis_kaeufe"]:
+        e.add_field(name=_t(interaction, "Gratis im Shop (`/buy`)", "Free in the shop (`/buy`)"),
+                    value="\n".join(f"• {g['menge']}× {g['item']}" + (f" – <t:{int(g['ablauf'])}:R>" if g["ablauf"] else "")
+                                    for g in extras["gratis_kaeufe"][:10])[:1000], inline=False)
     await interaction.response.send_message(embed=e, ephemeral=True)
 
 
@@ -47740,7 +48312,7 @@ async def wheel_spin(interaction: discord.Interaction, pay: bool = False):
     erg = await _rad_drehen(conn, sicht, interaction.guild, gid, uid, str(interaction.user), quelle)
     if not erg["ok"]:
         return await interaction.followup.send("❌ " + (erg["en"] if en else erg["de"]), ephemeral=True)
-    e = discord.Embed(title=_t(interaction, "🎡 Glücksrad", "🎡 Wheel of fortune"), color=0xF1C40F,
+    e = discord.Embed(title="🎡 " + (s["name"] or _t(interaction, "Glücksrad", "Wheel of fortune")), color=0xF1C40F,
                       description=f"**{erg['preis']['text_en' if en else 'text_de']}**\n{erg['en'] if en else erg['de']}")
     e.set_footer(text=_t(interaction, f"Gespeicherte Drehungen: {erg['drehungen']}", f"Saved spins: {erg['drehungen']}"))
     await interaction.followup.send(embed=e)
@@ -47762,6 +48334,92 @@ async def wheel_give(interaction: discord.Interaction, user: discord.Member, amo
 
 
 bot.tree.add_command(wheel_group)
+
+
+# ── Discord: /claim wheel prize ──
+claim_group = app_commands.Group(name="claim", description="🎁 Claim something you won")
+claim_wheel_group = app_commands.Group(name="wheel", description="🎡 Wheel of fortune prizes", parent=claim_group)
+
+
+def _rad_claim_conn(interaction: discord.Interaction, server: Optional[str]) -> Tuple[Optional[Any], Optional[str]]:
+    """Server fuer /claim wheel prize: ohne Angabe der Hauptserver der Guild (wie /wheel), mit `server` der genannte -
+    im Spielerbereich kann man auch auf einem weiteren Server der Guild gewinnen."""
+    if server and str(server).strip():
+        return _conn_waehlen(interaction, server)
+    return _conn_of(interaction), None
+
+
+async def _rad_gewinn_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Nur die EIGENEN offenen Gewinne auf dem Server dieser Guild (bei mehreren Servern: dem unter `server` gewaehlten)."""
+    conn = _rad_claim_conn(interaction, getattr(getattr(interaction, "namespace", None), "server", None))[0] if interaction.guild_id else None
+    if conn is None or guild_sicht(conn, interaction.guild_id) is None:
+        return []
+    such = (current or "").strip().lower()
+    en = _sprache(interaction) == "en"
+    out: List[app_commands.Choice[str]] = []
+    for r in db.rad_gewinne_offen(interaction.guild_id, conn.service_id, interaction.user.id):
+        g = _rad_gewinn_view(r, en)
+        label = f"#{g['id']} {g['name']} – {g['inhalt']}"
+        if not such or such in label.lower():
+            out.append(app_commands.Choice(name=label[:100], value=str(g["id"])))
+    return out[:25]
+
+
+@claim_wheel_group.command(name="prize", description="🎡 Claim a wheel prize – it spawns at a saved location or your coordinates")
+@app_commands.describe(
+    prize="The prize to claim (pick from the list of your unclaimed prizes)",
+    ort="Where it spawns: last known location, your last placements or a saved location (instead of x/z)",
+    x="iZurvive X coordinate (East – the FIRST number on iZurvive) – not needed with `ort`",
+    z="iZurvive Y coordinate (North – the SECOND number on iZurvive) – not needed with `ort`",
+    server="Welcher Nitrado-Server? (nur nötig, wenn der Gewinn nicht vom Hauptserver dieses Discords stammt)")
+async def claim_wheel_prize(interaction: discord.Interaction, prize: str, ort: Optional[str] = None,
+                            x: Optional[float] = None, z: Optional[float] = None, server: Optional[str] = None):
+    if not await _require_guild(interaction):
+        return
+    if not await _require_economy_enabled(interaction):
+        return
+    conn, fehler = _rad_claim_conn(interaction, server)
+    if conn is None or guild_sicht(conn, interaction.guild_id) is None:
+        return await interaction.response.send_message(fehler or _premium_missing_text(interaction), ephemeral=True)
+    en = _sprache(interaction) == "en"
+    text = str(prize or "").strip().lstrip("#")
+    if not re.fullmatch(r"[0-9]{1,15}", text):
+        return await interaction.response.send_message(_t(
+            interaction, "❌ Bitte einen Gewinn aus der Liste wählen. `/wheel info` zeigt deine offenen Gewinne.",
+            "❌ Please pick a prize from the list. `/wheel info` shows your unclaimed prizes."), ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
+    erg = await _rad_gewinn_einloesen(conn, interaction.guild_id, interaction.user.id, str(interaction.user), int(text), ort, x, z, en)
+    if not erg["ok"]:
+        hinweis = ""
+        if erg["code"] == "gewinn" and not server and len(_conns_of(interaction)) > 1:
+            hinweis = _t(interaction, "\nDieser Discord hat mehrere Server – gib mit `server` an, auf welchem du gewonnen hast.",
+                         "\nThis Discord has several servers – use `server` to say on which one you won.")
+        return await interaction.followup.send("❌ " + (erg["en"] if en else erg["de"]) + hinweis, ephemeral=True)
+    near_txt = _t(interaction, f"\n*(Nahe {erg['near']})*", f"\n*(Near {erg['near']})*") if erg["near"] else ""
+    e = discord.Embed(title=_t(interaction, "🎡 Gewinn eingelöst", "🎡 Prize claimed"), color=0x2ECC71,
+                      description=erg["en"] if en else erg["de"])
+    ort_zeile = f"**{erg['ort_label']}**\n" if erg["ort_label"] else ""
+    e.add_field(name=_t(interaction, "📍 Spawn-Ort", "📍 Spawn location"),
+                value=f"{ort_zeile}[{erg['x']:.1f} / {erg['z']:.1f}]({erg['link']}){near_txt}", inline=False)
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
+claim_wheel_prize.autocomplete("prize")(_rad_gewinn_autocomplete)
+async def _rad_ort_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    """Wie die Ortsvorschlaege von /buy, aber fuer den Server, auf dem /claim einloest (ohne `server` der Hauptserver)."""
+    conn = _rad_claim_conn(interaction, getattr(getattr(interaction, "namespace", None), "server", None))[0] if interaction.guild_id else None
+    if conn is None:
+        return []
+    en = _sprache(interaction) == "en"
+    such = (current or "").strip().lower()
+    return [app_commands.Choice(name=label[:100], value=wert)
+            for label, wert in _ort_vorschlaege(conn, interaction.guild_id, interaction.user.id, en)
+            if not such or such in label.lower()][:25]
+
+
+claim_wheel_prize.autocomplete("ort")(_rad_ort_autocomplete)
+claim_wheel_prize.autocomplete("server")(_server_autocomplete)
+bot.tree.add_command(claim_group)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -54477,7 +55135,9 @@ async def post_me_quote(request: web.Request) -> web.Response:
         return err("Dieses Item gibt es nicht." if not en else "This item does not exist.", 404)
     gutschein = str(data.get("gutschein") or "").strip() or None
     item_regeln = _item_rabatte(it) if art == "shop" else None
-    preis = _preis_berechnen(gid, ctx["rollen"], liste, gutschein, en, ctx["uid"], item_regeln=item_regeln)
+    gratis = _rad_gratis_fuer(conn, gid, ctx["uid"], it, menge, ctx["rollen"]) if art == "shop" else 0
+    preis = _preis_berechnen(gid, ctx["rollen"], liste, gutschein, en, ctx["uid"], item_regeln=item_regeln,
+                             gratis_menge=gratis, gratis_wert=(int(it.get("price", 0)) * gratis if gratis else 0))
     if isinstance(preis, _KaufFehler):
         return err(_klartext(preis.text(en)), 400, code=preis.code)
     return ok(_preis_view(preis, conn, en))
@@ -54488,6 +55148,7 @@ def _preis_view(preis: "_Preis", conn: ServerConnection, en: bool) -> Dict[str, 
             "rabatt": preis.rabatt, "rabatt_text": _spieler_geld(conn, preis.rabatt),
             "gutschein": preis.gutschein, "gutschein_abzug": preis.gutschein_abzug,
             "gutschein_text": _spieler_geld(conn, preis.gutschein_abzug),
+            "gratis_menge": preis.gratis_menge, "gratis_text": _spieler_geld(conn, preis.gratis_wert),
             "zeile": _klartext(_preis_zeile(preis, conn, en) or "")}
 
 
@@ -54600,6 +55261,7 @@ async def api_me_shop(request: web.Request) -> web.Response:
     if katalog is None:
         return err("Für diesen Server gibt es keinen Shop.", 404)
     guild = bot.get_guild(ctx["gid"])
+    gratis_stand = db.rad_gratis_stand(ctx["gid"], conn.service_id, ctx["uid"])     # Gratis-Kaeufe aus dem Gluecksrad
     items = []
     for it in katalog.items:
         if not _item_sichtbar(it):       # abgeschaltet oder versteckt: steht nicht in der Liste
@@ -54629,6 +55291,9 @@ async def api_me_shop(request: web.Request) -> web.Response:
             erlaubt, gekauft, _alt, lim = stand
             eintrag["limit"] = {"max": erlaubt, "rest": max(0, erlaubt - gekauft), "shared": lim["shared"],
                                 "zeitraum": _limit_dauer(lim["per_seconds"], ctx["en"])}
+        gratis = gratis_stand.get(eintrag["name"].lower())
+        if gratis:
+            eintrag["gratis"] = {"menge": gratis["menge"], "ablauf": gratis["ablauf"] or None}
         items.append(eintrag)
     wallet, _bank = db.get_balance(ctx["gid"], ctx["uid"])
     return ok({"items": items, "wallet": wallet, "wallet_text": _spieler_geld(conn, wallet),
@@ -54682,7 +55347,7 @@ async def post_me_shop_buy(request: web.Request) -> web.Response:
                     if not en else
                     f"You need {_spieler_geld(conn, plan.total)} but only have {_spieler_geld(conn, res.wallet)}.")
             return err(text, 402, code=res.code)
-        status = 503 if res.code in ("kein_ftp", "shop_start") else (409 if res.code == "gutschein" else 500)
+        status = 503 if res.code in ("kein_ftp", "shop_start") else (409 if res.code in ("gutschein", "gratis") else 500)
         return err(_klartext(res.text(en)), status, code=res.code)
     gespeichert = None
     if speichern_als:
@@ -56439,6 +57104,7 @@ def build_app() -> web.Application:
     r.add_get("/api/me/playtime", api_me_playtime)
     r.add_get("/api/me/rad", api_me_rad)
     r.add_post("/api/me/rad/drehen", post_me_rad_drehen)
+    r.add_post("/api/me/rad/einloesen", post_me_rad_einloesen)
     r.add_get("/api/me/livekarte", api_me_livekarte)
     r.add_get("/api/me/kredit", api_me_kredit)
     r.add_post("/api/me/kredit/vertrag", post_me_kredit_vertrag)
@@ -56530,6 +57196,8 @@ def build_app() -> web.Application:
     r.add_get("/api/discord-management/gluecksrad", get_discord_mgmt_rad)
     r.add_post("/api/discord-management/gluecksrad", post_discord_mgmt_rad)
     r.add_get("/api/discord-management/gluecksrad/items", get_discord_mgmt_rad_items)
+    r.add_get("/api/discord-management/gluecksrad/klassen", get_discord_mgmt_rad_klassen)
+    r.add_post("/api/discord-management/gluecksrad/event-vorlage", post_discord_mgmt_rad_event_vorlage)
     r.add_post("/api/discord-management/gluecksrad/geben", post_discord_mgmt_rad_geben)
     r.add_get("/api/discord-management/livekarte", get_discord_mgmt_livekarte)
     r.add_post("/api/discord-management/livekarte", post_discord_mgmt_livekarte)
@@ -57465,6 +58133,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "bce3178c72a3e1685b47378cb3f70ddb75d8424ca3b76241466c0ac262d857ce",
         "4d5214accd1d96cbdcd5ffbb82930f3accf21ccfbb8bb3d96a75262d37bbe072",
         "b101383fe831787443d1c174caed70a31ec0dbc659b3b98fd7544c8fff677de9",
+        "4d077e250e154e08b2168fd1e2a7bc83e7e5b0a819f47d582c88f1002dea3682",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -57739,6 +58408,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "d2783e9c3afbab1fbf6582e06566dc89bdb71461f4d6860db2048e5e80d52073",
         "dd733fa9a2e9751aeba30c4e5062465a05586d67ce60ed0f5110445128025855",
         "fdcd8576a6891955017b5d5f1a03d0f1f4b6600dbd242666c29eb3aa6c19a55e",
+        "2a9fd031e33444e17cc94e6e3318fed6f5c35ab94b2e322c0ffc57c4dc1b2dda",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",

@@ -1,10 +1,12 @@
 """Glücksrad: Einstellungen im Dashboard (Discord Management), Drehen im Spielerbereich und per /wheel.
 
-Geprüft werden die Preis-Prüfung, die gewichtete Ziehung, die Datenbank (Drehungen, Gratis-Zeit, Spielzeit-Gutschrift,
-Verlauf), jede Art der Drehung samt Rückgabe bei Fehlern, die Dashboard- und Spieler-API samt Rechten, die
-Mandanten-Trennung und die Slash-Befehle. Kein Test geht ins Internet oder zu Discord.
+Geprüft werden die Preis-Prüfung (alle Segment-Arten, Farbe, optionale Beschriftung), die gewichtete Ziehung, die
+Datenbank (Drehungen, Gratis-Zeit, Spielzeit-Gutschrift, Verlauf), jede Art der Drehung samt Rückgabe bei Fehlern, das
+Tageslimit, die Dashboard- und Spieler-API samt Rechten, die Mandanten-Trennung und die Slash-Befehle. Gratis-Käufe im
+Shop und offene Gewinne (/claim wheel prize) stehen in tests/test_gluecksrad_gewinne.py. Kein Test geht ins Internet
+oder zu Discord.
 
-    python3 -m pytest tests/test_gluecksrad.py -q
+    python3 -m pytest tests/test_gluecksrad.py tests/test_gluecksrad_gewinne.py -q
 """
 import asyncio
 import json
@@ -22,6 +24,13 @@ from test_spieler_dashboard import G_A, G_B, U, ANDERER, ROLLE_VIP, _session, ap
 from test_airstrike import servers  # noqa: F401 - Fixture (zwei Server 1000/2000)
 
 STUNDE = 3600
+TAG = 86400
+NIETE = {"typ": "niete", "gewicht": 1}        # Füllsegment: ein aktives Rad braucht mindestens 2 Segmente
+
+
+def _event_xml(klasse="CivilianSedan"):
+    """Ein gültiger events.xml-Eintrag, wie ihn das Dashboard über „event-vorlage“ baut."""
+    return bot._rental_vorlage_bauen(klasse)["event_xml"]
 
 
 @pytest.fixture(autouse=True)
@@ -68,18 +77,117 @@ def _drehen(welt, sicht, quelle, uid=U, gid=G_A, conn="a"):
     {"typ": "drehung", "name": "Nochmal", "gewicht": 5, "drehungen": 2},
     {"typ": "drehung", "name": "Nochmal", "gewicht": 5},
     {"typ": "niete", "name": "Leider nichts", "gewicht": 5},
-    {"typ": "geld", "name": "  Viel   Geld  ", "gewicht": 1.0, "betrag": 5.0}])
+    {"typ": "geld", "name": "  Viel   Geld  ", "gewicht": 1.0, "betrag": 5.0},
+    # Beschriftung ist optional: fehlt sie oder ist sie leer, gilt das Segment (gespeichert als "")
+    {"typ": "geld", "gewicht": 1, "betrag": 1},
+    {"typ": "geld", "name": "", "gewicht": 1, "betrag": 1},
+    {"typ": "geld", "name": "   ", "gewicht": 1, "betrag": 1},
+    {"typ": "geld", "name": "x" * 40, "gewicht": 1, "betrag": 1},
+    {"typ": "niete", "gewicht": 1},
+    # neue Arten: Klassennamen und events.xml-Eintrag
+    {"typ": "klassen", "gewicht": 1, "klassen": ["AKM"]},
+    {"typ": "klassen", "name": "Waffe", "gewicht": 1, "klassen": ["AKM", "Mag_AKM_30Rnd"], "menge": 50},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["K" * 80], "menge": 1},
+    {"typ": "klassen", "gewicht": 1, "klassen": [f"Klasse_{i}" for i in range(10)], "menge": 2.0},
+    {"typ": "event", "gewicht": 1, "event_xml": '<event name="VehicleX"><children><child type="Sedan_02"/></children></event>'},
+    {"typ": "event", "name": "Auto", "gewicht": 1, "event_xml": "<event name='VehicleX'><children><child type='Sedan_02'/></children></event>"}])
 def test_preis_gueltig(roh):
     p = bot._rad_preis_pruefen(roh, id_erzeugen=True)
     assert bot._RAD_ID_RE.fullmatch(p["id"]) and p["typ"] == roh["typ"] and p["gewicht"] == int(roh["gewicht"])
-    assert p["name"] == " ".join(roh["name"].split())
+    assert p["name"] == " ".join(roh.get("name", "").split())
+    assert "farbe" not in p                                          # nur gesetzt, wenn angegeben
+
+
+def test_preis_gueltig_feste_form_je_art():
+    def felder(roh):
+        return set(bot._rad_preis_pruefen(dict(roh, id="0123abcd", gewicht=1, boese="<script>")))
+    basis = {"id", "name", "typ", "gewicht"}
+    assert felder({"typ": "klassen", "klassen": [" AKM "], "betrag": 5}) == basis | {"klassen", "menge"}
+    assert felder({"typ": "event", "event_xml": _event_xml(), "klassen": ["X"], "menge": 3}) == basis | {"event_xml"}
+    assert felder({"typ": "item", "item": "Kiste", "event_xml": _event_xml()}) == basis | {"item", "menge"}
+    assert felder({"typ": "niete", "farbe": 3, "item": "Kiste"}) == basis | {"farbe"}
+    p = bot._rad_preis_pruefen({"id": "0123abcd", "typ": "klassen", "gewicht": 1, "klassen": [" AKM ", "Mag_AKM_30Rnd"]})
+    assert p["klassen"] == ["AKM", "Mag_AKM_30Rnd"] and p["menge"] == 1 and p["name"] == ""      # Menge-Vorgabe 1, Ränder weg
+    e = bot._rad_preis_pruefen({"id": "0123abcd", "typ": "event", "gewicht": 1, "event_xml": "  " + _event_xml() + "\n"})
+    assert e["event_xml"] == _event_xml()                                                         # ohne Leerraum am Rand
+
+
+def test_event_vorlage_ist_ein_gueltiger_preis_und_grenze_1000_zeichen():
+    xml = _event_xml()
+    assert bot._rad_preis_pruefen({"typ": "event", "gewicht": 1, "event_xml": xml}, id_erzeugen=True)["event_xml"] == xml
+    kopf, fuss = '<event name="V"><children><child type="', '"/></children></event>'
+    genau = kopf + "A" * (bot._RENTAL_MAX_EVENT_XML - len(kopf) - len(fuss)) + fuss
+    assert len(genau) == 1000 == bot._RENTAL_MAX_EVENT_XML
+    assert bot._rad_preis_pruefen({"typ": "event", "gewicht": 1, "event_xml": genau}, id_erzeugen=True)["event_xml"] == genau
+    with pytest.raises(ValueError, match="1000"):
+        bot._rad_preis_pruefen({"typ": "event", "gewicht": 1, "event_xml": genau.replace('type="A', 'type="AA')}, id_erzeugen=True)
+
+
+_EV = '<event name="VehicleX"><children><child type="Sedan_02"/></children></event>'
 
 
 @pytest.mark.parametrize("roh", [
     None, [], "x", 5, {},
     {"typ": "unbekannt", "name": "A", "gewicht": 1},
-    {"typ": "geld", "name": "", "gewicht": 1, "betrag": 1},
-    {"typ": "geld", "name": "   ", "gewicht": 1, "betrag": 1},
+    {"typ": "geld", "name": None, "gewicht": 1, "betrag": 1},
+    {"typ": "geld", "name": ["A"], "gewicht": 1, "betrag": 1},
+    {"typ": "geld", "name": True, "gewicht": 1, "betrag": 1},
+    # Farbe: ganze Zahl 0..11
+    {"typ": "geld", "gewicht": 1, "betrag": 1, "farbe": -1},
+    {"typ": "geld", "gewicht": 1, "betrag": 1, "farbe": 12},
+    {"typ": "geld", "gewicht": 1, "betrag": 1, "farbe": True},
+    {"typ": "geld", "gewicht": 1, "betrag": 1, "farbe": False},
+    {"typ": "geld", "gewicht": 1, "betrag": 1, "farbe": 1.5},
+    {"typ": "geld", "gewicht": 1, "betrag": 1, "farbe": "3"},
+    {"typ": "geld", "gewicht": 1, "betrag": 1, "farbe": [3]},
+    # Klassennamen: Liste mit 1..10 Namen aus [A-Za-z0-9_]{1,80}, Menge 1..50
+    {"typ": "klassen", "gewicht": 1},
+    {"typ": "klassen", "gewicht": 1, "klassen": []},
+    {"typ": "klassen", "gewicht": 1, "klassen": "AKM"},
+    {"typ": "klassen", "gewicht": 1, "klassen": {"a": "AKM"}},
+    {"typ": "klassen", "gewicht": 1, "klassen": [f"K{i}" for i in range(11)]},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["K" * 81]},
+    {"typ": "klassen", "gewicht": 1, "klassen": [""]},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["   "]},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["AKM", 5]},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["AKM", None]},
+    {"typ": "klassen", "gewicht": 1, "klassen": [True]},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["AK M"]},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["AKM-74"]},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["Äpfel"]},
+    {"typ": "klassen", "gewicht": 1, "klassen": ['AKM"/><x']},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["A\nB"]},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["../../etc"]},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["AKM"], "menge": 0},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["AKM"], "menge": 51},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["AKM"], "menge": True},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["AKM"], "menge": "2"},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["AKM"], "menge": 1.5},
+    {"typ": "klassen", "gewicht": 1, "klassen": ["AKM"], "menge": None},
+    # events.xml-Eintrag: genau ein <event name="…"> mit mindestens einem <child type="…"/>, höchstens 1000 Zeichen
+    {"typ": "event", "gewicht": 1},
+    {"typ": "event", "gewicht": 1, "event_xml": ""},
+    {"typ": "event", "gewicht": 1, "event_xml": "   "},
+    {"typ": "event", "gewicht": 1, "event_xml": 5},
+    {"typ": "event", "gewicht": 1, "event_xml": None},
+    {"typ": "event", "gewicht": 1, "event_xml": [_EV]},
+    {"typ": "event", "gewicht": 1, "event_xml": "kein xml"},
+    {"typ": "event", "gewicht": 1, "event_xml": '<event name="V"><children><child type="A"/></children>'},             # nicht geschlossen
+    {"typ": "event", "gewicht": 1, "event_xml": '<event name="V"><children><child type="A"></children></event>'},      # falsch verschachtelt
+    {"typ": "event", "gewicht": 1, "event_xml": _EV + _EV},                                                             # zwei Wurzeln
+    {"typ": "event", "gewicht": 1, "event_xml": '<events>' + _EV + '</events>'},                                        # falsche Wurzel
+    {"typ": "event", "gewicht": 1, "event_xml": '<eventx name="V"><child type="A"/></eventx>'},
+    {"typ": "event", "gewicht": 1, "event_xml": '<pos x="1" z="2"/>'},
+    {"typ": "event", "gewicht": 1, "event_xml": '<event name="V"><!-- x --><children><child type="A"/></children></event>'},
+    {"typ": "event", "gewicht": 1, "event_xml": '<!DOCTYPE x [<!ENTITY e SYSTEM "file:///etc/passwd">]>' + _EV},
+    {"typ": "event", "gewicht": 1, "event_xml": '<event name="V"><![CDATA[x]]><children><child type="A"/></children></event>'},
+    {"typ": "event", "gewicht": 1, "event_xml": '<?xml version="1.0"?>' + _EV},
+    {"typ": "event", "gewicht": 1, "event_xml": '<event name="V"><?pi x?><children><child type="A"/></children></event>'},
+    {"typ": "event", "gewicht": 1, "event_xml": '<event name="V"><children><child type="' + "A" * 1000 + '"/></children></event>'},
+    {"typ": "event", "gewicht": 1, "event_xml": '<event><children><child type="A"/></children></event>'},              # ohne Namen
+    {"typ": "event", "gewicht": 1, "event_xml": '<event name="V"><nominal>1</nominal></event>'},                        # ohne child
+    {"typ": "event", "gewicht": 1, "event_xml": '<event name="V"><children></children></event>'},
+    {"typ": "event", "gewicht": 1, "event_xml": '<event name="V"><children><child lootmax="0"/></children></event>'},  # child ohne type
     {"typ": "geld", "name": "x" * 41, "gewicht": 1, "betrag": 1},
     {"typ": "geld", "name": "a\x00b", "gewicht": 1, "betrag": 1},
     {"typ": "geld", "name": "a\nb‮c", "gewicht": 1, "betrag": 1},
@@ -127,6 +235,82 @@ def test_preis_ist_in_fester_form_und_fremde_felder_fallen_weg():
     assert set(p) == {"id", "name", "typ", "gewicht", "betrag"}
 
 
+# ── Farbe und Beschriftung ──────────────────────────────────────────────────
+@pytest.mark.parametrize("farbe", [0, 1, 11, 5.0])
+def test_farbe_gueltig(farbe):
+    p = bot._rad_preis_pruefen(_preis(id="0123abcd", farbe=farbe))
+    assert p["farbe"] == int(farbe) and isinstance(p["farbe"], int)
+
+
+def test_farbe_fehlt_oder_none_bleibt_beim_pruefen_weg():
+    assert "farbe" not in bot._rad_preis_pruefen(_preis(id="0123abcd"))
+    assert "farbe" not in bot._rad_preis_pruefen(_preis(id="0123abcd", farbe=None))
+
+
+def test_farbe_vorgabe_nach_index_beim_laden():
+    preise = [_preis(id=f"{i:08x}") for i in range(12)]
+    preise[3]["farbe"] = 9                                           # eine eigene Farbe bleibt
+    e = bot._rad_einstellungen(_Fake({"gluecksrad": {"preise": preise}}))
+    assert [p["farbe"] for p in e["preise"]] == [0, 1, 2, 9, 4, 5, 6, 7, 8, 9, 10, 11]
+
+
+def test_farbe_vorgabe_haengt_am_gespeicherten_platz_auch_wenn_ein_segment_kaputt_ist():
+    preise = [_preis(id="00000000"), {"typ": "kaputt"}, _preis(id="00000002")]
+    e = bot._rad_einstellungen(_Fake({"gluecksrad": {"preise": preise}}))
+    assert [(p["id"], p["farbe"]) for p in e["preise"]] == [("00000000", 0), ("00000002", 2)]
+
+
+def test_farbe_kaputt_gespeichert_wirft_das_segment_beim_laden_raus():
+    preise = [_preis(id="00000000", farbe=12), _preis(id="00000001", farbe=True), _preis(id="00000002", farbe=11)]
+    assert [p["id"] for p in bot._rad_einstellungen(_Fake({"gluecksrad": {"preise": preise}}))["preise"]] == ["00000002"]
+
+
+def _namen(p, welt, en=False):
+    return bot._rad_preis_name(p, welt["a"], en, welt["guilds"][G_A])
+
+
+def test_beschriftung_eigene_gewinnt_in_beiden_sprachen(welt):
+    for p in ({"typ": "geld", "name": "Jackpot", "betrag": 5}, {"typ": "niete", "name": "Jackpot"},
+              {"typ": "klassen", "name": "Jackpot", "klassen": ["AKM"], "menge": 3},
+              {"typ": "event", "name": "Jackpot", "event_xml": _event_xml()},
+              {"typ": "rolle", "name": "Jackpot", "role_id": str(ROLLE_VIP)}):
+        assert _namen(p, welt) == "Jackpot" and _namen(p, welt, en=True) == "Jackpot"
+
+
+@pytest.mark.parametrize("p,de,en", [
+    ({"typ": "item", "item": "Kiste", "menge": 1}, "Kiste", "Kiste"),
+    ({"typ": "item", "item": "Kiste", "menge": 3}, "3× Kiste", "3× Kiste"),
+    ({"typ": "klassen", "klassen": ["AKM"], "menge": 1}, "AKM", "AKM"),
+    ({"typ": "klassen", "klassen": ["AKM"], "menge": 4}, "4× AKM", "4× AKM"),
+    ({"typ": "klassen", "klassen": ["AKM", "Mag_AKM_30Rnd", "Ammo_762x39"], "menge": 1}, "AKM +2", "AKM +2"),
+    ({"typ": "klassen", "klassen": ["AKM", "Mag_AKM_30Rnd"], "menge": 2}, "2× AKM +1", "2× AKM +1"),
+    ({"typ": "event", "event_xml": '<event name="VehicleX"><children><child type="Sedan_02"/></children></event>'}, "Sedan_02", "Sedan_02"),
+    ({"typ": "rolle", "role_id": str(ROLLE_VIP)}, "VIP", "VIP"),
+    ({"typ": "rolle", "role_id": "999"}, "Rolle", "Role"),
+    ({"typ": "drehung", "drehungen": 1}, "+1 Drehung(en)", "+1 spin(s)"),
+    ({"typ": "drehung", "drehungen": 10}, "+10 Drehung(en)", "+10 spin(s)"),
+    ({"typ": "niete"}, "Niete", "Nothing"),
+    ({"typ": "niete", "name": ""}, "Niete", "Nothing")])
+def test_beschriftung_automatisch_je_art(welt, p, de, en):
+    assert _namen(p, welt) == de and _namen(p, welt, en=True) == en
+
+
+def test_beschriftung_automatisch_geld_nutzt_die_waehrung_des_servers(welt):
+    p = {"typ": "geld", "betrag": 1500}
+    assert _namen(p, welt) == bot._fmt_money(1500, welt["a"]) == _namen(p, welt, en=True)
+    assert _namen(p, welt).replace(bot._cur_symbol(welt["a"]), "").strip() == "1,500"
+
+
+def test_beschriftung_rolle_ohne_guild(welt):
+    p = {"typ": "rolle", "role_id": str(ROLLE_VIP)}
+    assert bot._rad_preis_name(p, welt["a"], False) == "Rolle" and bot._rad_preis_name(p, welt["a"], True) == "Role"
+
+
+def test_beschriftung_event_ohne_child_faellt_auf_event_zurueck():
+    assert bot._rad_event_klasse("") == "Event" and bot._rad_event_klasse(None) == "Event"
+    assert bot._rad_event_klasse("<event name='V'><child lootmax='0' type='Hatchback_02'/></event>") == "Hatchback_02"
+
+
 # ── Einstellungen laden ─────────────────────────────────────────────────────
 class _Sicht(dict):
     pass
@@ -134,19 +318,34 @@ class _Sicht(dict):
 
 def test_einstellungen_vorgaben_und_kaputte_werte():
     assert bot._rad_einstellungen(_Fake({})) == {
-        "enabled": False, "kosten": 0, "gratis_stunden": 0, "spielzeit_stunden": 0, "max_gespeichert": 10, "preise": []}
+        "enabled": False, "name": "", "kosten": 0, "max_pro_tag": 0, "gratis_stunden": 0, "spielzeit_stunden": 0,
+        "max_gespeichert": 10, "gratis_kauf_tage": 0, "preise": []}
     kaputt = _Fake({"gluecksrad": {"enabled": 1, "kosten": -5, "gratis_stunden": "x", "spielzeit_stunden": 99999,
-                                   "max_gespeichert": 0, "preise": [_preis(id="0123abcd"), {"typ": "x"}, 5, None]}})
+                                   "max_gespeichert": 0, "name": "x" * 41, "max_pro_tag": 101, "gratis_kauf_tage": 366,
+                                   "preise": [_preis(id="0123abcd"), {"typ": "x"}, 5, None]}})
     e = bot._rad_einstellungen(kaputt)
     assert e["enabled"] is True and e["kosten"] == 0 and e["gratis_stunden"] == 0 and e["spielzeit_stunden"] == 0
     assert e["max_gespeichert"] == 10 and [p["id"] for p in e["preise"]] == ["0123abcd"]
+    assert e["name"] == "" and e["max_pro_tag"] == 0 and e["gratis_kauf_tage"] == 0
     assert bot._rad_einstellungen(_Fake({"gluecksrad": "kaputt"}))["preise"] == []
     assert bot._rad_einstellungen(_Fake({"gluecksrad": {"preise": "x"}}))["preise"] == []
 
 
-def test_einstellungen_laden_hoechstens_20_preise():
+@pytest.mark.parametrize("roh,erwartet", [
+    ({"name": "  Mein   Rad ", "max_pro_tag": 100, "gratis_kauf_tage": 365}, ("Mein Rad", 100, 365)),
+    ({"name": "x" * 40, "max_pro_tag": 1, "gratis_kauf_tage": 1}, ("x" * 40, 1, 1)),
+    ({"name": 5, "max_pro_tag": True, "gratis_kauf_tage": "7"}, ("", 0, 0)),
+    ({"name": "a\x00b", "max_pro_tag": -1, "gratis_kauf_tage": 1.5}, ("", 0, 0)),
+    ({"name": None, "max_pro_tag": None, "gratis_kauf_tage": None}, ("", 0, 0))])
+def test_einstellungen_neue_felder_grenzen_und_kaputte_werte(roh, erwartet):
+    e = bot._rad_einstellungen(_Fake({"gluecksrad": roh}))
+    assert (e["name"], e["max_pro_tag"], e["gratis_kauf_tage"]) == erwartet
+
+
+def test_einstellungen_laden_hoechstens_12_preise():
     preise = [_preis(id=f"{i:08x}") for i in range(30)]
-    assert len(bot._rad_einstellungen(_Fake({"gluecksrad": {"preise": preise}}))["preise"]) == 20
+    geladen = bot._rad_einstellungen(_Fake({"gluecksrad": {"preise": preise}}))["preise"]
+    assert len(geladen) == 12 == bot._RAD_MAX_PREISE and [p["id"] for p in geladen] == [f"{i:08x}" for i in range(12)]
 
 
 class _Fake:
@@ -426,49 +625,91 @@ def _item_preis(**kw):
     return dict({"typ": "item", "name": "Kiste", "gewicht": 1, "item": "Kiste", "menge": 2}, **kw)
 
 
-def test_preis_item_wird_wie_ein_gratis_kauf_am_letzten_ort_geliefert(welt, monkeypatch):
+def test_preis_item_ergibt_gratis_kaeufe_statt_einer_lieferung(welt, monkeypatch):
+    """Früher: sofort am letzten Ort geliefert. Jetzt: `menge` Gratis-Käufe dieses Shop-Items, den Ort wählt der Spieler beim Kauf."""
     monkeypatch.setattr(bot, "_ort_letzter_bekannter", lambda c, g, u: {"x": 4640.0, "z": 10350.0, "ts": time.time()})
     sicht = _einstellen(welt, [_item_preis()], gratis_stunden=24)
     bot.db.add_wallet(G_A, U, 70)
     erg = _drehen(welt, sicht, "gratis")
     assert erg["ok"], erg
-    assert welt["a"].shop.aufrufe == [(4640.0, 0.0, 10350.0)] and welt["b"].shop.aufrufe == []
-    assert bot.db.get_balance(G_A, U)[0] == 70                                  # nichts abgebucht
-    kauf = bot.db.purchases_of_user("1000", G_A, U, 5)[0]
-    assert (kauf["item_name"], kauf["amount"], kauf["total_price"], kauf["status"]) == ("Kiste", 2, 0, "pending")
+    assert welt["a"].shop.aufrufe == [] and welt["b"].shop.aufrufe == []         # nichts geliefert
+    assert bot.db.purchases_of_user("1000", G_A, U, 5) == []                     # keine Bestellung
+    assert bot.db.get_balance(G_A, U)[0] == 70                                   # nichts abgebucht, nichts gutgeschrieben
+    assert bot.db.rad_gratis_stand(G_A, "1000", U) == {"kiste": {"name": "Kiste", "menge": 2, "ablauf": 0.0}}
+    z = bot.db.rad_log(G_A, U)[0]
+    assert (z["typ"], z["wert"], z["preis_name"]) == ("item", "gratis:2x Kiste", "Kiste")
+    assert "2× Kiste gratis im Shop" in erg["de"] and "/buy" in erg["de"] and "for free in the shop" in erg["en"]
+    assert "Gültig" not in erg["de"] and "Valid" not in erg["en"]                # gratis_kauf_tage 0 = verfällt nie
 
 
-def test_preis_item_ohne_ort_gibt_den_geldwert(welt, monkeypatch):
+def test_preis_item_ohne_ort_gibt_keinen_geldersatz_mehr(welt, monkeypatch):
+    """Der alte Rückfall „Ort unbekannt -> Shop-Wert als Geld“ existiert nicht mehr."""
     monkeypatch.setattr(bot, "_ort_letzter_bekannter", lambda c, g, u: None)
     sicht = _einstellen(welt, [_item_preis()], gratis_stunden=24)
     erg = _drehen(welt, sicht, "gratis")
-    assert erg["ok"] and bot.db.get_balance(G_A, U)[0] == 200 and welt["a"].shop.aufrufe == []
-    assert bot.db.rad_log(G_A, U)[0]["wert"] == "ersatz:200"
+    assert erg["ok"] and bot.db.get_balance(G_A, U)[0] == 0 and welt["a"].shop.aufrufe == []
+    assert bot.db.rad_log(G_A, U)[0]["wert"] == "gratis:2x Kiste"
+    assert bot.db.rad_gratis_stand(G_A, "1000", U)["kiste"]["menge"] == 2
 
 
-def test_preis_item_ohne_ort_und_ohne_wert_scheitert_und_gibt_zurueck(welt, monkeypatch):
+def test_preis_item_ohne_ort_und_ohne_wert_ergibt_trotzdem_einen_gratis_kauf(welt, monkeypatch):
+    """Früher scheiterte das (kein Ort, kein Geldwert). Jetzt braucht der Gewinn weder Ort noch Preis."""
     monkeypatch.setattr(bot, "_ort_letzter_bekannter", lambda c, g, u: None)
     welt["a"]._catalog.items.append({"name": "Gratis", "classname": "WoodenCrate", "price": 0, "enabled": True})
     sicht = _einstellen(welt, [_item_preis(item="Gratis", name="Gratis")], gratis_stunden=24)
     erg = _drehen(welt, sicht, "gratis")
-    assert erg["ok"] is False and "/link" in erg["de"] and bot.db.rad_spieler(G_A, U)["letzter_gratis"] == 0.0
+    assert erg["ok"] is True and "/link" not in erg["de"]
+    assert bot.db.rad_gratis_stand(G_A, "1000", U)["gratis"]["menge"] == 2
 
 
 def test_preis_item_nicht_mehr_im_katalog(welt, monkeypatch):
     monkeypatch.setattr(bot, "_ort_letzter_bekannter", lambda c, g, u: {"x": 1.0, "z": 2.0, "ts": 0})
     sicht = _einstellen(welt, [_item_preis(item="Gibt es nicht")], gratis_stunden=24)
     erg = _drehen(welt, sicht, "gratis")
-    assert erg["ok"] is False and "Katalog" in erg["de"] and welt["a"].shop.aufrufe == []
-    assert bot.db.rad_spieler(G_A, U)["letzter_gratis"] == 0.0
+    assert erg["ok"] is False and erg["code"] == "auszahlung" and "im Shop nicht (mehr)" in erg["de"] and "returned" in erg["en"]
+    assert welt["a"].shop.aufrufe == [] and bot.db.rad_gratis_stand(G_A, "1000", U) == {}
+    assert bot.db.rad_spieler(G_A, U)["letzter_gratis"] == 0.0 and bot.db.rad_log(G_A, U) == []
 
 
-def test_preis_item_lieferung_scheitert_nichts_verbraucht(welt, monkeypatch):
+@pytest.mark.parametrize("item", ["Aus", "Leer"])
+def test_preis_item_deaktiviert_oder_ohne_classnames_gibt_alles_zurueck(welt, item):
+    """Deaktiviertes Item bzw. Item ohne Classnames: Auszahlung scheitert, jede Art der Drehung kommt zurück."""
+    welt["a"]._catalog.items.append({"name": "Leer", "price": 5, "enabled": True})
+    sicht = _einstellen(welt, [_item_preis(item=item)], gratis_stunden=24, kosten=100)
+    assert _drehen(welt, sicht, "gratis")["code"] == "auszahlung" and bot.db.rad_spieler(G_A, U)["letzter_gratis"] == 0.0
+    bot.db.rad_drehungen_aendern(G_A, U, 1, 10)
+    assert _drehen(welt, sicht, "gespeichert")["code"] == "auszahlung" and bot.db.rad_spieler(G_A, U)["drehungen"] == 1
+    bot.db.add_wallet(G_A, U, 100)
+    assert _drehen(welt, sicht, "bezahlt")["code"] == "auszahlung" and bot.db.get_balance(G_A, U)[0] == 100
+    assert bot.db.rad_gratis_stand(G_A, "1000", U) == {} and bot.db.rad_log(G_A, U) == [] and welt["feeds"] == []
+
+
+def test_preis_item_ohne_ftp_gewinnt_trotzdem_den_gratis_kauf(welt, monkeypatch):
+    """Früher scheiterte die Drehung ohne FTP (sofortige Lieferung). Jetzt wird beim Gewinn nichts geliefert – der Gratis-Kauf
+    wird gutgeschrieben, die bezahlte Drehung kostet; FTP braucht erst der spätere Kauf."""
     monkeypatch.setattr(bot, "_ort_letzter_bekannter", lambda c, g, u: {"x": 1.0, "z": 2.0, "ts": 0})
-    welt["a"].ftp = None                                                         # ohne FTP kann nichts geliefert werden
+    welt["a"].ftp = None
     sicht = _einstellen(welt, [_item_preis()], kosten=100)
     bot.db.add_wallet(G_A, U, 100)
     erg = _drehen(welt, sicht, "bezahlt")
-    assert erg["ok"] is False and bot.db.get_balance(G_A, U)[0] == 100 and bot.db.purchases_of_user("1000", G_A, U, 5) == []
+    assert erg["ok"] is True and bot.db.get_balance(G_A, U)[0] == 0 and bot.db.purchases_of_user("1000", G_A, U, 5) == []
+    assert bot.db.rad_gratis_stand(G_A, "1000", U)["kiste"]["menge"] == 2
+
+
+def test_preis_item_schreibt_den_namen_aus_dem_katalog_gut(welt):
+    """Im Segment steht „kiste“, im Katalog „Kiste“: gutgeschrieben wird der Katalog-Name (der Kauf findet ihn so wieder)."""
+    sicht = _einstellen(welt, [_item_preis(item="kiste", menge=1)], gratis_stunden=24)
+    assert _drehen(welt, sicht, "gratis")["ok"]
+    assert bot.db.rad_gratis_stand(G_A, "1000", U) == {"kiste": {"name": "Kiste", "menge": 1, "ablauf": 0.0}}
+
+
+def test_preis_item_mit_frist_nennt_die_tage_und_setzt_den_verfall(welt, monkeypatch):
+    jetzt = 1_800_000_000.0
+    monkeypatch.setattr(bot.time, "time", lambda: jetzt)
+    sicht = _einstellen(welt, [_item_preis(menge=3)], gratis_stunden=24, gratis_kauf_tage=7)
+    erg = _drehen(welt, sicht, "gratis")
+    assert erg["ok"] and "Gültig 7 Tag(e)." in erg["de"] and "Valid for 7 day(s)." in erg["en"]
+    assert bot.db.rad_gratis_stand(G_A, "1000", U) == {"kiste": {"name": "Kiste", "menge": 3, "ablauf": jetzt + 7 * TAG}}
 
 
 def test_zwei_gleichzeitige_drehungen_mit_einer_gespeicherten(welt):
@@ -549,8 +790,27 @@ def test_status_zeigt_nur_oeffentliche_angaben(welt):
     assert s["aktiv"] is True and s["drehungen"] == 0 and s["gratis"] == {"stunden": 6, "bereit": True, "in_sekunden": 0}
     assert s["kosten"] == 100 and [p["name"] for p in s["preise"]] == ["Bargeld", "Kiste", "Leer"]
     assert sum(p["chance"] for p in s["preise"]) == pytest.approx(100, abs=0.05)
-    assert all(set(p) == {"id", "name", "typ", "chance", "text"} for p in s["preise"])
+    assert all(set(p) == {"id", "name", "typ", "farbe", "chance", "text"} for p in s["preise"])
+    assert [p["farbe"] for p in s["preise"]] == [0, 1, 2]
     assert "gewicht" not in json.dumps(s) and "betrag" not in json.dumps(s)
+    assert s["name"] == "" and s["tag"] == {"max": 0, "heute": 0, "rest": None, "neu_in_sekunden": TAG - 1_000_000 % TAG}
+
+
+def test_status_zeigt_radnamen_farben_und_automatische_beschriftung(welt):
+    preise = [{"typ": "geld", "gewicht": 1, "betrag": 250, "farbe": 7}, {"typ": "item", "gewicht": 1, "item": "Kiste", "menge": 2},
+              {"typ": "klassen", "gewicht": 1, "klassen": ["AKM", "Mag_AKM_30Rnd"], "menge": 2},
+              {"typ": "event", "gewicht": 1, "event_xml": _event_xml()}, {"typ": "niete", "gewicht": 1, "farbe": 0}]
+    sicht = _einstellen(welt, preise, gratis_stunden=1, name="Mega-Rad")
+    de = bot._rad_status(welt["a"], sicht, welt["guilds"][G_A], G_A, U, False)
+    en = bot._rad_status(welt["a"], sicht, welt["guilds"][G_A], G_A, U, True)
+    assert de["name"] == "Mega-Rad" == en["name"]
+    assert [p["name"] for p in de["preise"]] == [bot._fmt_money(250, welt["a"]), "2× Kiste", "2× AKM +1", "CivilianSedan", "Niete"]
+    assert [p["name"] for p in en["preise"]][-1] == "Nothing"
+    assert [p["farbe"] for p in de["preise"]] == [7, 1, 2, 3, 0]
+    assert [p["text"] for p in de["preise"]][1:4] == ["🛒 2× Kiste gratis im Shop", "📦 2× AKM + Mag_AKM_30Rnd", "🚗 Dauer-Spawn: CivilianSedan"]
+    assert [p["text"] for p in en["preise"]][1:4] == ["🛒 2× Kiste free in the shop", "📦 2× AKM + Mag_AKM_30Rnd", "🚗 Permanent spawn: CivilianSedan"]
+    roh = json.dumps(de) + json.dumps(en)
+    assert "<event" not in roh and "event_xml" not in roh and "lifetime" not in roh      # nie das rohe XML
 
 
 def test_status_wartezeit_laeuft_runter(welt):
@@ -570,7 +830,12 @@ def test_status_aus_oder_ohne_preise_ist_inaktiv(welt):
 def test_preis_texte_deutsch_und_englisch(welt):
     c = welt["a"]
     assert "💰" in bot._rad_preis_text({"typ": "geld", "betrag": 5}, c, False)
-    assert bot._rad_preis_text({"typ": "item", "item": "Kiste", "menge": 3}, c, False) == "🎁 3× Kiste"
+    assert bot._rad_preis_text({"typ": "item", "item": "Kiste", "menge": 3}, c, False) == "🛒 3× Kiste gratis im Shop"
+    assert bot._rad_preis_text({"typ": "item", "item": "Kiste", "menge": 1}, c, True) == "🛒 1× Kiste free in the shop"
+    assert bot._rad_preis_text({"typ": "klassen", "klassen": ["AKM"], "menge": 1}, c, False) == "📦 AKM"
+    assert bot._rad_preis_text({"typ": "klassen", "klassen": ["AKM", "Mag_AKM_30Rnd"], "menge": 3}, c, True) == "📦 3× AKM + Mag_AKM_30Rnd"
+    assert bot._rad_preis_text({"typ": "event", "event_xml": _event_xml("Hatchback_02")}, c, False) == "🚗 Dauer-Spawn: Hatchback_02"
+    assert bot._rad_preis_text({"typ": "event", "event_xml": _event_xml("Hatchback_02")}, c, True) == "🚗 Permanent spawn: Hatchback_02"
     assert bot._rad_preis_text({"typ": "drehung", "drehungen": 2}, c, False) == "🔄 +2 Drehung(en)"
     assert bot._rad_preis_text({"typ": "drehung", "drehungen": 2}, c, True) == "🔄 +2 spin(s)"
     assert bot._rad_preis_text({"typ": "niete"}, c, False) == "💨 Niete" and bot._rad_preis_text({"typ": "niete"}, c, True) == "💨 Nothing"
@@ -712,7 +977,7 @@ def test_mgmt_gast_ohne_eintrag_sieht_nichts(welt):
 
 
 def test_mgmt_kunde_besitzer_darf_auf_seinem_server(welt):
-    st, d = _mgmt(welt, "POST", "", {"enabled": True, "kosten": 10, "preise": [_preis()]}, admin=False)
+    st, d = _mgmt(welt, "POST", "", {"enabled": True, "kosten": 10, "preise": [_preis(), NIETE]}, admin=False)
     assert st == 200, d
 
 
@@ -721,7 +986,10 @@ def test_mgmt_lesen_leer_mit_grenzen(welt):
     assert st == 200
     e = d["data"]
     assert e["enabled"] is False and e["preise"] == [] and e["max_gespeichert"] == 10
-    assert e["limits"]["preise"] == 20 and e["limits"]["gewicht"] == 1000
+    assert (e["name"], e["max_pro_tag"], e["gratis_kauf_tage"]) == ("", 0, 0)
+    assert e["limits"] == {"preise": 12, "min_preise": 2, "gewicht": 1000, "stunden": 720, "sparen": 100, "betrag": 1_000_000_000,
+                           "menge": 50, "drehungen": 10, "pro_tag": 100, "tage": 365, "klassen": 10, "farben": 12, "name": 40,
+                           "event_xml": 1000}
 
 
 def test_mgmt_speichern_und_lesen(welt):
@@ -732,39 +1000,114 @@ def test_mgmt_speichern_und_lesen(welt):
     assert e["enabled"] and e["kosten"] == 250 and [p["chance"] for p in e["preise"]] == [90.0, 10.0]
     assert all(bot._RAD_ID_RE.fullmatch(p["id"]) for p in e["preise"])
     assert [p["name"] for p in bot._rad_einstellungen(bot.guild_sicht(welt["a"], G_A))["preise"]] == ["Klein", "Leer"]
-    assert [z["detail"] for z in bot._audit_log if z["action"] == "Discord-Management aktualisiert"] == ["gluecksrad · 2 Preis(e) · Server 1000"]
+    assert [z["detail"] for z in bot._audit_log if z["action"] == "Discord-Management aktualisiert"] == ["gluecksrad · 2 Segment(e) · Server 1000"]
+
+
+def test_mgmt_speichern_neue_felder_und_arten(welt):
+    preise = [{"typ": "geld", "gewicht": 5, "betrag": 100, "farbe": 11},
+              {"typ": "klassen", "name": "Waffe", "gewicht": 3, "klassen": ["AKM", " Mag_AKM_30Rnd "], "menge": 2},
+              {"typ": "event", "gewicht": 1, "event_xml": _event_xml()},
+              {"typ": "item", "gewicht": 1, "item": "Kiste", "menge": 2, "farbe": 0}]
+    st, d = _speichern(welt, preise, name="  Mega   Rad ", max_pro_tag=3, gratis_kauf_tage=7)
+    assert st == 200, d
+    e = d["data"]
+    assert (e["name"], e["max_pro_tag"], e["gratis_kauf_tage"]) == ("Mega Rad", 3, 7)
+    assert [p["farbe"] for p in e["preise"]] == [11, 1, 2, 0]                    # ohne Angabe: Platz im Rad
+    assert [p["name"] for p in e["preise"]] == ["", "Waffe", "", ""]            # Beschriftung optional
+    assert e["preise"][1]["klassen"] == ["AKM", "Mag_AKM_30Rnd"] and e["preise"][1]["menge"] == 2
+    assert e["preise"][2]["event_xml"] == _event_xml()
+    gespeichert = bot.guild_sicht(welt["a"], G_A).get("gluecksrad")
+    assert set(gespeichert) == {"enabled", "name", "kosten", "max_pro_tag", "gratis_stunden", "spielzeit_stunden",
+                                "max_gespeichert", "gratis_kauf_tage", "preise"}
+    assert [p["farbe"] for p in gespeichert["preise"]] == [11, 1, 2, 0]         # die Vorgabe wird mitgespeichert
+    st, d = _mgmt(welt, "GET", "")
+    assert st == 200 and d["data"]["name"] == "Mega Rad" and [p["typ"] for p in d["data"]["preise"]] == ["geld", "klassen", "event", "item"]
+
+
+def test_mgmt_neue_felder_fehlen_dann_gelten_die_vorgaben(welt):
+    st, d = _mgmt(welt, "POST", "", {"enabled": True, "gratis_stunden": 1, "preise": [_preis(), NIETE]})
+    assert st == 200 and (d["data"]["name"], d["data"]["max_pro_tag"], d["data"]["gratis_kauf_tage"]) == ("", 0, 0)
+
+
+def test_mgmt_grenzen_der_neuen_felder_genau(welt):
+    st, d = _speichern(welt, [_preis(), NIETE], name="x" * 40, max_pro_tag=100, gratis_kauf_tage=365)
+    assert st == 200 and (d["data"]["max_pro_tag"], d["data"]["gratis_kauf_tage"], len(d["data"]["name"])) == (100, 365, 40)
+
+
+def test_mgmt_genau_zwoelf_segmente_gehen_dreizehn_nicht(welt):
+    st, d = _speichern(welt, [_preis(name=f"P{i}") for i in range(12)])
+    assert st == 200 and len(d["data"]["preise"]) == 12 and [p["farbe"] for p in d["data"]["preise"]] == list(range(12))
+    st, d = _speichern(welt, [_preis(name=f"P{i}") for i in range(13)])
+    assert st == 400 and d["error"] == "Höchstens 12 Segmente."
+    assert len(bot._rad_einstellungen(bot.guild_sicht(welt["a"], G_A))["preise"]) == 12      # die 12 bleiben unverändert
+
+
+def test_mgmt_aktives_rad_braucht_zwei_segmente_ausgeschaltet_reicht_eines(welt):
+    for preise in ([], [_preis()]):
+        st, d = _speichern(welt, preise)
+        assert st == 400 and d["error"] == "Ein aktives Rad braucht 2 bis 12 Segmente.", d
+    st, d = _speichern(welt, [_preis()], enabled=False)
+    assert st == 200 and d["data"]["enabled"] is False and len(d["data"]["preise"]) == 1
+    st, d = _speichern(welt, [_preis(), NIETE])
+    assert st == 200 and d["data"]["enabled"] is True
 
 
 def test_mgmt_kennung_bleibt_beim_erneuten_speichern(welt):
-    st, d = _speichern(welt, [_preis()])
+    st, d = _speichern(welt, [_preis(), NIETE])
     pid = d["data"]["preise"][0]["id"]
-    st, d = _speichern(welt, [_preis(id=pid, betrag=900)])
+    st, d = _speichern(welt, [_preis(id=pid, betrag=900), NIETE])
     assert st == 200 and d["data"]["preise"][0]["id"] == pid and d["data"]["preise"][0]["betrag"] == 900
 
 
 @pytest.mark.parametrize("daten,teil", [
-    ({"preise": "x"}, "Höchstens"),
-    ({"preise": [_preis()] * 21}, "Höchstens"),
-    ({"preise": [_preis(gewicht=0)]}, "Zahlenwert"),
-    ({"preise": [_preis(betrag=0)]}, "Zahlenwert"),
-    ({"preise": [_preis(typ="boese")]}, "Preis-Typ"),
-    ({"preise": [_preis(name="")]}, "Name"),
-    ({"preise": [_preis()], "kosten": -1}, "Zahlenwert"),
-    ({"preise": [_preis()], "kosten": "5"}, "Zahlenwert"),
-    ({"preise": [_preis()], "gratis_stunden": 721}, "Zahlenwert"),
-    ({"preise": [_preis()], "spielzeit_stunden": -2}, "Zahlenwert"),
-    ({"preise": [_preis()], "max_gespeichert": 0}, "Zahlenwert"),
-    ({"preise": [_preis()], "max_gespeichert": 101}, "Zahlenwert"),
-    ({"preise": [], "enabled": True}, "mindestens einen Preis"),
-    ({"preise": [_preis()], "enabled": True, "gratis_stunden": 0, "kosten": 0, "spielzeit_stunden": 0}, "Weg"),
+    ({"preise": "x"}, "Höchstens 12 Segmente."),
+    ({"preise": [_preis()] * 13}, "Höchstens 12 Segmente."),
+    ({"preise": [_preis()] * 21}, "Höchstens 12 Segmente."),
+    ({"preise": [_preis(gewicht=0), NIETE]}, "Zahlenwert"),
+    ({"preise": [_preis(betrag=0), NIETE]}, "Zahlenwert"),
+    ({"preise": [_preis(typ="boese"), NIETE]}, "Preis-Typ"),
+    ({"preise": [_preis(name="x" * 41), NIETE]}, "Beschriftung"),
+    ({"preise": [_preis(name="a\x00b"), NIETE]}, "Beschriftung"),
+    ({"preise": [_preis(name=5), NIETE]}, "Beschriftung"),
+    ({"preise": [_preis(farbe=12), NIETE]}, "Zahlenwert"),
+    ({"preise": [_preis(farbe=True), NIETE]}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "kosten": -1}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "kosten": "5"}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "gratis_stunden": 721}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "spielzeit_stunden": -2}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "max_gespeichert": 0}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "max_gespeichert": 101}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "max_pro_tag": -1}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "max_pro_tag": 101}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "max_pro_tag": True}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "max_pro_tag": "3"}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "gratis_kauf_tage": -1}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "gratis_kauf_tage": 366}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "gratis_kauf_tage": 1.5}, "Zahlenwert"),
+    ({"preise": [_preis(), NIETE], "name": "x" * 41}, "Name des Rads"),
+    ({"preise": [_preis(), NIETE], "name": "Rad\x07"}, "Name des Rads"),
+    ({"preise": [_preis(), NIETE], "name": 5}, "Name des Rads"),
+    ({"preise": [_preis(), NIETE], "name": None}, "Name des Rads"),
+    ({"preise": [], "enabled": True}, "Ein aktives Rad braucht 2 bis 12 Segmente."),
+    ({"preise": [_preis()], "enabled": True}, "Ein aktives Rad braucht 2 bis 12 Segmente."),
+    ({"preise": [_preis(), NIETE], "enabled": True, "gratis_stunden": 0, "kosten": 0, "spielzeit_stunden": 0}, "Weg"),
     ({"preise": [_preis(id="0123abcd"), _preis(id="0123abcd")]}, "Doppelte"),
-    ({"preise": [_preis(typ="item", item="Gibt es nicht", menge=1)]}, "Katalog")])
+    ({"preise": [_preis(typ="item", item="Gibt es nicht", menge=1), NIETE]}, "Katalog"),
+    ({"preise": [{"typ": "klassen", "gewicht": 1, "klassen": []}, NIETE]}, "Klassennamen"),
+    ({"preise": [{"typ": "klassen", "gewicht": 1, "klassen": ["A"] * 11}, NIETE]}, "1 bis 10 Klassennamen"),
+    ({"preise": [{"typ": "klassen", "gewicht": 1, "klassen": ["AK M"]}, NIETE]}, "Ungültiger Klassenname"),
+    ({"preise": [{"typ": "klassen", "gewicht": 1, "klassen": ["AKM"], "menge": 51}, NIETE]}, "Zahlenwert"),
+    ({"preise": [{"typ": "event", "gewicht": 1, "event_xml": "<event name='V'>"}, NIETE]}, "events.xml-Eintrag"),
+    ({"preise": [{"typ": "event", "gewicht": 1, "event_xml": "<event name='V'><!-- x --><child type='A'/></event>"}, NIETE]}, "Kommentare"),
+    ({"preise": [{"typ": "event", "gewicht": 1, "event_xml": "<event name='V'><nominal>1</nominal></event>"}, NIETE]}, "child"),
+    ({"preise": [{"typ": "event", "gewicht": 1, "event_xml": "<event name='V'><child type='" + "A" * 1000 + "'/></event>"}, NIETE]}, "1000")])
 def test_mgmt_ablehnungen_speichern_nichts(welt, daten, teil):
     basis = {"enabled": True, "kosten": 0, "gratis_stunden": 24, "spielzeit_stunden": 0, "max_gespeichert": 5}
     basis.update(daten)
     st, d = _mgmt(welt, "POST", "", basis)
     assert st == 400 and teil in d["error"], d
     assert bot._rad_einstellungen(bot.guild_sicht(welt["a"], G_A))["preise"] == []
+    assert bot.guild_sicht(welt["a"], G_A).get("gluecksrad") is None
 
 
 def test_mgmt_kein_json_objekt(welt):
@@ -777,21 +1120,23 @@ def test_mgmt_ausschalten_ohne_preise_erlaubt(welt):
 
 
 def test_mgmt_item_aus_dem_katalog_ok(welt):
-    st, d = _speichern(welt, [_preis(typ="item", name="Kiste", item="Kiste", menge=2)])
+    st, d = _speichern(welt, [_preis(typ="item", name="Kiste", item="Kiste", menge=2), NIETE])
     assert st == 200 and d["data"]["preise"][0]["item"] == "Kiste" and d["data"]["preise"][0]["menge"] == 2
 
 
 def test_mgmt_rolle_pruefungen(welt, monkeypatch):
     monkeypatch.setattr(bot, "_rolle_vergebbar", lambda guild, rolle: None)
-    st, d = _speichern(welt, [{"typ": "rolle", "name": "VIP", "gewicht": 1, "role_id": str(ROLLE_VIP)}])
+    st, d = _speichern(welt, [{"typ": "rolle", "name": "VIP", "gewicht": 1, "role_id": str(ROLLE_VIP)}, NIETE])
     assert st == 200, d
     # Rolle gehoert nicht zur Guild
-    st, d = _speichern(welt, [{"typ": "rolle", "name": "Fremd", "gewicht": 1, "role_id": "999"}])
+    st, d = _speichern(welt, [{"typ": "rolle", "name": "Fremd", "gewicht": 1, "role_id": "999"}, NIETE])
     assert st == 400 and "gibt es in dem gewählten Discord-Server nicht" in d["error"]
     # Rolle nicht vergebbar
     monkeypatch.setattr(bot, "_rolle_vergebbar", lambda guild, rolle: ("Die Rolle liegt über der Bot-Rolle.", "x"))
-    st, d = _speichern(welt, [{"typ": "rolle", "name": "VIP", "gewicht": 1, "role_id": str(ROLLE_VIP)}])
+    st, d = _speichern(welt, [{"typ": "rolle", "name": "VIP", "gewicht": 1, "role_id": str(ROLLE_VIP)}, NIETE])
     assert st == 400 and "Bot-Rolle" in d["error"]
+    # die erste, gültige Fassung steht noch
+    assert [p["typ"] for p in bot._rad_einstellungen(bot.guild_sicht(welt["a"], G_A))["preise"]] == ["rolle", "niete"]
 
 
 def test_mgmt_rolle_einer_fremden_guild_wird_abgelehnt(welt, monkeypatch):
@@ -802,7 +1147,7 @@ def test_mgmt_rolle_einer_fremden_guild_wird_abgelehnt(welt, monkeypatch):
         gesehen.append((gid, rid))
         return bot.err("Diese Rolle gehört nicht zu diesem Discord-Server.")
     monkeypatch.setattr(bot, "_rolle_gehoert_guild", pruefen)
-    st, d = _speichern(welt, [{"typ": "rolle", "name": "VIP", "gewicht": 1, "role_id": str(ROLLE_VIP)}])
+    st, d = _speichern(welt, [{"typ": "rolle", "name": "VIP", "gewicht": 1, "role_id": str(ROLLE_VIP)}, _preis()])   # aktiv: mind. 2 Segmente
     assert st == 400 and gesehen == [(G_A, ROLLE_VIP)]
     assert bot._rad_einstellungen(bot.guild_sicht(welt["a"], G_A))["preise"] == []
 
@@ -866,7 +1211,7 @@ def test_mgmt_nicht_in_config_json_gespiegelt(welt):
 
 
 def test_gluecksrad_status_in_der_kartenuebersicht(welt):
-    _speichern(welt, [_preis()])
+    assert _speichern(welt, [_preis(), _preis(name="Zweites")])[0] == 200                # aktiv: mind. 2 Segmente
     assert bot._discord_mgmt_payload(bot.guild_sicht(welt["a"], G_A))["gluecksrad"] == {"enabled": True}
     assert bot._discord_mgmt_payload(bot.guild_sicht(welt["a"], G_A))["wortfilter"] == {"enabled": False}
 
