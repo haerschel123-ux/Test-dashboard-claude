@@ -1844,6 +1844,8 @@ class ConfigManager:
             "footer_ts": bool(roh.get("footer_ts", False)),
             "note": str(roh.get("note") or ""),
             "enabled": bool(roh.get("enabled", True)),
+            # Eigene Sprüche: Liste (Ereignis-Feeds) bzw. Dict je Meldungsart (shop_log/economy_log).
+            "sprueche": roh.get("sprueche") if isinstance(roh.get("sprueche"), (list, dict)) else None,
         }
 
     def set_channel(self, guild_id: int, log_type: str, channel_id: int,
@@ -3430,6 +3432,386 @@ def _feed_anwenden(e: discord.Embed,
     except Exception:  # noqa: BLE001 – Darstellung darf den Versand nie kippen
         pass
     return e
+
+
+# ══════════════════════════════════════════════════════════════
+#  SPRÜCHE – einstellbare Zufallssätze je Feed (Vorbild: Vigil Killfeed)
+#
+#  Jeder Feed-Typ mit einem Beschreibungssatz hat hier seine Standard-Zeilen
+#  (Deutsch UND Englisch; gepostet wird die Feed-Sprache des Servers) und die
+#  erlaubten Platzhalter. Beim Posten wird EINE Zeile zufällig gewählt und nur
+#  die Beschreibung des Embeds ersetzt – Titel und alle Felder (IDs, Waffe,
+#  Distanz, Standort) bleiben unverändert.
+#
+#  Eigene Zeilen je Feed stehen in dessen Einstellungen ("sprueche", siehe
+#  feed_settings/set_feed): sobald welche gespeichert sind, gelten NUR noch
+#  sie (wie bei Vigil: "Editing any line makes the whole set yours"); sie
+#  werden wie getippt gepostet, egal welche Feed-Sprache eingestellt ist.
+#  Zeile 1 jedes Standard-Satzes ist immer der bisherige Satz des Bots.
+#
+#  "nur_eigene": der Standard fasst die Beschreibung NICHT an (z. B. Emote,
+#  dessen bisheriger Satz einen bedingten Zusatz hat) – erst eigene Zeilen
+#  ändern dort etwas.
+# ══════════════════════════════════════════════════════════════
+_SPRUECHE_MAX_ZEILEN = 20
+_SPRUECHE_MAX_LAENGE = 200
+_SPRUCH_MUSTER_RE = re.compile(r"\{([a-z_]+)\}")
+
+def _sp(platzhalter: str, de: List[str], en: List[str], nur_eigene: bool = False) -> Dict[str, Any]:
+    return {"platzhalter": platzhalter.split(), "de": de, "en": en, "nur_eigene": nur_eigene}
+
+
+_SPRUECHE: Dict[str, Dict[str, Any]] = {
+    "kill": _sp("killer victim weapon distance", [
+        "**{killer}** hat **{victim}** getötet",
+        "**{killer}** erwischt **{victim}** mit der **{weapon}** (**{distance}**)",
+        "**{killer}** schickt **{victim}** zurück an die Küste",
+        "**{victim}** wurde von **{killer}** umgelegt",
+        "**{killer}** hat **{victim}** ausgeknipst",
+        "**{victim}** hatte keine Chance gegen **{killer}**",
+        "**{killer}** macht kurzen Prozess mit **{victim}**",
+        "**{killer}** streicht **{victim}** von der Karte",
+    ], [
+        "**{killer}** killed **{victim}**",
+        "**{killer}** got **{victim}** with a **{weapon}** (**{distance}**)",
+        "**{killer}** sent **{victim}** back to the coast",
+        "**{victim}** got dropped by **{killer}**",
+        "**{killer}** took out **{victim}**",
+        "**{victim}** had no chance against **{killer}**",
+        "**{killer}** caught **{victim}** slipping",
+        "**{killer}** wiped **{victim}** off the map",
+    ]),
+    "long_range_kill": _sp("killer victim weapon distance", [
+        "**{killer}** hat **{victim}** getötet",
+        "**{killer}** trifft **{victim}** über **{distance}** – was für ein Schuss!",
+        "Ein Schuss aus **{distance}**: **{killer}** erwischt **{victim}**",
+        "**{victim}** hat **{killer}** nie gesehen – **{distance}** mit der **{weapon}**",
+    ], [
+        "**{killer}** killed **{victim}**",
+        "**{killer}** hits **{victim}** across **{distance}** – what a shot!",
+        "A shot from **{distance}**: **{killer}** got **{victim}**",
+        "**{victim}** never saw **{killer}** – **{distance}** with a **{weapon}**",
+    ]),
+    "suicide_death": _sp("player", [
+        "**{player}** hat sein Leben beendet",
+        "**{player}** hat die letzte Entscheidung selbst getroffen",
+        "**{player}** wollte nicht mehr",
+    ], [
+        "**{player}** ended their own life",
+        "**{player}** made the final call",
+        "**{player}** checked out early",
+    ]),
+    "zombie_death": _sp("player cause", [
+        "**{player}** ist gestorben",
+        "Die Infizierten haben **{player}** erwischt",
+        "**{player}** ist jetzt selbst Teil der Horde",
+        "Die Zombies hatten **{player}** zum Frühstück",
+    ], [
+        "**{player}** has died",
+        "The infected got **{player}**",
+        "**{player}** just joined the horde",
+        "The zombies had **{player}** for breakfast",
+    ]),
+    "wolf_death": _sp("player cause", [
+        "**{player}** ist gestorben",
+        "Das Rudel hat **{player}** erwischt",
+        "**{player}** endet als Wolfsfutter",
+    ], [
+        "**{player}** has died",
+        "The pack got **{player}**",
+        "**{player}** ended up as wolf food",
+    ]),
+    "bear_death": _sp("player cause", [
+        "**{player}** ist gestorben",
+        "Ein Bär hat **{player}** zerlegt",
+        "**{player}** hat den falschen Bären geweckt",
+    ], [
+        "**{player}** has died",
+        "A bear mauled **{player}**",
+        "**{player}** poked the wrong bear",
+    ]),
+    "fall_death": _sp("player cause", [
+        "**{player}** ist gestorben",
+        "**{player}** hat die Schwerkraft unterschätzt",
+        "**{player}** ist dem Boden zu schnell nähergekommen",
+    ], [
+        "**{player}** has died",
+        "**{player}** underestimated gravity",
+        "**{player}** met the ground at full speed",
+    ]),
+    "fire_death": _sp("player cause", [
+        "**{player}** ist gestorben",
+        "**{player}** ist in Flammen aufgegangen",
+    ], [
+        "**{player}** has died",
+        "**{player}** went up in flames",
+    ]),
+    "explosion_death": _sp("player cause", [
+        "**{player}** ist gestorben",
+        "**{player}** wurde in Stücke gerissen",
+    ], [
+        "**{player}** has died",
+        "**{player}** got blown to pieces",
+    ]),
+    "trap_death": _sp("player cause", [
+        "**{player}** ist gestorben",
+        "**{player}** ist in eine Falle getappt",
+    ], [
+        "**{player}** has died",
+        "**{player}** walked right into a trap",
+    ]),
+    "barbed_wire_death": _sp("player cause", [
+        "**{player}** ist gestorben",
+        "Der Stacheldraht hat **{player}** nicht mehr losgelassen",
+    ], [
+        "**{player}** has died",
+        "The barbed wire didn't let go of **{player}**",
+    ]),
+    "vehicle_death": _sp("player cause", [
+        "**{player}** ist gestorben",
+        "**{player}** hat den Kampf gegen ein Fahrzeug verloren",
+    ], [
+        "**{player}** has died",
+        "**{player}** lost a fight with a vehicle",
+    ]),
+    "bleed_out_death": _sp("player cause", [
+        "**{player}** ist gestorben",
+        "**{player}** ist verblutet – kein Verband in Sicht",
+    ], [
+        "**{player}** has died",
+        "**{player}** bled out with no bandage in sight",
+    ]),
+    "unknown_death": _sp("player cause", [
+        "**{player}** ist gestorben",
+        "**{player}** ist auf mysteriöse Weise gestorben ({cause})",
+    ], [
+        "**{player}** has died",
+        "**{player}** died mysteriously ({cause})",
+    ]),
+    "player_hit": _sp("attacker victim weapon distance damage bodypart", [
+        "**{attacker}** trifft **{victim}**",
+        "**{attacker}** erwischt **{victim}** am Körperteil **{bodypart}**",
+        "**{attacker}** verpasst **{victim}** satte **{damage}**",
+    ], [
+        "**{attacker}** hits **{victim}**",
+        "**{attacker}** tags **{victim}** in the **{bodypart}**",
+        "**{attacker}** deals a solid **{damage}** to **{victim}**",
+    ]),
+    "animal_hit": _sp("attacker victim weapon distance damage bodypart",
+                      ["**{attacker}** trifft **{victim}**"], ["**{attacker}** hits **{victim}**"]),
+    "trap_hit": _sp("attacker victim weapon distance damage bodypart",
+                    ["**{attacker}** trifft **{victim}**"], ["**{attacker}** hits **{victim}**"]),
+    "fire_hit": _sp("attacker victim weapon distance damage bodypart",
+                    ["**{attacker}** trifft **{victim}**"], ["**{attacker}** hits **{victim}**"]),
+    "explosion_hit": _sp("attacker victim weapon distance damage bodypart",
+                         ["**{attacker}** trifft **{victim}**"], ["**{attacker}** hits **{victim}**"]),
+    "fall_damage_hit": _sp("attacker victim weapon distance damage bodypart",
+                           ["**{attacker}** trifft **{victim}**"], ["**{attacker}** hits **{victim}**"]),
+    "vehicle_hit": _sp("attacker victim weapon distance damage bodypart",
+                       ["**{attacker}** trifft **{victim}**"], ["**{attacker}** hits **{victim}**"]),
+    "barbed_wire_hit": _sp("attacker victim weapon distance damage bodypart",
+                           ["**{attacker}** trifft **{victim}**"], ["**{attacker}** hits **{victim}**"]),
+    "connect": _sp("player", [
+        "**{player}** hat sich mit dem Gameserver verbunden.",
+        "**{player}** ist zurück an der Küste.",
+        "**{player}** ist wieder da.",
+    ], [
+        "**{player}** connected to the game server.",
+        "**{player}** is back on the coast.",
+        "**{player}** is back.",
+    ]),
+    "disconnect": _sp("player", [
+        "**{player}** hat den Gameserver verlassen.",
+        "**{player}** macht Feierabend.",
+        "**{player}** ist offline – bis zum nächsten Mal.",
+    ], [
+        "**{player}** left the game server.",
+        "**{player}** called it a day.",
+        "**{player}** went offline – see you next time.",
+    ]),
+    "connection_attempt": _sp("player", ["**{player}** verbindet sich..."], ["**{player}** is connecting..."]),
+    "unconscious": _sp("player", [
+        "**{player}** ist bewusstlos",
+        "**{player}** liegt im Dreck",
+    ], [
+        "**{player}** is unconscious",
+        "**{player}** is taking a dirt nap",
+    ]),
+    "conscious": _sp("player", [
+        "**{player}** ist wieder bei Bewusstsein",
+        "**{player}** ist wieder auf den Beinen",
+    ], [
+        "**{player}** has regained consciousness",
+        "**{player}** is back on their feet",
+    ]),
+    "emote": _sp("player emote", ["**{player}** hat **{emote}** gespielt"],
+                 ["**{player}** played **{emote}**"], nur_eigene=True),
+    "combat_log": _sp("player sekunden gegner", [
+        "**{player}** hat **{sekunden} s** nach einem Kampf mit **{gegner}** die Verbindung getrennt.",
+        "**{player}** zieht **{sekunden} s** nach dem Kampf gegen **{gegner}** den Stecker.",
+    ], [
+        "**{player}** disconnected **{sekunden} s** after fighting **{gegner}**.",
+        "**{player}** pulled the plug **{sekunden} s** into the fight with **{gegner}**.",
+    ]),
+    "rage_quit": _sp("player sekunden killer", [
+        "**{player}** hat **{sekunden} s** nach dem Tod durch **{killer}** die Verbindung getrennt.",
+        "**{player}** konnte die Niederlage gegen **{killer}** nicht ertragen.",
+        "**{killer}** hat **{player}** direkt vom Server geärgert.",
+    ], [
+        "**{player}** disconnected **{sekunden} s** after being killed by **{killer}**.",
+        "**{player}** couldn't handle losing to **{killer}**.",
+        "**{killer}** tilted **{player}** right out of the server.",
+    ]),
+    "killstreak": _sp("player streak victim", [
+        "**{player}** ist auf **{streak} Kills** in Folge – zuletzt **{victim}**.",
+        "**{player}** ist nicht zu stoppen – **{streak}** Kills in Folge!",
+        "**{streak}** in Folge: **{player}** räumt auf, zuletzt **{victim}**.",
+    ], [
+        "**{player}** is on a **{streak} kill** streak – latest victim **{victim}**.",
+        "**{player}** is unstoppable – **{streak}** kills in a row!",
+        "**{streak}** in a row: **{player}** is cleaning up, latest victim **{victim}**.",
+    ]),
+    "admin_action": _sp("admin", ["**{admin}** hat einen Befehl ausgeführt"], ["**{admin}** executed a command"]),
+    # Bau-Verben: bisher stand bei allen "hat gebaut" – die Standard-Zeile nennt jetzt das passende Verb.
+    "build": _sp("player object", ["**{player}** hat gebaut: **{object}**"], ["**{player}** built: **{object}**"]),
+    "dismantle": _sp("player object", ["**{player}** hat **{object}** abgebaut"], ["**{player}** dismantled **{object}**"]),
+    "place": _sp("player object", ["**{player}** hat **{object}** platziert"], ["**{player}** placed **{object}**"]),
+    "pack": _sp("player object", ["**{player}** hat **{object}** eingepackt"], ["**{player}** packed **{object}**"]),
+    "fold": _sp("player object", ["**{player}** hat **{object}** zusammengelegt"], ["**{player}** folded **{object}**"]),
+    "repair": _sp("player object", ["**{player}** hat **{object}** repariert"], ["**{player}** repaired **{object}**"]),
+    "mount": _sp("player object", ["**{player}** hat **{object}** angebracht"], ["**{player}** mounted **{object}**"]),
+    "unmount": _sp("player object", ["**{player}** hat **{object}** abgenommen"], ["**{player}** unmounted **{object}**"]),
+    "bury": _sp("player object", ["**{player}** hat **{object}** vergraben"], ["**{player}** buried **{object}**"]),
+    "unbury": _sp("player object", ["**{player}** hat **{object}** ausgegraben"], ["**{player}** dug up **{object}**"]),
+    "flag_raise": _sp("player object", ["**{player}** hat die Flagge gehisst"], ["**{player}** raised the flag"]),
+    "flag_lower": _sp("player object", ["**{player}** hat die Flagge eingeholt"], ["**{player}** lowered the flag"]),
+}
+
+# Bot-Meldungen auf den Feeds shop_log/economy_log: eigener Unterschlüssel je
+# Meldungsart, weil auf demselben Feed auch andere Meldungen laufen (Economy-
+# Admin-Aktionen, Kredite ...), die bewusst NICHT einstellbar sind.
+_SPRUECHE_BOT: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "shop_log": {
+        "kauf": _sp("player menge item", ["{player} hat **{menge}× {item}** gekauft"],
+                    ["{player} bought **{menge}× {item}**"]),
+        "miete": _sp("player item neustarts", ["{player} hat **{item}** für **{neustarts} Neustart(s)** gemietet"],
+                     ["{player} rented **{item}** for **{neustarts} restart(s)**"]),
+    },
+    "economy_log": {
+        "rad": _sp("player gewinn inhalt", ["{player} hat **{gewinn}** gewonnen ({inhalt})"],
+                   ["{player} won **{gewinn}** ({inhalt})"]),
+    },
+}
+
+
+def _spruch_einsetzen(zeile: str, werte: Dict[str, str]) -> str:
+    """Platzhalter {name} durch Werte ersetzen. Unbekannte Platzhalter bleiben wortwörtlich
+    stehen (kein KeyError wie bei str.format), und eingesetzte Werte werden nicht erneut
+    durchsucht - geschweifte Klammern in Spielernamen oder Chat-Text richten nichts an."""
+    return _SPRUCH_MUSTER_RE.sub(lambda m: str(werte.get(m.group(1), m.group(0))), zeile)
+
+
+def _spruch_zeilen_pruefen(roh: Any) -> Union[List[str], None, str]:
+    """Eigene Zeilen aus dem Dashboard: Liste -> bereinigte Liste, leer -> None (= Standard),
+    sonst eine Fehlermeldung (str)."""
+    if roh is None:
+        return None
+    if not isinstance(roh, list):
+        return "Sprüche müssen eine Liste von Zeilen sein."
+    if len(roh) > _SPRUECHE_MAX_ZEILEN:
+        return f"Höchstens {_SPRUECHE_MAX_ZEILEN} Sprüche je Feed."
+    zeilen: List[str] = []
+    for z in roh:
+        if not isinstance(z, str):
+            return "Jeder Spruch muss Text sein."
+        text = " ".join(z.split())
+        if not text:
+            continue
+        if len(text) > _SPRUECHE_MAX_LAENGE:
+            return f"Ein Spruch darf höchstens {_SPRUECHE_MAX_LAENGE} Zeichen lang sein."
+        if any(unicodedata.category(c) == "Cc" for c in text):
+            return "Sprüche dürfen keine Steuerzeichen enthalten."
+        zeilen.append(text)
+    return zeilen or None
+
+
+def _spruch_werte(ev: Dict[str, Any], sprache: str) -> Optional[Dict[str, str]]:
+    """Die Platzhalter-Werte eines geparsten Ereignisses - None, wenn der Ereignistyp
+    keine Sprüche kennt. Formatierungen (Distanz, Schaden) wie in den bisherigen Sätzen."""
+    t = ev.get("type")
+    if t in ("kill_pvp",):
+        return {"killer": str(ev.get("killer", "?")), "victim": str(ev.get("victim", "?")),
+                "weapon": str(ev.get("weapon", "?")), "distance": _dist(ev.get("distance", "?"), sprache)}
+    if t == "suicide":
+        return {"player": str(ev.get("player", "?"))}
+    if t == "kill_env":
+        return {"player": str(ev.get("player", "?")), "cause": str(ev.get("cause", "?"))}
+    if t == "damage":
+        return {"attacker": str(ev.get("attacker", "?")), "victim": str(ev.get("victim", "?")),
+                "weapon": str(ev.get("weapon", "?")), "distance": _dist(ev.get("distance", "?"), sprache),
+                "damage": f"{ev.get('damage', '?')} HP", "bodypart": str(ev.get("hit_zone", "?"))}
+    if t in ("connect", "disconnect", "connecting", "unconscious", "conscious"):
+        return {"player": str(ev.get("player", "?"))}
+    if t == "emote":
+        return {"player": str(ev.get("player", "?")), "emote": _emote_label(ev.get("emote"))}
+    if t == "basebuild":
+        return {"player": str(ev.get("player", "?")), "object": str(ev.get("item", "?"))}
+    if t == "combat_log":
+        return {"player": str(ev.get("player", "?")), "sekunden": str(ev.get("sekunden", "?")),
+                "gegner": str(ev.get("gegner", "?"))}
+    if t == "rage_quit":
+        return {"player": str(ev.get("player", "?")), "sekunden": str(ev.get("sekunden", "?")),
+                "killer": str(ev.get("killer", "?"))}
+    if t == "killstreak":
+        return {"player": str(ev.get("player", "?")), "streak": str(ev.get("streak", "?")),
+                "victim": str(ev.get("victim", "?"))}
+    if t == "admin_action":
+        return {"admin": str(ev.get("admin", "?"))}
+    return None
+
+
+def _spruch_embed_anwenden(e: discord.Embed, feed: Optional[Dict[str, Any]], feed_key: Optional[str],
+                           ev: Dict[str, Any], sprache: str) -> None:
+    """Ersetzt die Beschreibung des Embeds durch einen zufällig gewählten Spruch dieses Feeds.
+    Eigene Zeilen des Feeds gewinnen; sonst der Standard-Satz in der Feed-Sprache. Fasst nichts
+    an, wenn der Feed-Typ keine Sprüche kennt oder etwas schiefgeht - der Versand geht vor."""
+    satz = _SPRUECHE.get(feed_key or "")
+    if satz is None:
+        return
+    try:
+        werte = _spruch_werte(ev, sprache)
+        if werte is None:
+            return
+        eigene = (feed or {}).get("sprueche")
+        zeilen = _spruch_zeilen_pruefen(eigene) if isinstance(eigene, list) else None
+        if not isinstance(zeilen, list):
+            if satz["nur_eigene"]:
+                return                      # Standard lässt den bisherigen Satz unangetastet
+            zeilen = satz["en" if sprache == "en" else "de"]
+        # Discord erlaubt hoechstens 4096 Zeichen Beschreibung - eine Zeile voller
+        # wiederholter Platzhalter plus langer Namen koennte das sonst reissen.
+        e.description = _spruch_einsetzen(random.choice(zeilen), werte)[:4096]
+    except Exception:  # noqa: BLE001 – ein kaputter Spruch darf den Versand nie kippen
+        pass
+
+
+def _spruch_bot_zeile(gid: Any, conn: Optional["ServerConnection"], feed_key: str, unterkey: str,
+                      werte: Dict[str, str]) -> str:
+    """Der Beschreibungssatz einer Bot-Meldung (Shop-Kauf, Miete, Glücksrad-Gewinn) für diese
+    Guild: eigene Zeilen aus den Feed-Einstellungen, sonst der Standard in der Feed-Sprache."""
+    satz = _SPRUECHE_BOT[feed_key][unterkey]
+    sprache = _feed_sprache(conn)
+    zeilen = satz["en" if sprache == "en" else "de"]
+    try:
+        feed = cfg.feed_settings(int(gid), feed_key, conn.service_id if conn is not None else None)
+        eigene = (feed or {}).get("sprueche")
+        if isinstance(eigene, dict):
+            geprueft = _spruch_zeilen_pruefen(eigene.get(unterkey))
+            if isinstance(geprueft, list):
+                zeilen = geprueft
+    except Exception:  # noqa: BLE001
+        pass
+    return _spruch_einsetzen(random.choice(zeilen), werte)[:4096]
 
 
 class EmbedBuilder:
@@ -8351,6 +8733,8 @@ class DayZBot(discord.Client):
                 continue
             ch_id = feed["channel_id"]
             send_embed = _feed_anwenden(embed.copy(), feed)
+            # Sprüche: zufälliger Beschreibungssatz je Feed (eigene Zeilen oder Standard-Satz).
+            _spruch_embed_anwenden(send_embed, feed, treffer_schluessel, ev, _feed_sprache(conn))
             reward_line = rewards.get(int(gid_str))
             if reward_line:
                 send_embed.add_field(name=_ft(conn, "💰 Belohnung", "💰 Reward"), value=reward_line, inline=False)
@@ -34108,6 +34492,16 @@ BEG_FAIL = [
     "Someone threw a rotten fruit at you instead of money.",
 ]
 
+def _economy_spruch(conf: Dict[str, Any], feld: str, standard: List[str], amount_text: str = "") -> str:
+    """Zufaelliger Satz fuer /work, /daily, /beg: eigene Zeilen aus den Economy-Einstellungen
+    ("zeilen"/"fehl_zeilen", Dashboard) oder die Standard-Liste. {amount} wird eingesetzt;
+    eigene Zeilen werden wie getippt gepostet (keine Uebersetzung)."""
+    zeilen = _spruch_zeilen_pruefen(conf.get(feld)) if isinstance(conf.get(feld), list) else None
+    if not isinstance(zeilen, list):
+        zeilen = standard
+    return _spruch_einsetzen(random.choice(zeilen), {"amount": amount_text})
+
+
 async def _require_guild(interaction: discord.Interaction) -> bool:
     """Economy/Shop funktionieren nur in einer Guild (Salden sind pro Guild)."""
     if interaction.guild_id:
@@ -34155,7 +34549,7 @@ async def cmd_work(interaction: discord.Interaction):
 
     embed = discord.Embed(
         title=_t(interaction, "💼 Arbeit erledigt", "💼 Work complete"),
-        description=random.choice(WORK_FLAVOR).format(amount=f"**{_fmt_money(amount)}**"),
+        description=_economy_spruch(conf, "zeilen", WORK_FLAVOR, f"**{_fmt_money(amount)}**"),
         color=0x2ECC71)
     embed.set_footer(text=_t(interaction, f"Wallet: {_fmt_money(wallet)}",
                              f"Wallet: {_fmt_money(wallet)}"))
@@ -34185,10 +34579,11 @@ async def cmd_daily(interaction: discord.Interaction):
     wallet, _bank = db.add_wallet(gid, uid, amount)
     db.set_cooldown(gid, uid, "daily", int(conf.get("cooldown_seconds", 86400)))
 
+    standard_daily = [_t(interaction, "Du hast deinen Tagesbonus von {amount} abgeholt!",
+                         "You claimed your daily bonus of {amount}!")]
     embed = discord.Embed(
         title=_t(interaction, "📅 Tagesbonus", "📅 Daily bonus"),
-        description=_t(interaction, f"Du hast deinen Tagesbonus von **{_fmt_money(amount)}** abgeholt!",
-                       f"You claimed your daily bonus of **{_fmt_money(amount)}**!"),
+        description=_economy_spruch(conf, "zeilen", standard_daily, f"**{_fmt_money(amount)}**"),
         color=0x2ECC71)
     embed.set_footer(text=f"Wallet: {_fmt_money(wallet)}")
     await interaction.response.send_message(embed=embed)
@@ -34213,7 +34608,7 @@ async def cmd_beg(interaction: discord.Interaction):
     if random.random() < float(conf.get("fail_chance", 0.35)):
         embed = discord.Embed(
             title=_t(interaction, "🥺 Betteln fehlgeschlagen", "🥺 Begging failed"),
-            description=random.choice(BEG_FAIL),
+            description=_economy_spruch(conf, "fehl_zeilen", BEG_FAIL),
             color=0xE74C3C)
         return await interaction.response.send_message(embed=embed)
 
@@ -34223,7 +34618,7 @@ async def cmd_beg(interaction: discord.Interaction):
 
     embed = discord.Embed(
         title=_t(interaction, "🥺 Betteln hat sich gelohnt", "🥺 Begging paid off"),
-        description=random.choice(BEG_SUCCESS).format(amount=f"**{_fmt_money(amount)}**"),
+        description=_economy_spruch(conf, "zeilen", BEG_SUCCESS, f"**{_fmt_money(amount)}**"),
         color=0x2ECC71)
     embed.set_footer(text=f"Wallet: {_fmt_money(wallet)}")
     await interaction.response.send_message(embed=embed)
@@ -36682,8 +37077,8 @@ async def _miete_ausfuehren(conn: "ServerConnection", gid: int, uid: int, user_n
     near_feed = (f"\n*({_ft(conn, 'Nahe', 'Near')} {near})*") if near else ""
     feed = discord.Embed(
         title=_ft(conn, "🚗 MIET-KAUF", "🚗 RENTAL PURCHASE"),
-        description=_ft(conn, f"<@{uid}> hat **{it['name']}** für **{restarts} Neustart(s)** gemietet",
-                        f"<@{uid}> rented **{it['name']}** for **{restarts} restart(s)**"),
+        description=_spruch_bot_zeile(gid, conn, "shop_log", "miete",
+                                      {"player": f"<@{uid}>", "item": str(it["name"]), "neustarts": str(restarts)}),
         color=0x3498DB)
     feed.add_field(name=_ft(conn, "Preis", "Price"), value=_fmt_money(total, conn), inline=True)
     feed.add_field(name=_ft(conn, "Ort", "Location"), value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_feed}", inline=True)
@@ -39285,8 +39680,8 @@ async def _kauf_ausfuehren_innen(conn: "ServerConnection", gid: int, uid: int, u
     near_feed = (f"\n*({_ft(conn, 'Nahe', 'Near')} {near})*") if near else ""
     feed = discord.Embed(
         title=_ft(conn, "🛒 SHOP-KAUF", "🛒 SHOP PURCHASE"),
-        description=_ft(conn, f"<@{uid}> hat **{amount}× {it['name']}** gekauft",
-                        f"<@{uid}> bought **{amount}× {it['name']}**"),
+        description=_spruch_bot_zeile(gid, conn, "shop_log", "kauf",
+                                      {"player": f"<@{uid}>", "menge": str(amount), "item": str(it["name"])}),
         color=0x3498DB)
     feed.add_field(name=_ft(conn, "Preis", "Price"), value=_fmt_money(total, conn), inline=True)
     feed.add_field(name=_ft(conn, "Ort", "Location"), value=f"[{x:.1f} / {z:.1f}]({loc_url}){near_feed}", inline=True)
@@ -44764,6 +45159,7 @@ def _guild_payload(gid: int, service_id: Optional[str] = None) -> dict:
             "location": s["location"],
             "footer_ts": s["footer_ts"],
             "note": s["note"],
+            "sprueche": s.get("sprueche"),
             "enabled": s["enabled"],
         })
     return {
@@ -44809,11 +45205,22 @@ async def get_feeds(request: web.Request) -> web.Response:
         erlaubt = await _module_erlaubt(k, sess, conn)
         if not erlaubt and tier != "under_review":
             continue
-        feed_types.append({"key": k, "label": v["label"], "gruppe": v["gruppe"],
-                           "emoji": v["emoji"],
-                           "colour": f"#{v['farbe'] & 0xFFFFFF:06x}",
-                           "tier": tier, "selectable": erlaubt})
+        eintrag = {"key": k, "label": v["label"], "gruppe": v["gruppe"],
+                   "emoji": v["emoji"],
+                   "colour": f"#{v['farbe'] & 0xFFFFFF:06x}",
+                   "tier": tier, "selectable": erlaubt}
+        # Sprüche-Definition fuers Dashboard: Platzhalter + Standard-Zeilen (beide Sprachen).
+        if k in _SPRUECHE:
+            s = _SPRUECHE[k]
+            eintrag["sprueche_def"] = {"platzhalter": s["platzhalter"], "de": s["de"], "en": s["en"],
+                                       "nur_eigene": s["nur_eigene"]}
+        elif k in _SPRUECHE_BOT:
+            eintrag["sprueche_def"] = {"unter": {u: {"platzhalter": s["platzhalter"], "de": s["de"], "en": s["en"]}
+                                                 for u, s in _SPRUECHE_BOT[k].items()}}
+        feed_types.append(eintrag)
     return ok({
+        "feed_sprache": _feed_sprache(conn),
+        "sprueche_limits": {"zeilen": _SPRUECHE_MAX_ZEILEN, "laenge": _SPRUECHE_MAX_LAENGE},
         # Die waehlbaren Feed-Typen, nach Gruppen sortiert wie im Dropdown.
         "feed_types": feed_types,
         "guilds": [_guild_payload(int(gid), sid) for gid in guild_ids],
@@ -44872,6 +45279,32 @@ def _kanal_gehoert_guilds(guild_ids: Iterable[int], kanal_id: int,
     return err(f"Diese {feld}-ID gibt es in dem gewählten Discord-Server nicht.")
 
 
+def _sprueche_feld_pruefen(log_type: str, roh: Any) -> Tuple[Any, Optional[str]]:
+    """Das "sprueche"-Feld eines set_feed-Aufrufs: (gespeicherter Wert oder None, Fehlermeldung).
+    Ereignis-Feeds speichern eine Liste, shop_log/economy_log ein Dict je Meldungsart."""
+    if roh is None:
+        return None, None
+    if log_type in _SPRUECHE_BOT:
+        if not isinstance(roh, dict):
+            return None, "Sprüche müssen hier je Meldungsart angegeben werden."
+        aus: Dict[str, List[str]] = {}
+        for unterkey, zeilen_roh in roh.items():
+            if unterkey not in _SPRUECHE_BOT[log_type]:
+                return None, f"Unbekannte Meldungsart: {unterkey}"
+            zeilen = _spruch_zeilen_pruefen(zeilen_roh)
+            if isinstance(zeilen, str):
+                return None, zeilen
+            if zeilen:
+                aus[unterkey] = zeilen
+        return (aus or None), None
+    if log_type in _SPRUECHE:
+        zeilen = _spruch_zeilen_pruefen(roh)
+        if isinstance(zeilen, str):
+            return None, zeilen
+        return zeilen, None
+    return None, "Für diesen Feed gibt es keine Sprüche."
+
+
 async def set_feed(request: web.Request) -> web.Response:
     gid = request.match_info["guild_id"]
     log_type = request.match_info["log_type"]
@@ -44910,6 +45343,16 @@ async def set_feed(request: web.Request) -> web.Response:
             if absage is not None:
                 return absage
         vorhanden["enabled"] = bool(data["enabled"])
+        # Kommt "sprueche" mit (ohne channel_id schickt das Frontend das zwar nie,
+        # die API soll es aber nicht stillschweigend verwerfen): mitspeichern.
+        if "sprueche" in data:
+            sprueche, fehler_text = _sprueche_feld_pruefen(log_type, data.get("sprueche"))
+            if fehler_text is not None:
+                return err(fehler_text)
+            if sprueche is None:
+                vorhanden.pop("sprueche", None)
+            else:
+                vorhanden["sprueche"] = sprueche
         cfg.server_feeds(int(gid), conn.service_id, anlegen=True)[log_type] = vorhanden
         cfg.save_guilds()
         _audit_add("dashboard", _audit_actor(_sess_get(request)),
@@ -44971,6 +45414,16 @@ async def set_feed(request: web.Request) -> web.Response:
         "note": str(data.get("note") or "")[:200],
         "enabled": bool(data.get("enabled", bisher["enabled"] if bisher else True)),
     }
+    # Eigene Sprüche: nur wenn der Aufruf das Feld mitschickt, sonst bleiben die
+    # gespeicherten erhalten (gleiche Regel wie bei "enabled").
+    if "sprueche" in data:
+        sprueche, fehler_text = _sprueche_feld_pruefen(log_type, data.get("sprueche"))
+        if fehler_text is not None:
+            return err(fehler_text)
+        if sprueche is not None:
+            eintrag["sprueche"] = sprueche
+    elif bisher and bisher.get("sprueche") is not None:
+        eintrag["sprueche"] = bisher["sprueche"]
     cfg.server_feeds(int(gid), conn.service_id, anlegen=True)[log_type] = eintrag
     cfg.save_guilds()
     _audit_add("dashboard", _audit_actor(_sess_get(request)),
@@ -47837,9 +48290,11 @@ async def _rad_drehen(conn: Any, sicht: Any, guild: Any, gid: int, uid: int, use
         db.rad_log_add(gid, uid, p["id"], name_de, p["typ"], wert, quelle, e["kosten"] if quelle == "bezahlt" else 0)
         if p["typ"] != "niete":
             try:
+                feed_en = _feed_sprache(conn) == "en"
                 embed = discord.Embed(title=_ft(conn, "🎡 GLÜCKSRAD", "🎡 WHEEL OF FORTUNE"), color=0xF1C40F,
-                                      description=_ft(conn, f"<@{uid}> hat **{name_de}** gewonnen ({_rad_preis_text(p, conn, False, guild)})",
-                                                      f"<@{uid}> won **{name_en}** ({_rad_preis_text(p, conn, True, guild)})"))
+                                      description=_spruch_bot_zeile(gid, conn, "economy_log", "rad", {
+                                          "player": f"<@{uid}>", "gewinn": name_en if feed_en else name_de,
+                                          "inhalt": _rad_preis_text(p, conn, feed_en, guild)}))
                 await _post_feed(gid, "economy_log", embed, service_id=conn.service_id)
             except Exception as exc:  # noqa: BLE001
                 log.debug(f"[RAD] Feed fehlgeschlagen: {exc}")
@@ -55990,6 +56445,10 @@ async def api_economy_get_config(request: web.Request) -> web.Response:
         "check_other_balances_bypass_role_ids":
             conn.get("check_other_balances_bypass_role_ids", []),
         "max_linked_accounts": int(conn.get("max_linked_accounts", 1) or 1),
+        # Standard-Sprüche der Verdienst-Befehle (fuer den Sprüche-Editor im Dashboard).
+        "sprueche_standard": {"work": list(WORK_FLAVOR), "beg": list(BEG_SUCCESS), "beg_fehl": list(BEG_FAIL),
+                              "daily": ["Du hast deinen Tagesbonus von {amount} abgeholt!"]},
+        "sprueche_limits": {"zeilen": _SPRUECHE_MAX_ZEILEN, "laenge": _SPRUECHE_MAX_LAENGE},
     })
 
 
@@ -56001,6 +56460,12 @@ _ECONOMY_ZAHLENFELDER = {
     "daily": ("amount", "cooldown_seconds"),
     "beg":   ("min", "max", "cooldown_seconds"),
 }
+# Einstellbare Sprüche der Economy-Befehle (Platzhalter {amount}); leer = Standard.
+_ECONOMY_ZEILENFELDER = {
+    "work":  ("zeilen",),
+    "daily": ("zeilen",),
+    "beg":   ("zeilen", "fehl_zeilen"),
+}
 _CASINO_ZAHLENFELDER = {
     "slots":     ("min_bet", "max_bet", "cooldown_seconds"),
     "roulette":  ("min_bet", "max_bet", "cooldown_seconds"),
@@ -56009,7 +56474,8 @@ _CASINO_ZAHLENFELDER = {
 
 
 def _teilobjekt_mergen(vorhanden: Any, neu: Dict[str, Any],
-                       erlaubte_felder: Dict[str, Tuple[str, ...]]
+                       erlaubte_felder: Dict[str, Tuple[str, ...]],
+                       zeilen_felder: Optional[Dict[str, Tuple[str, ...]]] = None
                        ) -> Tuple[Optional[Dict], Optional[str]]:
     """Fügt NUR die im Dashboard gezeigten Zahlenfelder in ``vorhanden`` ein
     (pro Unterschlüssel, z. B. 'work' oder 'slots') – Felder wie
@@ -56049,6 +56515,17 @@ def _teilobjekt_mergen(vorhanden: Any, neu: Dict[str, Any],
             if klein in eintrag and gross in eintrag and eintrag[klein] > eintrag[gross]:
                 return None, (f"{unterschluessel}: {klein} ({eintrag[klein]}) darf nicht "
                               f"größer sein als {gross} ({eintrag[gross]}).")
+        # Sprüche (Listen eigener Zeilen): mitgeschickt = ersetzen, leer/None = zurück auf Standard.
+        for feld in (zeilen_felder or {}).get(unterschluessel, ()):
+            if feld not in werte:
+                continue
+            zeilen = _spruch_zeilen_pruefen(werte[feld])
+            if isinstance(zeilen, str):
+                return None, f"{unterschluessel}.{feld}: {zeilen}"
+            if zeilen:
+                eintrag[feld] = zeilen
+            else:
+                eintrag.pop(feld, None)
         ziel[unterschluessel] = eintrag
     return ziel, None
 
@@ -56109,7 +56586,7 @@ async def api_economy_set_config(request: web.Request) -> web.Response:
         if not isinstance(data["economy"], dict):
             return err("economy muss ein Objekt sein.")
         merged, fehler = _teilobjekt_mergen(conn.get("economy"), data["economy"],
-                                            _ECONOMY_ZAHLENFELDER)
+                                            _ECONOMY_ZAHLENFELDER, _ECONOMY_ZEILENFELDER)
         if fehler:
             return err(fehler)
         _conn_store(conn, "economy", merged)
@@ -58134,6 +58611,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "4d5214accd1d96cbdcd5ffbb82930f3accf21ccfbb8bb3d96a75262d37bbe072",
         "b101383fe831787443d1c174caed70a31ec0dbc659b3b98fd7544c8fff677de9",
         "4d077e250e154e08b2168fd1e2a7bc83e7e5b0a819f47d582c88f1002dea3682",
+        "8ddecf765939de704a15ed41f319d5d6b4c93503944cc2c5116fcbdc2ae0d105",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -58409,6 +58887,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "dd733fa9a2e9751aeba30c4e5062465a05586d67ce60ed0f5110445128025855",
         "fdcd8576a6891955017b5d5f1a03d0f1f4b6600dbd242666c29eb3aa6c19a55e",
         "2a9fd031e33444e17cc94e6e3318fed6f5c35ab94b2e322c0ffc57c4dc1b2dda",
+        "e0a8099c44bee41f88c186cfa51aca8988b8813ce047ecba4787bbc38b2b8de5",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
