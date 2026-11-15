@@ -4378,7 +4378,7 @@ class ServerConnection:
         "map_name", "auto_restart_schedule", "auto_restart_after_purchase",
         "welcome_message", "leave_message", "reaction_roles",
         "ticket_categories", "ticket_open", "ticket_language", "ticket_transcript_channel",
-        "level_system", "honeypot", "wortfilter", "gluecksrad", "live_karte", "kredite", "guild_daten",
+        "level_system", "honeypot", "wortfilter", "gluecksrad", "live_karte", "kredite", "verifizierung", "guild_daten",
         # Social-Benachrichtigungen: Feed-Adressen (koennen Zugangsschluessel enthalten) gehoeren genau einer Guild.
         "social_feeds",
         # KI-Helfer: Einstellungen je Guild inkl. eigenem API-Schluessel; der
@@ -4894,7 +4894,7 @@ class ConnectionRegistry:
 _GUILD_SCHLUESSEL_GRUPPEN: Tuple[Tuple[str, ...], ...] = (
     ("welcome_message",), ("leave_message",), ("reaction_roles",),
     ("ticket_categories", "ticket_open", "ticket_language", "ticket_transcript_channel"),
-    ("level_system",), ("honeypot",), ("wortfilter",), ("gluecksrad",), ("live_karte",), ("kredite",), ("ki_helfer",), ("social_feeds",),
+    ("level_system",), ("honeypot",), ("wortfilter",), ("gluecksrad",), ("live_karte",), ("kredite",), ("verifizierung",), ("ki_helfer",), ("social_feeds",),
     ("giveaways", "giveaway_farbe", "giveaway_required_role_id"),
     ("ban_immune_role_ids",), ("link_add_role_ids", "link_remove_role_ids"),
     ("log_ban_temp_channel_id", "log_ban_perm_channel_id", "log_unban_channel_id"),
@@ -5774,6 +5774,10 @@ class DayZBot(discord.Client):
         # Persistente Views registrieren, damit Panel-/Freigabe-Buttons einen
         # Bot-Neustart überleben (timeout=None + feste custom_ids)
         try:
+            self.add_view(VerifPanelView())          # Verifizierungs-Button (eine feste custom_id fuer alle Guilds)
+        except Exception as e:
+            log.error(f"[BOT] Verifizierungs-View konnte nicht registriert werden: {e}")
+        try:
             # Alt-Panels ohne Server-Endung weiter bedienen …
             self.add_view(WhitelistPanelView())
             # … und je verbundenem Server eine eigene, damit die Anfrage weiss,
@@ -5941,6 +5945,17 @@ class DayZBot(discord.Client):
         except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
             log.debug(f"[DISCORD_MGMT] on_member_remove: {e}")
 
+        # Lens: war es ein Kick? Steht nur im Audit-Log (braucht "Audit-Log anzeigen") - ohne die Berechtigung wird nichts gemerkt.
+        try:
+            if _verif_guild_sicht(member.guild.id)[0] is not None and member.guild.me.guild_permissions.view_audit_log:
+                grenze = datetime.now(timezone.utc) - timedelta(seconds=15)
+                async for eintrag in member.guild.audit_logs(limit=5, action=discord.AuditLogAction.kick, after=grenze):
+                    if getattr(eintrag.target, "id", None) == member.id:
+                        await _verif_ban_kick_merken(member.guild, member.id, "kick")
+                        break
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[VERIF] on_member_remove: {e}")
+
     async def on_member_join(self, member: discord.Member):
         """Automatisches Nachreichen der Premium-/Beta-Badge-Rolle im
         Betreiber-Discord: wurde einem Kunden eine Rolle gegeben, WAEHREND er
@@ -5972,11 +5987,20 @@ class DayZBot(discord.Client):
         except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
             log.debug(f"[DISCORD_MGMT] on_member_join: {e}")
 
+        try:
+            await _verif_beitritt(member)
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[VERIF] on_member_join: {e}")
+
     async def on_member_ban(self, guild: discord.Guild, user: discord.abc.User):
         """Sofortiger Entzug der Freischaltung bei einem Bann im Betreiber-
         Discord - unabhaengig davon, ob discord.py zusaetzlich on_member_remove
         feuert (tut es meistens auch, aber nicht sicher bei Konten, die den
         Server vorher schon verlassen hatten und danach gebannt werden)."""
+        try:
+            await _verif_ban_kick_merken(guild, user.id, "ban")       # Lens (Verifizierung)
+        except Exception as e:  # noqa: BLE001 – darf den Bot nie stören
+            log.debug(f"[VERIF] on_member_ban: {e}")
         try:
             gid = str(cfg.config.get("premium_role_guild_id") or "").strip()
             if not gid or int(gid) != guild.id:
@@ -6138,6 +6162,8 @@ class DayZBot(discord.Client):
             self.social_feeds_loop.start()
         if not self.kredit_loop.is_running():
             self.kredit_loop.start()
+        if not self.verif_loop.is_running():
+            self.verif_loop.start()
         if not self.temp_unban_loop.is_running():
             self.temp_unban_loop.start()
         if not self.rollen_ablauf_loop.is_running():
@@ -7881,6 +7907,20 @@ class DayZBot(discord.Client):
     async def _before_kredit_loop(self):
         await self.wait_until_ready()
 
+    @tasks.loop(minutes=1)
+    async def verif_loop(self):
+        """Verifizierung: Auto-Kick nach Zeitablauf; einmal je Stunde abgelaufene Signale loeschen (Speicherdauer)."""
+        try:
+            await _verif_kick_lauf()
+            if int(time.time()) // 60 % 60 == 0:
+                _verif_aufraeumen()
+        except Exception as e:  # noqa: BLE001 - darf den Bot nie stoppen
+            log.error(f"[VERIF] Fehler: {type(e).__name__}: {e}")
+
+    @verif_loop.before_loop
+    async def _before_verif_loop(self):
+        await self.wait_until_ready()
+
     @tasks.loop(minutes=5)
     async def temp_unban_loop(self):
         """Zeitlich begrenzte Bans (Zonen-Auto-Ban mit ``temp_ban``) wieder
@@ -9318,7 +9358,8 @@ def _conn_store(conn: ServerConnection, key: str, value: Any, *, strict: bool = 
     # social_feeds: Feed-Adressen koennen Zugangsschluessel enthalten - ebenfalls nie nach config.json spiegeln.
     # wortfilter: Regeln mit Mitglieds-IDs gehoeren genau einer Guild - ebenfalls nie nach config.json spiegeln.
     # gluecksrad: Preise mit Rollen-IDs einer Guild - ebenfalls nie nach config.json spiegeln.
-    if key in ("eigene_npcs", "airstrikes", "ki_helfer", "airdrop_json", "social_feeds", "wortfilter", "gluecksrad", "live_karte", "kredite"):
+    if key in ("eigene_npcs", "airstrikes", "ki_helfer", "airdrop_json", "social_feeds", "wortfilter", "gluecksrad", "live_karte", "kredite",
+               "verifizierung"):
         return
     if connections.primary() is conn:
         cfg.config[key] = value
@@ -31375,6 +31416,49 @@ class EconomyDB:
                 z             REAL,
                 verweis       TEXT    NOT NULL DEFAULT '')""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_rad_gewinne_user ON rad_gewinne (guild_id, service_id, user_id, status)")
+            # ── Verifizierung (Discord Management): Zweitaccount-Erkennung UEBER ALLE Kunden ──
+            # Gespeichert werden nie IP oder Geraete-Kennung im Klartext, nur ihr HMAC (Schluessel nur beim Betreiber).
+            c.execute("""CREATE TABLE IF NOT EXISTS verif_konto (
+                user_id  INTEGER PRIMARY KEY,
+                name     TEXT    NOT NULL DEFAULT '',
+                erst_ts  REAL    NOT NULL,
+                letzt_ts REAL    NOT NULL,
+                lens_aus INTEGER NOT NULL DEFAULT 0)""")
+            c.execute("""CREATE TABLE IF NOT EXISTS verif_signal (
+                art     TEXT    NOT NULL,
+                wert    TEXT    NOT NULL,
+                user_id INTEGER NOT NULL,
+                ts      REAL    NOT NULL,
+                erst    REAL    NOT NULL DEFAULT 0,
+                PRIMARY KEY (art, wert, user_id))""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_verif_signal_user ON verif_signal (user_id)")
+            c.execute("""CREATE TABLE IF NOT EXISTS verif_status (
+                guild_id INTEGER NOT NULL,
+                user_id  INTEGER NOT NULL,
+                status   TEXT    NOT NULL,
+                ts       REAL    NOT NULL,
+                grund    TEXT    NOT NULL DEFAULT '',
+                haupt_id INTEGER,
+                PRIMARY KEY (guild_id, user_id))""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_verif_status_guild ON verif_status (guild_id, status)")
+            c.execute("""CREATE TABLE IF NOT EXISTS verif_ereignis (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id  INTEGER NOT NULL,
+                art      TEXT    NOT NULL,
+                ts       REAL    NOT NULL,
+                haupt_id INTEGER,
+                details  TEXT    NOT NULL DEFAULT '',
+                teilen   INTEGER NOT NULL DEFAULT 1)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_verif_ereignis_user ON verif_ereignis (user_id, art)")
+            c.execute("""CREATE TABLE IF NOT EXISTS verif_token (
+                token      TEXT    PRIMARY KEY,
+                guild_id   INTEGER NOT NULL,
+                service_id TEXT    NOT NULL,
+                user_id    INTEGER NOT NULL,
+                erstellt   REAL    NOT NULL,
+                ablauf     REAL    NOT NULL,
+                benutzt    INTEGER NOT NULL DEFAULT 0)""")
             # Kredite (experimentell): je Kredit ein Schnappschuss der angenommenen Bedingungen (Strafen, Belohnung, Pfand-Ort).
             c.execute("""CREATE TABLE IF NOT EXISTS kredite (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33231,6 +33315,211 @@ class EconomyDB:
             self._conn.execute("UPDATE rad_gewinne SET status='offen', eingeloest_ts=NULL, x=NULL, z=NULL "
                                "WHERE id=? AND guild_id=? AND service_id=? AND user_id=? AND status='eingeloest'",
                                (int(gewinn_id), guild_id, str(service_id), user_id))
+            self._conn.commit()
+
+    # ── Verifizierung: Einmal-Links ──
+    def verif_token_neu(self, guild_id: int, service_id: str, user_id: int, minuten: int) -> str:
+        """Neuer Einmal-Link fuer genau dieses Mitglied in genau dieser Guild. Abgelaufene Links werden dabei geloescht."""
+        jetzt = time.time()
+        token = secrets.token_urlsafe(24)
+        with self._lock:
+            self._conn.execute("DELETE FROM verif_token WHERE ablauf < ?", (jetzt - 3600,))
+            self._conn.execute("INSERT INTO verif_token (token, guild_id, service_id, user_id, erstellt, ablauf) VALUES (?,?,?,?,?,?)",
+                               (token, int(guild_id), str(service_id), int(user_id), jetzt, jetzt + int(minuten) * 60))
+            self._conn.commit()
+        return token
+
+    def verif_token_holen(self, token: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM verif_token WHERE token=?", (str(token),)).fetchone()
+        return dict(row) if row is not None else None
+
+    def verif_token_verbrauchen(self, token: str, jetzt: Optional[float] = None) -> bool:
+        """Den Link atomar als benutzt markieren. False = unbekannt, schon benutzt oder abgelaufen."""
+        jetzt = time.time() if jetzt is None else jetzt
+        with self._lock:
+            cur = self._conn.execute("UPDATE verif_token SET benutzt=1 WHERE token=? AND benutzt=0 AND ablauf>?", (str(token), float(jetzt)))
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    # ── Verifizierung: Konten, Signale, Gruppen (global ueber alle Kunden) ──
+    def verif_konto_merken(self, user_id: int, name: str, jetzt: Optional[float] = None) -> None:
+        jetzt = time.time() if jetzt is None else jetzt
+        with self._lock:
+            self._conn.execute("INSERT INTO verif_konto (user_id, name, erst_ts, letzt_ts) VALUES (?,?,?,?) "
+                               "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, letzt_ts=excluded.letzt_ts",
+                               (int(user_id), str(name)[:100], jetzt, jetzt))
+            self._conn.commit()
+
+    def verif_konto(self, user_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM verif_konto WHERE user_id=?", (int(user_id),)).fetchone()
+        return dict(row) if row is not None else None
+
+    def verif_signal_merken(self, user_id: int, art: str, wert: str, jetzt: Optional[float] = None) -> None:
+        jetzt = time.time() if jetzt is None else jetzt
+        with self._lock:
+            # ts = zuletzt gesehen (Speicherdauer), erst = zuerst gesehen (wer ist Hauptaccount) - erst wird nie ueberschrieben.
+            self._conn.execute("INSERT INTO verif_signal (art, wert, user_id, ts, erst) VALUES (?,?,?,?,?) "
+                               "ON CONFLICT(art, wert, user_id) DO UPDATE SET ts=excluded.ts",
+                               (str(art), str(wert), int(user_id), jetzt, jetzt))
+            self._conn.commit()
+
+    def verif_gruppe(self, user_id: int, zusatz: Optional[List[Tuple[str, str]]] = None, seit: float = 0.0,
+                     grenze: int = 200) -> List[int]:
+        """Alle Konten, die ueber gemeinsame Signale (IP-Hash, Geraet) mit diesem Konto verbunden sind - auch ueber Umwege
+        (A teilt die IP mit B, B das Geraet mit C). ``zusatz``: Signale, die noch nicht gespeichert sind (laufende
+        Verifizierung). Nur Signale juenger als ``seit`` zaehlen (Speicherdauer). Hoechstens ``grenze`` Konten."""
+        gefunden = {int(user_id)}
+        erledigt: Set[Tuple[str, str]] = set()
+        offen_signale = set((str(a), str(w)) for a, w in (zusatz or []))
+        offen_konten = [int(user_id)]
+        with self._lock:
+            while (offen_konten or offen_signale) and len(gefunden) < grenze:
+                for uid in offen_konten:
+                    for r in self._conn.execute("SELECT art, wert FROM verif_signal WHERE user_id=? AND ts>=?", (uid, float(seit))):
+                        offen_signale.add((r["art"], r["wert"]))
+                offen_konten = []
+                offen_signale -= erledigt
+                for art, wert in offen_signale:
+                    erledigt.add((art, wert))
+                    for r in self._conn.execute("SELECT user_id FROM verif_signal WHERE art=? AND wert=? AND ts>=?", (art, wert, float(seit))):
+                        if int(r["user_id"]) not in gefunden and len(gefunden) < grenze:
+                            gefunden.add(int(r["user_id"]))
+                            offen_konten.append(int(r["user_id"]))
+                offen_signale = set()
+        return sorted(gefunden)
+
+    def verif_erstes_signal(self, user_ids: List[int]) -> Dict[int, float]:
+        """Fruehestes gespeichertes Signal je Konto = erste echte Verifizierung. Konten ohne Signal fehlen im Ergebnis
+        (blosser Beitritt zaehlt nicht - sonst koennte ein frueh beigetretener Zweitaccount zum Hauptaccount werden)."""
+        if not user_ids:
+            return {}
+        with self._lock:
+            rows = self._conn.execute(f"SELECT user_id, MIN(erst) AS t FROM verif_signal WHERE user_id IN ({','.join('?' * len(user_ids))}) "
+                                      "GROUP BY user_id", [int(u) for u in user_ids]).fetchall()
+        return {int(r["user_id"]): float(r["t"]) for r in rows}
+
+    def verif_ereignisse_guild(self, user_ids: List[int], guild_id: int, limit: int = 50) -> List[Dict[str, Any]]:
+        """Nur die Ereignisse dieser Konten IN DIESER Guild (Verlauf im Dashboard)."""
+        if not user_ids:
+            return []
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(
+                f"SELECT * FROM verif_ereignis WHERE guild_id=? AND user_id IN ({','.join('?' * len(user_ids))}) ORDER BY id DESC LIMIT ?",
+                [int(guild_id)] + [int(u) for u in user_ids] + [int(limit)]).fetchall()]
+
+    def verif_konten(self, user_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        if not user_ids:
+            return {}
+        with self._lock:
+            rows = self._conn.execute(f"SELECT * FROM verif_konto WHERE user_id IN ({','.join('?' * len(user_ids))})",
+                                      [int(u) for u in user_ids]).fetchall()
+        return {int(r["user_id"]): dict(r) for r in rows}
+
+    def verif_status_setzen(self, guild_id: int, user_id: int, status: str, grund: str = "", haupt_id: Optional[int] = None,
+                            jetzt: Optional[float] = None) -> None:
+        jetzt = time.time() if jetzt is None else jetzt
+        with self._lock:
+            self._conn.execute("INSERT INTO verif_status (guild_id, user_id, status, ts, grund, haupt_id) VALUES (?,?,?,?,?,?) "
+                               "ON CONFLICT(guild_id, user_id) DO UPDATE SET status=excluded.status, ts=excluded.ts, "
+                               "grund=excluded.grund, haupt_id=excluded.haupt_id",
+                               (int(guild_id), int(user_id), str(status), jetzt, str(grund)[:300], haupt_id))
+            self._conn.commit()
+
+    def verif_status(self, guild_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM verif_status WHERE guild_id=? AND user_id=?", (int(guild_id), int(user_id))).fetchone()
+        return dict(row) if row is not None else None
+
+    def verif_status_liste(self, guild_id: int, status: Optional[str] = None, vor: Optional[float] = None) -> List[Dict[str, Any]]:
+        sql, args = "SELECT * FROM verif_status WHERE guild_id=?", [int(guild_id)]
+        if status is not None:
+            sql += " AND status=?"
+            args.append(str(status))
+        if vor is not None:
+            sql += " AND ts<?"
+            args.append(float(vor))
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(sql + " ORDER BY ts", args).fetchall()]
+
+    def verif_status_zaehlen(self, guild_id: int) -> Dict[str, int]:
+        with self._lock:
+            rows = self._conn.execute("SELECT status, COUNT(*) AS n FROM verif_status WHERE guild_id=? GROUP BY status", (int(guild_id),)).fetchall()
+        return {str(r["status"]): int(r["n"]) for r in rows}
+
+    def verif_ereignis_add(self, guild_id: int, user_id: int, art: str, haupt_id: Optional[int] = None, details: str = "",
+                           teilen: bool = True, jetzt: Optional[float] = None) -> None:
+        jetzt = time.time() if jetzt is None else jetzt
+        with self._lock:
+            self._conn.execute("INSERT INTO verif_ereignis (guild_id, user_id, art, ts, haupt_id, details, teilen) VALUES (?,?,?,?,?,?,?)",
+                               (int(guild_id), int(user_id), str(art), jetzt, haupt_id, str(details)[:500], 1 if teilen else 0))
+            self._conn.commit()
+
+    def verif_ereignisse(self, user_ids: List[int], guild_id: Optional[int] = None, limit: int = 200) -> List[Dict[str, Any]]:
+        """Ereignisse dieser Konten. Mit ``guild_id``: nur die dieser Guild PLUS die geteilten anderer Guilds (fuer Lens)."""
+        if not user_ids:
+            return []
+        platz = ",".join("?" * len(user_ids))
+        args: List[Any] = [int(u) for u in user_ids]
+        sql = f"SELECT * FROM verif_ereignis WHERE user_id IN ({platz})"
+        if guild_id is not None:
+            sql += " AND (guild_id=? OR teilen=1)"
+            args.append(int(guild_id))
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(sql + " ORDER BY id DESC LIMIT ?", args + [int(limit)]).fetchall()]
+
+    def verif_suche(self, guild_id: int, q: str, limit: int = 25) -> List[Dict[str, Any]]:
+        """Konten mit einem Status IN DIESER Guild, deren Name oder ID passt - Grundlage der Dashboard-Suche (nie die
+        globale Datenbank direkt durchsuchbar)."""
+        q = str(q or "").strip()
+        with self._lock:
+            if q.isdigit():
+                rows = self._conn.execute("SELECT s.*, k.name FROM verif_status s LEFT JOIN verif_konto k ON k.user_id=s.user_id "
+                                          "WHERE s.guild_id=? AND s.user_id=? LIMIT ?", (int(guild_id), int(q), int(limit))).fetchall()
+            else:
+                rows = self._conn.execute("SELECT s.*, k.name FROM verif_status s LEFT JOIN verif_konto k ON k.user_id=s.user_id "
+                                          "WHERE s.guild_id=? AND (?='' OR k.name LIKE ? ESCAPE '\\') ORDER BY s.ts DESC LIMIT ?",
+                                          (int(guild_id), q, "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%",
+                                           int(limit))).fetchall()
+        return [dict(r) for r in rows]
+
+    def verif_aufraeumen(self, signale_vor: float) -> int:
+        """Signale aelter als die Speicherdauer loeschen (die Zuordnung Haupt-/Zweitaccount im Status bleibt)."""
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM verif_signal WHERE ts < ?", (float(signale_vor),))
+            self._conn.execute("DELETE FROM verif_token WHERE ablauf < ?", (time.time() - 3600,))
+            self._conn.commit()
+            return cur.rowcount
+
+    def verif_lens_setzen(self, user_id: int, aus: bool) -> None:
+        with self._lock:
+            self._conn.execute("INSERT INTO verif_konto (user_id, name, erst_ts, letzt_ts, lens_aus) VALUES (?,?,?,?,?) "
+                               "ON CONFLICT(user_id) DO UPDATE SET lens_aus=excluded.lens_aus",
+                               (int(user_id), "", time.time(), time.time(), 1 if aus else 0))
+            self._conn.commit()
+
+    def verif_export(self, user_id: int) -> Dict[str, Any]:
+        """Alles, was zu diesem Konto gespeichert ist (/privacy export) - Signale nur als Art und Zeitpunkt, nie der Hash."""
+        uid = int(user_id)
+        with self._lock:
+            konto = self._conn.execute("SELECT * FROM verif_konto WHERE user_id=?", (uid,)).fetchone()
+            signale = self._conn.execute("SELECT art, ts FROM verif_signal WHERE user_id=?", (uid,)).fetchall()
+            # Ohne haupt_id: die ID des Hauptaccounts gehoert zu einer ANDEREN Person und wird nicht herausgegeben.
+            status = self._conn.execute("SELECT guild_id, status, ts, grund FROM verif_status WHERE user_id=?", (uid,)).fetchall()
+            ereignisse = self._conn.execute("SELECT guild_id, art, ts FROM verif_ereignis WHERE user_id=?", (uid,)).fetchall()
+        return {"konto": dict(konto) if konto else None, "signale": [dict(r) for r in signale],
+                "status": [dict(r) for r in status], "ereignisse": [dict(r) for r in ereignisse]}
+
+    def verif_daten_loeschen(self, user_id: int) -> None:
+        """Recht auf Loeschung (/privacy delete): Signale, Konto, Links, Status und Ereignisse dieses Kontos ueberall weg;
+        Verweise anderer Konten auf es als Hauptaccount werden geleert. Die Erkennung beginnt fuer dieses Konto neu."""
+        uid = int(user_id)
+        with self._lock:
+            for tabelle in ("verif_signal", "verif_konto", "verif_token", "verif_status", "verif_ereignis"):
+                self._conn.execute(f"DELETE FROM {tabelle} WHERE user_id=?", (uid,))
+            self._conn.execute("UPDATE verif_status SET haupt_id=NULL WHERE haupt_id=?", (uid,))
+            self._conn.execute("UPDATE verif_ereignis SET haupt_id=NULL WHERE haupt_id=?", (uid,))
             self._conn.commit()
 
     def rad_gewinn_verweis(self, gewinn_id: int, verweis: str) -> None:
@@ -40861,7 +41150,8 @@ _SESS_TTL = 60 * 60 * 12  # 12 Stunden
 _SESS_STORE: Dict[str, Dict[str, Any]] = {}
 
 # Pfade, die ohne Session erreichbar sind
-_SESS_PUBLIC_PREFIXES = ("/api/auth/", "/static/", "/vendor/", "/maps/")
+# /api/verify/: Verifizier-Seite fuer Discord-Mitglieder - der Einmal-Link ist die Berechtigung (siehe verif_seite_post).
+_SESS_PUBLIC_PREFIXES = ("/api/auth/", "/static/", "/vendor/", "/maps/", "/api/verify/")
 _SESS_PUBLIC_EXACT = ("/", "/index.html", "/api/session", "/favicon.ico", "/api/health", "/api/public/stats",
                       # Stripe ruft das ohne Session-Cookie auf - die eigentliche
                       # Absicherung ist die Signaturpruefung im Handler selbst.
@@ -46430,6 +46720,7 @@ def _discord_mgmt_payload(conn: "ServerConnection") -> Dict[str, Any]:
             "gluecksrad": {"enabled": bool(_rad_einstellungen(conn)["enabled"])},
             "livekarte": {"enabled": _livekarte_einstellungen(conn)["modus"] != "team"},
             "kredite": {"enabled": bool(_kredit_einstellungen(conn)["enabled"])},
+            "verifizierung": {"enabled": bool(_verif_einstellungen(conn)["enabled"])},
             "ki_helfer": {"enabled": bool(_ki_einstellungen(conn)["befehl_aktiv"]
                                           or _ki_einstellungen(conn)["ticket_aktiv"])},
             **{f"social_{p}": {"enabled": _social_aktiv(conn, p)} for p in _SOCIAL_PLATTFORMEN}}
@@ -49615,6 +49906,1012 @@ async def loan_forgive(interaction: discord.Interaction, user: discord.Member):
 
 bot.tree.add_command(loan_group)
 
+
+# ══════════════════════════════════════════════════════════════
+#  Discord Management: Verifizierung mit Zweitaccount-Erkennung (Vorbild: Double Counter)
+# ══════════════════════════════════════════════════════════════
+# Ablauf: Ein Mitglied klickt im Verifizierungs-Channel auf den Button (oder bekommt den Link per DM). Es erhaelt einen
+# Einmal-Link auf die Verifizier-Seite des Dashboards (ohne Discord-Login). Die Seite meldet IP-Adresse und eine
+# Geraete-Kennung (Cookie + Browser-Speicher). Gespeichert wird von beidem nur ein HMAC mit einem Schluessel, den nur der
+# Betreiber kennt - nie die IP im Klartext.
+#
+# Erkennung UEBER ALLE KUNDEN: teilt das Konto IP-Hash oder Geraet mit einem anderen Konto (auch ueber Umwege), sind beide
+# eine "Gruppe"; Hauptaccount ist das Konto der Gruppe, das zuerst bekannt war. Jeder andere ist ein Zweitaccount. Ein
+# Kunde sieht dabei Name und ID des Hauptaccounts, aber NIE, auf welchem anderen Discord-Server er bekannt ist.
+#
+# Je Guild in conn.data["verifizierung"] (GuildSicht). Was bei einem Zweitaccount passiert, stellt der Kunde ein:
+# keine Aktion (verifiziert, aber im Log markiert - der Owner entscheidet selbst), blockieren (keine Rolle, bis jemand
+# /manverify nutzt), kicken oder bannen. Lens: Bericht ueber ein Konto quer ueber alle Kunden (Bans/Kicks anderswo,
+# Zweitaccount- und VPN-Versuche), nur aus Guilds, die "Lens-Daten teilen" anhaben, und nie fuer Nutzer mit /privacy lens aus.
+_VERIF_MODI = ("panel", "auto_dm", "blind")
+_VERIF_AKTIONEN = ("keine", "blockieren", "kicken", "bannen")
+_VERIF_VPN_AKTIONEN = ("keine", "blockieren", "kicken")
+_VERIF_MAX_ROLLEN = 10
+_VERIF_MAX_STAFF = 25
+_VERIF_NACHRICHT_MAX = 1000
+_VERIF_PANEL_ID = "brigarde_verif:start"
+_VERIF_SPEICHER_VORGABE = 24          # Monate (wie Double Counter)
+_VERIF_PROXYCHECK_FREI_PRO_TAG = 100  # proxycheck.io ohne Schluessel
+_VERIF_LOCKS: Dict[Tuple[int, int], asyncio.Lock] = {}
+_VERIF_VPN_CACHE: Dict[str, Tuple[float, Optional[bool]]] = {}
+_VERIF_VPN_ZAEHLER: Dict[str, Any] = {"tag": "", "n": 0}
+_VERIF_SEITE_LIMIT: Dict[str, float] = {}
+
+
+def _verif_zahl(wert: Any, niedrig: int, hoch: int, vorgabe: int) -> int:
+    if isinstance(wert, bool) or not isinstance(wert, (int, float)) or not math.isfinite(wert) or wert != int(wert):
+        return vorgabe
+    return int(wert) if niedrig <= int(wert) <= hoch else vorgabe
+
+
+def _verif_ids(roh: Any, grenze: int) -> List[str]:
+    out: List[str] = []
+    for r in (roh if isinstance(roh, list) else [])[:grenze]:
+        text = str(r).strip() if isinstance(r, (str, int)) and not isinstance(r, bool) else ""
+        if re.fullmatch(r"[0-9]{1,20}", text) and int(text) > 0 and text not in out:
+            out.append(text)
+    return out
+
+
+def _verif_id(roh: Any) -> Optional[str]:
+    ids = _verif_ids([roh], 1)
+    return ids[0] if ids else None
+
+
+def _verif_einstellungen(sicht: Any) -> Dict[str, Any]:
+    roh = sicht.get("verifizierung") if sicht is not None else None
+    roh = roh if isinstance(roh, dict) else {}
+    nachricht = roh.get("nachricht")
+    return {
+        "enabled": bool(roh.get("enabled", False)),
+        "modus": roh.get("modus") if roh.get("modus") in _VERIF_MODI else "panel",
+        "channel_id": _verif_id(roh.get("channel_id")),
+        "log_channel_id": _verif_id(roh.get("log_channel_id")),
+        "verified_role_ids": _verif_ids(roh.get("verified_role_ids"), _VERIF_MAX_ROLLEN),
+        "unverified_role_id": _verif_id(roh.get("unverified_role_id")),
+        "staff_role_ids": _verif_ids(roh.get("staff_role_ids"), _VERIF_MAX_STAFF),
+        "staff_user_ids": _verif_ids(roh.get("staff_user_ids"), _VERIF_MAX_STAFF),
+        "ping_role_id": _verif_id(roh.get("ping_role_id")),
+        "aktion_alt": roh.get("aktion_alt") if roh.get("aktion_alt") in _VERIF_AKTIONEN else "blockieren",
+        "aktion_vpn": roh.get("aktion_vpn") if roh.get("aktion_vpn") in _VERIF_VPN_AKTIONEN else "blockieren",
+        "vpn_pruefen": bool(roh.get("vpn_pruefen", False)),
+        "nur_vpn": bool(roh.get("nur_vpn", False)),
+        "min_alter_tage": _verif_zahl(roh.get("min_alter_tage", 0), 0, 365, 0),
+        "kick_minuten": _verif_zahl(roh.get("kick_minuten", 0), 0, 1440, 0),
+        "link_minuten": _verif_zahl(roh.get("link_minuten", 10), 2, 30, 10),
+        "log_erfolg": bool(roh.get("log_erfolg", True)),
+        "dm_hinweis": bool(roh.get("dm_hinweis", True)),
+        "lens_teilen": bool(roh.get("lens_teilen", True)),
+        "nachricht": nachricht.strip()[:_VERIF_NACHRICHT_MAX] if isinstance(nachricht, str) else "",
+        # eigener proxycheck.io-Schluessel des Kunden (mehr Abfragen); nie an das Dashboard zurueckgeben
+        "proxycheck_key": str(roh.get("proxycheck_key") or "")[:64],
+    }
+
+
+def _verif_guild_sicht(guild_id: int) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+    """Die Sicht der Guild mit eingeschalteter Verifizierung (bei mehreren Servern derselben Guild die erste)."""
+    for c in connections.all_for_guild(guild_id):
+        sicht = guild_sicht(c, guild_id)
+        if sicht is None:
+            continue
+        e = _verif_einstellungen(sicht)
+        if e["enabled"]:
+            return sicht, e
+    return None, None
+
+
+def _verif_geheimnis() -> bytes:
+    """HMAC-Schluessel fuer IP- und Geraete-Hashes. Einmal erzeugt und in config.json gemerkt - wechselt er, passen alte
+    Hashes nicht mehr (die Erkennung beginnt dann von vorn, verraten wird dadurch nichts)."""
+    roh = str(cfg.config.get("verifizierung_geheimnis") or "")
+    if len(roh) < 32:
+        roh = secrets.token_hex(32)
+        cfg.config["verifizierung_geheimnis"] = roh
+        try:
+            cfg.save_config()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"[VERIF] Schluessel nicht gespeichert: {exc}")
+    return roh.encode("utf-8")
+
+
+def _verif_hash(art: str, wert: str) -> str:
+    return hmac.new(_verif_geheimnis(), f"{art}:{wert}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _verif_ip_norm(ip: str) -> Optional[str]:
+    """IPv4 wie sie ist, IPv6 als /64-Netz (ein Anschluss hat meist ein ganzes /64)."""
+    try:
+        adr = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return None
+    if adr.version == 6:
+        if adr.ipv4_mapped is not None:
+            return str(adr.ipv4_mapped)
+        return str(ipaddress.ip_network(f"{adr}/64", strict=False))
+    return str(adr)
+
+
+def _verif_client_ip(request: web.Request) -> Optional[str]:
+    """Die IP des Mitglieds. Hinter dem Cloudflare-Tunnel kommt jede Anfrage von localhost - dann (und NUR dann) gilt der
+    Header CF-Connecting-IP bzw. X-Forwarded-For; von aussen gesetzte Header werden sonst ignoriert."""
+    remote = request.remote or ""
+    try:
+        lokal = ipaddress.ip_address(remote).is_loopback
+    except ValueError:
+        lokal = False
+    if lokal:
+        for kopf in ("CF-Connecting-IP", "X-Forwarded-For"):
+            wert = str(request.headers.get(kopf) or "").split(",")[0].strip()
+            if wert and _verif_ip_norm(wert):
+                return wert
+    return remote or None
+
+
+def _verif_ip_oeffentlich(norm: str) -> bool:
+    try:
+        return ipaddress.ip_network(norm, strict=False).network_address.is_global
+    except ValueError:
+        return False
+
+
+def _verif_hauptaccount(gruppe: List[int], jetzt: float) -> int:
+    """Hauptaccount = das Konto der Gruppe, das sich ZUERST verifiziert hat (fruehestes Signal). Wer noch kein Signal hat
+    (die laufende Verifizierung), zaehlt als jetzt."""
+    erste = db.verif_erstes_signal(gruppe)
+    return min(gruppe, key=lambda u: (erste.get(u, jetzt), u))
+
+
+def _verif_konto_alter_tage(user_id: int, jetzt: Optional[float] = None) -> float:
+    jetzt = time.time() if jetzt is None else jetzt
+    erstellt = ((int(user_id) >> 22) + 1420070400000) / 1000.0
+    return max(0.0, (jetzt - erstellt) / 86400.0)
+
+
+def _verif_speicher_monate() -> int:
+    return _verif_zahl(cfg.config.get("verifizierung_speicher_monate", _VERIF_SPEICHER_VORGABE), 1, 60, _VERIF_SPEICHER_VORGABE)
+
+
+def _verif_seit(jetzt: Optional[float] = None) -> float:
+    jetzt = time.time() if jetzt is None else jetzt
+    return jetzt - _verif_speicher_monate() * 30 * 86400
+
+
+async def _verif_vpn(ip: str, eigener_key: str = "") -> Optional[bool]:
+    """True = VPN/Proxy/Rechenzentrum, False = normaler Anschluss, None = unbekannt (Dienst nicht erreichbar oder
+    Tageskontingent ohne Schluessel aufgebraucht - dann wird NICHT blockiert). Ohne eigenen Schluessel des Kunden gilt der
+    kostenlose des Betreibers (config "verifizierung_proxycheck_key"), sonst die kostenlose Abfrage ohne Schluessel."""
+    norm = _verif_ip_norm(ip)
+    if norm is None:
+        return None
+    try:
+        if not ipaddress.ip_address(norm.split("/")[0]).is_global:
+            return False
+    except ValueError:
+        return None
+    jetzt = time.time()
+    treffer = _VERIF_VPN_CACHE.get(norm)
+    if treffer is not None and jetzt - treffer[0] < 6 * 3600:
+        return treffer[1]
+    key = (eigener_key or str(cfg.config.get("verifizierung_proxycheck_key") or "")).strip()
+    if not key:
+        tag = time.strftime("%Y-%m-%d", time.gmtime(jetzt))
+        if _VERIF_VPN_ZAEHLER["tag"] != tag:
+            _VERIF_VPN_ZAEHLER.update({"tag": tag, "n": 0})
+        if _VERIF_VPN_ZAEHLER["n"] >= _VERIF_PROXYCHECK_FREI_PRO_TAG:
+            return None
+        _VERIF_VPN_ZAEHLER["n"] += 1
+    abfrage_ip = norm.split("/")[0]
+    url = f"https://proxycheck.io/v2/{abfrage_ip}?vpn=1" + (f"&key={key}" if key else "")
+    try:
+        async with aiohttp.ClientSession(trust_env=True, timeout=aiohttp.ClientTimeout(total=6)) as s:
+            async with s.get(url) as r:
+                daten = await r.json(content_type=None)
+    except Exception as exc:  # noqa: BLE001
+        log.info(f"[VERIF] VPN-Pruefung nicht erreichbar: {type(exc).__name__}")
+        return None
+    eintrag = daten.get(abfrage_ip) if isinstance(daten, dict) else None
+    if not isinstance(eintrag, dict) or str(daten.get("status", "")).lower() not in ("ok", "warning"):
+        return None
+    ergebnis = str(eintrag.get("proxy", "")).lower() == "yes"
+    _VERIF_VPN_CACHE[norm] = (jetzt, ergebnis)
+    if len(_VERIF_VPN_CACHE) > 5000:
+        for k in sorted(_VERIF_VPN_CACHE, key=lambda k: _VERIF_VPN_CACHE[k][0])[:1000]:
+            _VERIF_VPN_CACHE.pop(k, None)
+    return ergebnis
+
+
+def _verif_ist_staff(member: Any, guild: Any, e: Dict[str, Any]) -> bool:
+    """Owner, Administratoren sowie die im Dashboard gewaehlten Rollen und Mitglieder."""
+    if member is None or guild is None:
+        return False
+    if getattr(guild, "owner_id", None) == member.id:
+        return True
+    rechte = getattr(member, "guild_permissions", None)
+    if rechte is not None and getattr(rechte, "administrator", False):
+        return True
+    if str(member.id) in e["staff_user_ids"]:
+        return True
+    return any(str(r.id) in e["staff_role_ids"] for r in getattr(member, "roles", []) or [])
+
+
+async def _verif_log(guild: Any, e: Dict[str, Any], embed: discord.Embed, ping: bool = False) -> None:
+    kanal_id = e.get("log_channel_id")
+    if not kanal_id or guild is None:
+        return
+    ch = guild.get_channel(int(kanal_id))
+    if ch is None:
+        return
+    inhalt = f"<@&{e['ping_role_id']}>" if (ping and e.get("ping_role_id")) else None
+    try:
+        await ch.send(content=inhalt, embed=embed, allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False))
+    except Exception as exc:  # noqa: BLE001
+        log.debug(f"[VERIF] Log nicht gesendet: {exc}")
+
+
+def _verif_konto_text(uid: Any, konten: Dict[int, Dict[str, Any]]) -> str:
+    k = konten.get(int(uid)) if uid is not None else None
+    name = (k or {}).get("name") or "?"
+    return f"{discord.utils.escape_markdown(str(name))} (`{uid}`)"
+
+
+async def _verif_rollen_geben(guild: Any, uid: int, e: Dict[str, Any]) -> List[str]:
+    """Verifiziert-Rollen geben, Unverifiziert-Rolle nehmen. Gibt die Fehlertexte (deutsch) zurueck."""
+    fehler: List[str] = []
+    for rid in e["verified_role_ids"]:
+        problem = await _rolle_geben(guild, uid, int(rid), "Verifizierung")
+        if problem is not None:
+            fehler.append(problem[0])
+    if e["unverified_role_id"]:
+        await _rolle_nehmen(guild, uid, int(e["unverified_role_id"]), "Verifizierung")
+    return fehler
+
+
+async def _verif_strafe(guild: Any, uid: int, aktion: str, grund: str) -> str:
+    """kicken/bannen ausfuehren - nie gegen Administratoren oder Rollen auf/ueber der Bot-Rolle. Rueckgabe: kurzer Status."""
+    if aktion not in ("kicken", "bannen"):
+        return ""
+    member = await _member_von(guild, uid)
+    if member is None:
+        return "nicht mehr Mitglied"
+    me = getattr(guild, "me", None)
+    if getattr(getattr(member, "guild_permissions", None), "administrator", False) or (
+            me is not None and member.top_role.position >= me.top_role.position):
+        return "ausgenommen (Admin bzw. Rolle über dem Bot)"
+    try:
+        if aktion == "kicken":
+            await member.kick(reason=grund)
+            return "gekickt"
+        await guild.ban(member, reason=grund, delete_message_seconds=0)
+        return "gebannt"
+    except discord.Forbidden:
+        return "keine Berechtigung"
+    except discord.HTTPException as exc:
+        return f"Discord-Fehler {getattr(exc, 'status', '?')}"
+
+
+async def _verif_pruefen(guild: Any, gid: int, uid: int, name: str, ip: Optional[str], geraete: List[str],
+                         jetzt: Optional[float] = None) -> Dict[str, Any]:
+    """Eine Verifizierung auswerten und alles Folgende ausfuehren (Rollen, Aktion, Log). Rueckgabe fuer die Webseite:
+    {ergebnis: verifiziert|alt|vpn|zu_jung|aus|fehler, de, en}."""
+    jetzt = time.time() if jetzt is None else jetzt
+    sicht, e = _verif_guild_sicht(gid)
+    if sicht is None or e is None:
+        return {"ergebnis": "aus", "de": "Die Verifizierung ist auf diesem Server nicht aktiv.",
+                "en": "Verification is not active on this server."}
+    async with _VERIF_LOCKS.setdefault((gid, uid), asyncio.Lock()):
+        db.verif_konto_merken(uid, name, jetzt)
+        bisher = db.verif_status(gid, uid)
+        manuell = bool(bisher and bisher["status"] == "manuell")
+        teilen = e["lens_teilen"]
+
+        # 1. Mindestalter des Discord-Kontos
+        alter = _verif_konto_alter_tage(uid, jetzt)
+        if e["min_alter_tage"] and alter < e["min_alter_tage"] and not manuell:
+            rest = max(1, math.ceil(e["min_alter_tage"] - alter))
+            db.verif_status_setzen(gid, uid, "zu_jung", f"Konto {alter:.1f} Tage alt", jetzt=jetzt)
+            db.verif_ereignis_add(gid, uid, "zu_jung", details=f"{alter:.1f}", teilen=teilen, jetzt=jetzt)
+            emb = discord.Embed(title="⏳ Konto zu jung", color=0xE67E22,
+                                description=f"<@{uid}> – Discord-Konto erst {alter:.1f} Tage alt (Minimum {e['min_alter_tage']}).")
+            await _verif_log(guild, e, emb)
+            return {"ergebnis": "zu_jung", "de": f"Dein Discord-Konto ist zu neu. Versuche es in {rest} Tag(en) erneut.",
+                    "en": f"Your Discord account is too new. Try again in {rest} day(s)."}
+
+        # 2. Signale (nur als Hash)
+        signale: List[Tuple[str, str]] = []
+        norm = _verif_ip_norm(ip) if ip else None
+        if norm and _verif_ip_oeffentlich(norm):
+            # localhost/private Netze (z. B. Tunnel ohne Kopfzeile) waeren fuer alle gleich - nie als Signal.
+            signale.append(("ip", _verif_hash("ip", norm)))
+        for g in geraete:
+            if isinstance(g, str) and re.fullmatch(r"[A-Za-z0-9_-]{16,64}", g):
+                signale.append(("geraet", _verif_hash("geraet", g)))
+
+        # 3. VPN
+        vpn = False
+        if e["vpn_pruefen"] and ip and not manuell:
+            vpn = bool(await _verif_vpn(ip, e["proxycheck_key"]))
+        if vpn:
+            db.verif_ereignis_add(gid, uid, "vpn", teilen=teilen, jetzt=jetzt)
+            emb = discord.Embed(title="🛡️ VPN/Proxy erkannt", color=0xE67E22,
+                                description=f"<@{uid}> wollte sich über einen VPN, Proxy oder ein Rechenzentrum verifizieren.")
+            if e["aktion_vpn"] != "keine":
+                db.verif_status_setzen(gid, uid, "vpn", "VPN/Proxy", jetzt=jetzt)
+                status = await _verif_strafe(guild, uid, e["aktion_vpn"], "Verifizierung: VPN/Proxy")
+                emb.add_field(name="Aktion", value=f"{e['aktion_vpn']}" + (f" – {status}" if status else ""), inline=False)
+                await _verif_log(guild, e, emb)
+                return {"ergebnis": "vpn", "de": "Bitte schalte VPN oder Proxy aus und öffne den Link erneut über Discord.",
+                        "en": "Please turn off your VPN or proxy and open the link again from Discord."}
+            emb.add_field(name="Aktion", value="keine (Entscheidung beim Team)", inline=False)
+            await _verif_log(guild, e, emb)
+
+        # 4. Zweitaccount
+        haupt: Optional[int] = None
+        gruppe: List[int] = [uid]
+        if not e["nur_vpn"] and signale:
+            gruppe = db.verif_gruppe(uid, signale, seit=_verif_seit(jetzt))
+            haupt = _verif_hauptaccount(gruppe, jetzt)
+        for art, wert in signale:
+            db.verif_signal_merken(uid, art, wert, jetzt)
+        konten = db.verif_konten(gruppe)
+        if haupt is not None and haupt != uid and not manuell:
+            weitere = [u for u in gruppe if u not in (uid, haupt)][:10]
+            db.verif_ereignis_add(gid, uid, "alt", haupt_id=haupt, teilen=teilen, jetzt=jetzt)
+            emb = discord.Embed(title="👥 Zweitaccount erkannt", color=0xE74C3C,
+                                description=f"<@{uid}> {_verif_konto_text(uid, konten)} gehört zu einem bereits bekannten Konto.")
+            emb.add_field(name="Hauptaccount", value=_verif_konto_text(haupt, konten), inline=False)
+            if weitere:
+                emb.add_field(name="Weitere verknüpfte Konten", value="\n".join(_verif_konto_text(u, konten) for u in weitere), inline=False)
+            if e["aktion_alt"] == "keine":
+                db.verif_status_setzen(gid, uid, "verifiziert", "Zweitaccount (keine Aktion)", haupt_id=haupt, jetzt=jetzt)
+                fehler = await _verif_rollen_geben(guild, uid, e)
+                emb.add_field(name="Aktion", value="keine – verifiziert, Entscheidung beim Team" + (f"\n⚠️ {fehler[0]}" if fehler else ""),
+                              inline=False)
+                await _verif_log(guild, e, emb, ping=True)
+                return {"ergebnis": "verifiziert", "de": "Du bist verifiziert. Du kannst dieses Fenster schließen.",
+                        "en": "You are verified. You can close this window."}
+            db.verif_status_setzen(gid, uid, "alt", "Zweitaccount", haupt_id=haupt, jetzt=jetzt)
+            status = await _verif_strafe(guild, uid, e["aktion_alt"], "Verifizierung: Zweitaccount")
+            emb.add_field(name="Aktion", value=e["aktion_alt"] + (f" – {status}" if status else ""), inline=False)
+            emb.set_footer(text="Freischalten: /manverify")
+            await _verif_log(guild, e, emb, ping=True)
+            return {"ergebnis": "alt", "de": "Dieses Konto wurde als Zweitaccount erkannt. Wende dich an das Team des Servers.",
+                    "en": "This account was detected as an alternate account. Please contact the server staff."}
+
+        # 5. Verifiziert
+        db.verif_status_setzen(gid, uid, "manuell" if manuell else "verifiziert", "", haupt_id=None, jetzt=jetzt)
+        db.verif_ereignis_add(gid, uid, "verifiziert", teilen=teilen, jetzt=jetzt)
+        fehler = await _verif_rollen_geben(guild, uid, e)
+        if e["log_erfolg"] or fehler:
+            emb = discord.Embed(title="✅ Verifiziert", color=0x2ECC71, description=f"<@{uid}> {_verif_konto_text(uid, konten)}")
+            if fehler:
+                emb.add_field(name="⚠️ Rolle", value=fehler[0], inline=False)
+            await _verif_log(guild, e, emb)
+        if fehler:
+            return {"ergebnis": "fehler", "de": "Verifiziert – aber die Rolle konnte nicht vergeben werden. Bitte melde das dem Team.",
+                    "en": "Verified – but the role could not be assigned. Please tell the staff."}
+        return {"ergebnis": "verifiziert", "de": "Du bist verifiziert. Du kannst dieses Fenster schließen.",
+                "en": "You are verified. You can close this window."}
+
+
+def _verif_basis_url() -> str:
+    """Adresse der Verifizier-Seite: config "verifizierung_url" (z. B. https://brigardekillfeed.xyz), sonst die oeffentliche
+    Dashboard-Adresse."""
+    eigen = str(cfg.config.get("verifizierung_url") or "").strip().rstrip("/")
+    if eigen.startswith("https://") or eigen.startswith("http://"):
+        return eigen
+    return _dash_public_url(_dash_resolve_port()) or f"http://127.0.0.1:{_dash_resolve_port()}"
+
+
+def _verif_link(gid: int, service_id: str, uid: int, e: Dict[str, Any]) -> str:
+    token = db.verif_token_neu(gid, service_id, uid, e["link_minuten"])
+    return f"{_verif_basis_url()}/verify/{token}"
+
+
+def _verif_dm_embed(guild: Any, e: Dict[str, Any], en: bool) -> discord.Embed:
+    text = e["nachricht"] or (f"Klicke auf den Button, um dich auf **{guild.name}** zu verifizieren. Der Link gilt "
+                              f"{e['link_minuten']} Minuten und nur für dich." if not en else
+                              f"Click the button to verify on **{guild.name}**. The link is valid for "
+                              f"{e['link_minuten']} minutes and only for you.")
+    emb = discord.Embed(title="✅ " + ("Verifizierung" if not en else "Verification"), description=text, color=0x2ECC71)
+    emb.set_footer(text="Brigarde Killfeed")
+    return emb
+
+
+def _verif_link_view(url: str, en: bool) -> discord.ui.View:
+    v = discord.ui.View(timeout=None)
+    v.add_item(discord.ui.Button(label="Jetzt verifizieren" if not en else "Verify now", url=url, emoji="✅"))
+    return v
+
+
+class VerifPanelView(discord.ui.View):
+    """Der dauerhafte Button im Verifizierungs-Channel (feste custom_id, ueberlebt Neustarts). Die Guild kommt aus der
+    Interaktion - ein Panel fuer alle Guilds."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Verify my account", style=discord.ButtonStyle.success, emoji="✅", custom_id=_VERIF_PANEL_ID)
+    async def verifizieren(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await _verif_knopf(interaction)
+
+
+async def _verif_knopf(interaction: discord.Interaction) -> None:
+    """Button oder /verify: dem Mitglied einen persoenlichen Einmal-Link zeigen (nur fuer es sichtbar)."""
+    en = _sprache(interaction) == "en"
+    if interaction.guild is None:
+        return await interaction.response.send_message("❌ Only on a Discord server.", ephemeral=True)
+    sicht, e = _verif_guild_sicht(interaction.guild.id)
+    if sicht is None or e is None:
+        return await interaction.response.send_message(_t(interaction, "❌ Die Verifizierung ist hier nicht aktiv.",
+                                                          "❌ Verification is not active here."), ephemeral=True)
+    gid, uid = interaction.guild.id, interaction.user.id
+    st = db.verif_status(gid, uid)
+    if st and st["status"] in ("verifiziert", "manuell") and all(
+            any(str(r.id) == rid for r in getattr(interaction.user, "roles", []) or []) for rid in e["verified_role_ids"]):
+        return await interaction.response.send_message(_t(interaction, "✅ Du bist bereits verifiziert.", "✅ You are already verified."),
+                                                       ephemeral=True)
+    if e["modus"] == "blind":
+        db.verif_konto_merken(uid, str(interaction.user))
+        db.verif_status_setzen(gid, uid, "verifiziert", "ohne Prüfung")
+        fehler = await _verif_rollen_geben(interaction.guild, uid, e)
+        return await interaction.response.send_message(
+            ("❌ " + fehler[0]) if fehler else _t(interaction, "✅ Du bist verifiziert.", "✅ You are verified."), ephemeral=True)
+    url = _verif_link(gid, sicht.service_id, uid, e)
+    await interaction.response.send_message(embed=_verif_dm_embed(interaction.guild, e, en), view=_verif_link_view(url, en), ephemeral=True)
+
+
+async def _verif_beitritt(member: Any) -> None:
+    """Neues Mitglied: Unverifiziert-Rolle geben, im Modus "auto_dm" den Link per DM schicken (bei geschlossenen DMs ein
+    kurzer Hinweis im Verifizierungs-Channel), im Modus "blind" sofort verifizieren. Der Zeitpunkt zaehlt fuer den
+    Auto-Kick."""
+    if getattr(member, "bot", False):
+        return
+    sicht, e = _verif_guild_sicht(member.guild.id)
+    if sicht is None or e is None:
+        return
+    gid, uid = member.guild.id, member.id
+    db.verif_konto_merken(uid, str(member))
+    if e["modus"] == "blind":
+        db.verif_status_setzen(gid, uid, "verifiziert", "ohne Prüfung")
+        await _verif_rollen_geben(member.guild, uid, e)
+        return
+    st = db.verif_status(gid, uid)
+    if not (st and st["status"] in ("verifiziert", "manuell")):
+        db.verif_status_setzen(gid, uid, "offen", "beigetreten")
+    if e["unverified_role_id"]:
+        await _rolle_geben(member.guild, uid, int(e["unverified_role_id"]), "Verifizierung: noch nicht verifiziert")
+    if e["modus"] != "auto_dm":
+        return
+    en = _feed_sprache(sicht) == "en"
+    url = _verif_link(gid, sicht.service_id, uid, e)
+    try:
+        await member.send(embed=_verif_dm_embed(member.guild, e, en), view=_verif_link_view(url, en))
+    except (discord.Forbidden, discord.HTTPException):
+        if e["dm_hinweis"] and e["channel_id"]:
+            ch = member.guild.get_channel(int(e["channel_id"]))
+            if ch is not None:
+                try:
+                    await ch.send(content=(f"{member.mention} Bitte öffne deine DMs oder klicke unten auf den Button, um dich zu verifizieren."
+                                           if not en else f"{member.mention} Please open your DMs or click the button below to verify."),
+                                  delete_after=20, allowed_mentions=discord.AllowedMentions(users=True))
+                except Exception:  # noqa: BLE001
+                    pass
+
+
+async def _verif_ban_kick_merken(guild: Any, user_id: int, art: str) -> None:
+    """Bans/Kicks fuer Lens merken - nur in Guilds mit Verifizierung; geteilt nur, wenn "Lens-Daten teilen" an ist."""
+    sicht, e = _verif_guild_sicht(guild.id)
+    if sicht is None or e is None:
+        return
+    db.verif_ereignis_add(guild.id, user_id, art, teilen=e["lens_teilen"])
+
+
+async def _verif_kick_lauf() -> None:
+    """Mitglieder, die sich nach dem Beitritt nicht innerhalb der eingestellten Minuten verifiziert haben, kicken."""
+    if bot is None:
+        return
+    jetzt = time.time()
+    for g in list(getattr(bot, "guilds", []) or []):
+        sicht, e = _verif_guild_sicht(g.id)
+        if sicht is None or e is None or not e["kick_minuten"] or e["modus"] == "blind":
+            continue
+        for st in db.verif_status_liste(g.id, "offen", vor=jetzt - e["kick_minuten"] * 60)[:50]:
+            uid = int(st["user_id"])
+            ergebnis = await _verif_strafe(g, uid, "kicken", "Verifizierung: Zeit abgelaufen")
+            db.verif_status_setzen(g.id, uid, "abgelaufen", ergebnis or "Zeit abgelaufen")
+            if ergebnis == "gekickt":
+                db.verif_ereignis_add(g.id, uid, "timeout", teilen=False)
+
+
+def _verif_aufraeumen() -> None:
+    try:
+        n = db.verif_aufraeumen(_verif_seit())
+        if n:
+            log.info(f"[VERIF] {n} abgelaufene Signal(e) gelöscht (Speicherdauer {_verif_speicher_monate()} Monate).")
+    except Exception as exc:  # noqa: BLE001
+        log.warning(f"[VERIF] Aufräumen fehlgeschlagen: {exc}")
+
+
+# ── Lens: Bericht ueber ein Konto quer ueber alle Kunden ──
+def _verif_lens(user_id: int, guild_id: int) -> Dict[str, Any]:
+    """Zusammenfassung ueber die ganze Gruppe dieses Kontos: in wie vielen ANDEREN Servern gebannt/gekickt, Zweitaccount-
+    und VPN-Versuche, Kontoalter, Verhaltens-Punkte (0-100). Nur geteilte Ereignisse anderer Guilds plus alles aus dieser;
+    nie welche Server. Hat das Konto Lens abgeschaltet, nur Kontoalter."""
+    uid = int(user_id)
+    gruppe = db.verif_gruppe(uid, seit=_verif_seit())
+    konten = db.verif_konten(gruppe)
+    alter = round(_verif_konto_alter_tage(uid), 1)
+    if (konten.get(uid) or {}).get("lens_aus"):
+        return {"lens_aus": True, "konto_alter_tage": alter}
+    ev = db.verif_ereignisse(gruppe, guild_id=guild_id, limit=1000)
+    def server(art: str, nur_fremde: bool = False) -> int:
+        return len({e["guild_id"] for e in ev if e["art"] == art and (not nur_fremde or e["guild_id"] != guild_id)})
+    def anzahl(art: str) -> int:
+        return sum(1 for e in ev if e["art"] == art)
+    bans, kicks, alts, vpns = server("ban", True), server("kick", True), anzahl("alt"), anzahl("vpn")
+    punkte = max(0, min(100, 100 - 25 * bans - 10 * kicks - 10 * alts - 5 * vpns - (10 if alter < 30 else 0)))
+    return {"lens_aus": False, "konto_alter_tage": alter, "konten": len(gruppe), "server_verifiziert": server("verifiziert"),
+            "bans_andere_server": bans, "kicks_andere_server": kicks, "zweitaccount_versuche": alts, "vpn_versuche": vpns,
+            "punkte": punkte}
+
+
+def _verif_gruppe_view(user_id: int, guild_id: int) -> Dict[str, Any]:
+    """Alle verknuepften Konten fuer das Dashboard: Name, ID, seit wann bekannt, Status NUR in dieser Guild, Hauptaccount."""
+    jetzt = time.time()
+    gruppe = db.verif_gruppe(int(user_id), seit=_verif_seit(jetzt))
+    konten = db.verif_konten(gruppe)
+    haupt = _verif_hauptaccount(gruppe, jetzt)
+    out = []
+    for u in gruppe:
+        st = db.verif_status(guild_id, u)
+        k = konten.get(u) or {}
+        out.append({"user_id": str(u), "name": k.get("name") or "", "erst_ts": k.get("erst_ts"), "hauptaccount": u == haupt,
+                    "status": st["status"] if st else None, "status_ts": st["ts"] if st else None})
+    out.sort(key=lambda x: (not x["hauptaccount"], x["erst_ts"] or 0))
+    eigene = db.verif_ereignisse_guild(gruppe, guild_id, 50)
+    return {"konten": out, "hauptaccount": str(haupt), "lens": _verif_lens(int(user_id), guild_id),
+            "verlauf": [{"user_id": str(e["user_id"]), "art": e["art"], "ts": e["ts"],
+                         "haupt_id": str(e["haupt_id"]) if e["haupt_id"] else None} for e in eigene[:50]]}
+
+
+# ── Verifizier-Seite (oeffentlich, ohne Anmeldung - der Einmal-Link ist die Berechtigung) ──
+def _verif_seite_en(request: web.Request) -> bool:
+    return str(request.headers.get("Accept-Language") or "").lower().startswith("en")
+
+
+def _verif_html(titel: str, inhalt: str, en: bool) -> web.Response:
+    seite = f"""<!doctype html><html lang="{'en' if en else 'de'}"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
+<title>{_html.escape(titel)}</title><style>
+:root{{--bg:#0f1316;--panel:#1b2127;--text:#e6edf3;--muted:#9aa7b2;--ok:#2ecc71;--bad:#e74c3c;--line:#2c353d}}
+@media (prefers-color-scheme: light){{:root{{--bg:#f4f6f8;--panel:#fff;--text:#1d2329;--muted:#5b6670;--line:#d7dde2}}}}
+body{{margin:0;background:var(--bg);color:var(--text);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+display:flex;min-height:100vh;align-items:center;justify-content:center;padding:16px;box-sizing:border-box}}
+.karte{{background:var(--panel);border:1px solid var(--line);border-radius:14px;max-width:440px;width:100%;padding:24px;box-sizing:border-box}}
+h1{{font-size:22px;margin:0 0 8px}} p{{margin:8px 0}} .muted{{color:var(--muted);font-size:14px}}
+button{{width:100%;padding:14px;border:0;border-radius:10px;background:var(--ok);color:#06210f;font-weight:700;font-size:17px;cursor:pointer;margin-top:12px}}
+button:disabled{{opacity:.6;cursor:wait}} .ok{{color:var(--ok)}} .bad{{color:var(--bad)}}
+</style></head><body><main class="karte">{inhalt}</main></body></html>"""
+    return web.Response(text=seite, content_type="text/html",
+                        headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer"})
+
+
+async def verif_seite(request: web.Request) -> web.Response:
+    en = _verif_seite_en(request)
+    token = request.match_info.get("token", "")
+    t = db.verif_token_holen(token) if re.fullmatch(r"[A-Za-z0-9_-]{20,64}", token or "") else None
+    if t is None or t["benutzt"] or t["ablauf"] < time.time():
+        return _verif_html("Verify", "<h1>⏳ " + ("Link expired" if en else "Link abgelaufen") + "</h1><p>"
+                           + ("This link is no longer valid. Click the verify button in Discord again."
+                              if en else "Dieser Link gilt nicht mehr. Klicke in Discord noch einmal auf den Verifizieren-Button.")
+                           + "</p>", en)
+    g = bot.get_guild(int(t["guild_id"])) if bot else None
+    server = _html.escape(g.name if g is not None else "Discord")
+    hinweis = ("To protect this server against alternate accounts, your IP address and a device identifier are checked. "
+               "Only an encrypted fingerprint (hash) is stored – never your IP address in plain text – and deleted after "
+               f"{_verif_speicher_monate()} months. You can export or delete your data with /privacy in Discord."
+               if en else
+               "Zum Schutz vor Zweitaccounts werden deine IP-Adresse und eine Geräte-Kennung geprüft. Gespeichert wird nur "
+               "ein verschlüsselter Fingerabdruck (Hash) – nie deine IP im Klartext – und nach "
+               f"{_verif_speicher_monate()} Monaten gelöscht. Mit /privacy im Discord kannst du deine Daten abrufen oder löschen.")
+    knopf = "Verify" if en else "Verifizieren"
+    inhalt = f"""<h1>✅ {('Verify on ' if en else 'Verifizierung für ')}{server}</h1>
+<p class="muted">{_html.escape(hinweis)}</p>
+<button id="los">{knopf}</button><p id="aus" role="status"></p>
+<script>
+(function(){{var k="bkf_geraet",g="";
+try{{g=localStorage.getItem(k)||"";if(!g){{g=(crypto.randomUUID?crypto.randomUUID():String(Math.random()).slice(2)+Date.now()).replace(/[^A-Za-z0-9_-]/g,"");localStorage.setItem(k,g);}}}}catch(e){{}}
+var b=document.getElementById("los"),a=document.getElementById("aus");
+b.addEventListener("click",function(){{b.disabled=true;a.textContent="…";
+fetch(location.pathname.replace("/verify/","/api/verify/"),{{method:"POST",headers:{{"Content-Type":"application/json"}},credentials:"same-origin",body:JSON.stringify({{geraet:g}})}})
+.then(function(r){{return r.json();}}).then(function(d){{a.className=d.ok?"ok":"bad";a.textContent=d.text||d.error||"?";b.style.display="none";}})
+.catch(function(){{a.className="bad";a.textContent="{('Connection failed – please try again.' if en else 'Verbindung fehlgeschlagen – bitte erneut versuchen.')}";b.disabled=false;}});}});}})();
+</script>"""
+    return _verif_html(f"{'Verify' if en else 'Verifizierung'} – {g.name if g is not None else 'Discord'}", inhalt, en)
+
+
+async def verif_seite_post(request: web.Request) -> web.Response:
+    en = _verif_seite_en(request)
+    ip = _verif_client_ip(request)
+    jetzt = time.monotonic()
+    schluessel = str(ip or "?")
+    if _VERIF_SEITE_LIMIT.get(schluessel, 0) > jetzt:
+        return err("Too many attempts – wait a moment." if en else "Zu viele Versuche – bitte kurz warten.", 429)
+    _VERIF_SEITE_LIMIT[schluessel] = jetzt + 3
+    if len(_VERIF_SEITE_LIMIT) > 10000:
+        for k in [k for k, v in _VERIF_SEITE_LIMIT.items() if v < jetzt][:5000]:
+            _VERIF_SEITE_LIMIT.pop(k, None)
+    token = request.match_info.get("token", "")
+    t = db.verif_token_holen(token) if re.fullmatch(r"[A-Za-z0-9_-]{20,64}", token or "") else None
+    if t is None or t["benutzt"] or t["ablauf"] < time.time():
+        return err("This link is no longer valid." if en else "Dieser Link gilt nicht mehr.", 410)
+    data = await body(request)
+    geraete = []
+    roh = data.get("geraet")
+    if isinstance(roh, str):
+        geraete.append(roh[:64])
+    keks = str(request.cookies.get("bkf_geraet") or "")
+    if re.fullmatch(r"[A-Za-z0-9_-]{16,64}", keks):
+        if keks not in geraete:
+            geraete.append(keks)
+    else:
+        keks = geraete[0] if geraete and re.fullmatch(r"[A-Za-z0-9_-]{16,64}", geraete[0]) else secrets.token_urlsafe(24)
+    gid, uid = int(t["guild_id"]), int(t["user_id"])
+    g = bot.get_guild(gid) if bot else None
+    if g is None:
+        return err("The bot cannot reach this Discord server." if en else "Der Bot erreicht diesen Discord-Server nicht.", 409)
+    member = await _member_von(g, uid)
+    if member is None:
+        return err("You are not a member of this server." if en else "Du bist nicht Mitglied dieses Servers.", 403)
+    # Erst jetzt verbrauchen (atomar): ein voruebergehend unerreichbarer Server kostet den Link nicht.
+    if not db.verif_token_verbrauchen(token):
+        return err("This link is no longer valid." if en else "Dieser Link gilt nicht mehr.", 410)
+    erg = await _verif_pruefen(g, gid, uid, str(member), ip, geraete)
+    antwort = web.json_response({"ok": erg["ergebnis"] == "verifiziert", "ergebnis": erg["ergebnis"],
+                                 "text": erg["en"] if en else erg["de"]})
+    antwort.set_cookie("bkf_geraet", keks, max_age=5 * 365 * 86400, httponly=True, samesite="Lax",
+                       secure=request.secure or str(request.headers.get("X-Forwarded-Proto", "")).lower() == "https")
+    return antwort
+
+
+# ── Dashboard: Einstellungen, Suche, Konto-Details ──
+def _verif_payload(sicht: Any, sess: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    e = _verif_einstellungen(sicht)
+    key = e.pop("proxycheck_key")
+    e["proxycheck_key_gesetzt"] = bool(key)
+    e["zaehler"] = db.verif_status_zaehlen(int(sicht.guild_id)) if getattr(sicht, "guild_id", None) else {}
+    e["speicher_monate"] = _verif_speicher_monate()
+    e["betreiber"] = bool((sess or {}).get("is_admin"))
+    e["betreiber_key_gesetzt"] = bool(str(cfg.config.get("verifizierung_proxycheck_key") or "").strip())
+    e["seite"] = _verif_basis_url() + "/verify/…"
+    e["limits"] = {"rollen": _VERIF_MAX_ROLLEN, "staff": _VERIF_MAX_STAFF, "nachricht": _VERIF_NACHRICHT_MAX,
+                   "frei_pro_tag": _VERIF_PROXYCHECK_FREI_PRO_TAG}
+    return e
+
+
+async def get_discord_mgmt_verif(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "view")
+    if denied is not None:
+        return denied
+    return ok(_verif_payload(conn, _sess_get(request)))
+
+
+async def post_discord_mgmt_verif(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.verifizierung", 3)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    if not gid:
+        return err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
+    alt = _verif_einstellungen(conn)
+    neu: Dict[str, Any] = {"enabled": bool(data.get("enabled", False))}
+    for k, erlaubt in (("modus", _VERIF_MODI), ("aktion_alt", _VERIF_AKTIONEN), ("aktion_vpn", _VERIF_VPN_AKTIONEN)):
+        if data.get(k) not in erlaubt:
+            return err("Ungültige Auswahl.")
+        neu[k] = data[k]
+    for k, lo, hi in (("min_alter_tage", 0, 365), ("kick_minuten", 0, 1440), ("link_minuten", 2, 30)):
+        w = data.get(k, 0 if k != "link_minuten" else 10)
+        if isinstance(w, bool) or not isinstance(w, (int, float)) or not math.isfinite(w) or w != int(w) or not lo <= int(w) <= hi:
+            return err(f"Ungültiger Zahlenwert – erlaubt sind ganze Zahlen von {lo} bis {hi}.")
+        neu[k] = int(w)
+    for k in ("vpn_pruefen", "nur_vpn", "log_erfolg", "dm_hinweis", "lens_teilen"):
+        neu[k] = bool(data.get(k, False))
+    nachricht = data.get("nachricht", "")
+    if not isinstance(nachricht, str) or len(nachricht) > _VERIF_NACHRICHT_MAX:
+        return err(f"Die Nachricht darf höchstens {_VERIF_NACHRICHT_MAX} Zeichen lang sein.")
+    neu["nachricht"] = nachricht.strip()
+    # Channels und Rollen: muessen in DIESER Guild liegen.
+    for k in ("channel_id", "log_channel_id"):
+        cid = _verif_id(data.get(k)) if data.get(k) not in (None, "") else None
+        if data.get(k) not in (None, "") and cid is None:
+            return err("Ungültige Channel-ID.")
+        if cid:
+            fehler = _kanal_gehoert_guild(gid, int(cid))
+            if fehler is not None:
+                return fehler
+        neu[k] = cid
+    for k, grenze in (("verified_role_ids", _VERIF_MAX_ROLLEN), ("staff_role_ids", _VERIF_MAX_STAFF)):
+        roh = data.get(k, [])
+        if not isinstance(roh, list) or len(roh) > grenze:
+            return err(f"Höchstens {grenze} Rollen.")
+        ids = _verif_ids(roh, grenze)
+        if len(ids) != len(roh):
+            return err("Ungültige Rollen-ID.")
+        neu[k] = ids
+    for k in ("unverified_role_id", "ping_role_id"):
+        rid = _verif_id(data.get(k)) if data.get(k) not in (None, "") else None
+        if data.get(k) not in (None, "") and rid is None:
+            return err("Ungültige Rollen-ID.")
+        neu[k] = rid
+    roh = data.get("staff_user_ids", [])
+    if not isinstance(roh, list) or len(roh) > _VERIF_MAX_STAFF:
+        return err(f"Höchstens {_VERIF_MAX_STAFF} Mitglieder.")
+    neu["staff_user_ids"] = _verif_ids(roh, _VERIF_MAX_STAFF)
+    if len(neu["staff_user_ids"]) != len(roh):
+        return err("Ungültige Mitglieds-ID.")
+    guild = bot.get_guild(gid) if bot else None
+    for rid in neu["verified_role_ids"] + neu["staff_role_ids"] + [r for r in (neu["unverified_role_id"], neu["ping_role_id"]) if r]:
+        fehler = _rolle_gehoert_guild(gid, int(rid))
+        if fehler is not None:
+            return fehler
+    for rid in neu["verified_role_ids"] + ([neu["unverified_role_id"]] if neu["unverified_role_id"] else []):
+        problem = _rolle_vergebbar(guild, guild.get_role(int(rid))) if guild is not None else None
+        if problem is not None:
+            return err(problem[0])
+    if neu["unverified_role_id"] and neu["unverified_role_id"] in neu["verified_role_ids"]:
+        return err("Die Unverifiziert-Rolle darf nicht zugleich eine Verifiziert-Rolle sein.")
+    if neu["enabled"] and neu["modus"] != "blind" and not neu["verified_role_ids"]:
+        return err("Bitte mindestens eine Verifiziert-Rolle wählen.")
+    if neu["enabled"] and not neu["channel_id"]:
+        return err("Bitte einen Verifizierungs-Channel wählen.")
+    # Eigener proxycheck.io-Schluessel: fehlt das Feld, bleibt er; "" loescht ihn.
+    if "proxycheck_key" in data:
+        k = data.get("proxycheck_key")
+        if not isinstance(k, str) or (k and not re.fullmatch(r"[A-Za-z0-9-]{6,64}", k.strip())):
+            return err("Ungültiger proxycheck.io-Schlüssel.")
+        neu["proxycheck_key"] = k.strip()
+    else:
+        neu["proxycheck_key"] = alt["proxycheck_key"]
+    # Speicherdauer gilt fuer alle Kunden - nur der Betreiber darf sie aendern.
+    sess = _sess_get(request) or {}
+    if "speicher_monate" in data and sess.get("is_admin"):
+        m = data.get("speicher_monate")
+        if isinstance(m, bool) or not isinstance(m, int) or not 1 <= m <= 60:
+            return err("Die Speicherdauer muss zwischen 1 und 60 Monaten liegen.")
+        cfg.config["verifizierung_speicher_monate"] = m
+        cfg.save_config()
+    _conn_store(conn, "verifizierung", neu)
+    _audit_add("dashboard", _audit_actor(sess), "Discord-Management aktualisiert", f"verifizierung · {conn.name}")
+    return ok(_verif_payload(conn, sess))
+
+
+async def get_discord_mgmt_verif_suche(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "view")
+    if denied is not None:
+        return denied
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    if not gid:
+        return ok({"treffer": []})
+    q = str(request.query.get("q") or "").strip()[:60]
+    treffer = []
+    for r in db.verif_suche(gid, q):
+        gruppe = db.verif_gruppe(int(r["user_id"]), seit=_verif_seit())
+        treffer.append({"user_id": str(r["user_id"]), "name": r.get("name") or "", "status": r["status"], "ts": r["ts"],
+                        "haupt_id": str(r["haupt_id"]) if r.get("haupt_id") else None, "konten": len(gruppe)})
+    return ok({"treffer": treffer})
+
+
+async def get_discord_mgmt_verif_konto(request: web.Request) -> web.Response:
+    conn, denied = await _honeypot_gate(request, "view")
+    if denied is not None:
+        return denied
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    uid_text = request.match_info.get("user_id", "")
+    if not gid or not re.fullmatch(r"[0-9]{1,20}", uid_text):
+        return err("Unbekanntes Konto.", 404)
+    uid = int(uid_text)
+    # Nur Konten, die in DIESER Guild einen Status haben (oder mit einem solchen verknuepft sind) - die globale Datenbank
+    # ist so nicht nach beliebigen IDs durchsuchbar.
+    gruppe = db.verif_gruppe(uid, seit=_verif_seit())
+    if not any(db.verif_status(gid, u) for u in gruppe):
+        return err("Unbekanntes Konto.", 404)
+    return ok(_verif_gruppe_view(uid, gid))
+
+
+async def post_discord_mgmt_verif_manuell(request: web.Request) -> web.Response:
+    """Wie /manverify, aus dem Dashboard."""
+    conn, denied = await _honeypot_gate(request, "edit")
+    if denied is not None:
+        return denied
+    denied = _dash_rate_limited(request, "discord_mgmt.verifizierung.manuell", 2)
+    if denied is not None:
+        return denied
+    data = await body(request)
+    gid = int(conn.guild_id) if conn.guild_id else 0
+    uid_text = str(data.get("user_id") or "").strip()
+    if not re.fullmatch(r"[0-9]{1,20}", uid_text):
+        return err("Bitte die Discord-ID des Mitglieds angeben.")
+    guild = bot.get_guild(gid) if (bot and gid) else None
+    if guild is None:
+        return err("Der Bot erreicht diesen Discord-Server nicht.", 409)
+    e = _verif_einstellungen(conn)
+    member = await _member_von(guild, int(uid_text))
+    if member is None:
+        return err("Dieses Mitglied gibt es auf dem Discord-Server nicht.")
+    db.verif_konto_merken(member.id, str(member))
+    db.verif_status_setzen(gid, member.id, "manuell", f"Dashboard: {_audit_actor(_sess_get(request))}")
+    db.verif_ereignis_add(gid, member.id, "manverify", teilen=False)
+    fehler = await _verif_rollen_geben(guild, member.id, e)
+    if fehler:
+        return err(fehler[0], 409)
+    emb = discord.Embed(title="✅ Manuell verifiziert", color=0x3498DB, description=f"<@{member.id}> – über das Dashboard")
+    await _verif_log(guild, e, emb)
+    return ok({"user_id": str(member.id)})
+
+
+# ── Discord-Befehle ──
+async def _verif_ctx(interaction: discord.Interaction, staff: bool) -> Optional[Tuple[Any, Dict[str, Any]]]:
+    if interaction.guild is None:
+        await interaction.response.send_message("❌ Only on a Discord server.", ephemeral=True)
+        return None
+    sicht, e = _verif_guild_sicht(interaction.guild.id)
+    if sicht is None or e is None:
+        await interaction.response.send_message(_t(interaction, "❌ Die Verifizierung ist hier nicht aktiv (Dashboard → Discord Management).",
+                                                   "❌ Verification is not active here (dashboard → Discord Management)."), ephemeral=True)
+        return None
+    if staff and not _verif_ist_staff(interaction.user, interaction.guild, e):
+        await interaction.response.send_message(_t(interaction, "❌ Nur Owner, Administratoren oder das Verifizierungs-Team.",
+                                                   "❌ Only the owner, administrators or the verification staff."), ephemeral=True)
+        return None
+    return sicht, e
+
+
+@bot.tree.command(name="manverify", description="✅ Verify a member manually (verification staff)")
+@app_commands.describe(user="The member to verify")
+async def cmd_manverify(interaction: discord.Interaction, user: discord.Member):
+    ctx = await _verif_ctx(interaction, staff=True)
+    if ctx is None:
+        return
+    _sicht, e = ctx
+    gid = interaction.guild.id
+    db.verif_konto_merken(user.id, str(user))
+    db.verif_status_setzen(gid, user.id, "manuell", f"/manverify von {interaction.user.id}")
+    db.verif_ereignis_add(gid, user.id, "manverify", teilen=False)
+    fehler = await _verif_rollen_geben(interaction.guild, user.id, e)
+    emb = discord.Embed(title="✅ Manuell verifiziert", color=0x3498DB, description=f"{user.mention} – von {interaction.user.mention}")
+    await _verif_log(interaction.guild, e, emb)
+    await interaction.response.send_message(("⚠️ " + fehler[0]) if fehler else _t(
+        interaction, f"✅ {user.mention} ist manuell verifiziert.", f"✅ {user.mention} is manually verified."), ephemeral=True)
+
+
+@bot.tree.command(name="verify", description="✅ Get your personal verification link")
+async def cmd_verify(interaction: discord.Interaction):
+    await _verif_knopf(interaction)
+
+
+verification_group = app_commands.Group(name="verification", description="✅ Verification and alt detection")
+
+
+@verification_group.command(name="panel", description="✅ Post the verification button (verification staff)")
+@app_commands.describe(channel="Where to post it (default: the verification channel from the dashboard)")
+async def verif_panel(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    ctx = await _verif_ctx(interaction, staff=True)
+    if ctx is None:
+        return
+    sicht, e = ctx
+    ziel = channel or (interaction.guild.get_channel(int(e["channel_id"])) if e["channel_id"] else None) or interaction.channel
+    en = _feed_sprache(sicht) == "en"
+    emb = discord.Embed(title="Verify to access this server" if en else "Verifiziere dich, um den Server zu nutzen",
+                        description=e["nachricht"] or ("This server is protected by **Brigarde Killfeed**. Click the button below to verify."
+                                                        if en else "Dieser Server ist durch **Brigarde Killfeed** geschützt. "
+                                                                   "Klicke unten auf den Button, um dich zu verifizieren."),
+                        color=0x2ECC71)
+    emb.set_footer(text="Powered by Brigarde Killfeed")
+    try:
+        await ziel.send(embed=emb, view=VerifPanelView())
+    except (discord.Forbidden, discord.HTTPException):
+        return await interaction.response.send_message(_t(interaction, "❌ Ich darf in diesem Channel nicht schreiben.",
+                                                          "❌ I cannot post in that channel."), ephemeral=True)
+    await interaction.response.send_message(_t(interaction, f"✅ Button gepostet in {ziel.mention}.", f"✅ Button posted in {ziel.mention}."),
+                                            ephemeral=True)
+
+
+@verification_group.command(name="force", description="✅ Send a member a new verification link by DM (verification staff)")
+@app_commands.describe(user="The member")
+async def verif_force(interaction: discord.Interaction, user: discord.Member):
+    ctx = await _verif_ctx(interaction, staff=True)
+    if ctx is None:
+        return
+    sicht, e = ctx
+    en = _feed_sprache(sicht) == "en"
+    url = _verif_link(interaction.guild.id, sicht.service_id, user.id, e)
+    try:
+        await user.send(embed=_verif_dm_embed(interaction.guild, e, en), view=_verif_link_view(url, en))
+    except (discord.Forbidden, discord.HTTPException):
+        return await interaction.response.send_message(_t(interaction, f"❌ {user.mention} hat DMs geschlossen.",
+                                                          f"❌ {user.mention} has DMs closed."), ephemeral=True)
+    await interaction.response.send_message(_t(interaction, f"✅ Link an {user.mention} geschickt.", f"✅ Link sent to {user.mention}."),
+                                            ephemeral=True)
+
+
+@verification_group.command(name="status", description="✅ Verification overview of this server (verification staff)")
+async def verif_status_cmd(interaction: discord.Interaction):
+    ctx = await _verif_ctx(interaction, staff=True)
+    if ctx is None:
+        return
+    _sicht, e = ctx
+    z = db.verif_status_zaehlen(interaction.guild.id)
+    en = _sprache(interaction) == "en"
+    namen = {"verifiziert": ("Verifiziert", "Verified"), "manuell": ("Manuell", "Manual"), "offen": ("Offen", "Pending"),
+             "alt": ("Zweitaccount", "Alt account"), "vpn": ("VPN", "VPN"), "zu_jung": ("Konto zu jung", "Account too new"),
+             "abgelaufen": ("Abgelaufen", "Timed out")}
+    zeilen = [f"{namen.get(k, (k, k))[1 if en else 0]}: **{v}**" for k, v in sorted(z.items())] or ["—"]
+    emb = discord.Embed(title="✅ " + ("Verification" if en else "Verifizierung"), description="\n".join(zeilen), color=0x2ECC71)
+    emb.add_field(name="Modus" if not en else "Mode", value=e["modus"], inline=True)
+    emb.add_field(name="VPN", value=("an" if not en else "on") if e["vpn_pruefen"] else ("aus" if not en else "off"), inline=True)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+@verification_group.command(name="lookup", description="✅ Show all linked accounts and the Lens report of a member (verification staff)")
+@app_commands.describe(user="The member")
+async def verif_lookup(interaction: discord.Interaction, user: discord.User):
+    ctx = await _verif_ctx(interaction, staff=True)
+    if ctx is None:
+        return
+    gid = interaction.guild.id
+    en = _sprache(interaction) == "en"
+    v = _verif_gruppe_view(user.id, gid)
+    konten = {int(k["user_id"]): {"name": k["name"]} for k in v["konten"]}
+    zeilen = [("👑 " if k["hauptaccount"] else "• ") + _verif_konto_text(int(k["user_id"]), konten)
+              + (f" – {k['status']}" if k["status"] else "") for k in v["konten"][:20]]
+    emb = discord.Embed(title=("🔎 Linked accounts" if en else "🔎 Verknüpfte Konten") + f" – {user}", description="\n".join(zeilen)[:3900],
+                        color=0x3498DB)
+    lens = v["lens"]
+    if lens.get("lens_aus"):
+        emb.add_field(name="Lens", value=("The user has turned Lens off." if en else "Der Nutzer hat Lens abgeschaltet."), inline=False)
+    else:
+        emb.add_field(name="Lens", value=(
+            f"{'Score' if en else 'Punkte'}: **{lens['punkte']}/100** · {'account age' if en else 'Kontoalter'}: {lens['konto_alter_tage']} d\n"
+            f"{'Bans on other servers' if en else 'Bans auf anderen Servern'}: {lens['bans_andere_server']} · "
+            f"{'Kicks' if en else 'Kicks'}: {lens['kicks_andere_server']}\n"
+            f"{'Alt attempts' if en else 'Zweitaccount-Versuche'}: {lens['zweitaccount_versuche']} · VPN: {lens['vpn_versuche']}"), inline=False)
+    await interaction.response.send_message(embed=emb, ephemeral=True)
+
+
+bot.tree.add_command(verification_group)
+
+privacy_group = app_commands.Group(name="privacy", description="🔒 Your verification data")
+
+
+@privacy_group.command(name="export", description="🔒 Get all verification data stored about you")
+async def privacy_export(interaction: discord.Interaction):
+    daten = db.verif_export(interaction.user.id)
+    datei = discord.File(io.BytesIO(json.dumps(daten, indent=2, ensure_ascii=False).encode("utf-8")), filename="verification-data.json")
+    await interaction.response.send_message(_t(interaction, "🔒 Deine gespeicherten Verifizierungs-Daten (IP und Gerät nur als Art und Zeitpunkt – der Hash selbst wird nie herausgegeben).",
+                                               "🔒 Your stored verification data (IP and device only as type and time – the hash itself is never handed out)."),
+                                            file=datei, ephemeral=True)
+
+
+@privacy_group.command(name="delete", description="🔒 Delete all verification data about you (you must verify again)")
+async def privacy_delete(interaction: discord.Interaction):
+    db.verif_daten_loeschen(interaction.user.id)
+    await interaction.response.send_message(_t(interaction, "🔒 Gelöscht. Auf Servern mit Verifizierung musst du dich neu verifizieren.",
+                                               "🔒 Deleted. On servers with verification you have to verify again."), ephemeral=True)
+
+
+@privacy_group.command(name="lens", description="🔒 Turn the Lens report about you on or off")
+@app_commands.describe(on="True = Lens may show your history, False = only your account age")
+async def privacy_lens(interaction: discord.Interaction, on: bool):
+    db.verif_lens_setzen(interaction.user.id, not on)
+    await interaction.response.send_message(_t(interaction, f"🔒 Lens ist für dich jetzt {'an' if on else 'aus'}.",
+                                               f"🔒 Lens is now {'on' if on else 'off'} for you."), ephemeral=True)
+
+
+bot.tree.add_command(privacy_group)
 
 # ══════════════════════════════════════════════════════════════
 #  Discord Management: Social-Benachrichtigungen (YouTube, Instagram, TikTok, X)
@@ -57675,6 +58972,13 @@ def build_app() -> web.Application:
     r.add_get("/api/discord-management/gluecksrad/items", get_discord_mgmt_rad_items)
     r.add_get("/api/discord-management/gluecksrad/klassen", get_discord_mgmt_rad_klassen)
     r.add_post("/api/discord-management/gluecksrad/event-vorlage", post_discord_mgmt_rad_event_vorlage)
+    r.add_get("/api/discord-management/verifizierung", get_discord_mgmt_verif)
+    r.add_post("/api/discord-management/verifizierung", post_discord_mgmt_verif)
+    r.add_get("/api/discord-management/verifizierung/suche", get_discord_mgmt_verif_suche)
+    r.add_get("/api/discord-management/verifizierung/konto/{user_id}", get_discord_mgmt_verif_konto)
+    r.add_post("/api/discord-management/verifizierung/manuell", post_discord_mgmt_verif_manuell)
+    r.add_get("/verify/{token}", verif_seite)
+    r.add_post("/api/verify/{token}", verif_seite_post)
     r.add_post("/api/discord-management/gluecksrad/geben", post_discord_mgmt_rad_geben)
     r.add_get("/api/discord-management/livekarte", get_discord_mgmt_livekarte)
     r.add_post("/api/discord-management/livekarte", post_discord_mgmt_livekarte)
@@ -58612,6 +59916,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "b101383fe831787443d1c174caed70a31ec0dbc659b3b98fd7544c8fff677de9",
         "4d077e250e154e08b2168fd1e2a7bc83e7e5b0a819f47d582c88f1002dea3682",
         "8ddecf765939de704a15ed41f319d5d6b4c93503944cc2c5116fcbdc2ae0d105",
+        "bc53b4eefe8140bbb6a1ff30a2155c394984ce35313d54ad4e6164c7b7bffcde",
     ),
     "app.js": (
         "bbffe58380f061fc4c8db16114c0d531174f974a2f3e07d8148ba123d8103b83",
@@ -58889,6 +60194,7 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "2a9fd031e33444e17cc94e6e3318fed6f5c35ab94b2e322c0ffc57c4dc1b2dda",
         "e0a8099c44bee41f88c186cfa51aca8988b8813ce047ecba4787bbc38b2b8de5",
         "d9661497efd399a1bbfdf5df8a00ff3d1d009ba33b3e1482b88ed2c7e455d0b8",
+        "28474d80965ebf4645b9ffe0006f7271bd77ed37042dcc6a94950049eb6a1c1b",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",
