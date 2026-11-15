@@ -45328,7 +45328,7 @@ async def post_setup_guild(request: web.Request) -> web.Response:
 # Bumpen, sobald sich Nutzungsbedingungen oder Auftragsverarbeitungsvereinbarung
 # inhaltlich aendern – dann muss jede Person erneut zustimmen, weil die alte
 # Zustimmung (an diese Version gebunden) nicht mehr passt.
-_CONSENT_VERSION = "2026-08-11"
+_CONSENT_VERSION = "2026-11-15"
 
 
 def _consent_ok(discord_user: Optional[Dict[str, Any]]) -> bool:
@@ -58429,15 +58429,17 @@ before a consumer arbitration board.</p>
 """
 
 _DATENSCHUTZ_DE = """
+<p><i>Stand: 15. November 2026</i></p>
 <h2>1. Verantwortlicher</h2>
 <p>Deacon Härschel, Roermonder Straße 48, 41812 Erkelenz<br>
 E-Mail: adminbrigardekillfeed@gmail.com</p>
 <h2>2. Übersicht der Verarbeitungen</h2>
-<p>Anmeldung über Discord, Betrieb des Discord-Bots (Server-, Kanal- und
-Rollenzuordnungen), dein eigener Nitrado-Zugang, die Server-Logs deines DayZ-Servers,
-Veröffentlichung erkannter Ereignisse in Discord, gespeicherte Statistiken und
-Einstellungen, Hosting, technische Protokolldateien sowie – falls genutzt – Spenden
-über PayPal.</p>
+<p>Anmeldung über Discord, Betrieb des Discord-Bots und seiner Community-Funktionen
+(u. a. Level-System, Tickets, Wortfilter, Honeypot, Glücksrad, Kredite, Shop), dein
+eigener Nitrado-Zugang, die Server-Logs deines DayZ-Servers, Veröffentlichung erkannter
+Ereignisse in Discord, das Spieler-Dashboard, die Verifizierung (Zweitaccount- und
+VPN-Erkennung), der KI-Helfer, Social-Feeds, Hosting, Protokolldateien sowie – falls
+genutzt – freiwillige Spenden über PayPal.</p>
 <h2>3. Anmeldung über Discord (OAuth)</h2>
 <p>Bei der Anmeldung übermittelt Discord deine Discord-ID, deinen Benutzernamen und dein
 Profilbild sowie die Discord-Server (Guilds), auf denen du Mitglied bist (angefragter
@@ -58445,13 +58447,29 @@ Umfang: <code>identify guilds</code> – keine Nachrichten, keine E-Mail-Adresse
 dabei ausgestellte Zugriffs-Token wird nur für diesen einen Anmeldevorgang verwendet
 und nicht gespeichert; ein dauerhafter Refresh-Token wird nicht angefordert.
 Rechtsgrundlage: Art. 6 Abs. 1 lit. b DSGVO (Erfüllung des Nutzungsverhältnisses).</p>
-<h2>4. Discord-Bot-Betrieb</h2>
+<h2>4. Discord-Bot-Betrieb und Community-Funktionen</h2>
 <p>Zur Beantwortung von Befehlen und zum Posten von Ereignissen verarbeitet der Bot
-Discord-Server-, Rollen-, Kanal- und Nachrichten-IDs sowie die ID der jeweiligen
-Interaktion. Diese Kennungen werden nur verarbeitet, soweit sie für die jeweilige
-Funktion (z. B. „in welchen Kanal posten") nötig sind, und dauerhaft nur insoweit
-gespeichert, wie du sie über das Dashboard einstellst (z. B. ein gewählter
-Feed-Kanal). Rechtsgrundlage: Art. 6 Abs. 1 lit. b DSGVO.</p>
+Discord-Server-, Rollen-, Kanal-, Nutzer- und Nachrichten-IDs, Benutzernamen sowie die
+ID der jeweiligen Interaktion. Je nachdem, welche Funktionen der Betreiber eines
+Discord-Servers einschaltet, kommen hinzu:</p>
+<ul>
+<li><b>Level-System:</b> Nutzer-ID, gesammelte Erfahrungspunkte und Level je Server.</li>
+<li><b>Tickets:</b> Inhalt der Ticket-Nachrichten; auf Wunsch des Betreibers wird beim
+Schließen ein Transkript in einen von ihm gewählten Kanal gepostet.</li>
+<li><b>Wortfilter und Honeypot:</b> der Text einer Nachricht wird automatisch geprüft;
+bei einem Treffer wird die Nachricht gelöscht bzw. das Konto nach den Einstellungen des
+Betreibers behandelt (z. B. Timeout, Kick, Bann) und der Vorgang im Log-Kanal des
+Betreibers vermerkt.</li>
+<li><b>Economy, Shop, Rollen-Shop, Gutscheine, Glücksrad, Kredite:</b> Kontostände,
+Käufe, Gewinne, Kredite und Rückzahlungen je Nutzer und Server.</li>
+<li><b>Willkommens-/Verlassen-Nachrichten, Reaction Roles:</b> Nutzer-ID, Name und ggf.
+Profilbild beim Posten der Nachricht bzw. beim Vergeben der Rolle.</li>
+</ul>
+<p>Dauerhaft gespeichert wird nur, was die jeweilige Funktion braucht. Für diese Daten
+der Mitglieder eines Discord-Servers handle ich im Auftrag des jeweiligen
+Server-Betreibers (siehe AVV). Rechtsgrundlage: Art. 6 Abs. 1 lit. b DSGVO gegenüber
+dem Betreiber, gegenüber den Mitgliedern Art. 6 Abs. 1 lit. f DSGVO (berechtigtes
+Interesse des Betreibers an Moderation und Community-Funktionen).</p>
 <h2>5. Dein Nitrado-Zugang</h2>
 <p>Verbindest du deinen eigenen Nitrado-Server, speichert der Dienst den von dir
 eingegebenen Nitrado-Token sowie die daraus abgeleiteten FTP-Zugangsdaten für genau
@@ -58461,195 +58479,353 @@ Abs. 1 lit. b DSGVO.</p>
 <h2>6. Server-Logs deines DayZ-Servers</h2>
 <p>Aus den Server-Logs deines Nitrado-Servers (ADM-Dateien) liest der Dienst
 Spielerkennungen/Gamertags, Kills, Treffer, Positionen, Verbindungszeitpunkte und ggf.
-Chat-Nachrichten aus, um Kill-Feed, Statistiken und Kartenanzeige zu betreiben. Diese
-Daten stammen nicht direkt von den betroffenen Spielern, sondern aus dem von dir
-betriebenen Server (Art. 14 DSGVO); für die ursprüngliche Erhebung gegenüber deinen
-Spielern bist du als Betreiber deines Servers selbst verantwortlich – siehe dazu die
-Auftragsverarbeitungsvereinbarung (AVV), abrufbar über den Fußbereich des Dashboards.</p>
+Chat-Nachrichten aus, um Kill-Feed, Statistiken, Spielzeiten und Kartenanzeige zu
+betreiben. Diese Daten stammen nicht direkt von den betroffenen Spielern, sondern aus
+dem von dir betriebenen Server (Art. 14 DSGVO); für die ursprüngliche Erhebung
+gegenüber deinen Spielern bist du als Betreiber deines Servers selbst verantwortlich –
+siehe dazu die Auftragsverarbeitungsvereinbarung (AVV).</p>
 <h2>7. Veröffentlichung in Discord-Kanälen</h2>
 <p>Erkannte Ereignisse (z. B. Kills, Verbindungen) veröffentlicht der Dienst in den von
 dir dafür ausgewählten Discord-Kanälen. Empfängerkreis sind alle Mitglieder deines
 Discord-Servers mit Zugriff auf den jeweiligen Kanal – wen du dort einlädst,
 entscheidest du.</p>
-<h2>8. Gespeicherte Statistiken, Einstellungen und Datenbanken</h2>
+<h2>8. Spieler-Dashboard, Kontoverknüpfung und Live-Karte</h2>
+<p>Spieler können ihr Discord-Konto mit ihrem Spielnamen verknüpfen (<code>/link</code>)
+und sich im Spieler-Dashboard über Discord anmelden. Dort werden ihre eigenen
+Statistiken, Kontostände, Käufe und – falls der Betreiber die Live-Karte freigibt –
+ihre letzte bekannte Position sowie gemerkte Orte angezeigt. Positionen anderer Spieler
+werden nur gezeigt, soweit der Betreiber das einstellt (z. B. Mitglieder desselben
+Teams). Rechtsgrundlage: Art. 6 Abs. 1 lit. b DSGVO (vom Spieler gewünschte Funktion)
+bzw. lit. f DSGVO.</p>
+<h2>9. Gespeicherte Statistiken, Einstellungen und Datenbanken</h2>
 <p>Kill-Statistiken, Spielzeiten, Wirtschafts-/Währungsdaten, Zonen, Shop-Käufe,
 Banliste, Whitelist, Ankündigungen und geplante Aufgaben werden gespeichert, solange
 der zugehörige Server-Zugang bei diesem Dienst besteht. Trennst du die Verbindung zu
 deinem Server, werden diese Daten NICHT automatisch gelöscht, damit sie bei erneutem
 Verbinden wieder vorliegen; eine Löschung kannst du jederzeit per E-Mail an die oben
 genannte Adresse verlangen.</p>
-<h2>9. Hosting</h2>
+<h2>10. Verifizierung (Zweitaccount- und VPN-Erkennung)</h2>
+<p>Schaltet der Betreiber eines Discord-Servers die Verifizierung ein, öffnen neue
+Mitglieder über einen persönlichen Einmal-Link eine Prüfseite dieses Dienstes. Dabei
+werden verarbeitet:</p>
+<ul>
+<li>die <b>IP-Adresse</b> des Aufrufs und eine <b>zufällige Gerätekennung</b>, die die
+Seite im Browser ablegt (Cookie <code>bkf_geraet</code> und lokaler Speicher, Laufzeit
+bis zu 5 Jahre). Es findet kein Browser-Fingerprinting statt.</li>
+<li>Gespeichert werden IP-Adresse und Gerätekennung <b>nur als verschlüsselter Hash</b>
+(HMAC mit geheimem Schlüssel), nicht im Klartext; private und lokale IP-Adressen werden
+nicht verwendet.</li>
+<li>Discord-ID, Benutzername, Kontoalter, Zeitpunkte der Verifizierung, das Ergebnis
+(z. B. verifiziert, Zweitaccount, VPN) und Bans/Kicks auf Servern mit aktiver
+Verifizierung.</li>
+</ul>
+<p><b>Abgleich:</b> Teilt ein Konto IP-Hash oder Gerätekennung mit einem bereits bekannten
+Konto, wird es als Zweitaccount erkannt – <b>auch serverübergreifend</b> über alle
+Discord-Server, die diesen Dienst mit Verifizierung nutzen. Den Betreibern wird dabei
+nur angezeigt, welches Konto mit welchem verknüpft ist; IP-Adressen werden niemandem
+angezeigt. Auf anderen Servern werden Bans/Kicks („Lens“) nur angezeigt, wenn der
+jeweilige Server das Teilen eingeschaltet hat und du es nicht mit
+<code>/privacy lens</code> abgeschaltet hast.</p>
+<p><b>VPN-Prüfung:</b> Hat der Betreiber sie eingeschaltet, wird die IP-Adresse zur
+Prüfung an proxycheck.io (Proxycheck Ltd., Vereinigtes Königreich) übermittelt; für das
+Vereinigte Königreich besteht ein Angemessenheitsbeschluss der EU-Kommission.</p>
+<p><b>Zweck und Rechtsgrundlage:</b> Schutz der Discord-Server vor Bann-Umgehung,
+Mehrfachkonten und Missbrauch – Art. 6 Abs. 1 lit. f DSGVO. Für den serverübergreifenden
+Abgleich bin ich Verantwortlicher; über das Einschalten und die Folgen auf seinem Server
+(keine Aktion, Blockieren, Kick, Bann) entscheidet der jeweilige Betreiber. Das Ablegen
+der Gerätekennung erfolgt, weil es für die vom Mitglied angeforderte Verifizierung
+unbedingt erforderlich ist (§ 25 Abs. 2 Nr. 2 TDDDG).</p>
+<p><b>Speicherdauer:</b> nach Einstellung des Betreibers (Standard 24 Monate seit der
+letzten Aktivität), Einmal-Links verfallen nach kurzer Zeit (Standard 10 Minuten).</p>
+<p><b>Deine Möglichkeiten:</b> Mit <code>/privacy export</code> erhältst du deine
+gespeicherten Daten, mit <code>/privacy delete</code> löschst du sie, mit
+<code>/privacy lens</code> verhinderst du die Anzeige deiner Bans/Kicks auf anderen
+Servern. Bei einer Ablehnung kannst du dich an das Team des Servers oder an mich wenden
+und eine Überprüfung durch einen Menschen verlangen.</p>
+<h2>11. KI-Helfer</h2>
+<p>Schaltet der Betreiber den KI-Helfer ein, werden die Frage bzw. die Ticket-Nachricht,
+die vom Betreiber hinterlegten Server-Informationen und der Verlauf der Unterhaltung zur
+Erstellung einer Antwort an OpenRouter (OpenRouter, Inc., USA) und von dort an das
+gewählte KI-Modell übermittelt. Discord-IDs werden nicht mitgeschickt. Hinterlegt der
+Betreiber einen eigenen Schlüssel oder eigenen Anbieter, gehen die Daten an diesen
+Anbieter. Bei kostenlosen Modellen können die Anbieter der Modelle Eingaben nach ihren eigenen Bedingungen speichern oder auswerten. Gib dem KI-Helfer deshalb keine sensiblen Daten. Antworten der KI können falsch sein.
+Rechtsgrundlage: Art. 6 Abs. 1 lit. f DSGVO; zur Übermittlung in die USA siehe Ziffer
+19.</p>
+<h2>12. Social-Feeds</h2>
+<p>Für Social-Feeds (z. B. YouTube, DayZ-News, Nitrado-Status) ruft der Dienst öffentliche
+Feeds der jeweiligen Anbieter ab und postet neue Beiträge in den gewählten Kanal. Dabei
+werden keine Daten deiner Mitglieder an diese Anbieter übermittelt; der Anbieter sieht
+nur die Abrufe des Servers dieses Dienstes.</p>
+<h2>13. Hosting</h2>
 <p>Dieses Dashboard läuft auf Servern von PebbleHost. Beim Aufruf verarbeitet PebbleHost
 technisch notwendige Verbindungsdaten (u. a. IP-Adresse).</p>
-<h2>10. Protokolldateien</h2>
+<h2>14. Protokolldateien</h2>
 <p>Das technische Anwendungsprotokoll auf dem Server hält Betriebsmeldungen fest und
-kann dabei Servernamen sowie Namen aus verarbeiteten Ereignissen enthalten; es wird
-nicht automatisch rotiert oder gelöscht. Getrennt davon führt das Dashboard ein
-Verwaltungsprotokoll der letzten 500 Aktionen (wer hat wann welche Einstellung
-geändert) zur Nachvollziehbarkeit und Missbrauchserkennung. Ein eigenes
-HTTP-Zugriffsprotokoll führt der Dienst NICHT; rein verbindungstechnische Daten (z. B.
-IP-Adresse beim Seitenaufruf) fallen ausschließlich beim Hosting-Anbieter an (siehe
-Ziffer 9). Rechtsgrundlage jeweils: Art. 6 Abs. 1 lit. f DSGVO (berechtigtes Interesse
-an Betrieb, Fehlersuche und Missbrauchsschutz).</p>
-<h2>11. Spenden</h2>
-<p>Freiwillige Spenden können über PayPal (PayPal (Europe) S.à r.l. et Cie, S.C.A.,
-22-24 Boulevard Royal, L-2449 Luxemburg) abgewickelt werden. Entscheidest du dich für
-eine Spende, verarbeitet PayPal die dafür nötigen Zahlungsdaten (u. a. Name,
-Zahlungsbetrag, Transaktionsdaten) in eigener Verantwortung nach dessen eigener
-Datenschutzerklärung
+kann dabei Servernamen sowie Namen aus verarbeiteten Ereignissen enthalten. Getrennt
+davon führt das Dashboard ein Verwaltungsprotokoll der letzten 500 Aktionen (wer hat
+wann welche Einstellung geändert) zur Nachvollziehbarkeit und Missbrauchserkennung. Ein
+eigenes HTTP-Zugriffsprotokoll führt der Dienst NICHT. Rechtsgrundlage jeweils: Art. 6
+Abs. 1 lit. f DSGVO (berechtigtes Interesse an Betrieb, Fehlersuche und
+Missbrauchsschutz).</p>
+<h2>15. Freiwillige Spenden</h2>
+<p>Die Nutzung ist kostenlos. Freiwillige Spenden ohne Gegenleistung können über PayPal
+(PayPal (Europe) S.à r.l. et Cie, S.C.A., 22-24 Boulevard Royal, L-2449 Luxemburg)
+abgewickelt werden. PayPal verarbeitet die dafür nötigen Zahlungsdaten in eigener
+Verantwortung nach seiner Datenschutzerklärung
 (<a href="https://www.paypal.com/de/webapps/mpp/ua/privacy-full" target="_blank"
-rel="noopener noreferrer">paypal.com/de/webapps/mpp/ua/privacy-full</a>). Als
-Empfänger der Spende erhalte ich dabei ebenfalls Name, ggf. E-Mail-Adresse, Betrag und
-Transaktionsdaten und verarbeite diese zur Zuordnung sowie für eigene steuerliche
-Aufzeichnungspflichten. Rechtsgrundlage: Art. 6 Abs. 1 lit. b und lit. c DSGVO.</p>
-<h2>12. Kontaktaufnahme per E-Mail</h2>
+rel="noopener noreferrer">paypal.com/de/webapps/mpp/ua/privacy-full</a>). Ich erhalte
+dabei Name, ggf. E-Mail-Adresse, Betrag und Transaktionsdaten und verarbeite diese zur
+Zuordnung sowie für gesetzliche Aufzeichnungspflichten. Rechtsgrundlage: Art. 6 Abs. 1
+lit. b und lit. c DSGVO.</p>
+<h2>16. Kontaktaufnahme per E-Mail</h2>
 <p>Schreibst du mich unter der oben genannten E-Mail-Adresse an, verarbeite ich deine
 Angaben (u. a. Absenderadresse, Inhalt) ausschließlich zur Bearbeitung deines
 Anliegens. Rechtsgrundlage: Art. 6 Abs. 1 lit. b bzw. lit. f DSGVO.</p>
-<h2>13. Cookies / Session</h2>
-<p>Zur Anmeldung wird ein technisch notwendiges Session-Cookie gesetzt, das nach
-maximal 12 Stunden Inaktivität automatisch abläuft. Es enthält keine Trackingfunktion
-und wird nicht zu Werbezwecken genutzt. Rechtsgrundlage: Art. 6 Abs. 1 lit. f DSGVO
-sowie § 25 Abs. 2 Nr. 2 TDDDG (das Cookie ist zur Erbringung des von dir ausdrücklich
-gewünschten Dienstes unbedingt erforderlich).</p>
-<h2>14. Empfänger und Auftragsverarbeiter</h2>
-<p>Je nach Verarbeitung sind Empfänger: Discord (Login, Veröffentlichung in deinen
-Kanälen), Nitrado (dein eigener Server-Zugang), PebbleHost (Hosting) und – bei
-Spenden – PayPal.</p>
-<h2>15. Übermittlung in Drittländer</h2>
-<p>Bei einzelnen der genannten Dienste kann es zu einer Übermittlung in Länder
-außerhalb der EU/des EWR kommen. Die jeweiligen Anbieter sind hierfür nach eigenen
-Angaben zu geeigneten Garantien verpflichtet (z. B. EU-Standardvertragsklauseln);
-Einzelheiten stehen in den Datenschutzhinweisen der jeweiligen Anbieter.</p>
-<h2>16. Speicherdauer und Löschung</h2>
+<h2>17. Cookies und lokaler Speicher</h2>
+<p>Es werden nur technisch notwendige Cookies verwendet, keine Tracking- oder
+Werbe-Cookies: das Session-Cookie zur Anmeldung (läuft nach max. 12 Stunden Inaktivität
+ab), ein kurzlebiges Cookie zur Absicherung der Discord-Anmeldung (wenige Minuten) und
+auf der Verifizierungsseite die Gerätekennung <code>bkf_geraet</code> (siehe Ziffer 10).
+Die gewählte Sprache wird auf dem Server und im Browser (lokaler Speicher) gemerkt. Rechtsgrundlage: § 25 Abs. 2 Nr. 2
+TDDDG und Art. 6 Abs. 1 lit. f DSGVO.</p>
+<h2>18. Empfänger und Auftragsverarbeiter</h2>
+<p>Je nach Verarbeitung sind Empfänger: Discord (Login, Bot, Veröffentlichung in
+Kanälen), Nitrado (dein eigener Server-Zugang), PebbleHost (Hosting), OpenRouter und
+das gewählte KI-Modell (nur bei aktivem KI-Helfer), proxycheck.io (nur bei aktiver
+VPN-Prüfung), die Betreiber der Discord-Server, auf denen du verifiziert wirst (nur
+Ergebnis und verknüpfte Konten, keine IP-Adressen) und – bei Spenden – PayPal.</p>
+<h2>19. Übermittlung in Drittländer</h2>
+<p>Discord und OpenRouter haben ihren Sitz in den USA. Eine Übermittlung erfolgt auf
+Grundlage des EU-US Data Privacy Framework, soweit der Anbieter zertifiziert ist, sonst
+auf Grundlage von EU-Standardvertragsklauseln (Art. 46 DSGVO). Für proxycheck.io
+(Vereinigtes Königreich) gilt ein Angemessenheitsbeschluss. Einzelheiten stehen in den
+Datenschutzhinweisen der jeweiligen Anbieter.</p>
+<h2>20. Speicherdauer und Löschung</h2>
 <p>Session-Cookie: max. 12 Stunden. Verwaltungsprotokoll: rollierend, letzte 500
-Aktionen. Anwendungsprotokoll: unbegrenzt, keine automatische Rotation. Server- und
-Spielerdaten (Kills, Zonen, Economy, Banliste u. Ä.): bis zur Löschung auf Anfrage,
-auch nach Trennen deiner Server-Verbindung (siehe Ziffer 8). E-Mail-Anfragen: bis zur
-Erledigung.</p>
-<h2>17. Automatisierte Entscheidungen</h2>
-<p>Es findet keine automatisierte Entscheidungsfindung einschließlich Profiling im
-Sinne von Art. 22 DSGVO statt.</p>
-<h2>18. Folgen fehlender Datenbereitstellung</h2>
+Aktionen. Verifizierungsdaten: nach Einstellung des Server-Betreibers, Standard 24
+Monate seit letzter Aktivität. Server-, Spieler- und Community-Daten (Kills, Zonen,
+Economy, Level, Banliste u. Ä.): bis zur Löschung auf Anfrage, auch nach Trennen deiner
+Server-Verbindung (siehe Ziffer 9). E-Mail-Anfragen: bis zur Erledigung.</p>
+<h2>21. Automatisierte Entscheidungen</h2>
+<p>Bei der Verifizierung, dem Wortfilter und dem Honeypot können automatisch Folgen
+eintreten (z. B. keine Freischaltung, Löschen einer Nachricht, Kick oder Bann), wenn der
+Server-Betreiber das so eingestellt hat. Diese Folgen betreffen nur den Zugang zu dem
+jeweiligen Discord-Server. Du kannst jederzeit verlangen, dass ein Mensch die
+Entscheidung überprüft – wende dich dazu an das Team des Servers (z. B. dort per
+<code>/manverify</code> freischaltbar) oder an mich, und du kannst deinen Standpunkt
+darlegen (Art. 22 Abs. 3 DSGVO). Ein Profiling zu Werbezwecken findet nicht statt.</p>
+<h2>22. Folgen fehlender Datenbereitstellung</h2>
 <p>Ohne Anmeldung über Discord und ohne die Zugangsdaten deines Nitrado-Servers kann
-der Dienst nicht genutzt werden – diese Angaben sind für die Erbringung notwendig.</p>
-<h2>19. Deine Rechte</h2>
+der Dienst nicht genutzt werden. Ohne die Verifizierung erhältst du auf Servern, die sie
+verlangen, unter Umständen keinen Zugang.</p>
+<h2>23. Deine Rechte</h2>
 <p>Du hast das Recht auf Auskunft, Berichtigung, Löschung, Einschränkung der
-Verarbeitung, Datenübertragbarkeit und Widerspruch gegen die Verarbeitung deiner
-Daten. Wende dich dazu an die oben genannte E-Mail-Adresse. Außerdem hast du das
-Recht, dich bei einer Datenschutz-Aufsichtsbehörde zu beschweren. Betreibst du selbst
-einen Server über diesen Dienst, gilt für die Verarbeitung der Daten deiner Spieler
-zusätzlich die Auftragsverarbeitungsvereinbarung (AVV).</p>
+Verarbeitung und Datenübertragbarkeit. Wende dich dazu an die oben genannte
+E-Mail-Adresse; für Verifizierungsdaten stehen dir zusätzlich die Befehle
+<code>/privacy export</code> und <code>/privacy delete</code> zur Verfügung. Außerdem
+hast du das Recht, dich bei einer Datenschutz-Aufsichtsbehörde zu beschweren, z. B. bei
+der Landesbeauftragten für Datenschutz und Informationsfreiheit Nordrhein-Westfalen.
+Betreibst du selbst einen Server über diesen Dienst, gilt für die Verarbeitung der Daten
+deiner Spieler und Mitglieder zusätzlich die Auftragsverarbeitungsvereinbarung
+(AVV).</p>
+<p><b>Widerspruchsrecht (Art. 21 DSGVO):</b> Soweit eine Verarbeitung auf Art. 6 Abs. 1
+lit. f DSGVO beruht, kannst du aus Gründen, die sich aus deiner besonderen Situation
+ergeben, jederzeit widersprechen.</p>
 """
 
 _DATENSCHUTZ_EN = """
+<p><i>Last updated: 15 November 2026</i></p>
 <h2>1. Controller</h2>
 <p>Deacon Härschel, Roermonder Straße 48, 41812 Erkelenz, Germany<br>
 Email: adminbrigardekillfeed@gmail.com</p>
 <h2>2. Overview of processing</h2>
-<p>Login via Discord, operating the Discord bot (server, channel, and role
-assignments), your own Nitrado access, the server logs of your DayZ server,
-publishing recognised events in Discord, stored statistics and settings, hosting,
-technical log files, and – if used – donations via PayPal.</p>
+<p>Login via Discord, operation of the Discord bot and its community features (including
+level system, tickets, word filter, honeypot, wheel of fortune, loans, shop), your own
+Nitrado access, the server logs of your DayZ server, publication of detected events in
+Discord, the player dashboard, verification (alt account and VPN detection), the AI
+helper, social feeds, hosting, log files and – if used – voluntary donations via
+PayPal.</p>
 <h2>3. Login via Discord (OAuth)</h2>
-<p>When you log in, Discord transmits your Discord ID, username, and avatar, plus the
-Discord servers (guilds) you are a member of (scope requested:
-<code>identify guilds</code> – no messages, no email address). The access token
-issued for this is used only for the login itself and is not stored; no long-lived
-refresh token is requested. Legal basis: Art. 6(1)(b) GDPR (performance of the usage
-relationship).</p>
-<h2>4. Discord bot operation</h2>
-<p>To respond to commands and post events, the bot processes Discord server, role,
-channel, and message IDs as well as the ID of the respective interaction. These
-identifiers are only processed as far as needed for the relevant feature, and only
-stored long-term to the extent you configure it in the dashboard (e.g. a chosen feed
-channel). Legal basis: Art. 6(1)(b) GDPR.</p>
+<p>When you log in, Discord transmits your Discord ID, username and avatar as well as
+the Discord servers (guilds) you are a member of (requested scope:
+<code>identify guilds</code> – no messages, no email address). The access token issued
+is used only for this one login and is not stored; no permanent refresh token is
+requested. Legal basis: Art. 6(1)(b) GDPR (performance of the user relationship).</p>
+<h2>4. Discord bot operation and community features</h2>
+<p>To answer commands and post events, the bot processes Discord server, role, channel,
+user and message IDs, usernames and the ID of the respective interaction. Depending on
+which features the operator of a Discord server enables, the following is added:</p>
+<ul>
+<li><b>Level system:</b> user ID, collected experience points and level per server.</li>
+<li><b>Tickets:</b> content of ticket messages; if the operator wishes, a transcript is
+posted to a channel of their choice when the ticket is closed.</li>
+<li><b>Word filter and honeypot:</b> the text of a message is checked automatically; on
+a match the message is deleted or the account is handled according to the operator's
+settings (e.g. timeout, kick, ban) and the event is noted in the operator's log
+channel.</li>
+<li><b>Economy, shop, role shop, coupons, wheel of fortune, loans:</b> balances,
+purchases, prizes, loans and repayments per user and server.</li>
+<li><b>Welcome/leave messages, reaction roles:</b> user ID, name and, where applicable,
+avatar when posting the message or assigning the role.</li>
+</ul>
+<p>Only what the respective feature needs is stored permanently. For this data of the
+members of a Discord server I act on behalf of the respective server operator (see
+DPA). Legal basis: Art. 6(1)(b) GDPR towards the operator; towards members Art.
+6(1)(f) GDPR (legitimate interest of the operator in moderation and community
+features).</p>
 <h2>5. Your Nitrado access</h2>
-<p>If you connect your own Nitrado server, the Service stores the Nitrado token you
-enter and the FTP credentials derived from it, for that server only. This access data
-is used exclusively to operate your own server and is not shared with other
-customers. Legal basis: Art. 6(1)(b) GDPR.</p>
-<h2>6. Your DayZ server's logs</h2>
-<p>From your Nitrado server's logs (ADM files), the Service reads player
-identifiers/gamertags, kills, hits, positions, connection times, and possibly chat
-messages, in order to operate the kill feed, statistics, and map display. This data
-does not come directly from the affected players, but from the server you operate
-(Art. 14 GDPR); you, as the operator of your server, remain responsible for the
-original collection towards your players – see the Data Processing Agreement (DPA),
-available via the dashboard footer.</p>
+<p>If you connect your own Nitrado server, the service stores the Nitrado token you
+enter and the FTP credentials derived from it for exactly this server. These
+credentials are used exclusively to operate your own server and are not shared with
+other customers. Legal basis: Art. 6(1)(b) GDPR.</p>
+<h2>6. Server logs of your DayZ server</h2>
+<p>From the server logs of your Nitrado server (ADM files) the service reads player
+identifiers/gamertags, kills, hits, positions, connection times and, where applicable,
+chat messages in order to operate the kill feed, statistics, playtime and map display.
+This data does not come directly from the players concerned but from the server you
+operate (Art. 14 GDPR); as the operator of your server you are responsible for the
+original collection from your players – see the Data Processing Agreement (DPA).</p>
 <h2>7. Publication in Discord channels</h2>
-<p>Recognised events (e.g. kills, connections) are published by the Service in the
-Discord channels you select for this. The recipients are all members of your Discord
-server with access to that channel – who you invite there is your decision.</p>
-<h2>8. Stored statistics, settings, and databases</h2>
-<p>Kill statistics, play time, economy/currency data, zones, shop purchases, ban
-list, whitelist, announcements, and scheduled tasks are stored for as long as the
-associated server access exists with this Service. If you disconnect your server,
-this data is NOT automatically deleted, so it is available again if you reconnect;
-you can request deletion at any time via email to the address above.</p>
-<h2>9. Hosting</h2>
-<p>This dashboard runs on servers provided by PebbleHost. When you access it,
-PebbleHost processes technically necessary connection data (including your IP
-address).</p>
-<h2>10. Log files</h2>
-<p>The technical application log on the server records operational messages and may
-contain server names as well as names from processed events; it is not automatically
-rotated or deleted. Separately, the dashboard keeps an administration log of the last
-500 actions (who changed which setting, and when) for traceability and abuse
-detection. The Service does NOT keep its own HTTP access log; purely
-connection-technical data (e.g. IP address on page load) is only processed by the
-hosting provider (see item 9). Legal basis in each case: Art. 6(1)(f) GDPR
-(legitimate interest in operation, troubleshooting, and abuse prevention).</p>
-<h2>11. Donations</h2>
-<p>Voluntary donations can be made via PayPal (PayPal (Europe) S.à r.l. et Cie,
-S.C.A., 22-24 Boulevard Royal, L-2449 Luxembourg). If you choose to donate, PayPal
-processes the payment data required for this (including name, payment amount,
-transaction data) under its own responsibility, based on its own privacy policy
-(<a href="https://www.paypal.com/en/webapps/mpp/ua/privacy-full" target="_blank"
-rel="noopener noreferrer">paypal.com/en/webapps/mpp/ua/privacy-full</a>). As the
-recipient of the donation, I also receive name, email address (if provided to
-PayPal), amount, and transaction data, and process this for allocation and for my
-own tax record-keeping obligations. Legal basis: Art. 6(1)(b) and (c) GDPR.</p>
-<h2>12. Contacting me by email</h2>
+<p>Detected events (e.g. kills, connections) are published in the Discord channels you
+selected for this purpose. Recipients are all members of your Discord server with
+access to the respective channel – you decide whom you invite there.</p>
+<h2>8. Player dashboard, account linking and live map</h2>
+<p>Players can link their Discord account to their in-game name (<code>/link</code>) and
+log in to the player dashboard via Discord. It shows their own statistics, balances,
+purchases and – if the operator enables the live map – their last known position and
+saved places. Positions of other players are only shown as far as the operator sets
+this up (e.g. members of the same team). Legal basis: Art. 6(1)(b) GDPR (feature
+requested by the player) or Art. 6(1)(f) GDPR.</p>
+<h2>9. Stored statistics, settings and databases</h2>
+<p>Kill statistics, playtimes, economy/currency data, zones, shop purchases, ban list,
+whitelist, announcements and scheduled tasks are stored as long as the associated
+server access exists with this service. If you disconnect your server, this data is
+NOT deleted automatically so that it is available again when you reconnect; you can
+request deletion at any time by email to the address above.</p>
+<h2>10. Verification (alt account and VPN detection)</h2>
+<p>If the operator of a Discord server enables verification, new members open a check
+page of this service via a personal one-time link. The following is processed:</p>
+<ul>
+<li>the <b>IP address</b> of the request and a <b>random device identifier</b> that the
+page stores in the browser (cookie <code>bkf_geraet</code> and local storage, lifetime
+up to 5 years). No browser fingerprinting takes place.</li>
+<li>IP address and device identifier are stored <b>only as an encrypted hash</b> (HMAC
+with a secret key), not in plain text; private and local IP addresses are not
+used.</li>
+<li>Discord ID, username, account age, times of verification, the result (e.g.
+verified, alt account, VPN) and bans/kicks on servers with verification enabled.</li>
+</ul>
+<p><b>Matching:</b> If an account shares an IP hash or device identifier with an already
+known account, it is detected as an alt account – <b>also across servers</b>, across all
+Discord servers that use this service with verification. Operators are only shown which
+account is linked to which; IP addresses are never shown to anyone. Bans/kicks are only
+shown on other servers ("Lens") if that server has sharing enabled and you have not
+turned it off with <code>/privacy lens</code>.</p>
+<p><b>VPN check:</b> If the operator enabled it, the IP address is transmitted to
+proxycheck.io (Proxycheck Ltd., United Kingdom) for checking; an adequacy decision of
+the EU Commission exists for the United Kingdom.</p>
+<p><b>Purpose and legal basis:</b> protecting Discord servers against ban evasion,
+multiple accounts and abuse – Art. 6(1)(f) GDPR. I am the controller for the
+cross-server matching; the respective operator decides on enabling it and on the
+consequences on their server (no action, block, kick, ban). The device identifier is
+stored because it is strictly necessary for the verification requested by the member
+(Section 25(2) No. 2 TDDDG).</p>
+<p><b>Retention:</b> according to the operator's setting (default 24 months since last
+activity); one-time links expire after a short time (default 10 minutes).</p>
+<p><b>Your options:</b> <code>/privacy export</code> gives you your stored data,
+<code>/privacy delete</code> deletes it, <code>/privacy lens</code> prevents your
+bans/kicks from being shown on other servers. If you are rejected, you can contact the
+server's team or me and request a review by a human.</p>
+<h2>11. AI helper</h2>
+<p>If the operator enables the AI helper, the question or ticket message, the server
+information provided by the operator and the conversation history are transmitted to
+OpenRouter (OpenRouter, Inc., USA) and from there to the selected AI model to generate
+an answer. Discord IDs are not sent. If the operator provides their own key or
+provider, the data goes to that provider. With free models, the model providers may
+store or evaluate inputs under their own terms. Therefore do not give the AI helper any
+sensitive data. AI answers can be wrong. Legal basis: Art. 6(1)(f) GDPR; for the
+transfer to the USA see Section 19.</p>
+<h2>12. Social feeds</h2>
+<p>For social feeds (e.g. YouTube, DayZ news, Nitrado status) the service retrieves
+public feeds of the respective providers and posts new entries to the selected channel.
+No data of your members is transmitted to these providers; they only see requests
+from this service's server.</p>
+<h2>13. Hosting</h2>
+<p>This dashboard runs on servers of PebbleHost. When it is accessed, PebbleHost
+processes technically necessary connection data (including IP address).</p>
+<h2>14. Log files</h2>
+<p>The technical application log on the server records operating messages and may
+contain server names and names from processed events. Separately, the dashboard keeps
+an administration log of the last 500 actions (who changed which setting when) for
+traceability and abuse detection. The service does NOT keep its own HTTP access log.
+Legal basis in each case: Art. 6(1)(f) GDPR (legitimate interest in operation,
+troubleshooting and abuse prevention).</p>
+<h2>15. Voluntary donations</h2>
+<p>Use of the service is free of charge. Voluntary donations without consideration can
+be made via PayPal (PayPal (Europe) S.à r.l. et Cie, S.C.A., 22-24 Boulevard Royal,
+L-2449 Luxembourg). PayPal processes the necessary payment data under its own
+responsibility according to its privacy policy
+(<a href="https://www.paypal.com/de/webapps/mpp/ua/privacy-full" target="_blank"
+rel="noopener noreferrer">paypal.com/de/webapps/mpp/ua/privacy-full</a>). I receive
+name, possibly email address, amount and transaction data and process them for
+allocation and for statutory record-keeping obligations. Legal basis: Art. 6(1)(b) and
+(c) GDPR.</p>
+<h2>16. Contact by email</h2>
 <p>If you write to me at the email address above, I process your details (including
-sender address, content) exclusively to handle your request. Legal basis:
-Art. 6(1)(b) or (f) GDPR.</p>
-<h2>13. Cookies / session</h2>
-<p>A technically necessary session cookie is set on login, which automatically
-expires after a maximum of 12 hours of inactivity. It has no tracking function and is
-not used for advertising purposes. Legal basis: Art. 6(1)(f) GDPR as well as
-§ 25(2) No. 2 TDDDG (German Telecommunications-Digital-Services-Data-Protection Act;
-the cookie is strictly necessary to provide the service you explicitly requested).</p>
-<h2>14. Recipients and processors</h2>
-<p>Depending on the processing, recipients are: Discord (login, publishing in your
-channels), Nitrado (your own server access), PebbleHost (hosting), and – for
-donations – PayPal.</p>
-<h2>15. Transfers to third countries</h2>
-<p>For some of the services named above, data may be transferred to countries
-outside the EU/EEA. The respective providers state that they are obliged to provide
-suitable safeguards for this (e.g. EU standard contractual clauses); details are set
-out in the respective providers' own privacy policies.</p>
-<h2>16. Storage period and deletion</h2>
+sender address, content) solely to handle your request. Legal basis: Art. 6(1)(b) or
+(f) GDPR.</p>
+<h2>17. Cookies and local storage</h2>
+<p>Only technically necessary cookies are used, no tracking or advertising cookies: the
+session cookie for login (expires after at most 12 hours of inactivity), a short-lived
+cookie securing the Discord login (a few minutes) and, on the verification page, the
+device identifier <code>bkf_geraet</code> (see Section 10). The selected language is
+remembered on the server and in the browser (local storage). Legal basis: Section 25(2)
+No. 2 TDDDG and Art. 6(1)(f) GDPR.</p>
+<h2>18. Recipients and processors</h2>
+<p>Depending on the processing, recipients are: Discord (login, bot, publication in
+channels), Nitrado (your own server access), PebbleHost (hosting), OpenRouter and the
+selected AI model (only with the AI helper enabled), proxycheck.io (only with the VPN
+check enabled), the operators of the Discord servers where you are verified (only the
+result and linked accounts, no IP addresses) and – for donations – PayPal.</p>
+<h2>19. Transfers to third countries</h2>
+<p>Discord and OpenRouter are based in the USA. Transfers take place on the basis of the
+EU-US Data Privacy Framework where the provider is certified, otherwise on the basis of
+EU standard contractual clauses (Art. 46 GDPR). For proxycheck.io (United Kingdom) an
+adequacy decision applies. Details can be found in the privacy notices of the
+respective providers.</p>
+<h2>20. Retention and deletion</h2>
 <p>Session cookie: max. 12 hours. Administration log: rolling, last 500 actions.
-Application log: unlimited, no automatic rotation. Server and player data (kills,
-zones, economy, ban list, etc.): until deletion is requested, even after
-disconnecting your server (see item 8). Email enquiries: until resolved.</p>
-<h2>17. Automated decisions</h2>
-<p>No automated decision-making, including profiling, within the meaning of
-Art. 22 GDPR takes place.</p>
-<h2>18. Consequences of not providing data</h2>
-<p>Without logging in via Discord and without your Nitrado server's credentials, the
-Service cannot be used – this data is necessary to provide it.</p>
-<h2>19. Your rights</h2>
-<p>You have the right to access, rectification, erasure, restriction of processing,
-data portability, and objection to the processing of your data. Contact the email
-address above to exercise these rights. You also have the right to lodge a complaint
-with a data protection supervisory authority. If you operate a server through this
-Service yourself, the Data Processing Agreement (DPA) additionally applies to the
-processing of your players' data.</p>
+Verification data: according to the server operator's setting, default 24 months since
+last activity. Server, player and community data (kills, zones, economy, levels, ban
+list etc.): until deletion on request, even after disconnecting your server (see
+Section 9). Email requests: until resolved.</p>
+<h2>21. Automated decisions</h2>
+<p>Verification, the word filter and the honeypot can automatically lead to
+consequences (e.g. no access, deletion of a message, kick or ban) if the server
+operator has set them up that way. These consequences only concern access to the
+respective Discord server. You can request at any time that a human reviews the
+decision – contact the server's team (who can unlock you there with
+<code>/manverify</code>) or me – and you can express your point of view (Art. 22(3)
+GDPR). No profiling for advertising purposes takes place.</p>
+<h2>22. Consequences of not providing data</h2>
+<p>Without logging in via Discord and without the credentials of your Nitrado server the
+service cannot be used. Without verification you may not get access to servers that
+require it.</p>
+<h2>23. Your rights</h2>
+<p>You have the right of access, rectification, erasure, restriction of processing and
+data portability. Contact the email address above; for verification data you can also
+use the commands <code>/privacy export</code> and <code>/privacy delete</code>. You
+also have the right to lodge a complaint with a data protection supervisory authority,
+e.g. the State Commissioner for Data Protection and Freedom of Information of North
+Rhine-Westphalia. If you operate a server through this service yourself, the Data
+Processing Agreement (DPA) also applies to the processing of your players' and members'
+data.</p>
+<p><b>Right to object (Art. 21 GDPR):</b> Where processing is based on Art. 6(1)(f)
+GDPR, you can object at any time on grounds relating to your particular situation.</p>
 """
 
 _NUTZUNGSBEDINGUNGEN_DE = """
+<p><i>Stand: 15. November 2026</i></p>
 <h2>1. Geltungsbereich</h2>
 <p>Diese Nutzungsbedingungen gelten für die Nutzung des Discord-Bots und
 Web-Dashboards „Brigarde Killfeed" (im Folgenden „der Dienst"), betrieben von
@@ -58661,36 +58837,60 @@ akzeptierst du diese Nutzungsbedingungen sowie die Auftragsverarbeitungsvereinba
 Discord-Server auswählst und diese Nutzungsbedingungen samt AVV ausdrücklich
 akzeptierst.</p>
 <h2>3. Mindestalter</h2>
-<p>Die Nutzung ist Personen ab 18 Jahren vorbehalten. Mit der Nutzung bestätigst du,
-mindestens 18 Jahre alt zu sein.</p>
+<p>Die Einrichtung und Verwaltung eines Servers über das Dashboard ist Personen ab 18
+Jahren vorbehalten. Mit der Nutzung bestätigst du, mindestens 18 Jahre alt zu sein.
+Für Mitglieder, die nur Bot-Befehle auf einem Discord-Server nutzen, gelten zusätzlich
+die Altersvorgaben von Discord.</p>
 <h2>4. Leistungsbeschreibung</h2>
 <p>Der Dienst verbindet einen von dir bereitgestellten Nitrado-DayZ-Server mit Discord
-und einem Web-Dashboard, u. a. für Kill-Feeds, Statistiken, Einstellungen und
-automatisierte Aufgaben.</p>
+und einem Web-Dashboard, u. a. für Kill-Feeds, Statistiken, Economy und Shop,
+Community-Funktionen (z. B. Level-System, Tickets, Wortfilter, Honeypot, Glücksrad),
+Verifizierung neuer Mitglieder, einen KI-Helfer, Social-Feeds und automatisierte
+Aufgaben. Einzelne Funktionen können als „Beta" oder „in Wartung" gekennzeichnet,
+eingeschränkt oder eingestellt werden.</p>
 <h2>5. Bestätigung deiner Berechtigung</h2>
 <p>Mit dem Verbinden eines Nitrado-Servers bestätigst du, Eigentümer oder von Nitrado
 autorisierter Administrator dieses Servers zu sein und berechtigt zu sein, seine
-Zugangsdaten und Server-Logs an diesen Dienst weiterzugeben.</p>
+Zugangsdaten und Server-Logs an diesen Dienst weiterzugeben. Mit dem Einrichten eines
+Discord-Servers bestätigst du, dort zur Verwaltung des Bots berechtigt zu sein.</p>
 <h2>6. Zulässige und verbotene Nutzung</h2>
 <p>Der Dienst darf nur im Rahmen der Nitrado- und Discord-Nutzungsbedingungen sowie
 geltenden Rechts eingesetzt werden. Insbesondere untersagt sind: der Zugriff auf
 Server oder Discord-Konten Dritter ohne deren Zustimmung, Versuche, die Sicherheit des
-Dienstes zu umgehen, sowie die Nutzung zur Verbreitung rechtswidriger Inhalte.</p>
-<h2>7. Verfügbarkeit</h2>
+Dienstes zu umgehen, die Nutzung zur Verbreitung rechtswidriger Inhalte sowie der
+Missbrauch der Verifizierungs- und Moderationsfunktionen (z. B. um Personen ohne
+sachlichen Grund auszuspähen oder serverübergreifend zu verfolgen).</p>
+<h2>7. Deine Pflichten als Server-Betreiber</h2>
+<p>Schaltest du Funktionen ein, die Daten deiner Spieler oder Discord-Mitglieder
+verarbeiten (z. B. Kill-Feed, Level-System, Tickets, Wortfilter, Verifizierung,
+KI-Helfer), informierst du deine Mitglieder darüber in geeigneter Weise, etwa in deinen
+Server-Regeln, und verweist auf die Datenschutzerklärung dieses Dienstes. Über die
+Folgen der Verifizierung und der Moderationsfunktionen auf deinem Server (z. B.
+Blockieren, Kick, Bann) entscheidest du selbst; prüfe Einsprüche betroffener Mitglieder
+und schalte zu Unrecht abgelehnte Konten frei (z. B. mit <code>/manverify</code>).</p>
+<h2>8. KI-Helfer</h2>
+<p>Antworten des KI-Helfers werden automatisch erzeugt und können falsch oder
+unvollständig sein. Sie sind keine verbindliche Auskunft des Server-Betreibers oder des
+Anbieters dieses Dienstes. Hinterlegst du einen eigenen KI-Schlüssel oder Anbieter, gelten
+zusätzlich dessen Bedingungen und Kosten.</p>
+<h2>9. Verfügbarkeit</h2>
 <p>Der Dienst wird nach bestem Wissen und Gewissen betrieben, es besteht jedoch kein
 Anspruch auf ununterbrochene Verfügbarkeit. Wartungsarbeiten, Ausfälle bei
-Drittanbietern (Discord, Nitrado, Hosting) oder technische Störungen können die
-Nutzung zeitweise einschränken.</p>
-<h2>8. Zugangsdaten und eigene Datensicherung</h2>
+Drittanbietern (Discord, Nitrado, Hosting, KI- oder VPN-Prüfdienste) oder technische
+Störungen können die Nutzung zeitweise einschränken.</p>
+<h2>10. Zugangsdaten und eigene Datensicherung</h2>
 <p>Für die Nutzung stellst du deinen eigenen Nitrado-Zugang bereit und bist für die
 Sicherheit deiner Zugangsdaten selbst verantwortlich. Automatisierte Funktionen (z. B.
-geplante Aufgaben) verändern Einstellungsdateien deines Servers; sichere wichtige
-eigene Konfigurationen selbst, bevor du solche Funktionen aktivierst.</p>
-<h2>9. Kostenlose Nutzung / Spenden</h2>
-<p>Die Nutzung ist derzeit kostenlos. Etwaige Spenden erfolgen freiwillig und ohne
-Anspruch auf eine bestimmte Gegenleistung, sofern nicht ausdrücklich anders
-vereinbart.</p>
-<h2>10. Haftung</h2>
+geplante Aufgaben, Item- oder Event-Werkzeuge) verändern Dateien deines Servers;
+sichere wichtige eigene Konfigurationen selbst, bevor du solche Funktionen
+aktivierst.</p>
+<h2>11. Kostenlose Nutzung / Spenden</h2>
+<p>Die Nutzung des Dienstes ist kostenlos. Freiwillige Spenden begründen keinen
+Anspruch auf eine Gegenleistung, bestimmte Funktionen oder eine bestimmte
+Verfügbarkeit. Ingame-Währung, Shop-Guthaben, Gewinne aus dem Glücksrad und Kredite
+innerhalb des Dienstes sind rein virtuell, haben keinen Geldwert und können nicht
+ausgezahlt werden.</p>
+<h2>12. Haftung</h2>
 <p>Bei Vorsatz und grober Fahrlässigkeit sowie für Schäden aus der Verletzung des
 Lebens, des Körpers oder der Gesundheit hafte ich unbeschränkt. Bei leicht
 fahrlässiger Verletzung wesentlicher Vertragspflichten (Pflichten, deren Erfüllung
@@ -58698,109 +58898,141 @@ die ordnungsgemäße Nutzung des Dienstes überhaupt erst ermöglicht und auf de
 Einhaltung du regelmäßig vertrauen darfst) ist die Haftung auf den bei
 Vertragsschluss vorhersehbaren, vertragstypischen Schaden begrenzt. Im Übrigen ist
 die Haftung für leichte Fahrlässigkeit ausgeschlossen. Für Datenverlust hafte ich
-nur, soweit der Schaden nicht durch zumutbare eigene Datensicherung (siehe Ziffer 8)
-hätte vermieden werden können.</p>
-<h2>11. Sperrung</h2>
+nur, soweit der Schaden nicht durch zumutbare eigene Datensicherung (siehe Ziffer 10)
+hätte vermieden werden können. Die Haftung nach dem Produkthaftungsgesetz bleibt
+unberührt.</p>
+<h2>13. Sperrung</h2>
 <p>Bei Missbrauch, Verstößen gegen diese Bedingungen oder gegen geltendes Recht kann
 ich den Zugang zum Dienst einschränken oder sperren – bei schwerwiegenden Verstößen
 fristlos, sonst mit angemessener Vorankündigung. Mit der Sperrung endet die
 Verarbeitung deiner Server-Daten für die Zukunft; bereits gespeicherte Daten werden
 nach den in der Datenschutzerklärung genannten Fristen behandelt.</p>
-<h2>12. Kündigung durch dich</h2>
+<h2>14. Kündigung durch dich</h2>
 <p>Du kannst die Nutzung jederzeit beenden, indem du deinen Server-Zugang im
-Dashboard trennst oder mich per E-Mail dazu aufforderst.</p>
-<h2>13. Änderungen</h2>
+Dashboard trennst, den Bot von deinem Discord-Server entfernst oder mich per E-Mail
+dazu aufforderst.</p>
+<h2>15. Änderungen</h2>
 <p>Diese Nutzungsbedingungen können bei Bedarf angepasst werden, etwa wenn sich der
-Funktionsumfang des Dienstes ändert. Wesentliche Änderungen zeige ich dir spätestens
-14 Tage vor Inkrafttreten im Dashboard an; nutzt du den Dienst danach weiter, gilt
-das als Zustimmung, sofern ich dich zuvor darauf hingewiesen habe. Zwingende
-verbraucherschützende Vorschriften deines gewöhnlichen Aufenthaltsstaates bleiben von
-dieser Regelung unberührt.</p>
-<h2>14. Abgrenzung zu Drittanbietern</h2>
+Funktionsumfang des Dienstes ändert. Wesentliche Änderungen zeige ich dir im Dashboard
+an und bitte dich dort erneut um deine Zustimmung, bevor du den Dienst weiter
+verwaltest. Zwingende verbraucherschützende Vorschriften deines gewöhnlichen
+Aufenthaltsstaates bleiben unberührt.</p>
+<h2>16. Abgrenzung zu Drittanbietern</h2>
 <p>Dieser Dienst ist ein unabhängiges, privates Projekt und steht in keiner
 Verbindung zu, wird nicht gesponsert von und ist nicht autorisiert durch Discord
-Inc., die Nitrado GmbH, Bohemia Interactive a.s. oder die Marke DayZ. Alle genannten
-Marken gehören ihren jeweiligen Inhabern.</p>
-<h2>15. Anwendbares Recht</h2>
-<p>Es gilt deutsches Recht. Diese Nutzungsbedingungen gelten zusammen mit der
-Auftragsverarbeitungsvereinbarung (AVV), abrufbar über den Fußbereich des
-Dashboards.</p>
+Inc., die Nitrado GmbH, Bohemia Interactive a.s., OpenRouter, Inc. oder die Marke
+DayZ. Alle genannten Marken gehören ihren jeweiligen Inhabern.</p>
+<h2>17. Anwendbares Recht</h2>
+<p>Es gilt deutsches Recht unter Ausschluss des UN-Kaufrechts. Bist du Verbraucher,
+bleiben zwingende Vorschriften deines gewöhnlichen Aufenthaltsstaates unberührt.
+Diese Nutzungsbedingungen gelten zusammen mit der Auftragsverarbeitungsvereinbarung
+(AVV) und der Datenschutzerklärung, abrufbar über den Fußbereich des Dashboards.</p>
 """
 
 _NUTZUNGSBEDINGUNGEN_EN = """
+<p><i>Last updated: 15 November 2026</i></p>
 <h2>1. Scope</h2>
-<p>These terms of service apply to the use of the Discord bot and web dashboard
-"Brigarde Killfeed" (the "Service"), operated by Deacon Härschel. By ticking the box
-when setting up your Discord server, you expressly accept these terms of service and
-the Data Processing Agreement (DPA) before the Service processes your data.</p>
-<h2>2. Formation of the contract</h2>
-<p>The usage agreement is formed once you log in via Discord, select a Discord
-server, and expressly accept these terms of service together with the DPA.</p>
+<p>These Terms of Service apply to the use of the Discord bot and web dashboard
+"Brigarde Killfeed" (hereinafter "the service"), operated by Deacon Härschel. By
+ticking the box when setting up your Discord server, you expressly accept these Terms
+of Service and the Data Processing Agreement (DPA) before the service processes your
+data.</p>
+<h2>2. Conclusion of contract</h2>
+<p>The user agreement is concluded as soon as you log in via Discord, select a Discord
+server and expressly accept these Terms of Service including the DPA.</p>
 <h2>3. Minimum age</h2>
-<p>Use of the Service is reserved for persons aged 18 and over. By using the
-Service, you confirm that you are at least 18 years old.</p>
-<h2>4. Description of service</h2>
-<p>The Service connects a Nitrado DayZ server you provide with Discord and a web
-dashboard, including kill feeds, statistics, settings, and automated tasks.</p>
-<h2>5. Confirmation of your authority</h2>
-<p>By connecting a Nitrado server, you confirm that you are the owner or a Nitrado
--authorised administrator of that server and are authorised to share its credentials
-and server logs with this Service.</p>
+<p>Setting up and managing a server via the dashboard is reserved for persons aged 18
+or over. By using it you confirm that you are at least 18 years old. Members who only
+use bot commands on a Discord server are additionally subject to Discord's age
+requirements.</p>
+<h2>4. Description of the service</h2>
+<p>The service connects a Nitrado DayZ server provided by you with Discord and a web
+dashboard, including kill feeds, statistics, economy and shop, community features
+(e.g. level system, tickets, word filter, honeypot, wheel of fortune), verification of
+new members, an AI helper, social feeds and automated tasks. Individual features may be
+marked as "beta" or "under review", restricted or discontinued.</p>
+<h2>5. Confirmation of your authorization</h2>
+<p>By connecting a Nitrado server you confirm that you are the owner or an
+administrator of this server authorized by Nitrado and that you are entitled to pass
+its credentials and server logs to this service. By setting up a Discord server you
+confirm that you are authorized to manage the bot there.</p>
 <h2>6. Permitted and prohibited use</h2>
-<p>The Service may only be used within the bounds of Nitrado's and Discord's own
-terms of service and applicable law. In particular, the following are prohibited:
-accessing servers or Discord accounts of third parties without their consent,
-attempting to circumvent the Service's security, and using the Service to
-distribute unlawful content.</p>
-<h2>7. Availability</h2>
-<p>The Service is operated to the best of our knowledge, but there is no entitlement
-to uninterrupted availability. Maintenance, outages at third-party providers
-(Discord, Nitrado, hosting), or technical faults may temporarily limit use.</p>
-<h2>8. Credentials and your own backups</h2>
-<p>You provide your own Nitrado access for using the Service and are responsible for
-the security of your own credentials. Automated features (e.g. scheduled tasks)
-modify configuration files on your server; back up any important configuration of
-your own before enabling such features.</p>
-<h2>9. Free use / donations</h2>
-<p>Use of the Service is currently free of charge. Any donations are made voluntarily
-and without entitlement to a specific consideration, unless expressly agreed
-otherwise.</p>
-<h2>10. Liability</h2>
-<p>I am liable without limitation for intent and gross negligence, and for damages
-arising from injury to life, body, or health. For slightly negligent breaches of
-material contractual obligations (obligations whose fulfilment enables proper use of
-the Service in the first place, and on whose observance you may regularly rely),
-liability is limited to the foreseeable damage typical for this type of contract at
-the time the contract was formed. Otherwise, liability for slight negligence is
-excluded. I am only liable for data loss to the extent the damage could not have been
-avoided by reasonable data backups of your own (see item 8).</p>
-<h2>11. Suspension</h2>
-<p>In case of misuse, violations of these terms, or violations of applicable law, I
-may restrict or suspend access to the Service – immediately for serious violations,
-otherwise with reasonable prior notice. Suspension ends future processing of your
-server data; data already stored is handled according to the periods stated in the
+<p>The service may only be used within the Nitrado and Discord terms of service and
+applicable law. In particular, the following are prohibited: accessing servers or
+Discord accounts of third parties without their consent, attempts to circumvent the
+security of the service, use for distributing illegal content and misuse of the
+verification and moderation features (e.g. to spy on people without objective reason or
+to track them across servers).</p>
+<h2>7. Your obligations as a server operator</h2>
+<p>If you enable features that process data of your players or Discord members (e.g.
+kill feed, level system, tickets, word filter, verification, AI helper), you inform
+your members about this in a suitable way, for example in your server rules, and refer
+to this service's privacy policy. You decide yourself on the consequences of
+verification and moderation features on your server (e.g. block, kick, ban); review
+objections from affected members and unlock wrongly rejected accounts (e.g. with
+<code>/manverify</code>).</p>
+<h2>8. AI helper</h2>
+<p>Answers of the AI helper are generated automatically and may be wrong or incomplete.
+They are not binding information from the server operator or the provider of this
+service. If you provide your own AI key or provider, their terms and costs also
+apply.</p>
+<h2>9. Availability</h2>
+<p>The service is operated to the best of my knowledge and belief, but there is no
+claim to uninterrupted availability. Maintenance, outages of third parties (Discord,
+Nitrado, hosting, AI or VPN check services) or technical faults may temporarily
+restrict use.</p>
+<h2>10. Credentials and your own backups</h2>
+<p>You provide your own Nitrado access and are responsible for the security of your
+credentials. Automated features (e.g. scheduled tasks, item or event tools) change files
+on your server; back up important configurations yourself before enabling such
+features.</p>
+<h2>11. Free use / donations</h2>
+<p>Use of the service is free of charge. Voluntary donations do not create any claim to
+consideration, specific features or a specific availability. In-game currency, shop
+credit, wheel of fortune prizes and loans within the service are purely virtual, have
+no monetary value and cannot be paid out.</p>
+<h2>12. Liability</h2>
+<p>I am liable without limitation for intent and gross negligence and for damage
+resulting from injury to life, body or health. In the event of a slightly negligent
+breach of essential contractual obligations (obligations whose fulfilment makes the
+proper use of the service possible in the first place and on whose compliance you may
+regularly rely), liability is limited to the foreseeable damage typical for the
+contract at the time the contract was concluded. Otherwise, liability for slight
+negligence is excluded. I am only liable for loss of data to the extent that the damage
+could not have been avoided by reasonable backups of your own (see Section 10).
+Liability under the German Product Liability Act remains unaffected.</p>
+<h2>13. Suspension</h2>
+<p>In the event of misuse or violations of these terms or applicable law, I may restrict
+or block access to the service – without notice in serious cases, otherwise with
+reasonable advance notice. Upon suspension, the processing of your server data ends for
+the future; data already stored is handled according to the periods stated in the
 privacy policy.</p>
-<h2>12. Termination by you</h2>
-<p>You may stop using the Service at any time by disconnecting your server access in
-the dashboard or by asking me to do so by email.</p>
-<h2>13. Changes</h2>
-<p>These terms of service may be adjusted as needed, e.g. when the scope of the
-Service changes. I will show you material changes in the dashboard at least 14 days
-before they take effect; if you continue to use the Service afterwards, this counts
-as acceptance, provided I have informed you beforehand. Mandatory consumer-protection
-provisions of your habitual country of residence remain unaffected by this clause.</p>
-<h2>14. No affiliation with third parties</h2>
-<p>This Service is an independent, private project and is not affiliated with,
-sponsored by, or authorised by Discord Inc., Nitrado GmbH, Bohemia Interactive a.s.,
-or the DayZ brand. All trademarks mentioned belong to their respective owners.</p>
-<h2>15. Applicable law</h2>
-<p>German law applies. These terms of service apply together with the Data
-Processing Agreement (DPA), available via the dashboard footer.</p>
+<h2>14. Termination by you</h2>
+<p>You can stop using the service at any time by disconnecting your server access in
+the dashboard, removing the bot from your Discord server or asking me to do so by
+email.</p>
+<h2>15. Changes</h2>
+<p>These Terms of Service may be adjusted as needed, for example if the scope of the
+service changes. I will show you material changes in the dashboard and ask for your
+consent there again before you continue managing the service. Mandatory consumer
+protection provisions of your country of habitual residence remain unaffected.</p>
+<h2>16. Third parties</h2>
+<p>This service is an independent, private project and is not affiliated with,
+sponsored by or authorized by Discord Inc., Nitrado GmbH, Bohemia Interactive a.s.,
+OpenRouter, Inc. or the DayZ brand. All trademarks mentioned belong to their respective
+owners.</p>
+<h2>17. Applicable law</h2>
+<p>German law applies, excluding the UN Convention on Contracts for the International
+Sale of Goods. If you are a consumer, mandatory provisions of your country of habitual
+residence remain unaffected. These Terms of Service apply together with the Data
+Processing Agreement (DPA) and the privacy policy, available in the footer of the
+dashboard.</p>
 """
 
 _AVV_DE = """
+<p><i>Stand: 15. November 2026</i></p>
 <p>Auftragsverarbeitungsvereinbarung (AVV) nach Art. 28 DSGVO zwischen dir als Betreiber
-deines DayZ-Servers („Verantwortlicher") und Deacon Härschel als Anbieter von
+deines DayZ- und Discord-Servers („Verantwortlicher") und Deacon Härschel als Anbieter von
 Brigarde Killfeed („Auftragsverarbeiter"). Sie ergänzt die Nutzungsbedingungen und
 gilt automatisch mit deren Annahme.</p>
 <h2>1. Gegenstand und Dauer</h2>
@@ -58808,93 +59040,130 @@ gilt automatisch mit deren Annahme.</p>
 der Nutzung von Brigarde Killfeed im Auftrag des Verantwortlichen anfallen. Sie gilt
 für die Dauer der Nutzung des Dienstes und endet automatisch mit deren Beendigung.</p>
 <h2>2. Art und Zweck der Verarbeitung</h2>
-<p>Verarbeitet werden die Daten, die aus den Server-Logs (ADM-Dateien) des vom
-Verantwortlichen betriebenen DayZ-Servers hervorgehen (siehe Datenschutzerklärung
-Ziffer 6), zum Zweck der Bereitstellung von Kill-Feed, Statistiken, Kartenanzeige und
-verwandten Funktionen des Dienstes.</p>
+<p>Verarbeitet werden (a) die Daten aus den Server-Logs (ADM-Dateien) des vom
+Verantwortlichen betriebenen DayZ-Servers und (b) die Daten der Mitglieder seines
+Discord-Servers, soweit der Verantwortliche die entsprechenden Funktionen einschaltet –
+zum Zweck der Bereitstellung von Kill-Feed, Statistiken, Kartenanzeige, Economy und
+Shop, Community- und Moderationsfunktionen, KI-Helfer und verwandten Funktionen des
+Dienstes (siehe Datenschutzerklärung Ziffern 4, 6, 8 und 11).</p>
 <h2>3. Art der Daten und Kategorien betroffener Personen</h2>
-<p>Verarbeitet werden Spielerkennungen/Gamertags, In-Game-Positionen, Kill- und
-Trefferereignisse, Verbindungszeitpunkte sowie ggf. Chat-Inhalte der Spieler auf dem
-Server des Verantwortlichen.</p>
-<h2>4. Weisungsgebundenheit</h2>
+<p>Betroffen sind die Spieler auf dem DayZ-Server und die Mitglieder des Discord-Servers
+des Verantwortlichen. Verarbeitet werden Spielerkennungen/Gamertags, In-Game-Positionen,
+Kill- und Trefferereignisse, Verbindungszeitpunkte, ggf. Chat-Inhalte, Discord-IDs und
+Benutzernamen, Level- und Economy-Daten, Käufe, Ticket-Inhalte, von Wortfilter oder
+Honeypot erfasste Nachrichten sowie an den KI-Helfer gerichtete Fragen.</p>
+<h2>4. Ausnahme: Verifizierung</h2>
+<p>Für den serverübergreifenden Abgleich der Verifizierung (Zweitaccount-Erkennung über
+IP-Hash und Gerätekennung, „Lens") ist der Auftragsverarbeiter selbst Verantwortlicher
+(Datenschutzerklärung Ziffer 10). Der Verantwortliche entscheidet über das Einschalten
+der Verifizierung und die Folgen auf seinem Server und informiert seine Mitglieder
+darüber. Soweit beide Seiten gemeinsam über Zwecke und Mittel entscheiden, gelten sie
+insoweit als gemeinsam Verantwortliche nach Art. 26 DSGVO: Der Auftragsverarbeiter
+stellt die Informationen nach Art. 13/14 DSGVO bereit und bearbeitet Anfragen zu den
+Verifizierungsdaten; der Verantwortliche bearbeitet Einsprüche gegen die Folgen auf
+seinem Server. Betroffene können ihre Rechte gegenüber jedem der beiden geltend
+machen.</p>
+<h2>5. Weisungsgebundenheit</h2>
 <p>Der Auftragsverarbeiter verarbeitet die Daten ausschließlich nach den über das
-Dashboard konfigurierten Einstellungen des Verantwortlichen (z. B. gewählte
-Feed-Kanäle, aktivierte Funktionen) und darüber hinausgehenden dokumentierten
+Dashboard und die Bot-Befehle konfigurierten Einstellungen des Verantwortlichen (z. B.
+gewählte Kanäle, aktivierte Funktionen) und darüber hinausgehenden dokumentierten
 Weisungen.</p>
-<h2>5. Vertraulichkeit und Sicherheit</h2>
+<h2>6. Vertraulichkeit und Sicherheit</h2>
 <p>Der Auftragsverarbeiter trifft angemessene technische und organisatorische
 Maßnahmen nach Art. 32 DSGVO (u. a. Zugriffsbeschränkung auf den eigenen
-Datenbestand je Server, verschlüsselte Übertragung, Absicherung der Sitzung) und
-verpflichtet eingesetzte Personen zur Verschwiegenheit.</p>
-<h2>6. Unterauftragsverarbeiter</h2>
-<p>Der Auftragsverarbeiter setzt PebbleHost (Hosting) als Unterauftragsverarbeiter
-ein. Der Einsatz weiterer Unterauftragsverarbeiter wird dem Verantwortlichen vorab
-angezeigt; widerspricht er nicht innerhalb von 14 Tagen, gilt dies als Zustimmung.</p>
-<h2>7. Unterstützung des Verantwortlichen</h2>
+Datenbestand je Server, verschlüsselte Übertragung, Absicherung der Sitzung,
+gehashte Speicherung von Verifizierungsmerkmalen) und verpflichtet eingesetzte
+Personen zur Verschwiegenheit.</p>
+<h2>7. Unterauftragsverarbeiter</h2>
+<p>Der Auftragsverarbeiter setzt ein: PebbleHost (Hosting), OpenRouter, Inc., USA, und
+das dort gewählte KI-Modell (nur wenn der Verantwortliche den KI-Helfer einschaltet;
+Übermittlung auf Grundlage von Art. 45/46 DSGVO) sowie Proxycheck Ltd., Vereinigtes
+Königreich (nur bei eingeschalteter VPN-Prüfung). Der Einsatz weiterer
+Unterauftragsverarbeiter wird dem Verantwortlichen vorab im Dashboard angezeigt;
+widerspricht er nicht innerhalb von 14 Tagen, gilt dies als Zustimmung. Bei einem
+Widerspruch kann er die betroffene Funktion abschalten oder die Nutzung beenden.</p>
+<h2>8. Unterstützung des Verantwortlichen</h2>
 <p>Der Auftragsverarbeiter unterstützt den Verantwortlichen im Rahmen des technisch
 Möglichen bei der Erfüllung von Betroffenenrechten (Art. 12–23 DSGVO) sowie bei
 Meldungen nach Art. 33/34 DSGVO und informiert ihn unverzüglich über ihm bekannt
 gewordene Datenschutzverletzungen, die Daten des Verantwortlichen betreffen.</p>
-<h2>8. Löschung und Rückgabe</h2>
+<h2>9. Löschung und Rückgabe</h2>
 <p>Nach Beendigung der Nutzung werden die dem Server des Verantwortlichen
 zugeordneten Daten auf dessen Anfrage gelöscht oder zurückgegeben, soweit keine
-gesetzliche Aufbewahrungspflicht entgegensteht (siehe Datenschutzerklärung Ziffer 16
+gesetzliche Aufbewahrungspflicht entgegensteht (siehe Datenschutzerklärung Ziffer 20
 zur Aufbewahrung nach Trennen der Verbindung).</p>
-<h2>9. Kontrollrechte</h2>
+<h2>10. Kontrollrechte</h2>
 <p>Der Verantwortliche kann sich in zumutbarem Umfang von der Einhaltung dieser
 Vereinbarung überzeugen, insbesondere durch Einsichtnahme in die Diagnose-Seite des
 Dashboards; eine Vor-Ort-Prüfung ist angesichts der Betriebsgröße nicht vorgesehen,
 kann aber auf Anfrage besprochen werden.</p>
-<h2>10. Haftung</h2>
+<h2>11. Haftung</h2>
 <p>Es gelten ergänzend die Haftungsregelungen der Nutzungsbedingungen.</p>
 """
 
 _AVV_EN = """
-<p>Data Processing Agreement (DPA) under Art. 28 GDPR between you as the operator of
-your DayZ server ("Controller") and Deacon Härschel as the provider of Brigarde
-Killfeed ("Processor"). It supplements the terms of service and applies
+<p><i>Last updated: 15 November 2026</i></p>
+<p>Data Processing Agreement (DPA) pursuant to Art. 28 GDPR between you as the operator
+of your DayZ and Discord server ("controller") and Deacon Härschel as the provider of
+Brigarde Killfeed ("processor"). It supplements the Terms of Service and applies
 automatically upon their acceptance.</p>
 <h2>1. Subject matter and duration</h2>
-<p>This agreement governs the processing of personal data that arises from the use
-of Brigarde Killfeed on behalf of the Controller. It applies for the duration of use
-of the Service and ends automatically when that use ends.</p>
+<p>This agreement governs the processing of personal data that arises on behalf of the
+controller in the course of using Brigarde Killfeed. It applies for the duration of the
+use of the service and ends automatically when it ends.</p>
 <h2>2. Nature and purpose of processing</h2>
-<p>The data processed is the data that results from the server logs (ADM files) of
-the DayZ server operated by the Controller (see privacy policy item 6), for the
-purpose of providing the kill feed, statistics, map display, and related features of
-the Service.</p>
-<h2>3. Type of data and categories of data subjects</h2>
-<p>The data processed includes player identifiers/gamertags, in-game positions,
-kill and hit events, connection times, and possibly chat content of players on the
-Controller's server.</p>
-<h2>4. Processing on instructions</h2>
-<p>The Processor processes the data exclusively according to the Controller's
-settings configured via the dashboard (e.g. chosen feed channels, enabled features)
-and any further documented instructions.</p>
-<h2>5. Confidentiality and security</h2>
-<p>The Processor takes appropriate technical and organisational measures under
-Art. 32 GDPR (including restricting access to each server's own data, encrypted
-transmission, session security) and binds any personnel involved to confidentiality.</p>
-<h2>6. Sub-processors</h2>
-<p>The Processor uses PebbleHost (hosting) as a sub-processor. The use of further
-sub-processors will be announced to the Controller in advance; if the Controller
-does not object within 14 days, this is deemed consent.</p>
-<h2>7. Assisting the Controller</h2>
-<p>The Processor assists the Controller, as far as technically possible, in fulfilling
-data subject rights (Art. 12-23 GDPR) and in notifications under Art. 33/34 GDPR, and
-will inform the Controller without undue delay of any personal data breach that
-becomes known to it and affects the Controller's data.</p>
-<h2>8. Deletion and return</h2>
-<p>After use of the Service ends, data associated with the Controller's server will
-be deleted or returned upon the Controller's request, unless a statutory retention
-obligation applies (see privacy policy item 16 on retention after disconnecting).</p>
-<h2>9. Audit rights</h2>
-<p>The Controller may satisfy itself, to a reasonable extent, that this agreement is
-being complied with, in particular by reviewing the dashboard's diagnostics page; an
-on-site audit is not envisaged given the size of the operation, but can be discussed
-on request.</p>
-<h2>10. Liability</h2>
-<p>The liability provisions of the terms of service apply in addition.</p>
+<p>Processed are (a) the data from the server logs (ADM files) of the DayZ server
+operated by the controller and (b) the data of the members of their Discord server, to
+the extent the controller enables the corresponding features – for the purpose of
+providing the kill feed, statistics, map display, economy and shop, community and
+moderation features, AI helper and related features of the service (see privacy policy
+Sections 4, 6, 8 and 11).</p>
+<h2>3. Types of data and categories of data subjects</h2>
+<p>Data subjects are the players on the DayZ server and the members of the controller's
+Discord server. Processed are player identifiers/gamertags, in-game positions, kill and
+hit events, connection times, where applicable chat content, Discord IDs and usernames,
+level and economy data, purchases, ticket content, messages captured by the word filter
+or honeypot and questions addressed to the AI helper.</p>
+<h2>4. Exception: verification</h2>
+<p>For the cross-server matching of verification (alt account detection via IP hash and
+device identifier, "Lens") the processor is itself the controller (privacy policy
+Section 10). The controller decides on enabling verification and the consequences on
+their server and informs their members about it. Insofar as both parties jointly
+determine purposes and means, they are joint controllers under Art. 26 GDPR: the
+processor provides the information under Art. 13/14 GDPR and handles requests regarding
+verification data; the controller handles objections against the consequences on their
+server. Data subjects can exercise their rights against either party.</p>
+<h2>5. Instructions</h2>
+<p>The processor processes the data exclusively in accordance with the controller's
+settings configured via the dashboard and bot commands (e.g. selected channels, enabled
+features) and further documented instructions.</p>
+<h2>6. Confidentiality and security</h2>
+<p>The processor takes appropriate technical and organizational measures under Art. 32
+GDPR (including restricting access to each server's own data, encrypted transmission,
+session security, hashed storage of verification signals) and commits persons employed
+to confidentiality.</p>
+<h2>7. Sub-processors</h2>
+<p>The processor uses: PebbleHost (hosting), OpenRouter, Inc., USA, and the AI model
+selected there (only if the controller enables the AI helper; transfer on the basis of
+Art. 45/46 GDPR) and Proxycheck Ltd., United Kingdom (only with the VPN check enabled).
+The use of further sub-processors will be announced to the controller in advance in the
+dashboard; if they do not object within 14 days, this is deemed consent. In case of
+objection they can switch off the affected feature or stop using the service.</p>
+<h2>8. Support of the controller</h2>
+<p>The processor supports the controller, as far as technically possible, in fulfilling
+data subject rights (Art. 12–23 GDPR) and in notifications under Art. 33/34 GDPR and
+informs them without undue delay of any personal data breaches affecting the
+controller's data that come to their knowledge.</p>
+<h2>9. Deletion and return</h2>
+<p>After the end of use, the data assigned to the controller's server is deleted or
+returned at their request, unless statutory retention obligations apply (see privacy
+policy Section 20 on retention after disconnecting).</p>
+<h2>10. Audit rights</h2>
+<p>The controller may verify compliance with this agreement to a reasonable extent, in
+particular by viewing the diagnostics page of the dashboard; an on-site inspection is
+not provided for given the size of the operation but can be discussed on request.</p>
+<h2>11. Liability</h2>
+<p>The liability provisions of the Terms of Service apply additionally.</p>
 """
 
 
