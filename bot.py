@@ -1084,6 +1084,24 @@ FEATURE_MODULES: Dict[str, Dict[str, str]] = {
                                            "gruppe": "Verbindung"},
     "factions":                          {"label": "Factions (gesamt)", "gruppe": "Factions"},
     "discord_mgmt":                      {"label": "Discord Management (gesamt)", "gruppe": "Discord Management"},
+    "discord_mgmt.welcome_message":      {"label": "Willkommen-Nachricht", "gruppe": "Discord Management"},
+    "discord_mgmt.leave_message":        {"label": "Verlassen-Nachricht", "gruppe": "Discord Management"},
+    "discord_mgmt.reaction_roles":       {"label": "Reaction Roles", "gruppe": "Discord Management"},
+    "discord_mgmt.ticket_tool":          {"label": "Ticket Tool", "gruppe": "Discord Management"},
+    "discord_mgmt.level_system":         {"label": "Level-System", "gruppe": "Discord Management"},
+    "discord_mgmt.honeypot":             {"label": "Honeypot", "gruppe": "Discord Management"},
+    "discord_mgmt.wortfilter":           {"label": "Wortfilter", "gruppe": "Discord Management"},
+    "discord_mgmt.gluecksrad":           {"label": "Glücksrad", "gruppe": "Discord Management"},
+    "discord_mgmt.livekarte":            {"label": "Live-Karte für Spieler", "gruppe": "Discord Management"},
+    "discord_mgmt.kredite":              {"label": "Kredite", "gruppe": "Discord Management"},
+    "discord_mgmt.verifizierung":        {"label": "Verifizierung", "gruppe": "Discord Management"},
+    "discord_mgmt.ki_helfer":            {"label": "KI-Helfer", "gruppe": "Discord Management"},
+    "discord_mgmt.social_youtube":       {"label": "YouTube", "gruppe": "Discord Management"},
+    "discord_mgmt.social_instagram":     {"label": "Instagram", "gruppe": "Discord Management"},
+    "discord_mgmt.social_tiktok":        {"label": "TikTok", "gruppe": "Discord Management"},
+    "discord_mgmt.social_x":             {"label": "X (Twitter)", "gruppe": "Discord Management"},
+    "discord_mgmt.social_dayz_news":     {"label": "DayZ-News", "gruppe": "Discord Management"},
+    "discord_mgmt.social_nitrado_status": {"label": "Nitrado-Status", "gruppe": "Discord Management"},
     "permissions":                       {"label": "Permissions (gesamt)", "gruppe": "Permissions"},
     "permissions.subcommands":           {"label": "Subcommand Permissions", "gruppe": "Permissions"},
     "event_catalog":                     {"label": "Event Vorlagen (gesamt)", "gruppe": "Event Vorlagen"},
@@ -1100,12 +1118,18 @@ _DISCORD_MODUL_MAP: Dict[str, str] = {
     "buy":  "shop.buy",
     "edit": "shop.catalog_admin",
     # Level-System (Dashboard → Discord Management): Freigabestufe des Moduls
-    "level": "discord_mgmt",
-    "levelrangliste": "discord_mgmt",
-    "levelset": "discord_mgmt",
-    "levelreset": "discord_mgmt",
-    # KI-Helfer (/ki): gleiche Freigabestufe wie das übrige Discord Management
-    "ki": "discord_mgmt",
+    # Einzel-Kacheln erben die Stufe von "discord_mgmt", solange sie keine eigene haben.
+    "level": "discord_mgmt.level_system",
+    "levelrangliste": "discord_mgmt.level_system",
+    "levelset": "discord_mgmt.level_system",
+    "levelreset": "discord_mgmt.level_system",
+    "ki": "discord_mgmt.ki_helfer",
+    "manverify": "discord_mgmt.verifizierung",
+    "verify": "discord_mgmt.verifizierung",
+    "verification": "discord_mgmt.verifizierung",
+    "wheel": "discord_mgmt.gluecksrad",
+    "claim": "discord_mgmt.gluecksrad",
+    "loan": "discord_mgmt.kredite",
     # Airdrops JSON (/airdrop add|list|remove): Freigabestufe des Tools
     "airdrop": "tools.airdropjson",
 }
@@ -41314,6 +41338,17 @@ async def api_public_stats(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "data": daten}, headers={"Cache-Control": "public, max-age=300"})
 
 
+# /api/discord-management/<abschnitt> -> Kachel (Modul "discord_mgmt.<kachel>").
+# Social-Abos pruefen die Plattform im Handler (_social_plattform_pruefen).
+_MGMT_PFAD_KACHEL: Dict[str, str] = {
+    "welcome": "welcome_message", "leave": "leave_message",
+    "reaction-roles": "reaction_roles", "tickets": "ticket_tool",
+    "level": "level_system", "honeypot": "honeypot", "wortfilter": "wortfilter",
+    "gluecksrad": "gluecksrad", "livekarte": "livekarte", "kredite": "kredite",
+    "verifizierung": "verifizierung", "ki-helfer": "ki_helfer",
+}
+
+
 @web.middleware
 async def _dash_auth_middleware(request: web.Request, handler):
     """Blockt geschützte /api/-Pfade ohne gültige Session mit 401."""
@@ -41348,6 +41383,18 @@ async def _dash_auth_middleware(request: web.Request, handler):
                           "Token unter „Optionen“ ein."},
                 status=401)
         request["session"] = sess
+        kachel = _MGMT_PFAD_KACHEL.get(path[len("/api/discord-management/"):].split("/", 1)[0]) \
+            if path.startswith("/api/discord-management/") else None
+        if kachel:
+            # Einzelne Kachel im Modul Manager gesperrt (Under Review/Beta/Premium)?
+            # Die Kategorie selbst prueft weiterhin jeder Handler.
+            # _session_conn kann die Sitzung beim Ablehnen zuruecksetzen – die
+            # Ablehnung deshalb gleich hier zurueckgeben (der Handler taete dasselbe).
+            k_conn, k_fehler = _session_conn(request, "discord_mgmt")
+            if k_fehler is None:
+                k_fehler = await _modul_pruefen("discord_mgmt." + kachel, request, k_conn)
+            if k_fehler is not None:
+                return k_fehler
     # Vor dem Handler merken: beim Abmelden ist die Session danach weg.
     actor = _audit_actor(request.get("session") or _sess_get(request))
     try:
@@ -46754,6 +46801,17 @@ async def get_discord_mgmt(request: web.Request) -> web.Response:
     payload = _discord_mgmt_payload(conn)
     payload["channels"] = _guild_payload(gid, conn.service_id)["channels"] if gid else []
     payload["kategorie_stufe"] = _module_tier("discord_mgmt")
+    # Je Kachel: gesperrt fuer diese Sitzung? (None = frei, sonst der Grund)
+    sess = _sess_get(request)
+    sperren: Dict[str, Optional[str]] = {}
+    for modul in FEATURE_MODULES:
+        if modul.startswith("discord_mgmt."):
+            frei = await _module_erlaubt(modul, sess, conn)
+            stufe = _module_tier(modul)
+            sperren[modul.split(".", 1)[1]] = None if frei else (
+                stufe if stufe in ("under_review", "beta") else "premium")
+    payload["kachel_sperren"] = sperren
+    payload["kachel_stufen"] = {k: _module_tier("discord_mgmt." + k) for k in sperren}
     return ok(payload)
 
 
@@ -49985,6 +50043,9 @@ def _verif_einstellungen(sicht: Any) -> Dict[str, Any]:
         "nachricht": nachricht.strip()[:_VERIF_NACHRICHT_MAX] if isinstance(nachricht, str) else "",
         # eigener proxycheck.io-Schluessel des Kunden (mehr Abfragen); nie an das Dashboard zurueckgeben
         "proxycheck_key": str(roh.get("proxycheck_key") or "")[:64],
+        # die zuletzt vom Bot gepostete Verifizierungs-Nachricht (wird beim Speichern bearbeitet statt neu gepostet)
+        "panel_channel_id": _verif_id(roh.get("panel_channel_id")),
+        "panel_message_id": _verif_id(roh.get("panel_message_id")),
     }
 
 
@@ -50684,9 +50745,20 @@ async def post_discord_mgmt_verif(request: web.Request) -> web.Response:
             return err("Die Speicherdauer muss zwischen 1 und 60 Monaten liegen.")
         cfg.config["verifizierung_speicher_monate"] = m
         cfg.save_config()
+    neu["panel_channel_id"], neu["panel_message_id"] = alt["panel_channel_id"], alt["panel_message_id"]
     _conn_store(conn, "verifizierung", neu)
     _audit_add("dashboard", _audit_actor(sess), "Discord-Management aktualisiert", f"verifizierung · {conn.name}")
-    return ok(_verif_payload(conn, sess))
+    # Aktiv und Channel gewaehlt: die Verifizierungs-Nachricht ohne /verification panel posten (bzw. die vorhandene aktualisieren).
+    panel = {"ergebnis": None, "channel": ""}
+    if neu["enabled"] and neu["channel_id"] and guild is not None:
+        try:
+            panel["ergebnis"], panel["channel"] = await _verif_panel_sichern(guild, conn)
+        except Exception as exc:  # noqa: BLE001 - Speichern gilt trotzdem
+            log.warning(f"[VERIF] Panel nicht gepostet: {type(exc).__name__}: {exc}")
+            panel["ergebnis"] = "keine_rechte"
+    antwort = _verif_payload(conn, sess)
+    antwort["panel"] = panel
+    return ok(antwort)
 
 
 async def get_discord_mgmt_verif_suche(request: web.Request) -> web.Response:
@@ -50796,14 +50868,7 @@ async def cmd_verify(interaction: discord.Interaction):
 verification_group = app_commands.Group(name="verification", description="✅ Verification and alt detection")
 
 
-@verification_group.command(name="panel", description="✅ Post the verification button (verification staff)")
-@app_commands.describe(channel="Where to post it (default: the verification channel from the dashboard)")
-async def verif_panel(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
-    ctx = await _verif_ctx(interaction, staff=True)
-    if ctx is None:
-        return
-    sicht, e = ctx
-    ziel = channel or (interaction.guild.get_channel(int(e["channel_id"])) if e["channel_id"] else None) or interaction.channel
+def _verif_panel_embed(sicht: Any, e: Dict[str, Any]) -> discord.Embed:
     en = _feed_sprache(sicht) == "en"
     emb = discord.Embed(title="Verify to access this server" if en else "Verifiziere dich, um den Server zu nutzen",
                         description=e["nachricht"] or ("This server is protected by **Brigarde Killfeed**. Click the button below to verify."
@@ -50811,13 +50876,55 @@ async def verif_panel(interaction: discord.Interaction, channel: Optional[discor
                                                                    "Klicke unten auf den Button, um dich zu verifizieren."),
                         color=0x2ECC71)
     emb.set_footer(text="Powered by Brigarde Killfeed")
+    return emb
+
+
+async def _verif_panel_sichern(guild: Any, sicht: Any, ziel: Any = None) -> Tuple[str, str]:
+    """Die Verifizierungs-Nachricht mit Button sicherstellen: steht die zuletzt gepostete noch im selben Channel, wird sie
+    nur aktualisiert (kein Doppelpost bei jedem Speichern); sonst wird sie neu gepostet und gemerkt. ``ziel``: anderer
+    Channel als der eingestellte (/verification panel channel:…) - dort wird immer neu gepostet.
+    Rueckgabe (ergebnis, channel_text): ergebnis "gepostet", "aktualisiert", "kein_channel" oder "keine_rechte"."""
+    e = _verif_einstellungen(sicht)
+    ch = ziel or (guild.get_channel(int(e["channel_id"])) if (guild is not None and e["channel_id"]) else None)
+    if ch is None:
+        return "kein_channel", ""
+    emb = _verif_panel_embed(sicht, e)
+    eigener = ziel is None or str(ch.id) == e["channel_id"]
+    if eigener and e["panel_message_id"] and e["panel_channel_id"] == str(ch.id):
+        try:
+            nachricht = await ch.fetch_message(int(e["panel_message_id"]))
+            await nachricht.edit(embed=emb, view=VerifPanelView())
+            return "aktualisiert", f"#{getattr(ch, 'name', ch.id)}"
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass                                    # geloescht oder nicht mehr erreichbar: neu posten
     try:
-        await ziel.send(embed=emb, view=VerifPanelView())
+        nachricht = await ch.send(embed=emb, view=VerifPanelView())
     except (discord.Forbidden, discord.HTTPException):
+        return "keine_rechte", f"#{getattr(ch, 'name', ch.id)}"
+    if eigener and getattr(nachricht, "id", None):
+        roh = sicht.get("verifizierung")
+        roh = dict(roh) if isinstance(roh, dict) else {}
+        roh.update({"panel_channel_id": str(ch.id), "panel_message_id": str(nachricht.id)})
+        _conn_store(sicht, "verifizierung", roh)
+    return "gepostet", f"#{getattr(ch, 'name', ch.id)}"
+
+
+@verification_group.command(name="panel", description="✅ Post the verification button (verification staff)")
+@app_commands.describe(channel="Where to post it (default: the verification channel from the dashboard)")
+async def verif_panel(interaction: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    ctx = await _verif_ctx(interaction, staff=True)
+    if ctx is None:
+        return
+    sicht, e = ctx
+    # Ohne channel: der eingestellte Verifizierungs-Channel (dort wird die vorhandene Nachricht aktualisiert), sonst der aktuelle.
+    ziel = channel if channel is not None else (None if e["channel_id"] and interaction.guild.get_channel(int(e["channel_id"]))
+                                                 else interaction.channel)
+    ergebnis, kanal = await _verif_panel_sichern(interaction.guild, sicht, ziel)
+    if ergebnis in ("kein_channel", "keine_rechte"):
         return await interaction.response.send_message(_t(interaction, "❌ Ich darf in diesem Channel nicht schreiben.",
                                                           "❌ I cannot post in that channel."), ephemeral=True)
-    await interaction.response.send_message(_t(interaction, f"✅ Button gepostet in {ziel.mention}.", f"✅ Button posted in {ziel.mention}."),
-                                            ephemeral=True)
+    await interaction.response.send_message(_t(interaction, f"✅ Button {'aktualisiert' if ergebnis == 'aktualisiert' else 'gepostet'} in {kanal}.",
+                                               f"✅ Button {'updated' if ergebnis == 'aktualisiert' else 'posted'} in {kanal}."), ephemeral=True)
 
 
 @verification_group.command(name="force", description="✅ Send a member a new verification link by DM (verification staff)")
@@ -51451,11 +51558,22 @@ async def _social_gate(request: web.Request, recht: str):
     return _mgmt_sicht(request, conn), None
 
 
+async def _social_plattform_pruefen(request: web.Request, conn: Any,
+                                    plattform: Any) -> Optional[web.Response]:
+    """Einzel-Freigabe der Social-Kachel (Modul "discord_mgmt.social_<plattform>")."""
+    if str(plattform) not in _SOCIAL_PLATTFORMEN:
+        return None
+    return await _modul_pruefen(f"discord_mgmt.social_{plattform}", request, conn)
+
+
 async def get_discord_mgmt_social(request: web.Request) -> web.Response:
     conn, denied = await _social_gate(request, "view")
     if denied is not None:
         return denied
-    return ok(_social_payload(conn))
+    payload = _social_payload(conn)
+    frei = [p for p in _SOCIAL_PLATTFORMEN if await _social_plattform_pruefen(request, conn, p) is None]
+    payload["abos"] = [a for a in payload["abos"] if a.get("platform") in frei]
+    return ok(payload)
 
 
 def _social_id_aus(wert: Any) -> Optional[int]:
@@ -51490,6 +51608,9 @@ async def post_discord_mgmt_social(request: web.Request) -> web.Response:
         plattform = str(data.get("platform") or "").strip().lower()
         if plattform not in _SOCIAL_PLATTFORMEN:
             return err("Unbekannte Plattform.")
+    denied = await _social_plattform_pruefen(request, conn, plattform)
+    if denied is not None:
+        return denied
     sprache = str(data.get("language") or "de").strip().lower()
     if sprache not in _DISCORD_MGMT_SPRACHEN:
         return err("Unbekannte Sprache.")
@@ -51558,6 +51679,11 @@ async def delete_discord_mgmt_social(request: web.Request) -> web.Response:
         return denied
     abo_id = str(request.match_info.get("id", "")).strip()
     abos = [a for a in _social_abos(conn) if isinstance(a, dict)]
+    for a in abos:
+        if a.get("id") == abo_id:
+            denied = await _social_plattform_pruefen(request, conn, a.get("platform"))
+            if denied is not None:
+                return denied
     rest = [a for a in abos if a.get("id") != abo_id]
     if len(rest) == len(abos):
         return err("Dieses Abo gibt es nicht.", 404)
@@ -51594,6 +51720,9 @@ async def post_discord_mgmt_social_pruefen(request: web.Request) -> web.Response
         if abo is None:
             return err("Dieses Abo gibt es nicht.", 404)
         plattform, quelle = abo["platform"], str(abo.get("source") or "")
+    denied = await _social_plattform_pruefen(request, conn, plattform)
+    if denied is not None:
+        return denied
     if plattform == "youtube":
         kid = _social_youtube_kanal_id(quelle)
         if not kid:
@@ -51625,6 +51754,9 @@ async def post_discord_mgmt_social_test(request: web.Request) -> web.Response:
     abo = next((a for a in _social_abos(conn) if isinstance(a, dict) and a.get("id") == abo_id), None)
     if abo is None:
         return err("Dieses Abo gibt es nicht.", 404)
+    denied = await _social_plattform_pruefen(request, conn, abo.get("platform"))
+    if denied is not None:
+        return denied
     gid = int(conn.guild_id) if conn.guild_id else 0
     if not gid:
         return err("Für diese Anmeldung ist keine Discord-Guild zugeordnet.", 409)
@@ -60195,6 +60327,8 @@ _ASSET_KNOWN_HASHES: Dict[str, Tuple[str, ...]] = {
         "e0a8099c44bee41f88c186cfa51aca8988b8813ce047ecba4787bbc38b2b8de5",
         "d9661497efd399a1bbfdf5df8a00ff3d1d009ba33b3e1482b88ed2c7e455d0b8",
         "28474d80965ebf4645b9ffe0006f7271bd77ed37042dcc6a94950049eb6a1c1b",
+        "f1e6e15c4391a063ea942c744141cf154a364beb251e76a28ae82f50b1a76062",
+        "61102b9a3048b07301672090b521acb732b3e0c5255681d719ce09ac74ab2218",
     ),
     "map.js": (
         "e5e0b3a512c5badc65c97c088b47bb27ae38552789603fb846af64b363ae464b",

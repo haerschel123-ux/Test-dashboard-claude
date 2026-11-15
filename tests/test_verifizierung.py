@@ -74,6 +74,26 @@ class VKanal:
         if self.kaputt:
             raise _forbidden()
         self.gesendet.append({"content": content, "embed": embed, "view": view, **kw})
+        nachricht = VNachricht(self, 9000 + len(self.gesendet), embed)
+        self.nachrichten = getattr(self, "nachrichten", {})
+        self.nachrichten[nachricht.id] = nachricht
+        return nachricht
+
+    async def fetch_message(self, mid):
+        n = getattr(self, "nachrichten", {}).get(int(mid))
+        if n is None:
+            raise bot.discord.NotFound(type("R", (), {"status": 404, "reason": "nf"})(), "Unknown Message")
+        return n
+
+
+class VNachricht:
+    """Eine gepostete Nachricht (für das Bearbeiten statt Neu-Posten der Verifizierungs-Nachricht)."""
+
+    def __init__(self, kanal, id_, embed):
+        self.kanal, self.id, self.embed, self.bearbeitet = kanal, id_, embed, 0
+
+    async def edit(self, embed=None, view=None, **kw):
+        self.embed, self.bearbeitet = embed, self.bearbeitet + 1
 
 
 class VMitglied:
@@ -1271,6 +1291,11 @@ def test_panel_postet_button(v):
     k = v["g"][G_A].channels[ids(G_A)["verif"]]
     assert "gepostet" in lauf(bot.verif_panel, VInter(v, uid=ADMIN), channel=None)
     assert k.gesendet[0]["embed"].description == "Bitte klicken" and isinstance(k.gesendet[0]["view"], bot.VerifPanelView)
+    # Zweiter Aufruf: die vorhandene Nachricht wird aktualisiert, nicht doppelt gepostet
+    assert "aktualisiert" in lauf(bot.verif_panel, VInter(v, uid=ADMIN), channel=None)
+    assert len(k.gesendet) == 1 and k.nachrichten[9001].bearbeitet == 1
+    # Nachricht gelöscht und Channel gesperrt -> Fehlermeldung
+    k.nachrichten.clear()
     k.kaputt = True
     assert "nicht schreiben" in lauf(bot.verif_panel, VInter(v, uid=ADMIN), channel=None)
     assert "Nur Owner" in lauf(bot.verif_panel, VInter(v, uid=HAUPT), channel=None)
@@ -1383,3 +1408,51 @@ def test_aufraeumen_nutzt_speicherdauer(v):
     bot.db.verif_signal_merken(ALT, "ip", "y", jetzt=time.time() - 29 * TAG)
     bot._verif_aufraeumen()
     assert [r["user_id"] for r in bot.db._conn.execute("SELECT user_id FROM verif_signal")] == [ALT]
+
+
+# ══ Verifizierungs-Nachricht automatisch beim Speichern ═════════════════════
+def test_dashboard_speichern_postet_die_nachricht_ohne_befehl(v):
+    k = v["g"][G_A].channels[ids(G_A)["verif"]]
+    st, d = mgmt(v, "POST", "", daten(nachricht="Hier verifizieren"))
+    assert st == 200 and d["data"]["panel"]["ergebnis"] == "gepostet", d
+    assert len(k.gesendet) == 1 and k.gesendet[0]["embed"].description == "Hier verifizieren"
+    assert isinstance(k.gesendet[0]["view"], bot.VerifPanelView)
+    e = bot._verif_einstellungen(bot.guild_sicht(v["a"], G_A))
+    assert e["panel_channel_id"] == str(ids(G_A)["verif"]) and e["panel_message_id"] == "9001"
+    # Erneut speichern (neuer Text): nur bearbeiten, kein zweiter Post; die gemerkte Nachricht bleibt erhalten
+    st, d = mgmt(v, "POST", "", daten(nachricht="Neuer Text"))
+    assert d["data"]["panel"]["ergebnis"] == "aktualisiert" and len(k.gesendet) == 1
+    assert k.nachrichten[9001].embed.description == "Neuer Text" and k.nachrichten[9001].bearbeitet == 1
+    assert bot._verif_einstellungen(bot.guild_sicht(v["a"], G_A))["panel_message_id"] == "9001"
+    # Nachricht in Discord gelöscht -> beim nächsten Speichern neu gepostet
+    k.nachrichten.clear()
+    st, d = mgmt(v, "POST", "", daten())
+    assert d["data"]["panel"]["ergebnis"] == "gepostet" and len(k.gesendet) == 2
+
+
+def test_dashboard_speichern_ohne_aktiv_postet_nichts_und_fehler_kippen_das_speichern_nicht(v):
+    k = v["g"][G_A].channels[ids(G_A)["verif"]]
+    st, d = mgmt(v, "POST", "", daten(enabled=False))
+    assert st == 200 and d["data"]["panel"]["ergebnis"] is None and k.gesendet == []
+    k.kaputt = True
+    st, d = mgmt(v, "POST", "", daten())
+    assert st == 200 and d["data"]["panel"]["ergebnis"] == "keine_rechte"
+    assert bot._verif_einstellungen(bot.guild_sicht(v["a"], G_A))["enabled"] is True        # gespeichert ist trotzdem
+
+
+def test_dashboard_channel_wechsel_postet_im_neuen_channel(v):
+    g = v["g"][G_A]
+    alt_k = g.channels[ids(G_A)["verif"]]
+    assert mgmt(v, "POST", "", daten())[1]["data"]["panel"]["ergebnis"] == "gepostet"
+    neu_id = ids(G_A)["log"]                                  # anderer Channel derselben Guild
+    st, d = mgmt(v, "POST", "", daten(channel_id=str(neu_id)))
+    assert d["data"]["panel"]["ergebnis"] == "gepostet" and len(g.channels[neu_id].gesendet) >= 1 and len(alt_k.gesendet) == 1
+    assert bot._verif_einstellungen(bot.guild_sicht(v["a"], G_A))["panel_channel_id"] == str(neu_id)
+
+
+def test_panel_ids_ueberleben_kaputte_werte():
+    class _S(dict):
+        pass
+    s = _S(verifizierung={"panel_channel_id": "abc", "panel_message_id": True})
+    e = bot._verif_einstellungen(s)
+    assert e["panel_channel_id"] is None and e["panel_message_id"] is None

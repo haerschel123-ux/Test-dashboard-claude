@@ -439,7 +439,8 @@ def test_payload_bereit_je_lage(monkeypatch):
 
 # ── Verdrahtung ──────────────────────────────────────────────────────────
 def test_ki_ist_im_modul_manager_und_als_befehl_registriert():
-    assert bot._DISCORD_MODUL_MAP["ki"] == "discord_mgmt"
+    assert bot._DISCORD_MODUL_MAP["ki"] == "discord_mgmt.ki_helfer"
+    assert "discord_mgmt.ki_helfer" in bot.FEATURE_MODULES
     assert bot.cmd_ki.name == "ki"
     parameter = bot.cmd_ki.parameters
     assert [p.name for p in parameter] == ["prompt"] and (parameter[0].min_value, parameter[0].max_value) == (1, 1500)
